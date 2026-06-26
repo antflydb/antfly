@@ -35,17 +35,7 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const AsyncEffectMirror = ha_types.AsyncEffectMirror;
 pub const AsyncBatchMirror = ha_types.AsyncBatchMirror;
@@ -896,7 +886,7 @@ test "storage.ha db fail-closed sync policy rejects before local batch commit" {
     try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
 }
 
-test "storage.ha db fail-closed metadata sync policy rejects before local lite table metadata commit" {
+test "storage.ha db fail-closed metadata sync policy rejects before local schema metadata commits" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -943,6 +933,16 @@ test "storage.ha db fail-closed metadata sync policy rejects before local lite t
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, db.applyTableSchemaJson(alloc, schema_json, .{}));
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
+    try std.testing.expect((try db.getSchemaJson(alloc)) == null);
+    var durable_schema = try schema_mod.loadSchema(db.core.store, alloc);
+    defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    try std.testing.expect(durable_schema == null);
+
     try std.testing.expectError(error.SyncPolicyUnsatisfied, db.applyLiteSqlTableRecord(alloc, .{
         .table_id = 42,
         .name = "usage_records",
@@ -957,12 +957,11 @@ test "storage.ha db fail-closed metadata sync policy rejects before local lite t
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
     try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), rejected.load(.acquire));
     try std.testing.expect((try db.getSchemaJson(alloc)) == null);
     try std.testing.expect((try db.getLiteSqlTableRecordAlloc(alloc)) == null);
 
-    const durable_schema = try schema_mod.loadSchema(db.core.store, alloc);
-    defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    durable_schema = try schema_mod.loadSchema(db.core.store, alloc);
     try std.testing.expect(durable_schema == null);
 }
 
@@ -1014,11 +1013,19 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
         });
         defer db.close();
 
+        const relational_columns = [_]schema_mod.RelationalColumn{.{
+            .name = "id",
+            .path = "id",
+            .field_type = .keyword,
+            .nullable = false,
+        }};
         try db.setSchema(.{
             .version = 12,
-            .default_type = "doc",
+            .default_type = "row",
             .ttl_duration_ns = 456,
             .ttl_field = "expires_at",
+            .storage_mode = .relational,
+            .relational_columns = relational_columns[0..],
         });
     }
 
@@ -1046,9 +1053,104 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
     defer schema_mod.freeSchema(alloc, replicated_schema);
     try std.testing.expectEqual(@as(u32, 12), replicated_schema.version);
-    try std.testing.expectEqualStrings("doc", replicated_schema.default_type);
+    try std.testing.expectEqualStrings("row", replicated_schema.default_type);
     try std.testing.expectEqual(@as(u64, 456), replicated_schema.ttl_duration_ns);
     try std.testing.expectEqualStrings("expires_at", replicated_schema.ttl_field);
+    try std.testing.expectEqual(schema_mod.StorageMode.relational, replicated_schema.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), replicated_schema.relational_columns.len);
+    try std.testing.expectEqualStrings("id", replicated_schema.relational_columns[0].name);
+    try std.testing.expect(standby_db.async_context.relational_base_rows);
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+}
+
+test "storage.ha db mirrors and applies local schema json metadata mutation records" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 253,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_metadata_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.applyTableSchemaJson(alloc, schema_json, .{});
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+
+    var decoded = try ha_effects_mod.decodeMetadataMutation(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(ha_effects_mod.MetadataMutationKind.schema, decoded.value.kind);
+    try std.testing.expectEqualStrings(schema_json, decoded.value.local_schema_json orelse return error.TestUnexpectedResult);
+    try std.testing.expect(decoded.value.lite_sql_table_record_json == null);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
+    defer schema_mod.freeSchema(alloc, replicated_schema);
+    try std.testing.expectEqual(@as(u32, 1), replicated_schema.version);
+    try std.testing.expectEqualStrings("row", replicated_schema.default_type);
+
+    const local_schema_json = (try standby_db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(local_schema_json);
+    try std.testing.expectEqualStrings(schema_json, local_schema_json);
 
     try standby_db.applyHAReplicationRecord(entry.record);
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
@@ -1435,6 +1537,10 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
+        db.finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(.{}, false),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
         db.finishDenseAutoBulkIngestSessionWithOptions(.{}),
     );
     try std.testing.expectError(
@@ -1449,6 +1555,10 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
         error.HAReadOnlyStandby,
         db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
     );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.drainDocumentArtifactChildRangeOutbox(noop_dispatcher, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "asset", @as(types.DocumentArtifactChildRangePlacementUpdate, undefined)));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.reprocessDocumentArtifact(alloc, "doc:a", "asset"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.reprocessDocumentArtifactRange(alloc, "asset", @as(types.DocumentArtifactTableReprocessRequest, undefined)));
     try std.testing.expectError(
         error.HAReadOnlyStandby,
         db.updateRange(.{ .start = "doc:a", .end = "doc:z" }),
@@ -1456,6 +1566,7 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitState(null));
     try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitState());
     try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitDeltaFinalSeq());
     try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitDeltaEntries());
     try std.testing.expectError(error.HAReadOnlyStandby, db.createShadowIndexManager("doc:m", "doc:z"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.closeShadowIndexManager());
@@ -1468,6 +1579,7 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.sync(false));
     try std.testing.expectError(error.HAReadOnlyStandby, db.syncIndexes(false));
     try std.testing.expectError(error.HAReadOnlyStandby, db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairRestoreRuntimeStateIfNeeded(alloc));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricMaintenanceForIdle());
     try std.testing.expectError(
         error.HAReadOnlyStandby,
@@ -1481,7 +1593,9 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", "worker-a", 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorSweep(.{}));
@@ -1490,7 +1604,26 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.retryQuarantinedIndexLoads(true));
     try std.testing.expectError(error.HAReadOnlyStandby, db.runUntilIdle());
     try std.testing.expectError(error.HAReadOnlyStandby, db.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSchema(.{ .version = 99 }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.applyTableSchemaJson(alloc, "{\"version\":99}", .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSchemaJson(alloc, "{\"version\":99}"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.reloadAlgebraicSchemaConfigs("{\"version\":99}"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.schemaRuntimeStageAlgebraicSchemaConfigsPending("{\"version\":99}"));
+    const metadata_table_manager = @import("../../metadata/table_manager.zig");
+    try std.testing.expectError(error.HAReadOnlyStandby, db.applyLiteSqlTableRecord(alloc, .{
+        .table_id = 99,
+        .name = "blocked",
+        .schema_json = "{\"version\":99}",
+    }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.executeClaimedSchemaRewriteJob(alloc, @as(metadata_table_manager.SchemaRewriteJobRecord, undefined)));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.addIndex(@as(types.IndexConfig, undefined)));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.addEnrichment(@as(types.EnrichmentConfig, undefined)));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertEnrichment(@as(types.EnrichmentConfig, undefined)));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.drainResolverBackfill());
     try std.testing.expectError(error.HAReadOnlyStandby, db.compactTextIndexes());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.drainScheduledTextMerges());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.forceCompactTextIndexes());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.bestEffortForceCompactTextIndexes());
     try std.testing.expectError(error.HAReadOnlyStandby, db.deleteIndex("missing"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.deleteEnrichment(.asset, "missing"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.removeResolver("missing"));
@@ -1505,17 +1638,43 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
     try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecordAt("job-at", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running", 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt("job-at", "complete", true, .{}, "[]", 0, false, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnosticsWithReport("job-a", .{}, "[]", 0, false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnosticsAt("job-at", "[]", 0, false, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnosticsWithReportAt("job-at", .{}, "[]", 0, false, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionJobWithUpdatedParentKey("action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionJobAt("action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionJobWithUpdatedParentKey("action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionJobAt("action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionScheduleWithUpdatedParentKey("schedule-b", "action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionScheduleAt("schedule-c", "action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionScheduleAt("schedule-c", "action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.markForeignKeyActionScheduleSeededAt("schedule-a", 1, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyActionJobPageAt("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyActionJobPageAt("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.finishClaimedForeignKeyActionJobPageAt(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.catchUpPendingDerivedReplay());
+    const NoopReplayProgress = struct {
+        fn hook(_: *anyopaque, _: []const u8, _: db_mod.ReplayProgress) anyerror!void {}
+    };
+    try std.testing.expectError(error.HAReadOnlyStandby, db.catchUpPendingDerivedReplayWithProgress(&noop_dispatcher_state, NoopReplayProgress.hook));
     try std.testing.expectError(error.HAReadOnlyStandby, db.derivedAsyncAppendDerivedBatchRecord(.{}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesForTargetCoverage(alloc));
     try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildSparseIndexesForTargetCoverage(alloc));
@@ -1524,12 +1683,16 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.runDensePostingMaintenanceForIdleBestEffort());
     try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
     try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, null, null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(alloc, null, null, null, null, null, null, null, 16, 16));
     try std.testing.expectError(error.HAReadOnlyStandby, db.replayGeneratedEnrichmentsFromStoredDocs(alloc));
     try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runMaintenanceUntilTargets(1, &.{"idx"}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
     try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
     try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, .{}, .{}, .{ .kind = .update }, 0, &.{}));
     const blocked_txn: transactions_mod.TxnId = .{ 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42 };
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransaction(1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithId(blocked_txn, 1));
@@ -1710,6 +1873,15 @@ pub fn Impl(comptime DB: type) type {
             try mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema);
         }
 
+        pub fn mirrorDBSchemaJsonMetadataCommit(
+            self: *DB,
+            table_schema: schema_mod.TableSchema,
+            schema_json: []const u8,
+        ) !void {
+            const resources = self.core.batchExecutionResources();
+            try mirrorSchemaJsonMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema, schema_json);
+        }
+
         pub fn mirrorDBLiteSqlTableMetadataCommit(
             self: *DB,
             table_schema: schema_mod.TableSchema,
@@ -1746,7 +1918,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
-            try self.core.setSchema(table_schema);
+            try DB.HAReplicationCallbacks.set_schema_replicated_apply(self, table_schema);
             if (applied_lsn_marker) |lsn| try Self.markReplicationRecordApplied(self, lsn);
         }
 
@@ -1777,6 +1949,13 @@ pub fn Impl(comptime DB: type) type {
                             decoded_schema,
                             schema_json,
                             table_record_json,
+                        );
+                        try Self.markReplicationRecordApplied(self, record.lsn);
+                    } else if (decoded.value.local_schema_json) |schema_json| {
+                        try DB.HAReplicationCallbacks.set_schema_with_local_schema_json_replicated_apply(
+                            self,
+                            decoded_schema,
+                            schema_json,
                         );
                         try Self.markReplicationRecordApplied(self, record.lsn);
                     } else {
@@ -1827,7 +2006,7 @@ pub fn preflightMirrorSyncCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEff
     if (configured.sync_policy.mode == .async) return;
     if (configured.sync_policy.failure_policy != .fail_closed) return;
 
-    platform.sync.lockYielding(log_mutex);
+    _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
 
     const target_lsn = configured.primary.nextLsn();
@@ -1841,7 +2020,7 @@ pub fn preflightMirrorSyncCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEff
 
 pub fn mirrorReplayPayloadBestEffort(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEffectMirror, payload: []const u8) void {
     const configured = mirror orelse return;
-    platform.sync.lockYielding(log_mutex);
+    _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{}) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -1854,7 +2033,7 @@ pub fn mirrorReplayPayloadBestEffort(log_mutex: *std.atomic.Mutex, mirror: ?Asyn
 pub fn mirrorReplayPayloadCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEffectMirror, payload: []const u8) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
-        platform.sync.lockYielding(log_mutex);
+        _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{}) catch |err| {
             noteMirrorFailure(configured, "derived effect", err);
@@ -1869,7 +2048,7 @@ pub fn mirrorReplayPayloadCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEff
 
 pub fn mirrorBatchMutationBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncBatchMirror, request: types.BatchRequest) void {
     const configured = mirror orelse return;
-    platform.sync.lockYielding(log_mutex);
+    _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{}) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -1882,7 +2061,7 @@ pub fn mirrorBatchMutationBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mu
 pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncBatchMirror, request: types.BatchRequest) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
-        platform.sync.lockYielding(log_mutex);
+        _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{}) catch |err| {
             noteMirrorFailure(configured, "batch mutation", err);
@@ -1897,7 +2076,7 @@ pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex,
 
 pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) void {
     const configured = mirror orelse return;
-    platform.sync.lockYielding(log_mutex);
+    _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{}) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -1910,10 +2089,38 @@ pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.M
 pub fn mirrorSchemaMetadataCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
-        platform.sync.lockYielding(log_mutex);
+        _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{}) catch |err| {
             noteMirrorFailure(configured, "metadata mutation", err);
+            if (mirrorSyncEnabled(configured)) return err;
+            return;
+        };
+        if (configured.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
+    };
+    try evaluateMirrorCommitGate(configured, lsn);
+}
+
+pub fn mirrorSchemaJsonMetadataCommit(
+    alloc: Allocator,
+    log_mutex: *std.atomic.Mutex,
+    mirror: ?AsyncMetadataMirror,
+    table_schema: schema_mod.TableSchema,
+    schema_json: []const u8,
+) !void {
+    const configured = mirror orelse return;
+    const lsn = blk: {
+        _ = platform.sync.lockAtomic(log_mutex);
+        defer log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendSchemaMetadataMutationWithPayloadOptions(
+            alloc,
+            configured.primary,
+            table_schema,
+            .{ .local_schema_json = schema_json },
+            .{},
+        ) catch |err| {
+            noteMirrorFailure(configured, "schema json metadata mutation", err);
             if (mirrorSyncEnabled(configured)) return err;
             return;
         };
@@ -1933,7 +2140,7 @@ pub fn mirrorLiteSqlTableMetadataCommit(
 ) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
-        platform.sync.lockYielding(log_mutex);
+        _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendSchemaMetadataMutationWithPayloadOptions(
             alloc,

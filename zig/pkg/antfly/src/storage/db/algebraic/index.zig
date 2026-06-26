@@ -3168,7 +3168,7 @@ pub const Index = struct {
 
     // Held only around a write transaction, so contention is brief.
     fn lockWrites(self: *Index) void {
-        platform.sync.lockYielding(&self.write_mutex);
+        _ = platform.sync.lockAtomic(&self.write_mutex);
     }
 
     fn unlockWrites(self: *Index) void {

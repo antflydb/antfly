@@ -45,25 +45,7 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub const FakePromotionSink = support.FakePromotionSink;
-    pub const FixedVectorEmbedder = support.FixedVectorEmbedder;
-    pub const TestAssetProducer = support.TestAssetProducer;
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-
-    pub fn lockApply(db: anytype) void {
-        support.lockApply(db);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
@@ -1807,7 +1789,7 @@ pub const ResolutionRuntime = struct {
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    platform.sync.lockYielding(mutex);
+    _ = platform.sync.lockAtomic(mutex);
 }
 
 const testing = std.testing;

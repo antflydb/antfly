@@ -65,41 +65,7 @@ else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
 
-const TestHelpers = if (builtin.is_test) struct {
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return @import("../test_support.zig").tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        @import("../test_support.zig").cleanupTempDir(path);
-    }
-
-    pub fn waitForSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
-        return @import("../test_support.zig").waitForSearchResult(alloc, db, req, min_hits);
-    }
-
-    pub fn waitForDenseSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
-        return @import("../test_support.zig").waitForDenseSearchResult(alloc, db, req, min_hits);
-    }
-
-    pub fn waitForAppliedSequenceAdvance(alloc: Allocator, db: anytype, index_name: []const u8, previous: u64) !u64 {
-        return @import("../test_support.zig").waitForAppliedSequenceAdvance(alloc, db, index_name, previous);
-    }
-
-    pub fn waitForDenseIndexResultsWithAttempts(
-        index: *@import("../../hbc_adapter.zig").HBCIndex,
-        query: []const f32,
-        k: usize,
-        min_hits: usize,
-        max_attempts: usize,
-    ) !@import("../../hbc_adapter.zig").SearchResults {
-        return @import("../test_support.zig").waitForDenseIndexResultsWithAttempts(index, query, k, min_hits, max_attempts);
-    }
-
-    pub fn slowWaitAttempts() usize {
-        return @import("../test_support.zig").slow_test_wait_attempts;
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("../test_support.zig") else struct {};
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -8331,7 +8297,7 @@ test "db enrichment runtime document extraction chunks units through source arti
     const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
     defer alloc.free(query_vec);
     const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
-    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, TestHelpers.slowWaitAttempts());
+    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, TestHelpers.slow_test_wait_attempts);
     defer direct.deinit();
     const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
         metadata
@@ -10759,7 +10725,7 @@ test "db enrichment runtime dense index can reference existing chunk embedding e
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
     const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
-    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, TestHelpers.slowWaitAttempts());
+    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, TestHelpers.slow_test_wait_attempts);
     defer direct.deinit();
 
     const internal_id = if (direct.takeMetadata(0)) |metadata|

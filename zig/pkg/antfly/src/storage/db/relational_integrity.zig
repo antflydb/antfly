@@ -29,41 +29,7 @@ const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-
-    pub fn expectRelationalTemporalPriceRow(
-        alloc: Allocator,
-        row_json: []const u8,
-        sku: []const u8,
-        valid_from: f64,
-        valid_to: f64,
-        price: f64,
-    ) !void {
-        return support.expectRelationalTemporalPriceRow(alloc, row_json, sku, valid_from, valid_to, price);
-    }
-
-    pub fn expectRelationalTemporalPrimarySelectorPriceRow(
-        alloc: Allocator,
-        db: anytype,
-        runtime_schema: schema_mod.TableSchema,
-        sku: []const u8,
-        point_json: []const u8,
-        valid_from: f64,
-        valid_to: f64,
-        price: f64,
-    ) !void {
-        return support.expectRelationalTemporalPrimarySelectorPriceRow(alloc, db, runtime_schema, sku, point_json, valid_from, valid_to, price);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;

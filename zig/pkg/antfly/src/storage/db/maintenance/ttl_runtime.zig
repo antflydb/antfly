@@ -31,21 +31,7 @@ const platform = @import("antfly_platform");
 const platform_clock = @import("../../../platform/clock.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("../test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-
-    pub fn waitForRawDelete(alloc: Allocator, db: anytype, key: []const u8, max_attempts: usize) !void {
-        return support.waitForRawDelete(alloc, db, key, max_attempts);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("../test_support.zig") else struct {};
 
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,

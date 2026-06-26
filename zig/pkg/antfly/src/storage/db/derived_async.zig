@@ -62,54 +62,7 @@ const profileDelta = db_internal.profileDelta;
 const readEnvUsize = db_internal.readEnvUsize;
 const readEnvU64 = db_internal.readEnvU64;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub const default_test_wait_attempts = support.default_test_wait_attempts;
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-
-    pub fn waitForSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
-        return support.waitForSearchResult(alloc, db, req, min_hits);
-    }
-
-    pub fn waitForAppliedSequenceAdvance(alloc: Allocator, db: anytype, index_name: []const u8, previous: u64) !u64 {
-        return support.waitForAppliedSequenceAdvance(alloc, db, index_name, previous);
-    }
-
-    pub fn putDenseEmbeddingArtifactForTest(db: anytype, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
-        return support.putDenseEmbeddingArtifactForTest(db, alloc, artifact_key, source_hash, vector);
-    }
-
-    pub fn putSparseEmbeddingArtifactForTest(
-        db: anytype,
-        alloc: Allocator,
-        artifact_key: []const u8,
-        source_hash: ?u64,
-        indices: []const u32,
-        values: []const f32,
-    ) !void {
-        return support.putSparseEmbeddingArtifactForTest(db, alloc, artifact_key, source_hash, indices, values);
-    }
-
-    pub fn stressDenseBackend() hbc_mod.StorageBackend {
-        return support.stressDenseBackend();
-    }
-
-    pub fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u8 {
-        return support.allocStressDenseDocJson(alloc, dims, doc_index);
-    }
-
-    pub fn profileBenchTestsEnabled() bool {
-        return support.profileBenchTestsEnabled();
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);

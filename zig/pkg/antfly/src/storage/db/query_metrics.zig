@@ -97,7 +97,7 @@ const MetricsMutex = struct {
     state: std.atomic.Mutex = .unlocked,
 
     fn lock(self: *@This()) void {
-        platform_sync.lockYielding(&self.state);
+        _ = platform_sync.lockAtomic(&self.state);
     }
 
     fn unlock(self: *@This()) void {

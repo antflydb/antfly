@@ -13,53 +13,33 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 
 const db_mod = @import("mod.zig");
 const db_config = @import("config.zig");
+const db_internal = @import("internal.zig");
 const docstore_mod = @import("../docstore.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const internal_keys = @import("../internal_keys.zig");
-const platform_clock = @import("../../platform/clock.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const split_restore = @import("split_restore.zig");
+const TestHelpers = @import("test_support.zig");
 const types = @import("types.zig");
 
 const DB = db_mod.DB;
 const PrimaryBackend = db_mod.PrimaryBackend;
-
-var temp_path_nonce: u64 = 0;
-
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
-    if (builtin.os.tag == .freestanding) return;
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
-}
-
-fn tempPath(buf: []u8) [*:0]const u8 {
-    const base = "/tmp/antfly-db-test-";
-    const pid: u32 = @intCast(std.posix.system.getpid());
-    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, pid, nonce }) catch unreachable;
-    return @ptrCast(path.ptr);
-}
-
-fn cleanupTempDir(path: [*:0]const u8) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
-}
 
 fn waitForSearchResult(alloc: std.mem.Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     var last = try db.search(alloc, req);
     var attempts: usize = 0;
     while (last.total_hits < min_hits and attempts < 100) : (attempts += 1) {
         last.deinit();
-        platform_clock.Clock.real().sleepMs(10);
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
         last = try db.search(alloc, req);
     }
     if (last.total_hits < min_hits) {
@@ -78,7 +58,7 @@ fn waitForAppliedSequenceAdvance(
     var applied = try db.core.loadAppliedSequence(alloc, index_name);
     var attempts: usize = 0;
     while (applied <= previous and attempts < 100) : (attempts += 1) {
-        platform_clock.Clock.real().sleepMs(10);
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
         applied = try db.core.loadAppliedSequence(alloc, index_name);
     }
     if (applied <= previous) return error.Timeout;
@@ -89,8 +69,8 @@ test "db split state and split deltas are exposed through public api" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -145,8 +125,8 @@ test "db shadow index manager backfills split-off range and ignores parent-range
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -197,12 +177,12 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
-    defer cleanupTempDir(dest);
+    const dest = TestHelpers.tempPath(&dest_buf);
+    defer TestHelpers.cleanupTempDir(dest);
 
     const identity_namespace = doc_identity.Namespace{ .table_id = 71, .shard_id = 101, .range_id = 1001 };
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -381,12 +361,12 @@ test "db split moves relational rows and column entries" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
-    defer cleanupTempDir(dest);
+    const dest = TestHelpers.tempPath(&dest_buf);
+    defer TestHelpers.cleanupTempDir(dest);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -471,12 +451,12 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
-    defer cleanupTempDir(dest);
+    const dest = TestHelpers.tempPath(&dest_buf);
+    defer TestHelpers.cleanupTempDir(dest);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -549,12 +529,12 @@ test "db split prepare survives reopen and finalizes with durable lsm primary ba
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
-    defer cleanupTempDir(parent_path);
+    const parent_path = TestHelpers.tempPath(&parent_buf);
+    defer TestHelpers.cleanupTempDir(parent_path);
 
     var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
-    defer cleanupTempDir(child_path);
+    const child_path = TestHelpers.tempPath(&child_buf);
+    defer TestHelpers.cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -607,12 +587,12 @@ test "db split prepare survives reopen and finalizes text sparse and graph index
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
-    defer cleanupTempDir(parent_path);
+    const parent_path = TestHelpers.tempPath(&parent_buf);
+    defer TestHelpers.cleanupTempDir(parent_path);
 
     var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
-    defer cleanupTempDir(child_path);
+    const child_path = TestHelpers.tempPath(&child_buf);
+    defer TestHelpers.cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -752,12 +732,12 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -780,14 +760,7 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
@@ -814,12 +787,12 @@ test "db split restore doc identity snapshot rejects invalid metadata" {
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -846,14 +819,7 @@ test "db split restore doc identity snapshot rejects invalid metadata" {
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try std.testing.expectError(error.InvalidDocIdentity, DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
@@ -864,12 +830,12 @@ test "db split restore doc identity deferred restore rejects strict namespace mi
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     const source_namespace = doc_identity.Namespace{
@@ -898,14 +864,7 @@ test "db split restore doc identity deferred restore rejects strict namespace mi
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
         alloc,
@@ -928,12 +887,12 @@ test "db restore snapshot recreates text sparse and graph indexes for durable ls
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -976,14 +935,7 @@ test "db restore snapshot recreates text sparse and graph indexes for durable ls
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
@@ -1025,12 +977,12 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -1073,14 +1025,7 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
@@ -1125,12 +1070,12 @@ test "db split restore doc identity runtime repair repairs managed chunked dense
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -1163,14 +1108,7 @@ test "db split restore doc identity runtime repair repairs managed chunked dense
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
@@ -1220,12 +1158,12 @@ test "db split restore doc identity incomplete deferred restore import recovers 
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
-    defer cleanupTempDir(src_path);
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
 
     var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
-    defer cleanupTempDir(restore_path);
+    const restore_path = TestHelpers.tempPath(&restore_buf);
+    defer TestHelpers.cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -1241,14 +1179,7 @@ test "db split restore doc identity incomplete deferred restore import recovers 
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
     defer alloc.free(snapshot_root);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
     try DB.beginRestoreImport(alloc, std.mem.span(restore_path), snapshot_root, .{
         .backup_id = "snap1",
@@ -1283,12 +1214,12 @@ test "db split cutover enrichment fence owns split range" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
-    defer cleanupTempDir(dest);
+    const dest = TestHelpers.tempPath(&dest_buf);
+    defer TestHelpers.cleanupTempDir(dest);
 
     var deterministic_parent = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -1375,12 +1306,12 @@ test "db split cutover enrichment fence owns split range with durable lsm primar
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
-    defer cleanupTempDir(dest);
+    const dest = TestHelpers.tempPath(&dest_buf);
+    defer TestHelpers.cleanupTempDir(dest);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -1471,12 +1402,12 @@ test "db merge-style cutover enrichment fence owns merged receiver range" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     var deterministic_receiver = embedder_mod.DeterministicDenseEmbedder{};
     var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{
@@ -1565,12 +1496,12 @@ test "db merge-style cutover enrichment fence owns merged receiver range with du
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -1663,12 +1594,12 @@ test "db merge-style cutover routes text sparse and graph indexes to the merged 
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -1778,12 +1709,12 @@ test "db split cutover enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
-    defer cleanupTempDir(parent_path);
+    const parent_path = TestHelpers.tempPath(&parent_buf);
+    defer TestHelpers.cleanupTempDir(parent_path);
 
     var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
-    defer cleanupTempDir(child_path);
+    const child_path = TestHelpers.tempPath(&child_buf);
+    defer TestHelpers.cleanupTempDir(child_path);
 
     {
         var deterministic_parent = embedder_mod.DeterministicDenseEmbedder{};
@@ -1906,12 +1837,12 @@ test "db split cutover enrichment resume and fencing across reopen with durable 
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
-    defer cleanupTempDir(parent_path);
+    const parent_path = TestHelpers.tempPath(&parent_buf);
+    defer TestHelpers.cleanupTempDir(parent_path);
 
     var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
-    defer cleanupTempDir(child_path);
+    const child_path = TestHelpers.tempPath(&child_buf);
+    defer TestHelpers.cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -2042,12 +1973,12 @@ test "db merge-style cutover enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     {
         var deterministic_receiver = embedder_mod.DeterministicDenseEmbedder{};
@@ -2173,12 +2104,12 @@ test "db merge-style cutover enrichment resume and fencing across reopen with du
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -2312,12 +2243,12 @@ test "db merge-style cutover preserves text sparse and graph indexes across reop
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -2441,12 +2372,12 @@ test "db merge-style cutover routes relational rows and column scans across reop
     const table_schema_api = @import("../../schema/mod.zig");
 
     var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
-    defer cleanupTempDir(receiver_path);
+    const receiver_path = TestHelpers.tempPath(&receiver_buf);
+    defer TestHelpers.cleanupTempDir(receiver_path);
 
     var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
-    defer cleanupTempDir(donor_path);
+    const donor_path = TestHelpers.tempPath(&donor_buf);
+    defer TestHelpers.cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     const schema_json =
@@ -2553,8 +2484,8 @@ test "db snapshot exports logical store only" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2568,15 +2499,8 @@ test "db snapshot exports logical store only" {
 
     const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
     defer alloc.free(store_snapshot_path);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
-    var io_impl = threadedIo();
+    defer TestHelpers.cleanupSnapshotDirForPath(path);
+    var io_impl = db_internal.threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
 }
@@ -2585,8 +2509,8 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -2602,15 +2526,8 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
 
     const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
     defer alloc.free(store_snapshot_path);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
-        } else |_| {}
-    }
-    var io_impl = threadedIo();
+    defer TestHelpers.cleanupSnapshotDirForPath(path);
+    var io_impl = db_internal.threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
 }

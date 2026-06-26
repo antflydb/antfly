@@ -304,7 +304,7 @@ test "derived log propagates wal group commit settings" {
         fn wait(self: *@This(), total: usize) void {
             var registered = false;
             while (true) {
-                platform_sync.lockYielding(&self.mutex);
+                _ = platform_sync.lockAtomic(&self.mutex);
                 if (!registered) {
                     self.waiting += 1;
                     registered = true;

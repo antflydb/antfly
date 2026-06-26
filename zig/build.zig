@@ -3410,6 +3410,7 @@ pub fn build(b: *std.Build) void {
     derived_log_test_mod.addImport("bloom", bloom_mod);
     derived_log_test_mod.addImport("antfly_vellum", vellum_mod);
     derived_log_test_mod.addImport("antfly_regex", regex_mod);
+    derived_log_test_mod.addImport("antfly_reranking", reranking_mod);
     const storage_backend_tests = antfly_tests_build.addStorageBackendTestSteps(b, .{
         .lmdb_engine = lmdb_engine_mod,
         .storage_lmdb = storage_lmdb_test_mod,

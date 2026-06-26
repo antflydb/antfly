@@ -13,13 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const db_mod = @import("mod.zig");
+const db_internal = @import("internal.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_time = @import("../../platform/time.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
+const TestHelpers = @import("test_support.zig");
 const types = @import("types.zig");
 const zig_lmdb = @import("lmdb_engine");
 
@@ -27,7 +28,6 @@ const Allocator = std.mem.Allocator;
 const DB = db_mod.DB;
 const OpenOptions = db_mod.OpenOptions;
 
-var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
 
 const db_split_sim_fixture = struct {
@@ -183,28 +183,9 @@ const db_split_sim_fixture = struct {
     }
 };
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
-    if (builtin.os.tag == .freestanding) return;
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
-}
-
-fn tempPath(buf: []u8) [*:0]const u8 {
-    const base = "/tmp/antfly-db-test-";
-    const pid: u32 = @intCast(std.posix.system.getpid());
-    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, pid, nonce }) catch unreachable;
-    return @ptrCast(path.ptr);
-}
-
-fn cleanupTempDir(path: [*:0]const u8) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
-}
-
 fn ensureDirPath(path: []const u8) !void {
     if (path.len == 0) return;
-    var io_impl = threadedIo();
+    var io_impl = db_internal.threadedIo();
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), path);
 }
@@ -654,10 +635,10 @@ fn reportReducedDbSplitSchedule(
         pub fn replay(self: @This(), candidate: []const DbSplitSimAction) !void {
             var source_path_buf: [256]u8 = undefined;
             var dest_path_buf: [256]u8 = undefined;
-            const source_path = tempPath(&source_path_buf);
-            const dest_path = tempPath(&dest_path_buf);
-            defer cleanupTempDir(source_path);
-            defer cleanupTempDir(dest_path);
+            const source_path = TestHelpers.tempPath(&source_path_buf);
+            const dest_path = TestHelpers.tempPath(&dest_path_buf);
+            defer TestHelpers.cleanupTempDir(source_path);
+            defer TestHelpers.cleanupTempDir(dest_path);
             const actual = try replayDbSplitActionsAtPaths(self.alloc, source_path, dest_path, candidate);
             try expectDbSplitSummaryEqual(self.case_label, try expectedDbSplitSummary(candidate), actual);
         }
@@ -753,10 +734,10 @@ fn runDbSplitReplayCase(
 
     var source_path_buf: [256]u8 = undefined;
     var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
-    defer cleanupTempDir(source_path);
-    defer cleanupTempDir(dest_path);
+    const source_path = TestHelpers.tempPath(&source_path_buf);
+    const dest_path = TestHelpers.tempPath(&dest_path_buf);
+    defer TestHelpers.cleanupTempDir(source_path);
+    defer TestHelpers.cleanupTempDir(dest_path);
 
     const actual = replayDbSplitActionsAtPaths(alloc, source_path, dest_path, actions) catch |err| {
         reportReducedDbSplitSchedule(alloc, case_label, seed, actions) catch {};
@@ -783,10 +764,10 @@ fn runModeledDbSplitReplayCase(
 
     var source_path_buf: [256]u8 = undefined;
     var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
-    defer cleanupTempDir(source_path);
-    defer cleanupTempDir(dest_path);
+    const source_path = TestHelpers.tempPath(&source_path_buf);
+    const dest_path = TestHelpers.tempPath(&dest_path_buf);
+    defer TestHelpers.cleanupTempDir(source_path);
+    defer TestHelpers.cleanupTempDir(dest_path);
     try ensureDirPath(std.mem.span(source_path));
     try ensureDirPath(std.mem.span(dest_path));
 
@@ -851,10 +832,10 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
         const fixture_name = fixture.case_label orelse fixture.label orelse fixture_rel_path;
         var source_path_buf: [256]u8 = undefined;
         var dest_path_buf: [256]u8 = undefined;
-        const source_path = tempPath(&source_path_buf);
-        const dest_path = tempPath(&dest_path_buf);
-        defer cleanupTempDir(source_path);
-        defer cleanupTempDir(dest_path);
+        const source_path = TestHelpers.tempPath(&source_path_buf);
+        const dest_path = TestHelpers.tempPath(&dest_path_buf);
+        defer TestHelpers.cleanupTempDir(source_path);
+        defer TestHelpers.cleanupTempDir(dest_path);
 
         const actual = try replayDbSplitActionsAtPaths(alloc, source_path, dest_path, fixture.actions);
         try expectDbSplitFixtureExpectation(fixture_name, fixture.opts, actual);
@@ -903,10 +884,10 @@ fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
 
         var source_path_buf: [256]u8 = undefined;
         var dest_path_buf: [256]u8 = undefined;
-        const source_path = tempPath(&source_path_buf);
-        const dest_path = tempPath(&dest_path_buf);
-        defer cleanupTempDir(source_path);
-        defer cleanupTempDir(dest_path);
+        const source_path = TestHelpers.tempPath(&source_path_buf);
+        const dest_path = TestHelpers.tempPath(&dest_path_buf);
+        defer TestHelpers.cleanupTempDir(source_path);
+        defer TestHelpers.cleanupTempDir(dest_path);
         try ensureDirPath(std.mem.span(source_path));
         try ensureDirPath(std.mem.span(dest_path));
 
@@ -961,10 +942,10 @@ test "db split full keeps subsequent left-side source writes searchable" {
 
     var source_path_buf: [256]u8 = undefined;
     var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
-    defer cleanupTempDir(source_path);
-    defer cleanupTempDir(dest_path);
+    const source_path = TestHelpers.tempPath(&source_path_buf);
+    const dest_path = TestHelpers.tempPath(&dest_path_buf);
+    defer TestHelpers.cleanupTempDir(source_path);
+    defer TestHelpers.cleanupTempDir(dest_path);
 
     var runtime = try DbSplitSimRuntime.init(alloc, source_path, dest_path);
     defer runtime.deinit();

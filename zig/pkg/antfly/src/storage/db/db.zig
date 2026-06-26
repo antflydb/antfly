@@ -296,11 +296,14 @@ pub const DB = struct {
         pub const save_index_status_snapshot = schema_runtime_impl.saveIndexStatusSnapshot;
         pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
         pub const mirror_ha_schema_metadata_commit = ha_replication_impl.mirrorDBSchemaMetadataCommit;
+        pub const mirror_ha_schema_json_metadata_commit = ha_replication_impl.mirrorDBSchemaJsonMetadataCommit;
         pub const mirror_ha_lite_sql_table_metadata_commit = ha_replication_impl.mirrorDBLiteSqlTableMetadataCommit;
     };
     pub const HAReplicationCallbacks = struct {
         pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
         pub const append_replicated_ha_derived_effect_context = derived_async_impl.appendReplicatedHADerivedEffectContext;
+        pub const set_schema_replicated_apply = schema_runtime_impl.setSchemaReplicatedApply;
+        pub const set_schema_with_local_schema_json_replicated_apply = schema_runtime_impl.setSchemaWithLocalSchemaJsonReplicatedApply;
         pub const set_schema_with_local_lite_sql_table_record_json_replicated_apply = schema_runtime_impl.setSchemaWithLocalLiteSqlTableRecordJsonReplicatedApply;
     };
 

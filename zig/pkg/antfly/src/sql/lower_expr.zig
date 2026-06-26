@@ -373,6 +373,25 @@ fn validateGeneratedChildExpressionPayloads(
     try validateGeneratedExpressionPayloads(tokens, child.*);
 }
 
+fn validateGeneratedEmptyList(list: generated_parser.GeneratedSqlListAst) !void {
+    if (list.count != 0 or
+        list.first_tokens != null or
+        list.last_tokens != null or
+        list.items.len != 0 or
+        list.expression_items.len != 0 or
+        list.alias_items.len != 0 or
+        list.alias_name_items.len != 0 or
+        list.direction_items.len != 0 or
+        list.directions.len != 0 or
+        list.order_using_operator_items.len != 0 or
+        list.nulls_order_items.len != 0 or
+        list.nulls_orders.len != 0 or
+        list.expressions.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedSetOperationPayloads(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -400,17 +419,34 @@ fn validateGeneratedSetOperationPayloads(
     } else if (right_query_tokens.start != operator_tokens.end) {
         return error.UnsupportedSqlShape;
     }
+    const right_projection_start = if (set_operation.right_distinct_tokens) |distinct_range| distinct_start: {
+        if (distinct_range.start != right_select_tokens.end) return error.UnsupportedSqlShape;
+        if (distinct_range.end > right_query_tokens.end) return error.UnsupportedSqlShape;
+        const distinct = try validateGeneratedDistinctClause(tokens, distinct_range, set_operation.right_distinct_on_items);
+        break :distinct_start distinct.end;
+    } else no_distinct: {
+        try validateGeneratedEmptyList(set_operation.right_distinct_on_items);
+        break :no_distinct right_select_tokens.end;
+    };
     if (set_operation.right_projection_tokens) |projection_range| {
         if (projection_range.start < right_query_tokens.start or projection_range.end > right_query_tokens.end) return error.UnsupportedSqlShape;
+        if (projection_range.start != right_projection_start) return error.UnsupportedSqlShape;
         try validateGeneratedProjectionListForClause(tokens, projection_range, set_operation.right_projection_items);
         try validateGeneratedReadListBoundaryExpressions(tokens, set_operation.right_projection_items, set_operation.right_projection_first_expression, set_operation.right_projection_last_expression);
     } else if (set_operation.right_projection_items.count != 0 or set_operation.right_projection_first_expression.tokens != null or set_operation.right_projection_last_expression.tokens != null) {
         return error.UnsupportedSqlShape;
     }
+    if (set_operation.right_source_tokens) |source_range| {
+        if (source_range.start >= source_range.end or source_range.end > right_query_tokens.end) return error.UnsupportedSqlShape;
+        if (source_range.start <= right_query_tokens.start or source_range.start - 1 >= tokens.len) return error.UnsupportedSqlShape;
+        if (!tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    }
     if (set_operation.right_where_tokens) |where_range| {
         if (where_range.start < right_query_tokens.start or where_range.end > right_query_tokens.end) return error.UnsupportedSqlShape;
         if (!generatedTokenRangeEqual(set_operation.right_where_expression.tokens orelse return error.UnsupportedSqlShape, where_range)) return error.UnsupportedSqlShape;
         try validateGeneratedExpressionPayloads(tokens, set_operation.right_where_expression);
+    } else if (set_operation.right_where_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
     }
 }
 
@@ -30740,6 +30776,50 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_set_operation_projection_boundary,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_distinct = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT DISTINCT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_distinct.deinit(alloc);
+    if (malformed_generated_set_operation_distinct.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.right_distinct_tokens == null or read.projection_tokens == null) return error.TestUnexpectedResult;
+                read.set_operation.right_distinct_tokens = read.projection_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_distinct,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_source.deinit(alloc);
+    if (malformed_generated_set_operation_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.right_source_tokens == null or read.projection_tokens == null) return error.TestUnexpectedResult;
+                read.set_operation.right_source_tokens = read.projection_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_source,
         schema,
         &.{},
         .{},

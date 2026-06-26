@@ -31,17 +31,7 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 pub const local_lite_sql_table_record_json_key = "\x00\x00__metadata__:lite_sql_table_record_json";
@@ -103,6 +93,12 @@ pub fn Impl(comptime DB: type) type {
             try self.core.setSchema(table_schema);
             Self.refreshRuntimeSideEffects(self);
             try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
+        }
+
+        pub fn setSchemaReplicatedApply(self: *DB, table_schema: schema_mod.TableSchema) !void {
+            try Self.validateRuntimeSchemaFeatureLevel(table_schema);
+            try self.core.setSchema(table_schema);
+            Self.refreshRuntimeSideEffects(self);
         }
 
         /// Apply table metadata schema JSON to the DB runtime and all schema-derived
@@ -170,7 +166,16 @@ pub fn Impl(comptime DB: type) type {
                 .value = schema_json,
             }};
             try Self.setSchemaWithMetadataNoMirror(self, table_schema, metadata_puts[0..]);
-            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
+            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_json_metadata_commit(self, table_schema, schema_json);
+        }
+
+        pub fn setSchemaWithLocalSchemaJsonReplicatedApply(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
+            try Self.validateRuntimeSchemaFeatureLevel(table_schema);
+            const metadata_puts = [_]schema_mod.SchemaMetadataPut{.{
+                .key = local_schema_json_key,
+                .value = schema_json,
+            }};
+            try Self.setSchemaWithMetadataNoMirror(self, table_schema, metadata_puts[0..]);
         }
 
         pub fn setSchemaWithLocalLiteSqlTableRecordJsonAfterGate(

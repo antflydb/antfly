@@ -68,27 +68,7 @@ const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 
 const run_until_idle_max_replay_rounds: usize = 16;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub const TestTransactionRecoveryResolver = support.TestTransactionRecoveryResolver;
-    pub const TxnResolverRecorder = support.TxnResolverRecorder;
-    pub const putDenseEmbeddingArtifactForTest = support.putDenseEmbeddingArtifactForTest;
-    pub const corruptNonEmptyFilesUnderDir = support.corruptNonEmptyFilesUnderDir;
-    pub const expectObsoletePathsReclaimable = support.expectObsoletePathsReclaimable;
-    pub const waitForSearchResult = support.waitForSearchResult;
-    pub const SharedReadLockHold = support.SharedReadLockHold;
-    pub const ConcurrentReadProbe = support.ConcurrentReadProbe;
-    pub const ConcurrentWriteProbe = support.ConcurrentWriteProbe;
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const DerivedReplayDebtStatus = struct {
     index_name: []const u8,
@@ -4138,7 +4118,8 @@ test "db lifecycle open query_readonly skips pending derived replay on reopen" {
 }
 
 test "db lifecycle open query_readonly lsm primary opens physical backend read-only" {
-    const DB = @import("mod.zig").DB;
+    const db_mod = @import("mod.zig");
+    const DB = db_mod.DB;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -4201,13 +4182,23 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     }));
     try std.testing.expectError(error.ReadOnly, readonly.applyDocumentArtifactChildRangeBatch(.{}));
     try std.testing.expectError(error.ReadOnly, readonly.beginBulkIngestSession());
+    try std.testing.expectError(error.ReadOnly, readonly.finishBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.beginDenseAutoBulkIngestSession());
+    try std.testing.expectError(error.ReadOnly, readonly.beginPrimaryStoreAutoBulkIngestSession());
+    try std.testing.expectError(error.ReadOnly, readonly.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(.{}, false));
     try std.testing.expectError(error.ReadOnly, readonly.finishDenseAutoBulkIngestSessionWithOptions(.{}));
     try std.testing.expectError(error.ReadOnly, readonly.rollDenseAutoBulkIngestSessionWithOptions(.{}));
     try std.testing.expectError(error.ReadOnly, readonly.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.drainDocumentArtifactChildRangeOutbox(noop_dispatcher, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "asset", @as(types.DocumentArtifactChildRangePlacementUpdate, undefined)));
+    try std.testing.expectError(error.ReadOnly, readonly.reprocessDocumentArtifact(alloc, "doc:a", "asset"));
+    try std.testing.expectError(error.ReadOnly, readonly.reprocessDocumentArtifactRange(alloc, "asset", @as(types.DocumentArtifactTableReprocessRequest, undefined)));
     try std.testing.expectError(error.ReadOnly, readonly.updateRange(.{ .start = "doc:a", .end = "doc:z" }));
     try std.testing.expectError(error.ReadOnly, readonly.setSplitState(null));
     try std.testing.expectError(error.ReadOnly, readonly.clearSplitState());
     try std.testing.expectError(error.ReadOnly, readonly.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.ReadOnly, readonly.clearSplitDeltaFinalSeq());
     try std.testing.expectError(error.ReadOnly, readonly.clearSplitDeltaEntries());
     try std.testing.expectError(error.ReadOnly, readonly.createShadowIndexManager("doc:m", "doc:z"));
     try std.testing.expectError(error.ReadOnly, readonly.closeShadowIndexManager());
@@ -4220,6 +4211,7 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.sync(false));
     try std.testing.expectError(error.ReadOnly, readonly.syncIndexes(false));
     try std.testing.expectError(error.ReadOnly, readonly.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.repairRestoreRuntimeStateIfNeeded(alloc));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricMaintenanceForIdle());
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedMaintenanceForIdle(.{}));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricServiceMaintenanceJsonAlloc(alloc, "{}"));
@@ -4230,7 +4222,9 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
     try std.testing.expectError(error.ReadOnly, readonly.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", "worker-a", 1));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", 1));
     try std.testing.expectError(error.ReadOnly, readonly.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
     try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorSweep(.{}));
@@ -4239,7 +4233,26 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.retryQuarantinedIndexLoads(true));
     try std.testing.expectError(error.ReadOnly, readonly.runUntilIdle());
     try std.testing.expectError(error.ReadOnly, readonly.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.ReadOnly, readonly.setSchema(.{ .version = 99 }));
+    try std.testing.expectError(error.ReadOnly, readonly.applyTableSchemaJson(alloc, "{\"version\":99}", .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.setSchemaJson(alloc, "{\"version\":99}"));
+    try std.testing.expectError(error.ReadOnly, readonly.reloadAlgebraicSchemaConfigs("{\"version\":99}"));
+    try std.testing.expectError(error.ReadOnly, readonly.schemaRuntimeStageAlgebraicSchemaConfigsPending("{\"version\":99}"));
+    const metadata_table_manager = @import("../../metadata/table_manager.zig");
+    try std.testing.expectError(error.ReadOnly, readonly.applyLiteSqlTableRecord(alloc, .{
+        .table_id = 99,
+        .name = "blocked",
+        .schema_json = "{\"version\":99}",
+    }));
+    try std.testing.expectError(error.ReadOnly, readonly.executeClaimedSchemaRewriteJob(alloc, @as(metadata_table_manager.SchemaRewriteJobRecord, undefined)));
+    try std.testing.expectError(error.ReadOnly, readonly.addIndex(@as(types.IndexConfig, undefined)));
+    try std.testing.expectError(error.ReadOnly, readonly.addEnrichment(@as(types.EnrichmentConfig, undefined)));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertEnrichment(@as(types.EnrichmentConfig, undefined)));
+    try std.testing.expectError(error.ReadOnly, readonly.drainResolverBackfill());
     try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+    try std.testing.expectError(error.ReadOnly, readonly.drainScheduledTextMerges());
+    try std.testing.expectError(error.ReadOnly, readonly.forceCompactTextIndexes());
+    try std.testing.expectError(error.ReadOnly, readonly.bestEffortForceCompactTextIndexes());
     try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing"));
     try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "missing"));
     try std.testing.expectError(error.ReadOnly, readonly.removeResolver("missing"));
@@ -4254,17 +4267,43 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
     try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
     try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecordAt("job-at", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running", 1));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
+    try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt("job-at", "complete", true, .{}, "[]", 0, false, 1));
     try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnosticsWithReport("job-a", .{}, "[]", 0, false));
+    try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnosticsAt("job-at", "[]", 0, false, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnosticsWithReportAt("job-at", .{}, "[]", 0, false, 1));
     try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionJobWithUpdatedParentKey("action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionJobAt("action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionJobWithUpdatedParentKey("action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionJobAt("action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionScheduleWithUpdatedParentKey("schedule-b", "action-b", "cascade", "worker-a", "fk_parent", "parent", "p1", "p2", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionScheduleAt("schedule-c", "action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionScheduleAt("schedule-c", "action-c", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1));
     try std.testing.expectError(error.ReadOnly, readonly.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.markForeignKeyActionScheduleSeededAt("schedule-a", 1, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyActionJobPageAt("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000, 1));
     try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyActionJobPageAt("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000, 1));
     try std.testing.expectError(error.ReadOnly, readonly.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.ReadOnly, readonly.finishClaimedForeignKeyActionJobPageAt(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null, 1));
     try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyIntegrityWorkUnitAt("claim-at", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000, 1));
     try std.testing.expectError(error.ReadOnly, readonly.catchUpPendingDerivedReplay());
+    const NoopReplayProgress = struct {
+        fn hook(_: *anyopaque, _: []const u8, _: db_mod.ReplayProgress) anyerror!void {}
+    };
+    try std.testing.expectError(error.ReadOnly, readonly.catchUpPendingDerivedReplayWithProgress(&noop_dispatcher_state, NoopReplayProgress.hook));
     try std.testing.expectError(error.ReadOnly, readonly.derivedAsyncAppendDerivedBatchRecord(.{}));
     try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesForTargetCoverage(alloc));
     try std.testing.expectError(error.ReadOnly, readonly.rebuildSparseIndexesForTargetCoverage(alloc));
@@ -4273,12 +4312,16 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.runDensePostingMaintenanceForIdleBestEffort());
     try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
     try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, null, null));
+    try std.testing.expectError(error.ReadOnly, readonly.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(alloc, null, null, null, null, null, null, null, 16, 16));
     try std.testing.expectError(error.ReadOnly, readonly.replayGeneratedEnrichmentsFromStoredDocs(alloc));
     try std.testing.expectError(error.ReadOnly, readonly.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.ReadOnly, readonly.runMaintenanceUntilTargets(1, &.{"idx"}));
     try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
     try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
     try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
     try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, .{}, .{}, .{ .kind = .update }, 0, &.{}));
     const blocked_txn: transactions_mod.TxnId = .{ 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43 };
     try std.testing.expectError(error.ReadOnly, readonly.beginTransaction(1));
     try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithId(blocked_txn, 1));

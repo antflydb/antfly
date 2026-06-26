@@ -74,6 +74,14 @@ pub fn cleanupTempDir(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+pub fn cleanupSnapshotDirForPath(path: [*:0]const u8) void {
+    var snapshots_buf: [512]u8 = undefined;
+    const snapshots = std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)}) catch return;
+    var io_impl = db_internal.threadedIo();
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+}
+
 pub fn corruptNonEmptyFilesUnderDir(alloc: Allocator, root_path: []const u8) !usize {
     var io_impl = db_internal.threadedIo();
     defer io_impl.deinit();
@@ -708,7 +716,7 @@ pub const TxnResolverRecorder = struct {
         _ = commit_version;
         if (!std.mem.eql(u8, participant, "remote")) return error.UnexpectedParticipant;
         const self: *TxnResolverRecorder = @ptrCast(@alignCast(ctx_ptr));
-        platform.sync.lockYielding(&self.mutex);
+        _ = platform.sync.lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.calls += 1;
     }
@@ -761,7 +769,7 @@ pub const FakePromotionSink = struct {
     fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
-        platform.sync.lockYielding(&self.mutex);
+        _ = platform.sync.lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const t = try self.alloc.dupe(u8, table);
         errdefer self.alloc.free(t);
@@ -773,7 +781,7 @@ pub const FakePromotionSink = struct {
     }
 
     pub fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
-        platform.sync.lockYielding(&self.mutex);
+        _ = platform.sync.lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (self.upserts.items) |u| {
             if (std.mem.eql(u8, u.key, key)) return u.doc;

@@ -761,7 +761,7 @@ fn shouldRefreshReplayCursor(worker: *const Worker, caught_up_sequence: u64) boo
 }
 
 fn lock(runtime: *DerivedRuntime) void {
-    platform.sync.lockYielding(&runtime.mutex);
+    _ = platform.sync.lockAtomic(&runtime.mutex);
 }
 
 const TestRuntimeCapture = struct {

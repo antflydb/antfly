@@ -32,19 +32,7 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const row_claim_intent_key_prefix = relational_store_mod.row_claim_intent_key_prefix;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub const TxnResolverRecorder = support.TxnResolverRecorder;
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub fn Impl(comptime DB: type) type {
     return struct {
@@ -2157,7 +2145,7 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
         stats.transaction_recovery.notification_successes > 0 and
         stats.transaction_recovery.cleaned_records > 0;
     var resolver_called = false;
-    platform.sync.lockYielding(&recorder.mutex);
+    _ = platform.sync.lockAtomic(&recorder.mutex);
     resolver_called = recorder.calls > 0;
     recorder.mutex.unlock();
 
@@ -2170,7 +2158,7 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
             stats.transaction_recovery.notification_attempts > 0 and
             stats.transaction_recovery.notification_successes > 0 and
             stats.transaction_recovery.cleaned_records > 0;
-        platform.sync.lockYielding(&recorder.mutex);
+        _ = platform.sync.lockAtomic(&recorder.mutex);
         resolver_called = recorder.calls > 0;
         recorder.mutex.unlock();
     }

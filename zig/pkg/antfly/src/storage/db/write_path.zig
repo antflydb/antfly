@@ -68,21 +68,7 @@ const BorrowedGraphMaterializationBatch = db_internal.BorrowedGraphMaterializati
 const containsStoreWriteKey = db_internal.containsStoreWriteKey;
 const filterChangedGraphMaterializationBatch = db_internal.filterChangedGraphMaterializationBatch;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-
-    pub fn profileBenchTestsEnabled() bool {
-        return support.profileBenchTestsEnabled();
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const BatchProfile = struct {
     total_ns: u64 = 0,

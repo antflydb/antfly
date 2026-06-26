@@ -35,17 +35,7 @@ const regex_mod = @import("antfly_regex");
 const Allocator = std.mem.Allocator;
 const physical_primary_key_prefix = "\x00antfly-rel-pk:";
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();

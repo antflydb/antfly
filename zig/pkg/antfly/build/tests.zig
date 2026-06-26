@@ -451,6 +451,34 @@ fn assertDBRootAfterGateForwardersHaveDurableGate(source: []const u8) void {
     }
 }
 
+fn assertDBRootMetadataForwardersHaveSyncPreflight(source: []const u8) void {
+    const metadata_mutation_calls = [_][]const u8{
+        "schema_runtime_impl.setSchemaAfterGate(",
+        "schema_runtime_impl.applyTableSchemaJsonAfterGate(",
+        "schema_runtime_impl.reloadAlgebraicSchemaConfigsAfterGate(",
+        "schema_runtime_impl.stageAlgebraicSchemaConfigsPending(",
+        "schema_runtime_impl.applyLiteSqlTableRecordAfterGate(",
+    };
+    inline for (metadata_mutation_calls) |needle| {
+        var search_index: usize = 0;
+        while (std.mem.indexOfPos(u8, source, search_index, needle)) |call_start| {
+            const fn_start = enclosingPublicFunctionStart(source, call_start) orelse {
+                std.debug.panic(
+                    "storage/db/db.zig calls metadata mutation helper '{s}' at line {} outside a public DB forwarding method",
+                    .{ needle, lineNumberForOffset(source, call_start) },
+                );
+            };
+            if (std.mem.indexOf(u8, source[fn_start..call_start], "preflightDBMetadataSyncCommit(self)") == null) {
+                std.debug.panic(
+                    "storage/db/db.zig calls metadata mutation helper '{s}' at line {} without first preflighting the HA metadata sync gate in the same public method",
+                    .{ needle, lineNumberForOffset(source, call_start) },
+                );
+            }
+            search_index = call_start + needle.len;
+        }
+    }
+}
+
 fn assertDBSourceDoesNotUseMixins(path: []const u8, source: []const u8) void {
     if (std.mem.indexOf(u8, source, "usingnamespace")) |start| {
         std.debug.panic(
@@ -494,7 +522,6 @@ fn assertDBStandaloneTestFilesReachable(b: *std.Build, test_root_source: []const
         std.debug.panic("failed to scan {s} for DB standalone test reachability guardrail: {}", .{ db_source_root, err });
     }) |entry| {
         if (entry.kind != .file) continue;
-        if (std.mem.indexOfScalar(u8, entry.path, '/') != null) continue;
         if (!std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
 
         const import_path = std.fmt.allocPrint(b.allocator, "storage/db/{s}", .{entry.path}) catch |err| {
@@ -667,6 +694,7 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     assertDBRootDoesNotOwnPrivateHelpers(source);
     assertDBRootForwardersDoNotAccessSelfMembers(source);
     assertDBRootAfterGateForwardersHaveDurableGate(source);
+    assertDBRootMetadataForwardersHaveSyncPreflight(source);
     assertDBTestRootImportsDBAggregateRoot(test_root_source);
     assertDBStandaloneTestFilesReachable(b, test_root_source);
     assertDBInstantiatedImplContracts(b, source, test_root_source);

@@ -87,22 +87,7 @@ pub const ExplicitTextStatRequest = db_query_search.ExplicitTextStatRequest;
 pub const ExplicitBackgroundTextStatRequest = db_query_search.ExplicitBackgroundTextStatRequest;
 pub const ProfiledDenseSearchResult = db_query_search.ProfiledDenseSearchResult;
 
-const TestHelpers = if (builtin.is_test) struct {
-    const support = @import("test_support.zig");
-
-    pub const waitForSearchResult = support.waitForSearchResult;
-    pub const putDenseEmbeddingArtifactForTest = support.putDenseEmbeddingArtifactForTest;
-    pub const profileBenchTestsEnabled = support.profileBenchTestsEnabled;
-    pub const cacheBlockHitsForBench = support.cacheBlockHitsForBench;
-
-    pub fn tempPath(buf: []u8) [*:0]const u8 {
-        return support.tempPath(buf);
-    }
-
-    pub fn cleanupTempDir(path: [*:0]const u8) void {
-        support.cleanupTempDir(path);
-    }
-} else struct {};
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const AlgebraicDocFilterRequest = struct {
     req: types.SearchRequest,

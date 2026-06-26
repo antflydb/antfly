@@ -417,7 +417,10 @@ entry points now also validate the whole generated read payload before typed
 planning starts, so list boundary expressions, optional clause payloads,
 pagination expressions, set-operation payloads, Antfly/graph table-function
 source item counts and argument ranges, and join metadata cannot drift from
-the generated AST while token fallback still exists. Generated CTE read lowering now derives non-recursive final read-family
+the generated AST while token fallback still exists. Set-operation payload
+validation now also fail-closes right-hand `DISTINCT`/`DISTINCT ON`, projection,
+source, and `WHERE` metadata so right-arm generated clause ranges cannot drift
+independently of the retained set-operation AST. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
 direct CTE query-plan lowering also preserves generated final set-operation
