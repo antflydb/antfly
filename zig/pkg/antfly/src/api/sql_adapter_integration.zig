@@ -28,6 +28,45 @@ const usermgr = @import("../usermgr/mod.zig");
 
 const AppParitySourceSchemaCatalog = sql_adapter.AppParitySourceSchemaCatalog;
 
+const AppParityDdlSummaryPlan = union(enum) {
+    session_catalog: ddl_plan.SessionCatalogPlan,
+    create_table: ddl_plan.CreateTablePlan,
+    table_clone: ddl_plan.TableClonePlan,
+    view_catalog: ddl_plan.ViewCatalogPlan,
+    materialized_view_catalog: ddl_plan.MaterializedViewCatalogPlan,
+    relation_lifetime: ddl_plan.RelationLifetimePlan,
+    enum_type_catalog: ddl_plan.EnumTypeCatalogPlan,
+    domain_catalog: ddl_plan.DomainCatalogPlan,
+    sequence_catalog: ddl_plan.SequenceCatalogPlan,
+    identity_allocator_catalog: ddl_plan.IdentityAllocatorPlan,
+    schema_namespace_catalog: ddl_plan.SchemaNamespaceCatalogPlan,
+    extension_catalog: ddl_plan.ExtensionCatalogPlan,
+    function_catalog: ddl_plan.FunctionCatalogPlan,
+    trigger_catalog: ddl_plan.TriggerCatalogPlan,
+    procedure_call: ddl_plan.ProcedureCallPlan,
+    authorization_catalog: ddl_plan.AuthorizationCatalogPlan,
+    bulk_io: ddl_plan.BulkIoPlan,
+    table_partition_catalog: ddl_plan.TablePartitionCatalogPlan,
+    row_security_catalog: ddl_plan.RowSecurityCatalogPlan,
+    database_catalog: ddl_plan.DatabaseCatalogPlan,
+    tablespace_catalog: ddl_plan.TablespaceCatalogPlan,
+    notification_channel: ddl_plan.NotificationChannelPlan,
+    logical_replication: ddl_plan.LogicalReplicationPlan,
+    type_system_catalog: ddl_plan.TypeSystemCatalogPlan,
+    maintenance_job: ddl_plan.MaintenanceJobPlan,
+    prepared_statement: ddl_plan.PreparedStatementPlan,
+    prepared_transaction: ddl_plan.PreparedTransactionPlan,
+    cursor_portal: ddl_plan.CursorPortalPlan,
+    savepoint_transaction: ddl_plan.SavepointTransactionPlan,
+    comment_metadata: ddl_plan.CommentMetadataPlan,
+    transaction_control: ddl_plan.TransactionControlPlan,
+    create_index: ddl_plan.CreateIndexPlan,
+    drop_index: ddl_plan.DropIndexPlan,
+    drop_table: ddl_plan.DropTablePlan,
+    alter_table: ddl_plan.AlterTablePlan,
+    create_update_policy: ddl_plan.CreateUpdatePolicyPlan,
+};
+
 const Parser = sql_adapter.ParserState;
 
 const TestPrimaryResolver = sql_adapter.TestPrimaryResolver;
@@ -160,16 +199,16 @@ fn expectDdlSummary(summary: AppParityPlanSummary, logical: sql_adapter.LogicalS
         .table_ddl => |plan| return try expectTableDdlSummary(summary, plan),
         .catalog_ddl => |plan| return try expectCatalogDdlSummary(summary, plan),
         .other_ddl => return error.TestUnexpectedResult,
-        .session => |plan| return try expectLoweredDdlSummary(summary, .{ .session_catalog = plan }),
+        .session => |plan| return try expectDdlSummaryPayload(summary, .{ .session_catalog = plan }),
         .transaction => |plan| return try expectTransactionDdlSummary(summary, plan),
-        .prepared_statement => |plan| return try expectLoweredDdlSummary(summary, .{ .prepared_statement = plan }),
-        .cursor => |plan| return try expectLoweredDdlSummary(summary, .{ .cursor_portal = plan }),
-        .notification => |plan| return try expectLoweredDdlSummary(summary, .{ .notification_channel = plan }),
+        .prepared_statement => |plan| return try expectDdlSummaryPayload(summary, .{ .prepared_statement = plan }),
+        .cursor => |plan| return try expectDdlSummaryPayload(summary, .{ .cursor_portal = plan }),
+        .notification => |plan| return try expectDdlSummaryPayload(summary, .{ .notification_channel = plan }),
         .routine => |plan| return try expectRoutineDdlSummary(summary, plan),
         .auth => |plan| return try expectAuthDdlSummary(summary, plan),
-        .extension => |plan| return try expectLoweredDdlSummary(summary, .{ .extension_catalog = plan }),
-        .maintenance => |plan| return try expectLoweredDdlSummary(summary, .{ .maintenance_job = plan }),
-        .bulk_io => |plan| return try expectLoweredDdlSummary(summary, .{ .bulk_io = plan }),
+        .extension => |plan| return try expectDdlSummaryPayload(summary, .{ .extension_catalog = plan }),
+        .maintenance => |plan| return try expectDdlSummaryPayload(summary, .{ .maintenance_job = plan }),
+        .bulk_io => |plan| return try expectDdlSummaryPayload(summary, .{ .bulk_io = plan }),
         .read, .write, .catalog_read, .catalog_write => return error.TestUnexpectedResult,
     }
 }
@@ -177,62 +216,62 @@ fn expectDdlSummary(summary: AppParityPlanSummary, logical: sql_adapter.LogicalS
 fn expectTableDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.TableDdlLogicalPlan) !void {
     switch (plan) {
         .moved => return error.TestUnexpectedResult,
-        .create_table => |payload| return try expectLoweredDdlSummary(summary, .{ .create_table = payload }),
-        .table_clone => |payload| return try expectLoweredDdlSummary(summary, .{ .table_clone = payload }),
-        .view_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .view_catalog = payload }),
-        .materialized_view_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .materialized_view_catalog = payload }),
-        .relation_lifetime => |payload| return try expectLoweredDdlSummary(summary, .{ .relation_lifetime = payload }),
-        .table_partition_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .table_partition_catalog = payload }),
-        .create_index => |payload| return try expectLoweredDdlSummary(summary, .{ .create_index = payload }),
-        .drop_index => |payload| return try expectLoweredDdlSummary(summary, .{ .drop_index = payload }),
-        .drop_table => |payload| return try expectLoweredDdlSummary(summary, .{ .drop_table = payload }),
-        .alter_table => |payload| return try expectLoweredDdlSummary(summary, .{ .alter_table = payload }),
-        .create_update_policy => |payload| return try expectLoweredDdlSummary(summary, .{ .create_update_policy = payload }),
+        .create_table => |payload| return try expectDdlSummaryPayload(summary, .{ .create_table = payload }),
+        .table_clone => |payload| return try expectDdlSummaryPayload(summary, .{ .table_clone = payload }),
+        .view_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .view_catalog = payload }),
+        .materialized_view_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .materialized_view_catalog = payload }),
+        .relation_lifetime => |payload| return try expectDdlSummaryPayload(summary, .{ .relation_lifetime = payload }),
+        .table_partition_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .table_partition_catalog = payload }),
+        .create_index => |payload| return try expectDdlSummaryPayload(summary, .{ .create_index = payload }),
+        .drop_index => |payload| return try expectDdlSummaryPayload(summary, .{ .drop_index = payload }),
+        .drop_table => |payload| return try expectDdlSummaryPayload(summary, .{ .drop_table = payload }),
+        .alter_table => |payload| return try expectDdlSummaryPayload(summary, .{ .alter_table = payload }),
+        .create_update_policy => |payload| return try expectDdlSummaryPayload(summary, .{ .create_update_policy = payload }),
     }
 }
 
 fn expectCatalogDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.CatalogDdlLogicalPlan) !void {
     switch (plan) {
         .moved => return error.TestUnexpectedResult,
-        .enum_type_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .enum_type_catalog = payload }),
-        .domain_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .domain_catalog = payload }),
-        .sequence_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .sequence_catalog = payload }),
-        .identity_allocator_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .identity_allocator_catalog = payload }),
-        .schema_namespace_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .schema_namespace_catalog = payload }),
-        .database_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .database_catalog = payload }),
-        .tablespace_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .tablespace_catalog = payload }),
-        .logical_replication => |payload| return try expectLoweredDdlSummary(summary, .{ .logical_replication = payload }),
-        .type_system_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .type_system_catalog = payload }),
-        .comment_metadata => |payload| return try expectLoweredDdlSummary(summary, .{ .comment_metadata = payload }),
+        .enum_type_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .enum_type_catalog = payload }),
+        .domain_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .domain_catalog = payload }),
+        .sequence_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .sequence_catalog = payload }),
+        .identity_allocator_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .identity_allocator_catalog = payload }),
+        .schema_namespace_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .schema_namespace_catalog = payload }),
+        .database_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .database_catalog = payload }),
+        .tablespace_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .tablespace_catalog = payload }),
+        .logical_replication => |payload| return try expectDdlSummaryPayload(summary, .{ .logical_replication = payload }),
+        .type_system_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .type_system_catalog = payload }),
+        .comment_metadata => |payload| return try expectDdlSummaryPayload(summary, .{ .comment_metadata = payload }),
     }
 }
 
 fn expectTransactionDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.TransactionLogicalPlan) !void {
     switch (plan) {
-        .control => |payload| return try expectLoweredDdlSummary(summary, .{ .transaction_control = payload }),
-        .prepared => |payload| return try expectLoweredDdlSummary(summary, .{ .prepared_transaction = payload }),
-        .savepoint => |payload| return try expectLoweredDdlSummary(summary, .{ .savepoint_transaction = payload }),
+        .control => |payload| return try expectDdlSummaryPayload(summary, .{ .transaction_control = payload }),
+        .prepared => |payload| return try expectDdlSummaryPayload(summary, .{ .prepared_transaction = payload }),
+        .savepoint => |payload| return try expectDdlSummaryPayload(summary, .{ .savepoint_transaction = payload }),
     }
 }
 
 fn expectRoutineDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.RoutineLogicalPlan) !void {
     switch (plan) {
-        .function_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .function_catalog = payload }),
-        .trigger_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .trigger_catalog = payload }),
-        .procedure_call => |payload| return try expectLoweredDdlSummary(summary, .{ .procedure_call = payload }),
+        .function_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .function_catalog = payload }),
+        .trigger_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .trigger_catalog = payload }),
+        .procedure_call => |payload| return try expectDdlSummaryPayload(summary, .{ .procedure_call = payload }),
     }
 }
 
 fn expectAuthDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.AuthorizationLogicalPlan) !void {
     switch (plan) {
-        .authorization_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .authorization_catalog = payload }),
-        .row_security_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .row_security_catalog = payload }),
+        .authorization_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .authorization_catalog = payload }),
+        .row_security_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .row_security_catalog = payload }),
     }
 }
 
-fn expectLoweredDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !void {
+fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlSummaryPlan) !void {
     const expected = summary.ddl_tag orelse return;
-    switch (lowered) {
+    switch (payload) {
         .adapter_noop => return error.TestUnexpectedResult,
         .session_catalog => |plan| switch (plan) {
             .set_search_path => try std.testing.expectEqual(AppParityDdlTag.set_search_path, expected),
@@ -2849,7 +2888,6 @@ const AppParityCorpusCoverage = sql_adapter.AppParityCorpusCoverage;
 const app_parity_default_schema_json = sql_adapter.app_parity_default_schema_json;
 
 const SqlValue = sql_adapter.SqlValue;
-const LoweredDdlPlan = ddl_plan.LoweredDdlPlan;
 const LoweredExplainPlan = sql_adapter.LoweredExplainPlan;
 const LoweredReadPlan = sql_adapter.LoweredReadPlan;
 const LoweredWritePlan = sql_adapter.LoweredWritePlan;
