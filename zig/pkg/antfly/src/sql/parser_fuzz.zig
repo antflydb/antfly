@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     const random = prng.random();
 
     var stats: FuzzStats = .{};
-    for (corpus) |case| try exerciseGeneratedParserFuzzSql(alloc, case.sql, &stats);
+    for (corpus) |case| try exerciseGeneratedParserCorpusCase(alloc, case, &stats);
     for (0..options.cases) |case_index| {
         var buffer: [512]u8 = undefined;
         const sql = if (case_index % 3 == 0)
@@ -76,6 +76,17 @@ pub fn main(init: std.process.Init) !void {
         stats.unsupported_token_shape,
     });
     try stdout.flush();
+}
+
+fn exerciseGeneratedParserCorpusCase(alloc: std.mem.Allocator, case: generated_parser.GeneratedSqlCorpusCase, stats: *FuzzStats) !void {
+    stats.attempted += 1;
+    var tokens = try lexer.tokenizeAlloc(alloc, case.sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parsed = try generated_parser.parseTokensAlloc(alloc, tokens.items);
+    defer parsed.deinit(alloc);
+    if (parsed.kind != case.kind) return error.UnexpectedCorpusStatementKind;
+    stats.parsed += 1;
 }
 
 fn parseOptions(alloc: std.mem.Allocator, args: std.process.Args) !Options {

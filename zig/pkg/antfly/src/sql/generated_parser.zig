@@ -1855,6 +1855,7 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1", .kind = .prepared },
     .{ .sql = "EXECUTE read_stmt()", .kind = .prepared },
     .{ .sql = "DEALLOCATE read_stmt", .kind = .prepared },
+    .{ .sql = "DEALLOCATE ALL", .kind = .prepared },
     .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records", .kind = .cursor },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
     .{ .sql = "CLOSE usage_cursor", .kind = .cursor },
@@ -7160,6 +7161,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .session = .set }, (try parseSqlAlloc(alloc, "SET search_path TO public")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .rollback }, (try parseSqlAlloc(alloc, "ROLLBACK")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .execute }, (try parseSqlAlloc(alloc, "EXECUTE read_stmt()")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .deallocate }, (try parseSqlAlloc(alloc, "DEALLOCATE ALL")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE usage_session_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
@@ -7446,6 +7448,22 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, prepared.parameter_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, prepared.inner_statement_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const deallocate_all_sql = "DEALLOCATE ALL";
+    var deallocate_all_tokens = try lexer.tokenizeAlloc(alloc, deallocate_all_sql);
+    defer lexer.freeTokens(alloc, &deallocate_all_tokens);
+    const deallocate_all_result = try parseTokensAlloc(alloc, deallocate_all_tokens.items);
+    switch (deallocate_all_result.ast.?) {
+        .prepared => |prepared| {
+            try std.testing.expectEqual(GeneratedSqlPreparedKind.deallocate, prepared.kind);
+            try std.testing.expectEqualStrings("DEALLOCATE", spanText(deallocate_all_sql, prepared.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
+            try std.testing.expect(prepared.parameter_tokens == null);
+            try std.testing.expect(prepared.argument_tokens == null);
+            try std.testing.expect(prepared.inner_statement_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

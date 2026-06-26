@@ -1386,9 +1386,10 @@ Generated grammar work needs evidence at multiple levels:
   scanner/parser mutation loop over accepted statement seeds and random
   SQL-token streams. Longer generated parser fuzzing now lives behind
   `zig build sql-parser-fuzz -- --cases <count> [--seed <seed>]`, mutates the
-  full generated compatibility corpus including Antfly-specific reads, and
-  requires every case to parse, reject as an unsupported token shape, or produce
-  a bounded generated parser diagnostic.
+  full generated compatibility corpus including Antfly-specific reads, first
+  requires every declared corpus seed to parse as its expected statement family,
+  and then requires every mutated/random case to parse, reject as an unsupported
+  token shape, or produce a bounded generated parser diagnostic.
 - Parser microbenchmarks for corpus throughput, allocation count, parse-table
   size, generated-code compile time, and binary size. The initial
   `sql-parser-bench` target now reports generated parser corpus throughput,
