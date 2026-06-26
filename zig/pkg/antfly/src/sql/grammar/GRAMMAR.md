@@ -451,7 +451,7 @@ maintenance `VACUUM`/`REINDEX`, ownership and system administration statements
 such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `DROP OWNED`, and `REASSIGN OWNED`, utility/control statements such as
 `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
-`CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
+`CHECKPOINT`, `LOAD`, `SECURITY LABEL`, and `UNLISTEN`, plus
 the remaining unsupported cursor movement command `MOVE`, plus common PostgreSQL extension
 catalog families for conversions, event triggers, extended statistics,
 operator/aggregate ALTER forms, operator class/family objects, and text-search
@@ -1195,7 +1195,7 @@ variants for:
   generated-first AST-to-plan lowering into typed cursor portal plans
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
-  `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
+  `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`,
   `SECURITY LABEL`, `UNLISTEN`, `MOVE`,
   `ALTER MATERIALIZED VIEW`, foreign table,
   foreign data wrapper, foreign schema import, user mapping, language,
@@ -1246,7 +1246,7 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
-  `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
+  `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`,
   `SECURITY LABEL`, `UNLISTEN`, cursor command `MOVE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, schema imports, servers, and user
   mappings, plus language, unsupported routine/language/transform DDL,

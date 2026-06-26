@@ -1209,7 +1209,6 @@ fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement
         tokenMatchesText(first, "lock") or
         tokenMatchesText(first, "move") or
         tokenMatchesKeyword(first, .notify) or
-        tokenMatchesKeyword(first, .refresh) or
         tokenMatchesKeyword(first, .reindex) or
         tokenMatchesText(first, "release") or
         tokenMatchesKeyword(first, .revoke) or
@@ -2949,6 +2948,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER VIEW active_usage RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP VIEW IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP MATERIALIZED VIEW IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW usage_summary WITH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN"));
