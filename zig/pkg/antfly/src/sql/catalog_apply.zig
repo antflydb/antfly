@@ -1802,15 +1802,29 @@ fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected:
     }
 }
 
+fn sessionCatalogPlanForCatalogApplyTest(plan: binder.LogicalSqlPlan) !ddl_plan.SessionCatalogPlan {
+    return switch (plan) {
+        .session => |session| session,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn preparedTransactionPlanForCatalogApplyTest(plan: binder.LogicalSqlPlan) !ddl_plan.PreparedTransactionPlan {
+    return switch (plan) {
+        .transaction => |transaction| switch (transaction) {
+            .prepared => |prepared| prepared,
+            else => error.TestUnexpectedResult,
+        },
+        else => error.TestUnexpectedResult,
+    };
+}
+
 test "catalog apply applies SQL session catalog plans" {
     const alloc = std.testing.allocator;
 
     var set_tenant_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO tenant_schema, public;");
     defer set_tenant_search_path.deinit(alloc);
-    const set_tenant_search_path_plan = switch (set_tenant_search_path) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_tenant_search_path_plan = try sessionCatalogPlanForCatalogApplyTest(set_tenant_search_path);
     var tenant_session = try applySessionCatalogPlanAlloc(alloc, catalog_resources.SqlCatalogSession.default(), set_tenant_search_path_plan);
     defer tenant_session.deinit(alloc);
     try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
@@ -1818,10 +1832,7 @@ test "catalog apply applies SQL session catalog plans" {
 
     var set_local_public_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO public;");
     defer set_local_public_search_path.deinit(alloc);
-    const set_local_public_search_path_plan = switch (set_local_public_search_path) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_local_public_search_path_plan = try sessionCatalogPlanForCatalogApplyTest(set_local_public_search_path);
     var local_public_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_public_search_path_plan);
     defer local_public_session.deinit(alloc);
     try std.testing.expect(local_public_session.transaction_local_search_path);
@@ -1829,10 +1840,7 @@ test "catalog apply applies SQL session catalog plans" {
 
     var set_local_tenant_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
     defer set_local_tenant_search_path.deinit(alloc);
-    const set_local_tenant_search_path_plan = switch (set_local_tenant_search_path) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_local_tenant_search_path_plan = try sessionCatalogPlanForCatalogApplyTest(set_local_tenant_search_path);
     var local_tenant_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_tenant_search_path_plan);
     defer local_tenant_session.deinit(alloc);
     try std.testing.expect(local_tenant_session.transaction_local_search_path);
@@ -1849,20 +1857,14 @@ test "catalog apply applies SQL session catalog plans" {
 
     var set_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer set_app_setting.deinit(alloc);
-    const set_app_setting_plan = switch (set_app_setting) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_app_setting_plan = try sessionCatalogPlanForCatalogApplyTest(set_app_setting);
     var app_setting_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_app_setting_plan);
     defer app_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("tenant-a", app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 
     var set_local_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL app.tenant_id = 'tenant-b';");
     defer set_local_app_setting.deinit(alloc);
-    const set_local_app_setting_plan = switch (set_local_app_setting) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_local_app_setting_plan = try sessionCatalogPlanForCatalogApplyTest(set_local_app_setting);
     var local_app_setting_session = try applyOwnedSessionCatalogPlanAlloc(alloc, app_setting_session, set_local_app_setting_plan);
     defer local_app_setting_session.deinit(alloc);
     try std.testing.expect(local_app_setting_session.transaction_local_settings);
@@ -1874,20 +1876,14 @@ test "catalog apply applies SQL session catalog plans" {
 
     var set_sync_level = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'full_index';");
     defer set_sync_level.deinit(alloc);
-    const set_sync_level_plan = switch (set_sync_level) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_sync_level_plan = try sessionCatalogPlanForCatalogApplyTest(set_sync_level);
     var sync_level_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_sync_level_plan);
     defer sync_level_session.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, try sqlSyncLevelFromSession(sync_level_session.session()));
 
     var set_local_sync_level = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
     defer set_local_sync_level.deinit(alloc);
-    const set_local_sync_level_plan = switch (set_local_sync_level) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_local_sync_level_plan = try sessionCatalogPlanForCatalogApplyTest(set_local_sync_level);
     var local_sync_level_session = try applyOwnedSessionCatalogPlanAlloc(alloc, sync_level_session, set_local_sync_level_plan);
     defer local_sync_level_session.deinit(alloc);
     try std.testing.expect(local_sync_level_session.transaction_local_settings);
@@ -1899,10 +1895,7 @@ test "catalog apply applies SQL session catalog plans" {
 
     var set_runtime_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '1ms';");
     defer set_runtime_setting.deinit(alloc);
-    const set_runtime_setting_plan = switch (set_runtime_setting) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const set_runtime_setting_plan = try sessionCatalogPlanForCatalogApplyTest(set_runtime_setting);
     var runtime_setting_session = try applySessionCatalogPlanAlloc(alloc, app_setting_session.session(), set_runtime_setting_plan);
     defer runtime_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("1ms", runtime_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
@@ -1924,10 +1917,7 @@ test "catalog apply applies SQL session catalog plans" {
 
     var disable_timeout = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '0';");
     defer disable_timeout.deinit(alloc);
-    const disable_timeout_plan = switch (disable_timeout) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const disable_timeout_plan = try sessionCatalogPlanForCatalogApplyTest(disable_timeout);
     var disabled_timeout_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), disable_timeout_plan);
     defer disabled_timeout_session.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, null), try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()));
@@ -1935,18 +1925,12 @@ test "catalog apply applies SQL session catalog plans" {
 
     var invalid_timeout = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = 'five';");
     defer invalid_timeout.deinit(alloc);
-    const invalid_timeout_plan = switch (invalid_timeout) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const invalid_timeout_plan = try sessionCatalogPlanForCatalogApplyTest(invalid_timeout);
     try std.testing.expectError(error.InvalidRoleSetting, applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), invalid_timeout_plan));
 
     var reset_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "RESET app.tenant_id;");
     defer reset_app_setting.deinit(alloc);
-    const reset_app_setting_plan = switch (reset_app_setting) {
-        .session_catalog => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const reset_app_setting_plan = try sessionCatalogPlanForCatalogApplyTest(reset_app_setting);
     var reset_app_setting_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), reset_app_setting_plan);
     defer reset_app_setting_session.deinit(alloc);
     try std.testing.expect(reset_app_setting_session.session().settingValue("app.tenant_id") == null);
@@ -3034,10 +3018,7 @@ test "catalog apply executes prepared transaction recovery intents" {
 
     var prepare = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
     defer prepare.deinit(alloc);
-    const prepare_plan = switch (prepare) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const prepare_plan = try preparedTransactionPlanForCatalogApplyTest(prepare);
     const expected_txn_id = preparedTransactionTxnIdFromGid("usage_batch");
     const prepared = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_000);
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.register_prepared, prepared.operation);
@@ -3056,10 +3037,7 @@ test "catalog apply executes prepared transaction recovery intents" {
 
     var commit = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
     defer commit.deinit(alloc);
-    const commit_plan = switch (commit) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const commit_plan = try preparedTransactionPlanForCatalogApplyTest(commit);
     const committed = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_000);
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed.operation);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed.status);
@@ -3074,26 +3052,17 @@ test "catalog apply executes prepared transaction recovery intents" {
 
     var rollback_committed = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
     defer rollback_committed.deinit(alloc);
-    const rollback_committed_plan = switch (rollback_committed) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const rollback_committed_plan = try preparedTransactionPlanForCatalogApplyTest(rollback_committed);
     try std.testing.expectError(error.PreparedTransactionDecisionConflict, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_committed_plan, 3_000));
 
     var rollback = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_abort';");
     defer rollback.deinit(alloc);
-    const rollback_prepare_plan = switch (rollback) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const rollback_prepare_plan = try preparedTransactionPlanForCatalogApplyTest(rollback);
     _ = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepare_plan, 4_000);
 
     var rollback_prepared = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_abort';");
     defer rollback_prepared.deinit(alloc);
-    const rollback_prepared_plan = switch (rollback_prepared) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const rollback_prepared_plan = try preparedTransactionPlanForCatalogApplyTest(rollback_prepared);
     const aborted = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepared_plan, 5_000);
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, aborted.operation);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, aborted.status);
@@ -3103,10 +3072,7 @@ test "catalog apply executes prepared transaction recovery intents" {
 
     var missing_commit = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'missing_gid';");
     defer missing_commit.deinit(alloc);
-    const missing_commit_plan = switch (missing_commit) {
-        .prepared_transaction => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
+    const missing_commit_plan = try preparedTransactionPlanForCatalogApplyTest(missing_commit);
     try std.testing.expectError(error.PreparedTransactionNotFound, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, missing_commit_plan, 6_000));
 }
 
