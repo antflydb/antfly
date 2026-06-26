@@ -1170,10 +1170,6 @@ pub const LogicalSqlPlan = union(enum) {
     }
 };
 
-pub fn logicalPlanFromLoweredDdlPlan(plan: *ddl_plan.LoweredDdlPlan) LogicalSqlPlan {
-    return ddl_plan.logicalPlanFromLoweredDdlPlan(plan);
-}
-
 pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const read = try bound.readCatalog();
     const target_binding = read.target_binding;

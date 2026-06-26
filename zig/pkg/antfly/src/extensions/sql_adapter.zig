@@ -25,28 +25,51 @@ pub fn executeRelationalSqlDdlOnService(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try sql_adapter.lowerDdlPlanAlloc(alloc, sql);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    var plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
     defer plan.deinit(alloc);
-    return try executeRelationalSqlDdlPlanOnService(service, alloc, plan);
+    return try executeRelationalSqlLogicalPlanOnService(service, alloc, plan);
 }
 
-pub fn executeRelationalSqlDdlPlanOnService(
+pub fn executeRelationalSqlLogicalPlanOnService(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: sql_adapter.LoweredDdlPlan,
+    plan: sql_adapter.LogicalSqlPlan,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    switch (plan) {
+        .other_ddl => |other| switch (other) {
+            .adapter_noop => |noop| {
+                if (noop.reason != .extension) return null;
+                return try noopRecordAlloc(alloc);
+            },
+            .moved => return null,
+        },
+        .extension => |extension_plan| return try executeRelationalSqlExtensionPlanOnService(service, alloc, extension_plan),
+        else => return null,
+    }
+}
+
+pub fn executeRelationalSqlOtherDdlPlanOnService(
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.OtherDdlLogicalPlan,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     switch (plan) {
         .adapter_noop => |noop| {
             if (noop.reason != .extension) return null;
             return try noopRecordAlloc(alloc);
         },
-        .extension_catalog => |extension_plan| {
-            switch (extension_plan) {
-                .create => |create| return try executeCreate(service, alloc, create),
-                .update => |update| return try executeUpdate(service, alloc, update),
-                .drop => |drop| return try executeDrop(service, alloc, drop),
-            }
-        },
+        .moved => return null,
+    }
+}
+
+pub fn executeRelationalSqlExtensionLogicalPlanOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.LogicalSqlPlan,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    switch (plan) {
+        .extension => |extension_plan| return try executeRelationalSqlExtensionPlanOnService(service, alloc, extension_plan),
         else => return null,
     }
 }

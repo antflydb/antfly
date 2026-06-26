@@ -334,7 +334,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
     if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return true;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement) and !isExtensionIndexGeneratedFallbackAllowed(tokens, raw_statement)) return true;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
@@ -349,7 +349,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement) and !isExtensionIndexGeneratedFallbackAllowed(tokens, raw_statement)) return false;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
@@ -475,6 +475,42 @@ fn isGeneratedTableOrIndexDdlHead(tokens: []const Token, raw_statement: RawSqlSt
     }
     if (tokenMatchesKeyword(first, .drop)) {
         return tokenMatchesKeyword(second, .table) or tokenMatchesKeyword(second, .index);
+    }
+    return false;
+}
+
+fn isExtensionIndexGeneratedFallbackAllowed(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    if (!tokenMatchesKeyword(tokens[start], .create)) return false;
+
+    var object_index = start + 1;
+    consumeRelationLifetime(tokens, &object_index, end);
+    if (object_index >= end) return false;
+    if (tokenMatchesKeyword(tokens[object_index], .unique)) object_index += 1;
+    if (object_index >= end or !tokenMatchesKeyword(tokens[object_index], .index)) return false;
+
+    var depth: usize = 0;
+    var index = object_index + 1;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0 or !tokenMatchesText(tokens[index], "using")) continue;
+        if (index + 1 >= end) return false;
+        const method = tokens[index + 1];
+        return tokenMatchesText(method, "hnsw") or
+            tokenMatchesText(method, "antfly_full_text") or
+            tokenMatchesText(method, "antfly_aknn") or
+            tokenMatchesText(method, "antfly_graph") or
+            tokenMatchesText(method, "antfly_graph_metric") or
+            tokenMatchesText(method, "antfly_hybrid") or
+            tokenMatchesText(method, "antfly_algebraic");
     }
     return false;
 }

@@ -558,7 +558,6 @@ pub const IdentityAllocatorPlan = sql_adapter.IdentityAllocatorPlan;
 pub const IdentityAllocatorKind = sql_adapter.IdentityAllocatorKind;
 pub const IdentityAllocatorSpec = sql_adapter.IdentityAllocatorSpec;
 
-pub const LoweredDdlPlan = sql_adapter.LoweredDdlPlan;
 pub const RelationLifetimePlan = sql_adapter.RelationLifetimePlan;
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
 pub const PrivilegeChangeAction = sql_adapter.PrivilegeChangeAction;
@@ -2924,36 +2923,6 @@ fn lowerLateralPlanWithSchemasParsedSqlAlloc(
         else => return err,
     };
     return lowered;
-}
-
-pub fn lowerDdlPlanAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-) !LoweredDdlPlan {
-    return try sql_adapter.lowerDdlPlanAlloc(alloc, sql);
-}
-
-pub fn lowerDdlPlanWithFunctionBindingsAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    function_bindings: SqlFunctionBindings,
-) !LoweredDdlPlan {
-    return try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
-}
-
-fn lowerDdlPlanParsedSqlAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const sql_adapter.ParsedSql,
-) !LoweredDdlPlan {
-    return try sql_adapter.lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql);
-}
-
-fn lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const sql_adapter.ParsedSql,
-    function_bindings: SqlFunctionBindings,
-) !LoweredDdlPlan {
-    return try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
 }
 
 pub const lowerAntflyQueryFunctionSqlAlloc = sql_adapter.lowerAntflyQueryFunctionSqlAlloc;
