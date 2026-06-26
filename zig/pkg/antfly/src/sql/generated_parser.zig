@@ -1854,8 +1854,12 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SET antfly.sync_level = 'write'", .kind = .session },
     .{ .sql = "SET search_path public", .kind = .session },
     .{ .sql = "SET search_path TO public", .kind = .session },
+    .{ .sql = "SET LOCAL antfly.sync_level = 'propose'", .kind = .session },
+    .{ .sql = "SET LOCAL search_path TO tenant_schema, public", .kind = .session },
     .{ .sql = "RESET search_path", .kind = .session },
+    .{ .sql = "RESET ALL", .kind = .session },
     .{ .sql = "SHOW search_path", .kind = .session },
+    .{ .sql = "SHOW ALL", .kind = .session },
     .{ .sql = "DISCARD ALL", .kind = .session },
     .{ .sql = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", .kind = .session },
     .{ .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY", .kind = .transaction },
@@ -2465,6 +2469,7 @@ fn appendTokenIds(
 fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
     _ = prev;
     if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.tokenId(.ROUTINE);
+    if (generatedSessionKeywordContext(tokens, index) and tok.matchesKeyword("local")) return generated.tokenId(.LOCAL);
     if (!generatedTransactionControlContext(tokens, index)) return null;
     if (tok.matchesKeyword("characteristics")) return generated.tokenId(.CHARACTERISTICS);
     if (tok.matchesKeyword("committed")) return generated.tokenId(.COMMITTED);
@@ -2485,6 +2490,11 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
     if (tok.matchesKeyword("work")) return generated.tokenId(.WORK);
     if (tok.matchesKeyword("write")) return generated.tokenId(.WRITE);
     return null;
+}
+
+fn generatedSessionKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or index != 1 or tokens.len == 0) return false;
+    return tokens[0].matchesKeywordTag(.set);
 }
 
 fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -3449,8 +3459,9 @@ fn buildSessionAst(
     };
     switch (kind) {
         .set => {
-            const value_start = findSetValueStart(tokens, end) orelse end;
-            if (value_start > 1) ast.name_tokens = .{ .start = 1, .end = value_start - 1 };
+            const name_start = findSetNameStart(tokens, end);
+            const value_start = findSetValueStart(tokens, end, name_start) orelse end;
+            if (value_start > name_start) ast.name_tokens = .{ .start = name_start, .end = value_start - 1 };
             if (value_start < end) ast.value_tokens = .{ .start = value_start, .end = end };
         },
         .reset, .show => {
@@ -3461,12 +3472,17 @@ fn buildSessionAst(
     return ast;
 }
 
-fn findSetValueStart(tokens: []const token_mod.Token, end: usize) ?usize {
-    var index: usize = 1;
+fn findSetNameStart(tokens: []const token_mod.Token, end: usize) usize {
+    if (end > 2 and tokens[1].matchesKeyword("local")) return 2;
+    return 1;
+}
+
+fn findSetValueStart(tokens: []const token_mod.Token, end: usize, name_start: usize) ?usize {
+    var index: usize = name_start;
     while (index < end) : (index += 1) {
         if (tokens[index].kind == .eq or tokens[index].matchesKeywordTag(.to)) return index + 1;
     }
-    return if (end > 2) 2 else null;
+    return if (end > name_start + 1) name_start + 1 else null;
 }
 
 fn buildPreparedAst(
@@ -7532,6 +7548,45 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("SET", spanText(set_sql, session.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, session.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const set_local_sql = "SET LOCAL antfly.sync_level = 'propose';";
+    const set_local_result = try parseSqlAlloc(alloc, set_local_sql);
+    switch (set_local_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.set, session.kind);
+            try std.testing.expectEqualStrings("SET LOCAL antfly.sync_level = 'propose'", spanText(set_local_sql, session.statement_span));
+            try std.testing.expectEqualStrings("SET", spanText(set_local_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, session.name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const reset_all_sql = "RESET ALL;";
+    const reset_all_result = try parseSqlAlloc(alloc, reset_all_sql);
+    switch (reset_all_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.reset, session.kind);
+            try std.testing.expectEqualStrings("RESET ALL", spanText(reset_all_sql, session.statement_span));
+            try std.testing.expectEqualStrings("RESET", spanText(reset_all_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, session.name_tokens.?);
+            try std.testing.expect(session.value_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const show_all_sql = "SHOW ALL;";
+    const show_all_result = try parseSqlAlloc(alloc, show_all_sql);
+    switch (show_all_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.show, session.kind);
+            try std.testing.expectEqualStrings("SHOW ALL", spanText(show_all_sql, session.statement_span));
+            try std.testing.expectEqualStrings("SHOW", spanText(show_all_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, session.name_tokens.?);
+            try std.testing.expect(session.value_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

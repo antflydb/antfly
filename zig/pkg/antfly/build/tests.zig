@@ -547,53 +547,13 @@ fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
     }
 }
 
-fn assertDBRootForwardersDoNotAccessConcreteFields(source: []const u8) void {
-    const db_struct_start = std.mem.indexOf(u8, source, "pub const DB = struct {") orelse {
-        std.debug.panic("storage/db/db.zig no longer declares pub const DB = struct", .{});
-    };
-
-    var line_start = std.mem.indexOfScalarPos(u8, source, db_struct_start, '\n') orelse source.len;
-    while (line_start < source.len) {
-        line_start += 1;
-        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
-        const line = source[line_start..line_end];
-        const trimmed_line = std.mem.trim(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed_line, "const split_restore_impl")) return;
-
-        const colon = std.mem.indexOfScalar(u8, trimmed_line, ':') orelse {
-            if (line_end == source.len) break;
-            line_start = line_end;
-            continue;
-        };
-        const field_name = std.mem.trim(u8, trimmed_line[0..colon], " \t");
-        if (field_name.len == 0 or std.mem.indexOfAny(u8, field_name, " .(){}") != null) {
-            if (line_end == source.len) break;
-            line_start = line_end;
-            continue;
-        }
-
-        var needle_buf: [128]u8 = undefined;
-        const needle = std.fmt.bufPrint(&needle_buf, "self.{s}", .{field_name}) catch {
-            std.debug.panic(
-                "storage/db/db.zig DB field name '{s}' is too long for DB refactor field-access guardrail",
-                .{field_name},
-            );
-        };
-        if (std.mem.indexOf(u8, source, needle)) |start| {
-            std.debug.panic(
-                "storage/db/db.zig accesses concrete DB field '{s}' at line {}; public methods should forward through an owning implementation module",
-                .{ field_name, lineNumberForOffset(source, start) },
-            );
-        }
-
-        if (line_end == source.len) break;
-        line_start = line_end;
+fn assertDBRootForwardersDoNotAccessSelfMembers(source: []const u8) void {
+    if (std.mem.indexOf(u8, source, "self.")) |start| {
+        std.debug.panic(
+            "storage/db/db.zig accesses a DB member at line {}; public methods should forward through an owning implementation module",
+            .{lineNumberForOffset(source, start)},
+        );
     }
-
-    std.debug.panic(
-        "storage/db/db.zig DB field block guardrail did not find the implementation module declarations",
-        .{},
-    );
 }
 
 fn assertDBSourceDoesNotUseMixins(path: []const u8, source: []const u8) void {
@@ -781,7 +741,7 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     );
     assertDBRootDoesNotOwnInlineTests(source);
     assertDBRootDoesNotOwnPrivateHelpers(source);
-    assertDBRootForwardersDoNotAccessConcreteFields(source);
+    assertDBRootForwardersDoNotAccessSelfMembers(source);
     assertDBTestRootImportsDBAggregateRoot(test_root_source);
     assertDBInstantiatedImplContracts(b, source, test_root_source);
     assertDBImplementationModuleContract(b);
@@ -890,6 +850,10 @@ pub const DBTestFilters = struct {
 
     pub const write_path = [_][]const u8{
         "storage.db.write_path.test.",
+    };
+
+    pub const ha_replication = [_][]const u8{
+        "storage.ha db ",
     };
 
     pub const foreign_key = [_][]const u8{
@@ -2656,6 +2620,11 @@ const db_storage_module_steps = [_]DBTestStep{
         .name = "db-write-path-test",
         .description = "Run focused storage/db write-path tests",
         .filters = &DBTestFilters.write_path,
+    },
+    .{
+        .name = "db-ha-replication-test",
+        .description = "Run focused storage/db HA replication tests",
+        .filters = &DBTestFilters.ha_replication,
     },
     .{
         .name = "db-foreign-key-test",

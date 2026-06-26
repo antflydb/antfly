@@ -67,7 +67,11 @@ prepared AST kind, statement/command spans, prepared-statement name ranges,
 parameter ranges, argument ranges, and inner-statement ranges before
 publishing the prepared family.
 Session catalog commands now have generated AST-to-plan parity
-for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
+for the generated-covered `SET`, `SET LOCAL`, `RESET`, `RESET ALL`, `SHOW`,
+`SHOW ALL`, and `DISCARD ALL` forms. Generated `SET ... TO ...` and
+`SET LOCAL ... TO ...` session values accept comma-separated expression lists
+so generated ingress covers PostgreSQL-style `search_path` updates before the
+typed session lowerer decides whether a setting is supported.
 Session command heads now require generated parser success at SQL ingress, so
 malformed multi-token session commands cannot fall back to the legacy session
 adapter. Parsed-statement classification validates retained session AST kind,
@@ -621,8 +625,9 @@ path until generated coverage has parity for a statement family.
 
 Suggested migration order:
 
-1. Session and control statements: `SET`, `RESET`, `SHOW`, `DISCARD ALL`,
-   `BEGIN`, `COMMIT`, `ROLLBACK`, `PREPARE`, `EXECUTE`, `DEALLOCATE`.
+1. Session and control statements: `SET`, `SET LOCAL`, `RESET`,
+   `RESET ALL`, `SHOW`, `SHOW ALL`, `DISCARD ALL`, `BEGIN`, `COMMIT`,
+   `ROLLBACK`, `PREPARE`, `EXECUTE`, `DEALLOCATE`.
    The generated prepared-statement grammar accepts PostgreSQL-compatible
    `DEALLOCATE PREPARE name` in addition to `DEALLOCATE name` and
    `DEALLOCATE ALL`, and the generated AST records the actual prepared

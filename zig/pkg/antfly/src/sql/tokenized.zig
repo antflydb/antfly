@@ -2888,6 +2888,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
 
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO public extra"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET LOCAL search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "RESET search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SHOW search_path EXTRA"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DISCARD TEMP"));
@@ -3855,6 +3856,40 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
     switch (session.statement) {
         .session => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var local_session = try ParsedSql.initAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose'");
+    defer local_session.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, local_session.generatedStatementKind().?);
+    switch (local_session.generated_statement.?.ast.?) {
+        .session => |generated_session| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlSessionKind.set, generated_session.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, generated_session.name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, generated_session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reset_all = try ParsedSql.initAlloc(alloc, "RESET ALL");
+    defer reset_all.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, reset_all.generatedStatementKind().?);
+    switch (reset_all.generated_statement.?.ast.?) {
+        .session => |generated_session| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlSessionKind.reset, generated_session.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_session.name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var show_all = try ParsedSql.initAlloc(alloc, "SHOW ALL");
+    defer show_all.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, show_all.generatedStatementKind().?);
+    switch (show_all.generated_statement.?.ast.?) {
+        .session => |generated_session| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlSessionKind.show, generated_session.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_session.name_tokens.?);
+        },
         else => return error.TestUnexpectedResult,
     }
 

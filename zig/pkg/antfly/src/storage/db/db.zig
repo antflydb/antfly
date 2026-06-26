@@ -1200,7 +1200,10 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        try self.applyTableSchemaJson(alloc, schema_json, .{});
+        if (schema_json.len == 0) return;
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
+        try schema_runtime_impl.applyTableSchemaJsonAfterGate(self, alloc, schema_json, .{});
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
