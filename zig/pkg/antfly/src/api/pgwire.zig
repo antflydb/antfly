@@ -788,7 +788,6 @@ const Connection = struct {
             return false;
         }
         self.active_execution.store(true, .release);
-        std.log.err("pgwire execute start sql={s}", .{sql});
         var outcome = self.executeSql(sql, params) catch |err| {
             self.active_execution.store(false, .release);
             std.log.warn("pgwire sql execution failed err={}", .{err});
@@ -796,7 +795,6 @@ const Connection = struct {
             if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         };
-        std.log.err("pgwire execute returned sql={s}", .{sql});
         self.active_execution.store(false, .release);
         if (self.consumeCancelRequested()) {
             switch (outcome) {
@@ -819,9 +817,7 @@ const Connection = struct {
             .result => |*result| {
                 defer result.deinit(self.api_server.alloc);
                 self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
-                std.log.err("pgwire encode start kind={s}", .{result.statement_kind});
                 try self.encodeSqlResult(result, result_formats, include_row_description);
-                std.log.err("pgwire encode done kind={s}", .{result.statement_kind});
                 return true;
             },
         }

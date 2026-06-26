@@ -1399,10 +1399,6 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
     if (batch.skip_intent_keys.len > 0) alloc.free(@constCast(batch.skip_intent_keys));
 }
 
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    platform.sync.lockYielding(mutex);
-}
-
 pub const Engine = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

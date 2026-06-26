@@ -1310,31 +1310,31 @@ test "sql adapter plan parses generated pagination from expression AST ranges" {
     const tokens = parsed_sql.items();
 
     var limit_pos: usize = 5;
-    const limit = (try parseGeneratedLimitValueForClause(tokens, 4, &limit_pos, &.{}, &read_ast)) orelse return error.TestUnexpectedResult;
+    const limit = (try parseGeneratedLimitValueForClause(tokens, 4, &limit_pos, &.{}, read_ast)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?u32, 5), limit.value);
     try std.testing.expectEqual(@as(usize, 6), limit_pos);
 
     var offset_pos: usize = 7;
-    const offset = (try parseGeneratedOffsetValueForClause(tokens, 6, &offset_pos, &.{}, &read_ast)) orelse return error.TestUnexpectedResult;
+    const offset = (try parseGeneratedOffsetValueForClause(tokens, 6, &offset_pos, &.{}, read_ast)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 2), offset);
     try std.testing.expectEqual(@as(usize, 9), offset_pos);
 
     var fetch_pos: usize = 10;
-    const fetch = (try parseGeneratedFetchLimitValueForClause(tokens, 9, &fetch_pos, &.{}, &read_ast)) orelse return error.TestUnexpectedResult;
+    const fetch = (try parseGeneratedFetchLimitValueForClause(tokens, 9, &fetch_pos, &.{}, read_ast)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?u32, 3), fetch.value);
     try std.testing.expectEqual(@as(usize, tokens.len), fetch_pos);
 
-    var malformed_limit_ast = read_ast;
+    var malformed_limit_ast = read_ast.*;
     malformed_limit_ast.limit_expression.tokens = malformed_limit_ast.projection_items.expression_items[0];
     limit_pos = 5;
     try std.testing.expectError(error.UnsupportedSqlShape, parseGeneratedLimitValueForClause(tokens, 4, &limit_pos, &.{}, &malformed_limit_ast));
 
-    var malformed_offset_ast = read_ast;
+    var malformed_offset_ast = read_ast.*;
     malformed_offset_ast.offset_expression.tokens = malformed_offset_ast.projection_items.expression_items[0];
     offset_pos = 7;
     try std.testing.expectError(error.UnsupportedSqlShape, parseGeneratedOffsetValueForClause(tokens, 6, &offset_pos, &.{}, &malformed_offset_ast));
 
-    var malformed_fetch_ast = read_ast;
+    var malformed_fetch_ast = read_ast.*;
     malformed_fetch_ast.fetch_count_expression.tokens = malformed_fetch_ast.projection_items.expression_items[0];
     fetch_pos = 10;
     try std.testing.expectError(error.UnsupportedSqlShape, parseGeneratedFetchLimitValueForClause(tokens, 9, &fetch_pos, &.{}, &malformed_fetch_ast));

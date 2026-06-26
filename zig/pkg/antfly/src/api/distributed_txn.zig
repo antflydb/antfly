@@ -1014,13 +1014,10 @@ fn executeMultiTableCommitOnce(
     }
 
     for (tables) |table| {
-        std.log.err("distributed txn plan table start table={s} writes={} deletes={} transforms={} predicates={}", .{ table.table_name, table.writes.len, table.deletes.len, table.transforms.len, table.predicates.len });
         const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table.table_name);
         if (topology_epoch == 0) return error.TableNotFound;
-        std.log.err("distributed txn plan topology table={s} epoch={}", .{ table.table_name, topology_epoch });
 
         try rejectUnsupportedDistributedForeignKeyTransforms(alloc, catalog, table.table_name, table.transforms);
-        std.log.err("distributed txn plan fk transform reject ok table={s}", .{table.table_name});
 
         for (table.writes) |write| {
             const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, write.key, topology_epoch)) orelse return error.UnknownGroup;
@@ -1042,15 +1039,10 @@ fn executeMultiTableCommitOnce(
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
-        std.log.err("distributed txn plan base participants table={s} count={}", .{ table.table_name, participants.items.len });
         try addForeignKeyParentParticipants(alloc, catalog, worker, &participants, table.table_name, table.writes, table.transforms, table.predicates, constraint_timing_overrides);
-        std.log.err("distributed txn plan fk parents table={s} count={}", .{ table.table_name, participants.items.len });
         try addForeignKeyTransformParticipants(alloc, catalog, worker, &participants, table.table_name, table.writes, table.deletes, table.transforms, table.predicates, constraint_timing_overrides);
-        std.log.err("distributed txn plan fk transforms table={s} count={}", .{ table.table_name, participants.items.len });
         try addForeignKeyChildDeleteParticipants(alloc, catalog, worker, &participants, table.table_name, table.deletes, table.transforms, table.predicates);
-        std.log.err("distributed txn plan fk child deletes table={s} count={}", .{ table.table_name, participants.items.len });
         try addForeignKeyParentUpdateParticipants(alloc, catalog, worker, &participants, table.table_name, table.writes, table.deletes, table.transforms, table.predicates, constraint_timing_overrides);
-        std.log.err("distributed txn plan fk parent updates table={s} count={}", .{ table.table_name, participants.items.len });
         try addForeignKeyParentDeleteParticipants(
             alloc,
             catalog,
@@ -1065,12 +1057,9 @@ fn executeMultiTableCommitOnce(
             0,
             foreign_key_action_default_cascade_max_depth,
         );
-        std.log.err("distributed txn plan fk parent deletes table={s} count={}", .{ table.table_name, participants.items.len });
         try addUniqueConstraintOwnerParticipants(alloc, catalog, worker, &participants, table.table_name, table.writes, table.deletes, table.transforms, table.predicates);
-        std.log.err("distributed txn plan unique owners table={s} count={}", .{ table.table_name, participants.items.len });
     }
     try applyForeignKeyConstraintTimingOverridesToParticipants(alloc, &participants, constraint_timing_overrides);
-    std.log.err("distributed txn plan timing overrides participants={}", .{participants.items.len});
 
     var participant_ids = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1094,7 +1083,6 @@ fn executeMultiTableCommitOnce(
     }
 
     for (participants.items) |participant| {
-        std.log.err("distributed txn begin participant table={s} group={}", .{ participant.table_name, participant.group_id });
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
@@ -1113,7 +1101,6 @@ fn executeMultiTableCommitOnce(
     }
 
     for (participants.items) |participant| {
-        std.log.err("distributed txn prepare participant table={s} group={} writes={} deletes={} transforms={} predicates={}", .{ participant.table_name, participant.group_id, participant.writes.items.len, participant.deletes.items.len, participant.transforms.items.len, participant.predicates.items.len });
         worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,

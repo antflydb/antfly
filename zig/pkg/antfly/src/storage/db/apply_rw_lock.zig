@@ -49,18 +49,18 @@ pub const ApplyRwLock = struct {
         _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
         _ = self.shared_waiters.fetchAdd(1, .monotonic);
         defer _ = self.shared_waiters.fetchSub(1, .monotonic);
-        if (!lockAtomic(&self.reader_gate)) {
+        if (!platform.sync.lockAtomic(&self.reader_gate)) {
             _ = self.shared_contended_calls.fetchAdd(1, .monotonic);
             noteWait(self, .shared, monotonicNs() -| started_ns);
         }
         defer self.reader_gate.unlock();
 
-        _ = lockAtomic(&self.reader_mutex);
+        _ = platform.sync.lockAtomic(&self.reader_mutex);
         defer self.reader_mutex.unlock();
 
         self.reader_count += 1;
         if (self.reader_count == 1) {
-            _ = lockAtomic(&self.resource_mutex);
+            _ = platform.sync.lockAtomic(&self.resource_mutex);
         }
     }
 
@@ -77,7 +77,7 @@ pub const ApplyRwLock = struct {
     }
 
     pub fn unlockShared(self: *@This()) void {
-        _ = lockAtomic(&self.reader_mutex);
+        _ = platform.sync.lockAtomic(&self.reader_mutex);
         defer self.reader_mutex.unlock();
 
         std.debug.assert(self.reader_count > 0);
@@ -100,9 +100,9 @@ pub const ApplyRwLock = struct {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
         yieldToQueuedReaders(self);
-        const gate_idle = lockAtomic(&self.reader_gate);
+        const gate_idle = platform.sync.lockAtomic(&self.reader_gate);
         errdefer self.reader_gate.unlock();
-        const resource_idle = lockAtomic(&self.resource_mutex);
+        const resource_idle = platform.sync.lockAtomic(&self.resource_mutex);
         if (!(gate_idle and resource_idle)) {
             _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
             noteWait(self, .exclusive, monotonicNs() -| started_ns);
@@ -128,12 +128,6 @@ pub const ApplyRwLock = struct {
         };
     }
 };
-
-fn lockAtomic(mutex: *std.atomic.Mutex) bool {
-    if (mutex.tryLock()) return true;
-    platform.sync.lockYielding(mutex);
-    return false;
-}
 
 fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
     var attempts: usize = 0;

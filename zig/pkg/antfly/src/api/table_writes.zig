@@ -62,6 +62,7 @@ const table_write_managed_db = @import("table_writes/managed_db.zig");
 const table_write_schema_jobs = @import("table_writes/schema_jobs.zig");
 const table_write_backup_restore = @import("table_writes/backup_restore.zig");
 const table_write_relational_mutation = @import("table_writes/relational_mutation.zig");
+const table_write_remote_wire = @import("table_writes/remote_wire.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
@@ -5607,15 +5608,17 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        // Recovery can notify this same table/group through the participant
+        // worker, so run it before taking the group activity gate.
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
         _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, participants);
     }
 
@@ -5629,24 +5632,20 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        std.log.err("provisioned txn prepare start table={s} group={} writes={} deletes={} transforms={} predicates={}", .{ table_name, group_id, req.writes.len, req.deletes.len, req.transforms.len, req.predicates.len });
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        std.log.err("provisioned txn prepare topology ok table={s} group={}", .{ table_name, group_id });
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
-        std.log.err("provisioned txn prepare db open table={s} group={}", .{ table_name, group_id });
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        // Recovery can notify this same table/group through the participant
+        // worker, so run it before taking the group activity gate.
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
-        std.log.err("provisioned txn prepare recovered table={s} group={}", .{ table_name, group_id });
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
-        std.log.err("provisioned txn prepare schema ok table={s} group={}", .{ table_name, group_id });
         db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
-        std.log.err("provisioned txn prepare done table={s} group={}", .{ table_name, group_id });
     }
 
     fn txnResolveGroupLocal(
@@ -5682,10 +5681,12 @@ pub const ProvisionedTableWriteSource = struct {
         db.resolveTransactionIntents(txn_id, status, commit_version) catch |err| {
             return normalizeRelationalConstraintError(err);
         };
-        if (status == .committed) try drainManagedDbBeforeClose(&db);
         const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
         defer alloc.free(participant);
         try db.markTransactionParticipantResolved(txn_id, participant);
+        // Keep the resolved participant marker in the same drain window as the
+        // committed row/index effects, so the next open does not recover it.
+        if (status == .committed) try drainManagedDbBeforeClose(&db);
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateWriteCache(table_name);
@@ -9330,21 +9331,15 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        std.log.err("hosted txn prepare start table={s} group={} writes={} deletes={} transforms={} predicates={}", .{ table_name, group_id, req.writes.len, req.deletes.len, req.transforms.len, req.predicates.len });
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        std.log.err("hosted txn prepare topology ok table={s} group={}", .{ table_name, group_id });
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        std.log.err("hosted txn prepare db open table={s} group={}", .{ table_name, group_id });
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
-        std.log.err("hosted txn prepare recovered table={s} group={}", .{ table_name, group_id });
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
-        std.log.err("hosted txn prepare schema ok table={s} group={}", .{ table_name, group_id });
         cached.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
-        std.log.err("hosted txn prepare done table={s} group={}", .{ table_name, group_id });
     }
 
     fn txnResolveGroupLocal(
@@ -9365,10 +9360,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         cached.db.resolveTransactionIntents(txn_id, status, commit_version) catch |err| {
             return normalizeRelationalConstraintError(err);
         };
-        if (status == .committed) try drainManagedDbBeforeClose(cached.db);
         const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
         defer alloc.free(participant);
         try cached.db.markTransactionParticipantResolved(txn_id, participant);
+        // Keep the resolved participant marker in the same drain window as the
+        // committed row/index effects, so the next open does not recover it.
+        if (status == .committed) try drainManagedDbBeforeClose(cached.db);
     }
 
     fn txnStatusGroupLocal(
@@ -11395,8 +11392,7 @@ fn applyGroupBatch(
     group: GroupBatch,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, group.writes.items, group.deletes.items, group.transforms.items);
-    try applyGroupBatchUnchecked(db, group, req);
+    try table_write_bulk_ingest.applyGroupBatch(alloc, catalog, db, table_name, group, req, runTestBeforeBatchExecutionHook);
 }
 
 fn applyGroupBatchWithSchemaJson(
@@ -11406,8 +11402,7 @@ fn applyGroupBatchWithSchemaJson(
     group: GroupBatch,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-    try applyGroupBatchUnchecked(db, group, req);
+    try table_write_bulk_ingest.applyGroupBatchWithSchemaJson(alloc, db, schema_json, group, req, runTestBeforeBatchExecutionHook);
 }
 
 fn applyGroupBatchUnchecked(
@@ -11424,6 +11419,7 @@ const parseIndexConfig = table_write_index_config.parseIndexConfig;
 const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
 const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
 const parseStartupConfiguredIndexes = table_write_index_config.parseStartupConfiguredIndexes;
+const encodeRemoteBatchRequest = table_write_remote_wire.encodeRemoteBatchRequest;
 const overlayDenseHbcCacheStatsFromDb = table_write_cache.overlayDenseHbcCacheStatsFromDb;
 const overlayRuntimeStatusReplayTargetFromDb = table_write_cache.overlayRuntimeStatusReplayTargetFromDb;
 const startupCatchUpStatsForPhase = table_write_cache.startupCatchUpStatsForPhase;
@@ -11435,12 +11431,6 @@ pub const validateIndexConfig = table_write_index_config.validateIndexConfig;
 pub const validateIndexConfigWithOptions = table_write_index_config.validateIndexConfigWithOptions;
 pub const normalizeManagedEmbeddingIndexDimensionJsonWithOptions = table_write_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions;
 pub const normalizeManagedEmbeddingIndexDimensionsJsonWithOptions = table_write_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions;
-
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
 
 fn reconcileCachedLocalTableIndexCreate(
     self: *ProvisionedTableWriteSource,
@@ -12011,55 +12001,6 @@ fn recoverHostedTransactionsOnce(
         .lease_owned = true,
     };
     _ = try db.runTransactionRecoveryOnce(resolver.config());
-}
-
-fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-
-    try out.appendSlice(alloc, "{\"inserts\":{");
-    for (req.writes, 0..) |write, i| {
-        if (i > 0) try out.append(alloc, ',');
-        try appendJsonString(alloc, &out, write.key);
-        try out.append(alloc, ':');
-        try out.appendSlice(alloc, write.value);
-    }
-    try out.append(alloc, '}');
-    if (req.deletes.len > 0) {
-        try out.appendSlice(alloc, ",\"deletes\":[");
-        for (req.deletes, 0..) |key, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try appendJsonString(alloc, &out, key);
-        }
-        try out.append(alloc, ']');
-    }
-    if (req.transforms.len > 0) {
-        try out.appendSlice(alloc, ",\"transforms\":[");
-        for (req.transforms, 0..) |transform, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try out.appendSlice(alloc, "{\"key\":");
-            try appendJsonString(alloc, &out, transform.key);
-            try out.appendSlice(alloc, ",\"operations\":[");
-            for (transform.operations, 0..) |op, op_index| {
-                if (op_index > 0) try out.append(alloc, ',');
-                try out.appendSlice(alloc, "{\"op\":");
-                try appendJsonString(alloc, &out, db_mod.transform.transformOpText(op.op));
-                try out.appendSlice(alloc, ",\"path\":");
-                try appendJsonString(alloc, &out, op.path);
-                if (op.value_json) |value_json| {
-                    try out.appendSlice(alloc, ",\"value\":");
-                    try out.appendSlice(alloc, value_json);
-                }
-                try out.append(alloc, '}');
-            }
-            try out.append(alloc, ']');
-            if (transform.upsert) try out.appendSlice(alloc, ",\"upsert\":true");
-            try out.append(alloc, '}');
-        }
-        try out.append(alloc, ']');
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
 }
 
 test "bound table write source applies batch writes" {
@@ -22416,36 +22357,6 @@ test "provisioned same-table foreign key action job routes runtime parent throug
     const child = (try reopened.get(alloc, "doc:report")) orelse return error.TestUnexpectedResult;
     defer alloc.free(child);
     try std.testing.expectEqualStrings("{\"status\":\"open\"}", child);
-}
-
-test "managed startup catch-up open disables optional runtimes and workers" {
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up/table-db", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try openManagedDbWithIndexesJsonAndCacheMode(
-        alloc,
-        path,
-        "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-        null,
-        null,
-        0,
-        null,
-        .startup_catch_up,
-    );
-    defer db.close();
-
-    try std.testing.expect(!db.start_index_workers);
-    try std.testing.expect(db.enrichment_runtime == null);
-    try std.testing.expect(db.resolution_runtime == null);
-    try std.testing.expect(db.promotion_runtime == null);
-    try std.testing.expect(db.ttl_runtime == null);
-    try std.testing.expect(db.transaction_runtime == null);
-    try std.testing.expect(db.text_merge_runtime == null);
 }
 
 test "managed startup catch-up uses provided indexes json without catalog fetch" {

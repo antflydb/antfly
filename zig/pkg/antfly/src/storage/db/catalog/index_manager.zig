@@ -1327,10 +1327,6 @@ pub const IndexManager = struct {
         self.alloc.destroy(mutex);
     }
 
-    fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-        platform.sync.lockYielding(mutex);
-    }
-
     pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
         self.catalog_mutex.lockShared();
         errdefer self.catalog_mutex.unlockShared();
@@ -1356,7 +1352,7 @@ pub const IndexManager = struct {
                 break :blk entry.apply_mutex;
             },
         };
-        lockAtomicWithBackoff(mutex);
+        _ = platform.sync.lockAtomic(mutex);
         return .{
             .manager = self,
             .mutex = mutex,

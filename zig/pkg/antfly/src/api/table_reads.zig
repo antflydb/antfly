@@ -245,68 +245,10 @@ const ProfiledDenseQuery = struct {
 };
 
 const ParsedAlgebraicPartialsRequest = table_read_remote_wire.ParsedAlgebraicPartialsRequest;
+pub const searchRequestFromVectorWorkerEnvelope = table_read_remote_wire.searchRequestFromVectorWorkerEnvelope;
 
 pub const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
 pub const TableReadSource = table_read_core.TableReadSource;
-
-pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
-    var req = switch (envelope.query) {
-        .dense => |dense| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .dense_knn = dense },
-        },
-        .sparse => |sparse| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .sparse_knn = sparse },
-        },
-    };
-    query_contract.applyNativeDocIdConstraintEnvelope(&req, envelope.native_doc_id_constraints.constraints);
-    return req;
-}
 
 const AlgebraicVectorWorkerCandidate = struct {
     index_name: []const u8,
@@ -1057,106 +999,7 @@ pub const BoundTableReadSource = struct {
 
 const documentAlgebraicAggregateFromDbAlloc = table_read_document_sql.aggregateFromDbAlloc;
 const documentAlgebraicAggregateMergeResponsesAlloc = table_read_document_sql.mergeResponsesAlloc;
-
-fn documentAlgebraicAggregateProvisionedHostedLocal(
-    replica_root_dir: []const u8,
-    catalog: table_catalog.CatalogSource,
-    requester: raft_mod.ReadableLeaseRequester,
-    alloc: std.mem.Allocator,
-    group_id: u64,
-    lsm_root_generation: u64,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    req: document_sql_runtime.AlgebraicAggregateRequest,
-    consistency: raft_mod.ReadConsistency,
-) !?document_sql_runtime.AlgebraicAggregateResponse {
-    return documentAlgebraicAggregateLocal(
-        replica_root_dir,
-        catalog,
-        requester,
-        alloc,
-        group_id,
-        lsm_root_generation,
-        backend_runtime,
-        table_name,
-        req,
-        consistency,
-    ) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try documentAlgebraicAggregateLocal(
-            replica_root_dir,
-            catalog,
-            requester,
-            alloc,
-            group_id,
-            lsm_root_generation,
-            backend_runtime,
-            table_name,
-            req,
-            .stale,
-        ),
-        else => err,
-    };
-}
-
-fn documentAlgebraicAggregateLocal(
-    replica_root_dir: []const u8,
-    catalog: table_catalog.CatalogSource,
-    requester: raft_mod.ReadableLeaseRequester,
-    alloc: std.mem.Allocator,
-    group_id: u64,
-    lsm_root_generation: u64,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    req: document_sql_runtime.AlgebraicAggregateRequest,
-    consistency: raft_mod.ReadConsistency,
-) !document_sql_runtime.AlgebraicAggregateResponse {
-    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
-    try reads.reads.prepareScanWithConsistency(group_id, "", "", .{}, consistency);
-
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
-    defer db.close();
-
-    return try documentAlgebraicAggregateFromDbAlloc(alloc, &db, req);
-}
-
-fn documentAlgebraicAggregateProvisionedGroups(
-    self: *ProvisionedTableReadSource,
-    alloc: std.mem.Allocator,
-    group_ids: []const u64,
-    table_name: []const u8,
-    req: document_sql_runtime.AlgebraicAggregateRequest,
-    consistency: raft_mod.ReadConsistency,
-) !?document_sql_runtime.AlgebraicAggregateResponse {
-    var shard_responses = std.ArrayListUnmanaged(document_sql_runtime.AlgebraicAggregateResponse).empty;
-    defer {
-        for (shard_responses.items) |*response| response.deinit(alloc);
-        shard_responses.deinit(alloc);
-    }
-
-    var local_req = req;
-    if (req.group_by != null) local_req.limit = null;
-
-    for (group_ids) |group_id| {
-        var response = (try documentAlgebraicAggregateProvisionedHostedLocal(
-            self.replica_root_dir,
-            self.catalog,
-            self.requester,
-            alloc,
-            group_id,
-            self.visibleRootGeneration(group_id),
-            self.backend_runtime,
-            table_name,
-            local_req,
-            consistency,
-        )) orelse return error.DocumentSqlIndexUnavailable;
-        errdefer response.deinit(alloc);
-        try shard_responses.append(alloc, response);
-    }
-    if (shard_responses.items.len == 0) return null;
-    return try documentAlgebraicAggregateMergeResponsesAlloc(alloc, req, shard_responses.items);
-}
+const documentAlgebraicAggregateProvisionedHostedLocal = table_read_document_sql.aggregateProvisionedHostedLocal;
 
 pub const ProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
@@ -1514,7 +1357,18 @@ pub const ProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        return try documentAlgebraicAggregateProvisionedGroups(self, alloc, group_ids, table_name, req, consistency);
+        return try table_read_document_sql.aggregateProvisionedGroupsAlloc(
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_ids,
+            self.group_visible_root_generation,
+            self.backend_runtime,
+            table_name,
+            req,
+            consistency,
+        );
     }
 
     fn documentAlgebraicAggregateCatalog(
@@ -15172,108 +15026,6 @@ test "internal worker doc identity exchange audit covers every boundary" {
     try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.graph_result_ref));
     try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.explicit_text_stats));
     try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.background_text_stats));
-}
-
-test "vector worker envelope converts to constrained search request" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
-    const candidate_input = algebraic_ir.TensorExpr{
-        .fragment = .slice,
-        .output_dims = &.{.doc},
-        .semantic_id = "native_doc_id_constraints",
-    };
-    const program = algebraic_ir.TensorProgram{
-        .inputs = &.{candidate_input},
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .input_dims = &.{.doc},
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-            .inputs = &.{.{ .input = 0 }},
-        }},
-        .output = .{ .step = 0 },
-    };
-    const encoded = try query_contract.encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .{
-            .fields = @constCast((&[_][]const u8{"title"})[0..]),
-            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
-            .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
-            .filter_prefix = "tenant/a/",
-            .filter_ids = &.{ 42, 99 },
-            .exclude_ids = &.{7},
-            .require_algebraic_filter_resolution = true,
-            .include_all_fields = false,
-            .defer_stored_projection = true,
-            .limit = 8,
-            .offset = 1,
-            .profile = true,
-            .include_stored = false,
-            .search_effort = 0.5,
-            .distance_over = 0.1,
-            .distance_under = 0.9,
-            .return_mode = .parent_with_chunks,
-            .max_chunks_per_parent = 2,
-            .identity_read_generation = 12345,
-        },
-        .{
-            .positive_filter = true,
-            .include_doc_ids = &.{ "doc:a", "doc:b" },
-            .exclude_doc_ids = &.{"doc:c"},
-        },
-        null,
-        null,
-        &.{access_path},
-        program,
-    );
-    defer alloc.free(encoded);
-
-    var envelope = try query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
-    defer envelope.deinit(alloc);
-    const req = searchRequestFromVectorWorkerEnvelope(&envelope);
-
-    try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
-    try std.testing.expectEqual(@as(u32, 8), req.limit);
-    try std.testing.expectEqual(@as(u32, 1), req.offset);
-    try std.testing.expect(req.profile);
-    try std.testing.expect(!req.include_stored);
-    try std.testing.expect(!req.include_all_fields);
-    try std.testing.expect(req.defer_stored_projection);
-    try std.testing.expectEqual(@as(usize, 1), req.fields.len);
-    try std.testing.expectEqualStrings("title", req.fields[0]);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}", req.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", req.exclusion_query_json);
-    try std.testing.expect(req.require_algebraic_filter_resolution);
-    try std.testing.expectEqualStrings("tenant/a/", req.filter_prefix);
-    try std.testing.expectEqual(@as(usize, 2), req.filter_ids.len);
-    try std.testing.expectEqual(@as(u64, 42), req.filter_ids[0]);
-    try std.testing.expectEqual(@as(u64, 99), req.filter_ids[1]);
-    try std.testing.expectEqual(@as(usize, 1), req.exclude_ids.len);
-    try std.testing.expectEqual(@as(u64, 7), req.exclude_ids[0]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), req.search_effort.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), req.distance_over.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), req.distance_under.?, 0.0001);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, req.return_mode);
-    try std.testing.expectEqual(@as(u32, 2), req.max_chunks_per_parent);
-    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-    try std.testing.expect(req.filter_doc_ids_positive);
-    try std.testing.expectEqual(@as(usize, 2), req.filter_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:a", req.filter_doc_ids[0]);
-    try std.testing.expectEqual(@as(usize, 1), req.exclude_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:c", req.exclude_doc_ids[0]);
-    switch (req.query) {
-        .dense_knn => |dense| {
-            try std.testing.expectEqual(@as(u32, 7), dense.k);
-            try std.testing.expectEqual(@as(usize, 2), dense.vector.len);
-        },
-        else => return error.TestUnexpectedResult,
-    }
 }
 
 test "simple vector shard request lowers to vector worker envelope" {

@@ -137,6 +137,7 @@ table_writes/core.zig
   -> relational_mutation.zig
   -> backup_restore.zig
   -> bulk_ingest.zig
+  -> remote_wire.zig
   -> sources.zig
 table_writes.zig facade re-exports public API
 ```
@@ -188,6 +189,10 @@ Proposed modules:
   - auto bulk ingest policy
   - bulk ingest session tracking
   - coalesced group batch helpers
+- `remote_wire.zig`
+  - internal group write encoders
+  - remote batch request serialization
+  - write-side wire-format tests that do not need source routing
 - `sources.zig`
   - `BoundTableWriteSource`
   - `ProvisionedTableWriteSource`
@@ -436,6 +441,7 @@ Expected long-term test placement:
   and restore repair coordination tests.
 - `table_writes/bulk_ingest.zig` owns batch sizing, drain policy, coalescing,
   and bulk ingest session policy tests.
+- `table_writes/remote_wire.zig` owns write-side internal wire encoding tests.
 - `table_writes/sources.zig` owns provisioned/hosted/bound write source
   integration tests that prove catalog routing, namespace resolution, managed DB
   opening through the source, vtable dispatch, and write lifecycle behavior.

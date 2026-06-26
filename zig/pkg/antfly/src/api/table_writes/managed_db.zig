@@ -1672,3 +1672,33 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\}]
     ));
 }
+
+test "managed startup catch-up open disables optional runtimes and workers" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try openManagedDbWithIndexesJsonAndCacheMode(
+        alloc,
+        path,
+        "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+        null,
+        null,
+        0,
+        null,
+        .startup_catch_up,
+    );
+    defer db.close();
+
+    try std.testing.expect(!db.start_index_workers);
+    try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.resolution_runtime == null);
+    try std.testing.expect(db.promotion_runtime == null);
+    try std.testing.expect(db.ttl_runtime == null);
+    try std.testing.expect(db.transaction_runtime == null);
+    try std.testing.expect(db.text_merge_runtime == null);
+}

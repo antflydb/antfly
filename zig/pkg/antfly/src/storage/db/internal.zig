@@ -1894,7 +1894,7 @@ pub const ProfiledApplyLock = struct {
 };
 
 pub fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    platform.sync.lockYielding(mutex);
+    _ = platform.sync.lockAtomic(mutex);
 }
 
 pub fn lockAtomicWithBackoffProfiled(

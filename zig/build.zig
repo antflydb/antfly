@@ -1228,6 +1228,7 @@ pub fn build(b: *std.Build) void {
     // wires durable suites and modules; it should not grow exact test-title
     // lists as API/storage refactors move coverage closer to implementation.
     antfly_tests_build.assertBuildZigDoesNotOwnTestInventory(b);
+    antfly_tests_build.assertDBRefactorBoundary(b);
 
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils

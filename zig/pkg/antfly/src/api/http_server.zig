@@ -5762,7 +5762,6 @@ pub const ApiHttpServer = struct {
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
             else => return err,
         };
-        std.log.err("public sql write lowered statement_kind={s}", .{@tagName(statement_kind)});
         var lowered_owned = true;
         defer if (lowered_owned) lowered.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5977,9 +5976,7 @@ pub const ApiHttpServer = struct {
             .delete => |*delete| &delete.batch,
             else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
         };
-        std.log.err("public sql write apply rows batch table={s} writes={} deletes={} transforms={} predicates={} returning={}", .{ target_table, rows_batch.writes.len, rows_batch.deletes.len, rows_batch.transforms.len, rows_batch.predicates.len, rows_batch.returning_rows.len });
         if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
-        std.log.err("public sql write applied rows batch table={s} returning={}", .{ target_table, rows_batch.returning_rows.len });
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         const owned_rows_batch = rows_batch.*;

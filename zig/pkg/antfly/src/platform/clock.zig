@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 
 pub const Clock = struct {
     ctx: ?*anyopaque = null,
@@ -59,7 +60,7 @@ pub const ManualClock = struct {
     }
 
     pub fn setRealtimeNs(self: *ManualClock, now_realtime_ns: u64) void {
-        lockAtomic(&self.mutex);
+        _ = platform.sync.lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.now_realtime_ns = now_realtime_ns;
     }
@@ -69,7 +70,7 @@ pub const ManualClock = struct {
     }
 
     pub fn advanceNs(self: *ManualClock, delta_ns: u64) void {
-        lockAtomic(&self.mutex);
+        _ = platform.sync.lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.now_realtime_ns +%= delta_ns;
     }
@@ -85,13 +86,9 @@ fn realNowRealtimeNs(_: ?*anyopaque) u64 {
 }
 
 fn realSleepMs(_: ?*anyopaque, ms: u64) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
     const sleep_ms = if (ms == 0) @as(u64, 1) else ms;
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(sleep_ms)),
-    }, io_impl.io()) catch {};
+    const sleep_ns = std.math.mul(u64, sleep_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    platform.time.sleepNs(sleep_ns);
 }
 
 fn freestandingNowRealtimeNs(_: ?*anyopaque) u64 {
@@ -102,7 +99,7 @@ fn freestandingSleepMs(_: ?*anyopaque, _: u64) void {}
 
 fn manualNowRealtimeNs(ctx: ?*anyopaque) u64 {
     const self: *ManualClock = @ptrCast(@alignCast(ctx.?));
-    lockAtomic(&self.mutex);
+    _ = platform.sync.lockAtomic(&self.mutex);
     defer self.mutex.unlock();
     return self.now_realtime_ns;
 }
@@ -110,9 +107,5 @@ fn manualNowRealtimeNs(ctx: ?*anyopaque) u64 {
 fn manualSleepMs(ctx: ?*anyopaque, ms: u64) void {
     _ = ctx;
     _ = ms;
-    if (builtin.os.tag != .freestanding) std.Thread.yield() catch {};
-}
-
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform.time.yieldBriefly();
 }

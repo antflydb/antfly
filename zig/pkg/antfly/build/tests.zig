@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const max_build_zig_bytes = 2 * 1024 * 1024;
+const max_db_zig_bytes = 1024 * 1024;
 
 pub const no_default_filters = [_][]const u8{};
 
@@ -281,10 +282,14 @@ pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
 pub const db_sim_step_name = "db-sim-test";
 
-fn readBuildSourceAlloc(b: *std.Build) []const u8 {
-    return b.build_root.handle.readFileAlloc(b.graph.io, "build.zig", b.allocator, .limited(max_build_zig_bytes)) catch |err| {
-        std.debug.panic("failed to read build.zig for test inventory guardrail: {}", .{err});
+fn readBuildRootFileAlloc(b: *std.Build, path: []const u8, max_bytes: usize, context: []const u8) []const u8 {
+    return b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(max_bytes)) catch |err| {
+        std.debug.panic("failed to read {s} for {s}: {}", .{ path, context, err });
     };
+}
+
+fn readBuildSourceAlloc(b: *std.Build) []const u8 {
+    return readBuildRootFileAlloc(b, "build.zig", max_build_zig_bytes, "test inventory guardrail");
 }
 
 fn lineNumberForOffset(source: []const u8, offset: usize) usize {
@@ -368,6 +373,32 @@ fn isStorageBackendTestStepName(name: []const u8) bool {
     return false;
 }
 
+const manifest_owned_api_test_step_names = [_][]const u8{
+    "api-transactions-test",
+    "api-table-writes-docid-test",
+    "provisioned-query-visibility-test",
+    "api-table-reads-docid-test",
+    "api-internal-group-write-routes-test",
+    "api-rows-test",
+    "sql-api-parity-test",
+    "sql-api-parity-fixture-promote",
+    "sql-api-parity-fixture-check",
+    "api-public-table-http-docid-test",
+    "public-api-parity-test",
+    "lib-resolution-source-test",
+    "lib-api-auth-test",
+    "lib-api-logic-test",
+    "docid-lifecycle-test",
+    "lib-api-swarm-backup-restore-test",
+};
+
+fn isManifestOwnedAPITestStepName(name: []const u8) bool {
+    inline for (manifest_owned_api_test_step_names) |step_name| {
+        if (std.mem.eql(u8, name, step_name)) return true;
+    }
+    return false;
+}
+
 fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
@@ -378,7 +409,8 @@ fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
         const name = source[name_start..name_end];
         if (isDBFocusedTestStepName(name) or
             isStandaloneModuleTestStepName(name) or
-            isStorageBackendTestStepName(name))
+            isStorageBackendTestStepName(name) or
+            isManifestOwnedAPITestStepName(name))
         {
             std.debug.panic(
                 "build.zig declares test inventory step '{s}' at line {}; move test inventories to pkg/antfly/build/tests.zig",
@@ -395,6 +427,41 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     assertBuildZigTestFiltersReferenceManifest(source);
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
+}
+
+fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {
+    if (std.mem.indexOf(u8, source, "\ntest \"")) |start| {
+        std.debug.panic(
+            "storage/db/db.zig declares an inline test at line {}; move implementation-local tests to the owning DB module",
+            .{lineNumberForOffset(source, start + 1)},
+        );
+    }
+}
+
+fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
+    var line_start: usize = 0;
+    while (line_start < source.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        const line = source[line_start..line_end];
+        if (std.mem.startsWith(u8, line, "fn ") or std.mem.startsWith(u8, line, "    fn ")) {
+            std.debug.panic(
+                "storage/db/db.zig declares private helper function at line {}; move implementation details to a coarse DB module",
+                .{lineNumberForOffset(source, line_start)},
+            );
+        }
+        line_start = if (line_end == source.len) source.len else line_end + 1;
+    }
+}
+
+pub fn assertDBRefactorBoundary(b: *std.Build) void {
+    const source = readBuildRootFileAlloc(
+        b,
+        "pkg/antfly/src/storage/db/db.zig",
+        max_db_zig_bytes,
+        "DB refactor boundary guardrail",
+    );
+    assertDBRootDoesNotOwnInlineTests(source);
+    assertDBRootDoesNotOwnPrivateHelpers(source);
 }
 
 pub const capi_default_filters = [_][]const u8{
@@ -1304,6 +1371,7 @@ pub const APITestFilters = struct {
         "write cache reserves retirement slots when pruning multiple leased generations",
         "full text memory attribution aggregation includes norm bytes",
         "table write source core forwards required batch and defaults optional capabilities",
+        "remote batch request encoder preserves writes deletes transforms and escaping",
         "primary lookup adopts seeded write cache across visible generation bump",
         "provisioned table write source coalesces same-group waiters",
         "provisioned table write coalescer isolates failed waiters",
@@ -1319,6 +1387,7 @@ pub const APITestFilters = struct {
         "secondary index promotion ignores stale ready rebuild generation",
         "foreign key integrity job diagnostics merge samples across passes",
         "foreign key integrity job records diagnostics across incomplete passes",
+        "managed startup catch-up open disables optional runtimes and workers",
         "unique schema controller maintenance",
         "foreign key schema controller maintenance",
         "foreign key schema controller maintenance resumes durable action job",
@@ -1384,6 +1453,7 @@ pub const APITestFilters = struct {
         "explicit text stats requests carry resolved doc filters and apply exact projection",
         "explicit text stats requests reject stale identity generation",
         "api.table_reads.remote_wire.test.algebraic partial request ",
+        "vector worker envelope converts to constrained search request",
         "algebraic partial request fails closed when lifecycle is stale",
         "algebraic partial request accepts current identity generation and rejects stale",
         "remote document algebraic aggregate preserves typed unavailable and not found errors",

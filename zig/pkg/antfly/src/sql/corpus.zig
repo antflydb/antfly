@@ -2319,10 +2319,20 @@ fn fixtureGateEnvPathAlloc(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
         const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
         if (std.mem.eql(u8, text[0..eq], name)) return try alloc.dupe(u8, text[eq + 1 ..]);
     }
-    return std.process.getEnvVarOwned(alloc, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
+    if (comptime @hasDecl(std.process.Environ.Block, "global")) {
+        const process_env: std.process.Environ = .{ .block = .global };
+        return process_env.getAlloc(alloc, name) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            else => return err,
+        };
+    }
+    var index: usize = 0;
+    while (std.c.environ[index]) |entry| : (index += 1) {
+        const text = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
+        if (std.mem.eql(u8, text[0..eq], name)) return try alloc.dupe(u8, text[eq + 1 ..]);
+    }
+    return null;
 }
 
 pub fn fixtureGateModeFromEnvAlloc(alloc: std.mem.Allocator) !AppParityFixtureGateMode {

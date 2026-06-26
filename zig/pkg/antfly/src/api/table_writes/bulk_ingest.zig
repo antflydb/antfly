@@ -16,11 +16,14 @@ const std = @import("std");
 
 const backend_types = @import("../../storage/backend_types.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const table_catalog = @import("../table_catalog.zig");
 const table_write_core = @import("core.zig");
 const table_write_managed_db = @import("managed_db.zig");
 
 pub const GroupBatch = table_write_core.GroupBatch;
 const drainManagedDbBeforeClose = table_write_managed_db.drainManagedDbBeforeClose;
+const validateTableBatchAgainstCatalogSchema = table_write_managed_db.validateTableBatchAgainstCatalogSchema;
+const validateTableBatchAgainstSchemaJson = table_write_managed_db.validateTableBatchAgainstSchemaJson;
 
 pub const min_batch_ops: usize = 100;
 pub const max_window_ops: usize = 25_000;
@@ -100,6 +103,31 @@ pub fn applyGroupBatchUnchecked(
         .sync_level = req.sync_level,
     });
     if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
+}
+
+pub fn applyGroupBatch(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group: GroupBatch,
+    req: db_mod.types.BatchRequest,
+    before_batch: ?*const fn () void,
+) !void {
+    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, group.writes.items, group.deletes.items, group.transforms.items);
+    try applyGroupBatchUnchecked(db, group, req, before_batch);
+}
+
+pub fn applyGroupBatchWithSchemaJson(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    schema_json: ?[]const u8,
+    group: GroupBatch,
+    req: db_mod.types.BatchRequest,
+    before_batch: ?*const fn () void,
+) !void {
+    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, group.writes.items, group.deletes.items, group.transforms.items);
+    try applyGroupBatchUnchecked(db, group, req, before_batch);
 }
 
 pub const WriteCoalesceQueue = struct {

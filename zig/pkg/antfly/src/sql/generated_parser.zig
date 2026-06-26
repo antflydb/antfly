@@ -196,11 +196,15 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_event_trigger,
     alter_foreign_table,
     alter_foreign_data_wrapper,
+    alter_function,
+    alter_language,
     alter_materialized_view,
     alter_operator,
     alter_operator_class,
     alter_operator_family,
     alter_policy,
+    alter_procedure,
+    alter_routine,
     alter_publication,
     alter_rule,
     alter_server,
@@ -212,6 +216,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_text_search_parser,
     alter_text_search_template,
     alter_trigger,
+    alter_transform,
     alter_user_mapping,
     create_access_method,
     create_conversion,
@@ -296,11 +301,15 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_event_trigger_not_planned_by_generated_parser,
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
+    alter_function_not_planned_by_generated_parser,
+    alter_language_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
     alter_operator_not_planned_by_generated_parser,
     alter_operator_class_not_planned_by_generated_parser,
     alter_operator_family_not_planned_by_generated_parser,
     alter_policy_not_planned_by_generated_parser,
+    alter_procedure_not_planned_by_generated_parser,
+    alter_routine_not_planned_by_generated_parser,
     alter_publication_not_planned_by_generated_parser,
     alter_rule_not_planned_by_generated_parser,
     alter_server_not_planned_by_generated_parser,
@@ -312,6 +321,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_text_search_parser_not_planned_by_generated_parser,
     alter_text_search_template_not_planned_by_generated_parser,
     alter_trigger_not_planned_by_generated_parser,
+    alter_transform_not_planned_by_generated_parser,
     alter_user_mapping_not_planned_by_generated_parser,
     create_access_method_not_planned_by_generated_parser,
     create_conversion_not_planned_by_generated_parser,
@@ -2058,10 +2068,14 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER EVENT TRIGGER usage_ddl_start DISABLE", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
+    .{ .sql = "ALTER FUNCTION normalize_status(text) OWNER TO app_role", .kind = .unsupported },
+    .{ .sql = "ALTER LANGUAGE usage_lang OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR === (text, text) OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2", .kind = .unsupported },
+    .{ .sql = "ALTER PROCEDURE refresh_usage_records() OWNER TO app_role", .kind = .unsupported },
+    .{ .sql = "ALTER ROUTINE normalize_status(text) OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
     .{ .sql = "ALTER SYSTEM SET work_mem = '64MB'", .kind = .unsupported },
@@ -2071,6 +2085,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2", .kind = .unsupported },
     .{ .sql = "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
+    .{ .sql = "ALTER TRANSFORM FOR jsonb LANGUAGE plpgsql OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
@@ -2571,7 +2586,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeyword("conversion")) return .{ .unsupported = .alter_conversion };
         if (second.matchesKeywordTag(.default) and tokens.len > 2 and tokens[2].matchesKeywordTag(.privileges)) return .{ .unsupported = .alter_default_privileges };
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_event_trigger };
+        if (second.matchesKeywordTag(.function)) return .{ .unsupported = .alter_function };
         if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
+        if (second.matchesKeyword("language")) return .{ .unsupported = .alter_language };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
         if (second.matchesKeywordTag(.operator)) {
             if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .alter_operator_class };
@@ -2579,6 +2596,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             return .{ .unsupported = .alter_operator };
         }
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .alter_policy };
+        if (second.matchesKeywordTag(.procedure)) return .{ .unsupported = .alter_procedure };
+        if (second.matchesKeyword("routine")) return .{ .unsupported = .alter_routine };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
@@ -2593,6 +2612,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (text_search_kind.matchesKeyword("template")) return .{ .unsupported = .alter_text_search_template };
         }
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
+        if (second.matchesKeyword("transform")) return .{ .unsupported = .alter_transform };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
         if (isGeneratedRoleAliasKeyword(second)) return .{ .ddl = .alter_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .alter_collation };
@@ -2839,11 +2859,15 @@ fn buildUnsupportedAst(
             .alter_event_trigger => .alter_event_trigger_not_planned_by_generated_parser,
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
+            .alter_function => .alter_function_not_planned_by_generated_parser,
+            .alter_language => .alter_language_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
             .alter_operator => .alter_operator_not_planned_by_generated_parser,
             .alter_operator_class => .alter_operator_class_not_planned_by_generated_parser,
             .alter_operator_family => .alter_operator_family_not_planned_by_generated_parser,
             .alter_policy => .alter_policy_not_planned_by_generated_parser,
+            .alter_procedure => .alter_procedure_not_planned_by_generated_parser,
+            .alter_routine => .alter_routine_not_planned_by_generated_parser,
             .alter_publication => .alter_publication_not_planned_by_generated_parser,
             .alter_rule => .alter_rule_not_planned_by_generated_parser,
             .alter_server => .alter_server_not_planned_by_generated_parser,
@@ -2855,6 +2879,7 @@ fn buildUnsupportedAst(
             .alter_text_search_parser => .alter_text_search_parser_not_planned_by_generated_parser,
             .alter_text_search_template => .alter_text_search_template_not_planned_by_generated_parser,
             .alter_trigger => .alter_trigger_not_planned_by_generated_parser,
+            .alter_transform => .alter_transform_not_planned_by_generated_parser,
             .alter_user_mapping => .alter_user_mapping_not_planned_by_generated_parser,
             .create_access_method => .create_access_method_not_planned_by_generated_parser,
             .create_conversion => .create_conversion_not_planned_by_generated_parser,
@@ -7243,6 +7268,8 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_parser }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_template }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_transform }, (try parseSqlAlloc(alloc, "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_transform }, (try parseSqlAlloc(alloc, "ALTER TRANSFORM FOR jsonb LANGUAGE plpgsql OWNER TO app_role")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_routine }, (try parseSqlAlloc(alloc, "ALTER ROUTINE normalize_status(text) OWNER TO app_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_dictionary }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_parser }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH PARSER IF EXISTS usage_parser")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_template }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template")).statement);
@@ -10914,6 +10941,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 11 },
         },
         .{
+            .sql = "ALTER FUNCTION normalize_status(text) OWNER TO app_role",
+            .kind = .alter_function,
+            .reason = .alter_function_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
+            .sql = "ALTER LANGUAGE usage_lang OWNER TO app_role",
+            .kind = .alter_language,
+            .reason = .alter_language_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2",
             .kind = .alter_materialized_view,
             .reason = .alter_materialized_view_not_planned_by_generated_parser,
@@ -10935,6 +10974,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2",
             .kind = .alter_operator_family,
             .reason = .alter_operator_family_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
+            .sql = "ALTER PROCEDURE refresh_usage_records() OWNER TO app_role",
+            .kind = .alter_procedure,
+            .reason = .alter_procedure_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER ROUTINE normalize_status(text) OWNER TO app_role",
+            .kind = .alter_routine,
+            .reason = .alter_routine_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
@@ -10990,6 +11041,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_trigger,
             .reason = .alter_trigger_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER TRANSFORM FOR jsonb LANGUAGE plpgsql OWNER TO app_role",
+            .kind = .alter_transform,
+            .reason = .alter_transform_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
             .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')",

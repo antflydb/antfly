@@ -15,12 +15,15 @@
 const std = @import("std");
 
 const db_mod = @import("../../storage/db/mod.zig");
+const metadata_mod = @import("../../metadata/mod.zig");
 const catalog_resources = @import("../catalog_resources.zig");
+const table_catalog = @import("../table_catalog.zig");
 const query_api = @import("../query.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const sql_adapter_runtime = @import("../../sql/runtime.zig");
 const raft_mod = @import("../../raft/mod.zig");
 const core = @import("core.zig");
+const cache = @import("cache.zig");
 
 pub const RuntimeSourceAdapter = struct {
     source: core.TableReadSource,
@@ -228,6 +231,114 @@ pub fn aggregateFromDbAlloc(
         .rows = rows,
         .total_groups = 1,
     };
+}
+
+pub fn aggregateProvisionedHostedLocal(
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !?document_sql_runtime.AlgebraicAggregateResponse {
+    return aggregateLocal(
+        replica_root_dir,
+        catalog,
+        requester,
+        alloc,
+        group_id,
+        lsm_root_generation,
+        backend_runtime,
+        table_name,
+        req,
+        consistency,
+    ) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try aggregateLocal(
+            replica_root_dir,
+            catalog,
+            requester,
+            alloc,
+            group_id,
+            lsm_root_generation,
+            backend_runtime,
+            table_name,
+            req,
+            .stale,
+        ),
+        else => err,
+    };
+}
+
+fn aggregateLocal(
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    try reads.reads.prepareScanWithConsistency(group_id, "", "", .{}, consistency);
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    var db = try cache.openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    defer db.close();
+
+    return try aggregateFromDbAlloc(alloc, &db, req);
+}
+
+pub fn aggregateProvisionedGroupsAlloc(
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    group_visible_root_generation: ?core.GroupVisibleRootGenerationSource,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !?document_sql_runtime.AlgebraicAggregateResponse {
+    var shard_responses = std.ArrayListUnmanaged(document_sql_runtime.AlgebraicAggregateResponse).empty;
+    defer {
+        for (shard_responses.items) |*response| response.deinit(alloc);
+        shard_responses.deinit(alloc);
+    }
+
+    var local_req = req;
+    if (req.group_by != null) local_req.limit = null;
+
+    for (group_ids) |group_id| {
+        const root_generation = if (group_visible_root_generation) |source|
+            source.visibleRootGenerationForGroup(group_id)
+        else
+            core.backend_current_root_generation;
+        var response = (try aggregateProvisionedHostedLocal(
+            replica_root_dir,
+            catalog,
+            requester,
+            alloc,
+            group_id,
+            root_generation,
+            backend_runtime,
+            table_name,
+            local_req,
+            consistency,
+        )) orelse return error.DocumentSqlIndexUnavailable;
+        errdefer response.deinit(alloc);
+        try shard_responses.append(alloc, response);
+    }
+    if (shard_responses.items.len == 0) return null;
+    return try mergeResponsesAlloc(alloc, req, shard_responses.items);
 }
 
 fn singleGroupJsonAlloc(
