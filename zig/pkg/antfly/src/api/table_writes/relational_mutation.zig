@@ -51,6 +51,34 @@ pub fn mutateRowsJoinedFromSourceRowsOnDb(
     return try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
 }
 
+pub fn mergeRowsFromSourceRowsOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    plan: sql_adapter.LoweredMergeMutationPlan,
+    source_rows: []const []const u8,
+    comptime normalize_error: fn (anyerror) anyerror,
+) !relational_rows_api.OwnedRowsBatchRequest {
+    const target_preimages = try db.collectRelationalRowsPreimagesAlloc(alloc, target_schema, .{});
+    defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_preimages);
+
+    const target_rows = try alloc.alloc(sql_adapter.MergeExecutionTargetRow, target_preimages.len);
+    defer alloc.free(target_rows);
+    for (target_preimages, 0..) |row, i| {
+        target_rows[i] = .{
+            .key = row.key,
+            .json = row.json,
+            .version = row.version,
+        };
+    }
+
+    var batch_req = try sql_adapter.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
+    errdefer batch_req.deinit(alloc);
+    db.batch(batch_req.req) catch |err| return normalize_error(err);
+    return batch_req;
+}
+
 pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     read_source: table_reads.TableReadSource,

@@ -879,6 +879,10 @@ pub const GeneratedSqlCteAst = struct {
     body_distinct_on_items: GeneratedSqlListAst = .{},
     body_projection_tokens: ?GeneratedSqlTokenRange = null,
     body_source_tokens: ?GeneratedSqlTokenRange = null,
+    body_source_antfly_function_items: []GeneratedSqlAntflyTableFunctionAst = &.{},
+    body_source_antfly_function_count: usize = 0,
+    body_source_graph_function_items: []GeneratedSqlGraphTableFunctionAst = &.{},
+    body_source_graph_function_count: usize = 0,
     body_join_tokens: ?GeneratedSqlTokenRange = null,
     body_join_operator_tokens: ?GeneratedSqlTokenRange = null,
     body_join_kind: ?GeneratedSqlJoinKind = null,
@@ -925,6 +929,9 @@ pub const GeneratedSqlCteAst = struct {
         self.body_projection_items.deinit(alloc);
         self.body_projection_first_expression.deinit(alloc);
         self.body_projection_last_expression.deinit(alloc);
+        for (self.body_source_antfly_function_items) |*item| item.deinit(alloc);
+        if (self.body_source_antfly_function_items.len > 0) alloc.free(self.body_source_antfly_function_items);
+        if (self.body_source_graph_function_items.len > 0) alloc.free(self.body_source_graph_function_items);
         self.body_join_predicate_expression.deinit(alloc);
         for (self.body_join_items) |*join| join.deinit(alloc);
         if (self.body_join_items.len > 0) alloc.free(self.body_join_items);
@@ -1434,6 +1441,84 @@ fn cloneRebasedGeneratedJoinSliceAlloc(
     return cloned;
 }
 
+fn cloneRebasedGeneratedNamedArgumentSliceAlloc(
+    alloc: std.mem.Allocator,
+    arguments: []const GeneratedSqlNamedArgumentAst,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlNamedArgumentAst {
+    if (arguments.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlNamedArgumentAst, arguments.len);
+    errdefer alloc.free(cloned);
+    for (arguments, cloned) |argument, *out| {
+        out.* = .{
+            .tokens = try rebaseGeneratedSqlTokenRange(argument.tokens, base, end),
+            .name_tokens = try rebaseGeneratedSqlTokenRange(argument.name_tokens, base, end),
+            .operator_tokens = try rebaseGeneratedSqlTokenRange(argument.operator_tokens, base, end),
+            .value_tokens = try rebaseGeneratedSqlTokenRange(argument.value_tokens, base, end),
+        };
+    }
+    return cloned;
+}
+
+fn cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(
+    alloc: std.mem.Allocator,
+    functions: []const GeneratedSqlAntflyTableFunctionAst,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlAntflyTableFunctionAst {
+    if (functions.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlAntflyTableFunctionAst, functions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*function| function.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (functions, cloned) |function, *out| {
+        out.* = .{
+            .tokens = try rebaseGeneratedSqlTokenRange(function.tokens, base, end),
+            .name_tokens = try rebaseGeneratedSqlTokenRange(function.name_tokens, base, end),
+            .argument_tokens = try rebaseGeneratedSqlTokenRange(function.argument_tokens, base, end),
+            .kind = function.kind,
+            .argument_items = try cloneRebasedGeneratedNamedArgumentSliceAlloc(alloc, function.argument_items, base, end),
+            .argument_count = function.argument_count,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneRebasedGeneratedGraphTableFunctionSliceAlloc(
+    alloc: std.mem.Allocator,
+    functions: []const GeneratedSqlGraphTableFunctionAst,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlGraphTableFunctionAst {
+    if (functions.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlGraphTableFunctionAst, functions.len);
+    errdefer alloc.free(cloned);
+    for (functions, cloned) |function, *out| {
+        out.* = .{
+            .tokens = try rebaseGeneratedSqlTokenRange(function.tokens, base, end),
+            .name_tokens = try rebaseGeneratedSqlTokenRange(function.name_tokens, base, end),
+            .argument_tokens = try rebaseGeneratedSqlTokenRange(function.argument_tokens, base, end),
+            .kind = function.kind,
+            .argument_count = function.argument_count,
+            .table_name_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.table_name_value_tokens, base, end),
+            .index_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.index_value_tokens, base, end),
+            .start_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.start_value_tokens, base, end),
+            .start_result_ref_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.start_result_ref_value_tokens, base, end),
+            .target_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.target_value_tokens, base, end),
+            .target_result_ref_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.target_result_ref_value_tokens, base, end),
+            .pattern_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.pattern_value_tokens, base, end),
+            .return_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.return_value_tokens, base, end),
+            .metric_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.metric_value_tokens, base, end),
+            .query_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(function.query_value_tokens, base, end),
+        };
+    }
+    return cloned;
+}
+
 fn cloneRebasedGeneratedWindowSliceAlloc(
     alloc: std.mem.Allocator,
     windows: []const GeneratedSqlWindowAst,
@@ -1491,6 +1576,17 @@ pub fn cloneCteBodyReadAstAlloc(
     cloned.projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_first_expression, body.start, body.end);
     cloned.projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_last_expression, body.start, body.end);
     cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_tokens, body.start, body.end);
+    cloned.source_antfly_function_items = try cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(alloc, cte.body_source_antfly_function_items, body.start, body.end);
+    cloned.source_antfly_function_count = cte.body_source_antfly_function_count;
+    cloned.source_graph_function_items = try cloneRebasedGeneratedGraphTableFunctionSliceAlloc(alloc, cte.body_source_graph_function_items, body.start, body.end);
+    cloned.source_graph_function_count = cte.body_source_graph_function_count;
+    if (cloned.source_graph_function_items.len > 0) {
+        const first = cloned.source_graph_function_items[0];
+        cloned.source_graph_function_tokens = first.tokens;
+        cloned.source_graph_function_name_tokens = first.name_tokens;
+        cloned.source_graph_function_argument_tokens = first.argument_tokens;
+        cloned.source_graph_function_kind = first.kind;
+    }
     cloned.join_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_tokens, body.start, body.end);
     cloned.join_operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_operator_tokens, body.start, body.end);
     cloned.join_kind = cte.body_join_kind;
@@ -4090,6 +4186,10 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             cte.body_source_tokens = source_tokens;
+            cte.body_source_antfly_function_items = try buildGeneratedAntflyTableFunctionItemsAst(alloc, tokens, source_tokens);
+            cte.body_source_antfly_function_count = cte.body_source_antfly_function_items.len;
+            cte.body_source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, tokens, cte.body_source_antfly_function_items);
+            cte.body_source_graph_function_count = cte.body_source_graph_function_items.len;
             cte.body_join_items = try buildGeneratedJoinItemsAst(alloc, tokens, source_tokens);
             if (cte.body_join_items.len > 0) {
                 cte.body_join_tree_root_index = cte.body_join_items.len - 1;
@@ -10200,6 +10300,32 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 12 }, read.cte_items[0].body_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.cte_items[0].body_row_lock_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_graph_source_body_read_sql = "WITH ranked AS (SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm) SELECT id FROM ranked";
+    var cte_graph_source_body_tokens = try lexer.tokenizeAlloc(alloc, cte_graph_source_body_read_sql);
+    defer lexer.freeTokens(alloc, &cte_graph_source_body_tokens);
+    const cte_graph_source_body_read_result = try parseTokensAlloc(alloc, cte_graph_source_body_tokens.items);
+    switch (cte_graph_source_body_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_source_antfly_function_items.len);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_source_graph_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_source_graph_function_items.len);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_metric, read.cte_items[0].body_source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric, read.cte_items[0].body_source_graph_function_items[0].kind);
+            try std.testing.expectEqualStrings(
+                "antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5)",
+                tokenRangeText(cte_graph_source_body_read_sql, cte_graph_source_body_tokens.items, read.cte_items[0].body_source_graph_function_items[0].tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "'pagerank'",
+                tokenRangeText(cte_graph_source_body_read_sql, cte_graph_source_body_tokens.items, read.cte_items[0].body_source_graph_function_items[0].metric_value_tokens.?),
+            );
         },
         else => return error.TestUnexpectedResult,
     }

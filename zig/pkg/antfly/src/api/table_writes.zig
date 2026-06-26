@@ -268,6 +268,7 @@ pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc = table
 pub const mergeRowsFromRecursiveCtePlanAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanAlloc;
 pub const mergeRowsFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanWithSessionAlloc;
 const mutateRowsJoinedFromSourceRowsOnDb = table_write_relational_mutation.mutateRowsJoinedFromSourceRowsOnDb;
+const mergeRowsFromSourceRowsOnDb = table_write_relational_mutation.mergeRowsFromSourceRowsOnDb;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const ManagedDbOpenOptions = table_write_managed_db.ManagedDbOpenOptions;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
@@ -2340,23 +2341,7 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
 
-        const target_preimages = try self.db.collectRelationalRowsPreimagesAlloc(alloc, target_schema, .{});
-        defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_preimages);
-
-        const target_rows = try alloc.alloc(sql_adapter.MergeExecutionTargetRow, target_preimages.len);
-        defer alloc.free(target_rows);
-        for (target_preimages, 0..) |row, i| {
-            target_rows[i] = .{
-                .key = row.key,
-                .json = row.json,
-                .version = row.version,
-            };
-        }
-
-        var batch_req = try sql_adapter.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
-        errdefer batch_req.deinit(alloc);
-        self.db.batch(batch_req.req) catch |err| return normalizeRelationalConstraintError(err);
-        return batch_req;
+        return try mergeRowsFromSourceRowsOnDb(alloc, self.db, target_schema, source_schema, plan, source_rows, normalizeRelationalConstraintError);
     }
 
     fn beginBulkIngest(

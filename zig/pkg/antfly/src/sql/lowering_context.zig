@@ -414,6 +414,8 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: *co
         if (cte.body_fetch_count_tokens) |body_fetch_count_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_fetch_count_tokens);
         if (cte.body_row_lock_tokens) |body_row_lock_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_row_lock_tokens);
         if (cte.body_set_operation_tokens) |body_set_operation_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_set_operation_tokens);
+        try validateGeneratedAntflySourceItemsMetadata(tokens, cte.body_source_tokens, cte.body_source_antfly_function_items, cte.body_source_antfly_function_count);
+        try validateGeneratedGraphSourceItemsMetadata(tokens, cte.body_source_tokens, cte.body_source_antfly_function_items, cte.body_source_graph_function_items, cte.body_source_graph_function_count);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.column_names);
         try validateGeneratedReadListAstContainedByOptionalRange(cte.column_names, cte.column_name_tokens);
         try validateGeneratedDistinctOnListAstRanges(tokens, read_ast, cte.body_distinct_tokens, cte.body_distinct_on_items);
@@ -626,6 +628,8 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
     } else if (cte.body_join_items.len != 0 or cte.body_join_tree_root_index != null or cte.body_join_tree_depth != 0 or
         cte.body_join_tokens != null or cte.body_join_operator_tokens != null or cte.body_join_kind != null or
         cte.body_join_left_tokens != null or cte.body_join_right_tokens != null or cte.body_join_predicate_tokens != null or
+        cte.body_source_antfly_function_items.len != 0 or cte.body_source_antfly_function_count != 0 or
+        cte.body_source_graph_function_items.len != 0 or cte.body_source_graph_function_count != 0 or
         generatedExpressionAstHasMetadata(cte.body_join_predicate_expression))
     {
         return error.UnsupportedSqlShape;
@@ -1459,21 +1463,33 @@ fn validateGeneratedAntflySourceMetadata(
     tokens: []const tokenized.Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
-    if (read_ast.source_antfly_function_items.len != read_ast.source_antfly_function_count) return error.UnsupportedSqlShape;
-    var previous_end: usize = if (read_ast.source_tokens) |source_tokens| source_tokens.start else 0;
-    for (read_ast.source_antfly_function_items) |item| {
+    try validateGeneratedAntflySourceItemsMetadata(tokens, read_ast.source_tokens, read_ast.source_antfly_function_items, read_ast.source_antfly_function_count);
+}
+
+fn validateGeneratedAntflySourceItemsMetadata(
+    tokens: []const tokenized.Token,
+    maybe_source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    count: usize,
+) !void {
+    if (items.len != count) return error.UnsupportedSqlShape;
+    const source_tokens = maybe_source_tokens orelse {
+        if (items.len == 0 and count == 0) return;
+        return error.UnsupportedSqlShape;
+    };
+    var previous_end: usize = source_tokens.start;
+    for (items) |item| {
         if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
-        try validateGeneratedAntflySourceItemMetadata(tokens, read_ast, item);
+        try validateGeneratedAntflySourceItemMetadata(tokens, source_tokens, item);
         previous_end = item.tokens.end;
     }
 }
 
 fn validateGeneratedAntflySourceItemMetadata(
     tokens: []const tokenized.Token,
-    read_ast: *const generated_parser.GeneratedSqlReadAst,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
     item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
 ) !void {
-    const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
     const function_tokens = item.tokens;
     const name_tokens = item.name_tokens;
     const argument_tokens = item.argument_tokens;
@@ -1648,12 +1664,34 @@ fn validateGeneratedGraphSourceMetadata(
         return error.UnsupportedSqlShape;
     }
 
-    var previous_end: usize = read_ast.source_tokens.?.start;
-    for (read_ast.source_graph_function_items) |item| {
+    try validateGeneratedGraphSourceItemsMetadata(
+        tokens,
+        read_ast.source_tokens,
+        read_ast.source_antfly_function_items,
+        read_ast.source_graph_function_items,
+        read_ast.source_graph_function_count,
+    );
+}
+
+fn validateGeneratedGraphSourceItemsMetadata(
+    tokens: []const tokenized.Token,
+    maybe_source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    antfly_items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    graph_items: []const generated_parser.GeneratedSqlGraphTableFunctionAst,
+    count: usize,
+) !void {
+    if (graph_items.len != count) return error.UnsupportedSqlShape;
+    const source_tokens = maybe_source_tokens orelse {
+        if (graph_items.len == 0 and count == 0) return;
+        return error.UnsupportedSqlShape;
+    };
+
+    var previous_end: usize = source_tokens.start;
+    for (graph_items) |item| {
         if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
-        try validateGeneratedGraphSourceItemMetadata(tokens, read_ast, item);
+        try validateGeneratedGraphSourceItemMetadata(tokens, source_tokens, item);
         var matching_antfly_item: ?generated_parser.GeneratedSqlAntflyTableFunctionAst = null;
-        for (read_ast.source_antfly_function_items) |antfly_item| {
+        for (antfly_items) |antfly_item| {
             if (!generatedGraphSourceItemMatchesAntflyItem(item, antfly_item)) continue;
             matching_antfly_item = antfly_item;
             break;
@@ -1666,10 +1704,9 @@ fn validateGeneratedGraphSourceMetadata(
 
 fn validateGeneratedGraphSourceItemMetadata(
     tokens: []const tokenized.Token,
-    read_ast: *const generated_parser.GeneratedSqlReadAst,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
     item: generated_parser.GeneratedSqlGraphTableFunctionAst,
 ) !void {
-    const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
     const function_tokens = item.tokens;
     const name_tokens = item.name_tokens;
     const argument_tokens = item.argument_tokens;
@@ -4508,6 +4545,31 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+
+    var malformed_cte_graph_source_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH ranked AS (SELECT * FROM antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm) SELECT id FROM ranked",
+    );
+    defer malformed_cte_graph_source_parsed_sql.deinit(alloc);
+    const malformed_cte_graph_source_generated_raw = malformed_cte_graph_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_graph_source_read_ast = switch (malformed_cte_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_graph_source_read_ast.cte_items[0].body_source_antfly_function_count += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_graph_source_parsed_sql, malformed_cte_graph_source_read_ast),
+    );
+    malformed_cte_graph_source_read_ast = switch (malformed_cte_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_graph_source_read_ast.cte_items[0].body_source_graph_function_items[0].metric_value_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_graph_source_parsed_sql, malformed_cte_graph_source_read_ast),
     );
 
     var duplicate_antfly_argument_parsed_sql = try tokenized.ParsedSql.initAlloc(

@@ -35,6 +35,34 @@ pub const DBStorageTestSteps = struct {
     sim: *std.Build.Step.Run,
 };
 
+pub const APIDocIdTestModules = struct {
+    root: *std.Build.Module,
+    transactions_docid: *std.Build.Module,
+    table_writes_docid: *std.Build.Module,
+    table_reads_docid: *std.Build.Module,
+    public_table_http_docid: *std.Build.Module,
+    rows: *std.Build.Module,
+    internal_group_write_routes: *std.Build.Module,
+    raft_transition_runtime_docid: *std.Build.Module,
+};
+
+pub const APIDocIdTestRuns = struct {
+    docid: *std.Build.Step.Run,
+    serverless_docid: *std.Build.Step.Run,
+    transactions_docid: *std.Build.Step.Run,
+    table_writes_docid: *std.Build.Step.Run,
+    provisioned_query_visibility: *std.Build.Step.Run,
+    table_reads_docid: *std.Build.Step.Run,
+    table_reads_graph_metric: *std.Build.Step.Run,
+    public_table_http_docid: *std.Build.Step.Run,
+    rows: *std.Build.Step.Run,
+    sql_api_parity: *std.Build.Step.Run,
+    sql_api_parity_fixture_promote: *std.Build.Step.Run,
+    sql_api_parity_fixture_check: *std.Build.Step.Run,
+    internal_group_write_routes: *std.Build.Step.Run,
+    raft_transition_runtime_docid: *std.Build.Step.Run,
+};
+
 pub const db_root_step_name = "lib-db-test";
 pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
@@ -1276,6 +1304,84 @@ fn addTestArtifact(
         .root_module = root_module,
         .filters = selectTestFilters(b, default_filters),
     });
+}
+
+fn addSimpleAPITestRun(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    default_filters: []const []const u8,
+    select_filters: bool,
+) *std.Build.Step.Run {
+    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    return b.addRunArtifact(tests);
+}
+
+fn addFocusedAPITestStep(
+    b: *std.Build,
+    name: []const u8,
+    description: []const u8,
+    run: *std.Build.Step.Run,
+) void {
+    const step = b.step(name, description);
+    step.dependOn(&run.step);
+}
+
+pub fn addAPIDocIdTestSteps(
+    b: *std.Build,
+    modules: APIDocIdTestModules,
+) APIDocIdTestRuns {
+    const docid = addSimpleAPITestRun(b, modules.root, &APITestFilters.docid, false);
+    const serverless_docid = addSimpleAPITestRun(b, modules.root, &APITestFilters.serverless_docid, false);
+    const transactions_docid = addSimpleAPITestRun(b, modules.transactions_docid, &APITestFilters.transactions_docid, false);
+    const table_writes_docid = addSimpleAPITestRun(b, modules.table_writes_docid, &APITestFilters.table_writes_docid, true);
+    const provisioned_query_visibility = addSimpleAPITestRun(b, modules.table_writes_docid, &APITestFilters.provisioned_query_visibility, true);
+    const table_reads_docid = addSimpleAPITestRun(b, modules.table_reads_docid, &APITestFilters.table_reads_docid, false);
+    const table_reads_graph_metric = addSimpleAPITestRun(b, modules.table_reads_docid, &APITestFilters.table_reads_graph_metric, false);
+    const public_table_http_docid = addSimpleAPITestRun(b, modules.public_table_http_docid, &APITestFilters.public_table_http_docid, false);
+    const rows = addSimpleAPITestRun(b, modules.rows, &APITestFilters.rows, true);
+    const sql_api_parity = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity, false);
+    const sql_api_parity_fixture_promote = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity_fixture, false);
+    sql_api_parity_fixture_promote.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
+    const sql_api_parity_fixture_check = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity_fixture, false);
+    sql_api_parity_fixture_check.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
+    const internal_group_write_routes = addSimpleAPITestRun(b, modules.internal_group_write_routes, &APITestFilters.internal_group_write_routes, false);
+    const raft_transition_runtime_docid = addSimpleAPITestRun(b, modules.raft_transition_runtime_docid, &APITestFilters.raft_transition_runtime_docid, false);
+
+    addFocusedAPITestStep(b, "api-transactions-test", "Run focused API transaction coordinator tests", transactions_docid);
+    addFocusedAPITestStep(b, "api-table-writes-docid-test", "Run focused API table write DOCID tests", table_writes_docid);
+    addFocusedAPITestStep(b, "provisioned-query-visibility-test", "Run focused provisioned query visibility tests", provisioned_query_visibility);
+    addFocusedAPITestStep(b, "api-table-reads-docid-test", "Run focused API table read DOCID tests", table_reads_docid);
+    addFocusedAPITestStep(b, "api-internal-group-write-routes-test", "Run focused internal group write route tests", internal_group_write_routes);
+    addFocusedAPITestStep(b, "api-rows-test", "Run focused relational row API tests", rows);
+    addFocusedAPITestStep(b, "sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests", sql_api_parity);
+    addFocusedAPITestStep(b, "sql-api-parity-fixture-promote", "Regenerate the SQL/API typed-plan parity fixture from the source corpus", sql_api_parity_fixture_promote);
+    addFocusedAPITestStep(b, "sql-api-parity-fixture-check", "Check that the SQL/API typed-plan parity fixture matches the source corpus", sql_api_parity_fixture_check);
+    addFocusedAPITestStep(b, "api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests", public_table_http_docid);
+
+    return .{
+        .docid = docid,
+        .serverless_docid = serverless_docid,
+        .transactions_docid = transactions_docid,
+        .table_writes_docid = table_writes_docid,
+        .provisioned_query_visibility = provisioned_query_visibility,
+        .table_reads_docid = table_reads_docid,
+        .table_reads_graph_metric = table_reads_graph_metric,
+        .public_table_http_docid = public_table_http_docid,
+        .rows = rows,
+        .sql_api_parity = sql_api_parity,
+        .sql_api_parity_fixture_promote = sql_api_parity_fixture_promote,
+        .sql_api_parity_fixture_check = sql_api_parity_fixture_check,
+        .internal_group_write_routes = internal_group_write_routes,
+        .raft_transition_runtime_docid = raft_transition_runtime_docid,
+    };
 }
 
 pub fn addDBRootTestStep(

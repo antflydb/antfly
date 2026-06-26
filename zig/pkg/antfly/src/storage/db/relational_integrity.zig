@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -28,6 +29,42 @@ const platform_clock = @import("../../platform/clock.zig");
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+
+    pub fn expectRelationalTemporalPriceRow(
+        alloc: Allocator,
+        row_json: []const u8,
+        sku: []const u8,
+        valid_from: f64,
+        valid_to: f64,
+        price: f64,
+    ) !void {
+        return support.expectRelationalTemporalPriceRow(alloc, row_json, sku, valid_from, valid_to, price);
+    }
+
+    pub fn expectRelationalTemporalPrimarySelectorPriceRow(
+        alloc: Allocator,
+        db: anytype,
+        runtime_schema: schema_mod.TableSchema,
+        sku: []const u8,
+        point_json: []const u8,
+        valid_from: f64,
+        valid_to: f64,
+        price: f64,
+    ) !void {
+        return support.expectRelationalTemporalPrimarySelectorPriceRow(alloc, db, runtime_schema, sku, point_json, valid_from, valid_to, price);
+    }
+} else struct {};
 
 const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;
@@ -4673,15 +4710,12 @@ pub fn Impl(comptime DB: type) type {
 test "db schema apply supports unvalidated foreign key then enforced validation flip" {
     const db_mod = @import("mod.zig");
     const DB = db_mod.DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4751,15 +4785,12 @@ test "db schema apply supports unvalidated foreign key then enforced validation 
 
 test "db schema apply drops foreign key refs and stops enforcement" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4803,15 +4834,12 @@ test "db schema apply drops foreign key refs and stops enforcement" {
 
 test "db direct schema apply validates and builds added foreign keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4846,15 +4874,12 @@ test "db direct schema apply validates and builds added foreign keys" {
 
 test "db direct schema apply builds added unique constraints before foreign keys to unique tuples" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4893,15 +4918,12 @@ test "db direct schema apply builds added unique constraints before foreign keys
 
 test "db direct schema apply rejects added foreign keys with orphaned existing rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4926,16 +4948,13 @@ test "db direct schema apply rejects added foreign keys with orphaned existing r
 
 test "db foreign key integrity progress is durable per range" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const table_schema_api = @import("../../schema/mod.zig");
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5025,15 +5044,12 @@ test "db foreign key integrity progress is durable per range" {
 
 test "db foreign key integrity work claims are leased and durable" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5130,15 +5146,12 @@ test "db foreign key integrity work claims are leased and durable" {
 
 test "db foreign key maintenance leases use durable realtime clock" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5191,15 +5204,12 @@ test "db foreign key maintenance leases use durable realtime clock" {
 
 test "db foreign key action jobs canonicalize SQL action aliases" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5293,15 +5303,12 @@ test "db foreign key action jobs canonicalize SQL action aliases" {
 
 test "db foreign key action schedule records zero-owner seed failures durably" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5411,16 +5418,13 @@ test "db foreign key action schedule records zero-owner seed failures durably" {
 
 test "db foreign key action job records page execution failures" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const table_schema_api = @import("../../schema/mod.zig");
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5464,15 +5468,12 @@ test "db foreign key action job records page execution failures" {
 
 test "db foreign key integrity job records persist intent and completion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5608,15 +5609,12 @@ test "db foreign key integrity job records persist intent and completion" {
 
 test "db direct schema apply validates and builds added unique constraints" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -5653,15 +5651,12 @@ test "db direct schema apply validates and builds added unique constraints" {
 
 test "db direct schema apply rejects added unique constraints with duplicate existing rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -5691,13 +5686,10 @@ test "relational expression partial predicates maintain indexes and unique owner
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5822,13 +5814,10 @@ test "relational text expression partial predicates maintain indexes and unique 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5881,13 +5870,10 @@ test "relational scalar expression partial predicates maintain indexes and uniqu
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5940,13 +5926,10 @@ test "relational boolean and pattern expression partial predicates maintain inde
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5999,13 +5982,10 @@ test "relational array and json object expression partial predicates maintain in
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6058,13 +6038,10 @@ test "relational temporal and case expression partial predicates maintain indexe
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6117,13 +6094,10 @@ test "db foreign key action job applies set-null children in durable pages" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6246,13 +6220,10 @@ test "db foreign key action job applies cascade children in durable pages" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6355,13 +6326,10 @@ test "db foreign key modeled relational identity workload covers repair and acti
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"id":{"type":"keyword"},"email":{"type":"keyword"},"customer_id":{"type":"keyword"},"customer_email":{"type":"keyword"},"nullable_customer_id":{"type":"keyword"},"deferred_customer_id":{"type":"keyword"},"order_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"unique_constraints":[{"name":"row_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"orders_customer_pk_fkey","columns":["tenant_id","customer_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_customer_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"row","columns":["tenant_id","email"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_customer_nullable_fkey","columns":["nullable_customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"set_null","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_deferred_customer_fkey","columns":["tenant_id","deferred_customer_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"no_action","on_update":"no_action","match":"simple","timing":"deferred","validation_state":"enforced"},{"name":"lines_order_fkey","columns":["tenant_id","order_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"cascade","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"}]}
@@ -6606,13 +6574,10 @@ test "db foreign key modeled relational identity workload covers repair and acti
 test "db foreign key action job rejects stale page finish after lease handoff" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6764,13 +6729,10 @@ test "db foreign key action job rejects stale page finish after lease handoff" {
 test "db foreign key action job requeue preserves durable cursor and clears failed claim" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6975,13 +6937,10 @@ test "db foreign key ref children page by child cursor" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7055,13 +7014,10 @@ test "db foreign key ref owner validation repairs stale parent prefix rows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7138,13 +7094,10 @@ test "db foreign key ref owner range validation repairs stale parent-key span ro
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7252,15 +7205,12 @@ test "db foreign key ref owner range validation repairs stale parent-key span ro
 
 test "db relational integrity constraints relational foreign key on update stays restrictive when delete cascades" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7294,15 +7244,12 @@ test "db relational integrity constraints relational foreign key on update stays
 
 test "db relational integrity constraints relational foreign key on update set null rewrites local unique children" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7348,15 +7295,12 @@ test "db relational integrity constraints relational foreign key on update set n
 
 test "db relational integrity constraints relational foreign key on update cascade rewrites local unique children" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7410,15 +7354,12 @@ test "db relational integrity constraints relational foreign key on update casca
 
 test "db relational integrity constraints deferred no action foreign key update validates final transaction state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7460,15 +7401,12 @@ test "db relational integrity constraints deferred no action foreign key update 
 
 test "db relational integrity constraints deferred restrict foreign key update remains immediate" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7499,15 +7437,12 @@ test "db relational integrity constraints deferred restrict foreign key update r
 
 test "db relational integrity constraints deferred no action foreign key delete validates final transaction state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7548,15 +7483,12 @@ test "db relational integrity constraints deferred no action foreign key delete 
 
 test "db relational integrity constraints deferred restrict foreign key delete remains restrictive" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7587,14 +7519,11 @@ test "db relational integrity constraints deferred restrict foreign key delete r
 
 test "db relational integrity constraints relational unique constraints enforce committed scalar values" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -7691,14 +7620,11 @@ test "db relational integrity constraints relational unique constraints enforce 
 
 test "db relational integrity constraints relational composite primary keys enforce identity and back foreign keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -7767,14 +7693,11 @@ test "db relational integrity constraints relational composite primary keys enfo
 
 test "db relational integrity constraints unique constraint integrity repair rebuilds backing rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -7869,13 +7792,10 @@ test "db relational foreign keys enforce parent existence and restrict deletes" 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8004,13 +7924,10 @@ test "db relational foreign keys no_action preserves action and blocks parent de
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8043,13 +7960,10 @@ test "db relational foreign keys no_action preserves action and blocks parent de
 test "db relational foreign keys setSchema accepts deferred and rejects controller-only states" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8112,13 +8026,10 @@ test "db relational foreign keys integrity ignores unvalidated constraints" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8190,13 +8101,10 @@ test "db relational foreign keys set nullable children null on parent delete" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8238,13 +8146,10 @@ test "db relational foreign keys cascade deletes through local children" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8288,13 +8193,10 @@ test "db relational foreign keys can reference local unique parent columns" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8373,13 +8275,10 @@ test "db relational foreign keys allow multiple constraints on the same child co
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8421,13 +8320,10 @@ test "db relational foreign keys reject partial match full composite references"
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8456,15 +8352,12 @@ test "db relational foreign keys reject partial match full composite references"
 
 test "db relational integrity transaction externalized foreign key parent checks still maintain refs" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8512,15 +8405,12 @@ test "db relational integrity transaction externalized foreign key parent checks
 
 test "db relational integrity transaction externalized foreign key proof records require local fk schema" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8563,15 +8453,12 @@ test "db relational integrity transaction externalized foreign key proof records
 
 test "db relational integrity transaction deferred foreign keys validate at local transaction commit and reject externalized checks" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8683,15 +8570,12 @@ test "db relational integrity transaction deferred foreign keys validate at loca
 
 test "db relational integrity transaction mixed immediate and deferred foreign keys require per-constraint proofs" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8744,15 +8628,12 @@ test "db relational integrity transaction mixed immediate and deferred foreign k
 
 test "db relational integrity transaction foreign key timing override survives intent resolution" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8810,15 +8691,12 @@ test "db relational integrity transaction foreign key timing override survives i
 
 test "db relational integrity transaction deferrable initially immediate foreign key can be deferred by transaction override" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8861,8 +8739,8 @@ test "db relational integrity transaction deferrable initially immediate foreign
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"immediate"}]}
     ;
     var path_buf_2: [256]u8 = undefined;
-    const path_2 = tempPath(&path_buf_2);
-    defer cleanupTempDir(path_2);
+    const path_2 = TestHelpers.tempPath(&path_buf_2);
+    defer TestHelpers.cleanupTempDir(path_2);
     var non_deferrable_db = try DB.open(alloc, std.mem.span(path_2), .{});
     defer non_deferrable_db.close();
     var non_deferrable_parsed = try table_schema_api.parseValidatedTableSchema(alloc, non_deferrable_schema_json);
@@ -8882,15 +8760,12 @@ test "db relational integrity transaction deferrable initially immediate foreign
 
 test "db relational integrity transaction deferred foreign keys preserve exact externalized unique parent proofs through commit" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8960,15 +8835,12 @@ test "db relational integrity transaction deferred foreign keys preserve exact e
 
 test "db relational integrity transaction deferred foreign keys require named cross-table unique parent proofs" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9024,15 +8896,12 @@ test "db relational integrity transaction deferred foreign keys require named cr
 
 test "db relational integrity transaction foreign key parent checks validate final prepared state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9156,15 +9025,12 @@ test "db relational integrity transaction foreign key parent checks validate fin
 
 test "db relational integrity transaction foreign key parent checks validate unique tuple state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9254,15 +9120,12 @@ test "db relational integrity transaction foreign key parent checks validate uni
 
 test "db relational integrity transaction foreign key parent delete checks support unique tuple keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9318,15 +9181,12 @@ test "db relational integrity transaction foreign key parent delete checks suppo
 
 test "db relational integrity transaction foreign key parent update checks use update action semantics" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9370,15 +9230,12 @@ test "db relational integrity transaction foreign key parent update checks use u
 
 test "db relational integrity transaction batch relational identity rewrite uses foreign key update semantics" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9415,8 +9272,8 @@ test "db relational integrity transaction batch relational identity rewrite uses
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_fkey","columns":["customer_id"],"references":{"table":"row","columns":["id"]},"on_delete":"restrict","on_update":"set_null"}]}
     ;
     var path_buf_set_null: [256]u8 = undefined;
-    const path_set_null = tempPath(&path_buf_set_null);
-    defer cleanupTempDir(path_set_null);
+    const path_set_null = TestHelpers.tempPath(&path_buf_set_null);
+    defer TestHelpers.cleanupTempDir(path_set_null);
     var set_null_db = try DB.open(alloc, std.mem.span(path_set_null), .{});
     defer set_null_db.close();
     var set_null_parsed = try table_schema_api.parseValidatedTableSchema(alloc, set_null_schema_json);
@@ -9449,15 +9306,12 @@ test "db relational integrity transaction batch relational identity rewrite uses
 
 test "db relational integrity transaction relational identity rewrite uses foreign key update semantics" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9499,15 +9353,12 @@ test "db relational integrity transaction relational identity rewrite uses forei
 
 test "db relational integrity transaction foreign key parent delete checks support cross-table unique tuple keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9568,15 +9419,12 @@ test "db relational integrity transaction foreign key parent delete checks suppo
 
 test "db relational integrity transaction foreign key parent delete checks honor deferred timing" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9644,15 +9492,12 @@ test "db relational integrity transaction foreign key parent delete checks honor
 
 test "db relational integrity transaction foreign key parent delete checks validate child references" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9817,15 +9662,12 @@ test "db relational integrity transaction foreign key parent delete checks valid
 
 test "db relational integrity transaction foreign key parent delete checks plan set null actions" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9892,15 +9734,12 @@ test "db relational integrity transaction foreign key parent delete checks plan 
 
 test "db relational integrity transaction foreign key cascade child actions delete exact children" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9940,15 +9779,12 @@ test "db relational integrity transaction foreign key cascade child actions dele
 
 test "db relational integrity transaction foreign key set-null child actions support unique tuple parent keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9996,15 +9832,12 @@ test "db relational integrity transaction foreign key set-null child actions sup
 
 test "db relational integrity transaction foreign key cascade child actions support unique tuple parent keys" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10049,15 +9882,12 @@ test "db relational integrity transaction foreign key cascade child actions supp
 
 test "db relational integrity transaction foreign key ref mutations support routed owner participants" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10150,13 +9980,10 @@ test "db relational integrity transaction foreign key ref mutations support rout
 test "db relational temporal primary keys enforce without-overlaps intervals" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10209,13 +10036,10 @@ test "db relational temporal primary keys enforce without-overlaps intervals" {
 test "db relational temporal foreign keys require covered parent periods" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10303,13 +10127,10 @@ test "db relational temporal foreign keys require covered parent periods" {
 test "db relational temporal foreign key delete actions respect remaining parent coverage" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var set_null_path_buf: [256]u8 = undefined;
-    const set_null_path = tempPath(&set_null_path_buf);
-    defer cleanupTempDir(set_null_path);
+    const set_null_path = TestHelpers.tempPath(&set_null_path_buf);
+    defer TestHelpers.cleanupTempDir(set_null_path);
 
     var set_null_db = try DB.open(alloc, std.mem.span(set_null_path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10344,8 +10165,8 @@ test "db relational temporal foreign key delete actions respect remaining parent
     try std.testing.expect(std.mem.indexOf(u8, uncovered_child, "\"parent_sku\"") == null);
 
     var set_null_update_path_buf: [256]u8 = undefined;
-    const set_null_update_path = tempPath(&set_null_update_path_buf);
-    defer cleanupTempDir(set_null_update_path);
+    const set_null_update_path = TestHelpers.tempPath(&set_null_update_path_buf);
+    defer TestHelpers.cleanupTempDir(set_null_update_path);
 
     var set_null_update_db = try DB.open(alloc, std.mem.span(set_null_update_path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10384,8 +10205,8 @@ test "db relational temporal foreign key delete actions respect remaining parent
     try std.testing.expect(std.mem.indexOf(u8, update_uncovered_child, "\"parent_sku\"") == null);
 
     var cascade_path_buf: [256]u8 = undefined;
-    const cascade_path = tempPath(&cascade_path_buf);
-    defer cleanupTempDir(cascade_path);
+    const cascade_path = TestHelpers.tempPath(&cascade_path_buf);
+    defer TestHelpers.cleanupTempDir(cascade_path);
 
     var cascade_db = try DB.open(alloc, std.mem.span(cascade_path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10421,13 +10242,10 @@ test "db relational temporal foreign key delete actions respect remaining parent
 test "db relational temporal foreign key repair rebuilds coverage refs" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10490,13 +10308,10 @@ test "db relational temporal foreign key repair rebuilds coverage refs" {
 test "db relational temporal portion mutation requires temporal primary identity" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10547,15 +10362,10 @@ test "db relational temporal portion mutation requires temporal primary identity
 test "db relational temporal mutation source splits portions transactionally" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
-    const expectRelationalTemporalPrimarySelectorPriceRow = db_test_support.expectRelationalTemporalPrimarySelectorPriceRow;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10613,7 +10423,7 @@ test "db relational temporal mutation source splits portions transactionally" {
     try std.testing.expectEqual(@as(u32, 1), update.matched);
     try std.testing.expectEqual(@as(u32, 1), update.staged);
     try std.testing.expectEqual(@as(usize, 1), update.returning_rows.len);
-    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "sku:a", 3, 7, 99);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "sku:a", 3, 7, 99);
     try db.commitTransaction(update_txn, 2_010);
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{
@@ -10628,12 +10438,12 @@ test "db relational temporal mutation source splits portions transactionally" {
     defer sku_a_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), sku_a_rows.total);
     try std.testing.expectEqual(@as(usize, 3), sku_a_rows.rows.len);
-    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[0], "sku:a", 0, 3, 10);
-    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[1], "sku:a", 3, 7, 99);
-    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[2], "sku:a", 7, 10, 10);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "2", 0, 3, 10);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "5", 3, 7, 99);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8", 7, 10, 10);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[0], "sku:a", 0, 3, 10);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[1], "sku:a", 3, 7, 99);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[2], "sku:a", 7, 10, 10);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "2", 0, 3, 10);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "5", 3, 7, 99);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8", 7, 10, 10);
 
     const repeat_update_txn = try db.beginTransaction(2_012);
     const repeat_update_operations = [_]types.TransformOp{.{
@@ -10663,7 +10473,7 @@ test "db relational temporal mutation source splits portions transactionally" {
     try std.testing.expectEqual(@as(u32, 3), repeat_update.matched);
     try std.testing.expectEqual(@as(u32, 1), repeat_update.staged);
     try std.testing.expectEqual(@as(usize, 1), repeat_update.returning_rows.len);
-    try expectRelationalTemporalPriceRow(alloc, repeat_update.returning_rows[0], "sku:a", 8, 9, 77);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeat_update.returning_rows[0], "sku:a", 8, 9, 77);
     try db.commitTransaction(repeat_update_txn, 2_018);
 
     var repeated_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -10674,12 +10484,12 @@ test "db relational temporal mutation source splits portions transactionally" {
     defer repeated_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 5), repeated_rows.total);
     try std.testing.expectEqual(@as(usize, 5), repeated_rows.rows.len);
-    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[0], "sku:a", 0, 3, 10);
-    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[1], "sku:a", 3, 7, 99);
-    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[2], "sku:a", 7, 8, 10);
-    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[3], "sku:a", 8, 9, 77);
-    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[4], "sku:a", 9, 10, 10);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 77);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[0], "sku:a", 0, 3, 10);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[1], "sku:a", 3, 7, 99);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[2], "sku:a", 7, 8, 10);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[3], "sku:a", 8, 9, 77);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[4], "sku:a", 9, 10, 10);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 77);
 
     const multi_row_update_txn = try db.beginTransaction(2_019);
     const multi_row_update_operations = [_]types.TransformOp{.{
@@ -10709,9 +10519,9 @@ test "db relational temporal mutation source splits portions transactionally" {
     try std.testing.expectEqual(@as(u32, 5), multi_row_update.matched);
     try std.testing.expectEqual(@as(u32, 3), multi_row_update.staged);
     try std.testing.expectEqual(@as(usize, 3), multi_row_update.returning_rows.len);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[0], "sku:a", 3, 7, 55);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[1], "sku:a", 7, 8, 55);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[2], "sku:a", 8, 9, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[0], "sku:a", 3, 7, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[1], "sku:a", 7, 8, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[2], "sku:a", 8, 9, 55);
     try db.commitTransaction(multi_row_update_txn, 2_019);
 
     var multi_row_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -10722,14 +10532,14 @@ test "db relational temporal mutation source splits portions transactionally" {
     defer multi_row_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 5), multi_row_rows.total);
     try std.testing.expectEqual(@as(usize, 5), multi_row_rows.rows.len);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[0], "sku:a", 0, 3, 10);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[1], "sku:a", 3, 7, 55);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[2], "sku:a", 7, 8, 55);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[3], "sku:a", 8, 9, 55);
-    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[4], "sku:a", 9, 10, 10);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "4", 3, 7, 55);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "7.5", 7, 8, 55);
-    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[0], "sku:a", 0, 3, 10);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[1], "sku:a", 3, 7, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[2], "sku:a", 7, 8, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[3], "sku:a", 8, 9, 55);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[4], "sku:a", 9, 10, 10);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "4", 3, 7, 55);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "7.5", 7, 8, 55);
+    try TestHelpers.expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 55);
 
     const scanned_rows = try relational_store_mod.scanRowsAlloc(alloc, db.core.store, "", "");
     defer relational_store_mod.freeRows(alloc, scanned_rows);
@@ -10793,7 +10603,7 @@ test "db relational temporal mutation source splits portions transactionally" {
     try std.testing.expectEqual(@as(u32, 1), delete.matched);
     try std.testing.expectEqual(@as(u32, 1), delete.staged);
     try std.testing.expectEqual(@as(usize, 1), delete.returning_rows.len);
-    try expectRelationalTemporalPriceRow(alloc, delete.returning_rows[0], "sku:b", 2, 8, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, delete.returning_rows[0], "sku:b", 2, 8, 20);
     try db.commitTransaction(delete_txn, 2_040);
 
     var sku_b_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -10804,21 +10614,17 @@ test "db relational temporal mutation source splits portions transactionally" {
     defer sku_b_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), sku_b_rows.total);
     try std.testing.expectEqual(@as(usize, 2), sku_b_rows.rows.len);
-    try expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[0], "sku:b", 0, 2, 20);
-    try expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[1], "sku:b", 8, 10, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[0], "sku:b", 0, 2, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[1], "sku:b", 8, 10, 20);
 }
 
 test "db relational temporal mutation source preserves foreign key coverage" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10876,7 +10682,7 @@ test "db relational temporal mutation source preserves foreign key coverage" {
     try std.testing.expectEqual(@as(u32, 1), update.matched);
     try std.testing.expectEqual(@as(u32, 1), update.staged);
     try std.testing.expectEqual(@as(usize, 1), update.returning_rows.len);
-    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
     try db.commitTransaction(update_txn, 2_010);
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{
@@ -10891,9 +10697,9 @@ test "db relational temporal mutation source preserves foreign key coverage" {
     defer child_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), child_rows.total);
     try std.testing.expectEqual(@as(usize, 3), child_rows.rows.len);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
 
     try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
         .deletes = &.{"price:parent:v1"},
@@ -10904,14 +10710,10 @@ test "db relational temporal mutation source preserves foreign key coverage" {
 test "db relational temporal workload combines portion splits foreign key repair and owner validation" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -10969,7 +10771,7 @@ test "db relational temporal workload combines portion splits foreign key repair
     defer update.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), update.matched);
     try std.testing.expectEqual(@as(u32, 1), update.staged);
-    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
     try db.commitTransaction(update_txn, 2_010);
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{
@@ -10983,9 +10785,9 @@ test "db relational temporal workload combines portion splits foreign key repair
     });
     defer child_rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), child_rows.total);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
-    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
+    try TestHelpers.expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
 
     const clean_fk_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
     try std.testing.expect(clean_fk_report.valid());

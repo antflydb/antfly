@@ -312,11 +312,13 @@ body clause-span metadata for the first body query, including set-operation
 tails, plus owned body projection/group/order lists, predicate expression
 metadata, generated body join-tree metadata with first-join compatibility
 fields, body pagination expression metadata for `LIMIT`, `OFFSET`, and
-`FETCH`, and the lowerer validates those body payloads before dispatch; CTE
-body sub-parsers now receive a body-local generated read AST cloned from the
-generated CTE metadata, so typed body planning consumes generated body
-projection, predicate, ordering, pagination, join, window, and set-operation
-ranges instead of relying only on outer CTE pre-validation;
+`FETCH`, body `antfly.*` table-function source item arrays, and body graph
+table-function semantic payloads, and the lowerer validates those body
+payloads before dispatch; CTE body sub-parsers now receive a body-local
+generated read AST cloned from the generated CTE metadata, so typed body
+planning consumes generated body projection, predicate, ordering, pagination,
+join, window, set-operation, row-lock, and table-function source ranges
+instead of relying only on outer CTE pre-validation;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
 CTE reads now validate generated recursive CTE metadata before dispatching to
@@ -354,8 +356,9 @@ explicit `DocumentSqlLockingUnsupported` diagnostic. The generated row-lock
 boundary is mode-aware so temporal `FOR SYSTEM_TIME` source clauses remain
 part of their relation source rather than being misclassified as lock tails.
 Generated CTE body metadata now retains and validates body-level
-`body_row_lock_tokens` as well, and rebases that metadata when a CTE body is
-cloned into the direct generated read AST path.
+`body_row_lock_tokens` as well as body-level Antfly and graph table-function
+source metadata, and rebases that metadata when a CTE body is cloned into the
+direct generated read AST path.
 Deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
 complete multi-join planning and richer join-tree semantics beyond the current
@@ -809,8 +812,10 @@ Unsupported DDL remains on the existing parser until
    payloads, plus owned body projection/group/order list payloads, body
    predicate expression payloads, generated body join-tree metadata with
    first-join compatibility fields, and body pagination
-   expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
-   lowering validates those body payloads and their clause keyword layout.
+   expression payloads for `LIMIT`, `OFFSET`, and `FETCH`, plus body Antfly
+   table-function source item arrays and graph table-function semantic
+   payloads; generated CTE lowering validates those body payloads and their
+   clause keyword layout.
    Parsed generated read classification now fails closed when retained
    generated read metadata is too incomplete to derive a read family, including
    recursive CTEs whose generated final `SELECT` metadata is corrupted, instead
@@ -899,7 +904,10 @@ Unsupported DDL remains on the existing parser until
    relational reads; document SQL returns the explicit
    `DocumentSqlLockingUnsupported` diagnostic. CTE read bodies now retain
    `body_row_lock_tokens`, validate the `FOR` row-lock boundary, and clone that
-   metadata into direct generated read ASTs. Incomplete generated read
+   metadata into direct generated read ASTs. CTE read bodies also retain,
+   validate, and clone body-level Antfly and graph table-function metadata so
+   generated child-read planning sees the same table-function source semantics
+   as direct top-level reads. Incomplete generated read
    clause-boundary shapes for
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
    incomplete boolean and comparison operator tails, ordering,
@@ -951,7 +959,10 @@ Unsupported DDL remains on the existing parser until
    preserves the generated-covered metric source shape through typed relation
    source planning, supports joins between graph-match and graph-metric table
    functions, and materializes direct graph metric score rows through the
-   existing graph table-function row contract. Broader graph DSL cutover still
+   existing graph table-function row contract. CTE bodies now retain the same
+   Antfly and graph table-function source metadata, validate it at the CTE
+   boundary, and rebase it into the direct generated read AST used by child
+   body planning. Broader graph DSL cutover still
    requires direct generated graph-query planning beyond retained semantic
    payload validation and broader unsupported-shape diagnostics.
 
