@@ -635,6 +635,8 @@ fn emitZigMetadata(
 
     var symbol_name_bytes: usize = 0;
     for (tables.symbols) |symbol| symbol_name_bytes += symbol.name.len;
+    const action_range_max = maxActionRangeLen(tables.states.len, tables.actions);
+    const goto_range_max = maxGotoRangeLen(tables.states.len, tables.gotos);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try appendFmt(allocator, &out,
@@ -700,8 +702,8 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const Production = struct { lhs: u16, rhs_start: u16, rhs_len: u16 };
-        \\pub const production_rhs = [_]u16{
+        \\const Production = struct { lhs: u16, rhs_start: u16, rhs_len: u16 };
+        \\const production_rhs = [_]u16{
         \\
     );
     for (tables.productions) |production| {
@@ -709,7 +711,7 @@ fn emitZigMetadata(
     }
     try out.appendSlice(allocator,
         \\};
-        \\pub const productions = [_]Production{
+        \\const productions = [_]Production{
         \\
     );
     var rhs_start: usize = 0;
@@ -720,8 +722,8 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const Item = struct { production: u16, dot: u16 };
-        \\pub const state_items = [_]Item{
+        \\const Item = struct { production: u16, dot: u16 };
+        \\const state_items = [_]Item{
         \\
     );
     for (tables.states) |state| {
@@ -729,8 +731,8 @@ fn emitZigMetadata(
     }
     try out.appendSlice(allocator,
         \\};
-        \\pub const State = struct { item_start: u32, item_len: u16 };
-        \\pub const states = [_]State{
+        \\const State = struct { item_start: u32, item_len: u16 };
+        \\const states = [_]State{
         \\
     );
     var item_start: usize = 0;
@@ -741,10 +743,10 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const ActionKind = enum { shift, reduce, accept };
-        \\pub const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
-        \\pub const TableRange = struct { start: u32, len: u16 };
-        \\pub const actions = [_]Action{
+        \\const ActionKind = enum { shift, reduce, accept };
+        \\const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
+        \\const TableRange = struct { start: u32, len: u16 };
+        \\const actions = [_]Action{
         \\
     );
     for (tables.actions) |action| {
@@ -752,15 +754,15 @@ fn emitZigMetadata(
     }
     try out.appendSlice(allocator,
         \\};
-        \\pub const action_ranges = [_]TableRange{
+        \\const action_ranges = [_]TableRange{
         \\
     );
     try emitTableRanges(allocator, &out, tables.states.len, tables.actions, actionState);
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const Goto = struct { nonterminal: u16, target: u16 };
-        \\pub const gotos = [_]Goto{
+        \\const Goto = struct { nonterminal: u16, target: u16 };
+        \\const gotos = [_]Goto{
         \\
     );
     for (tables.gotos) |goto_entry| {
@@ -768,15 +770,15 @@ fn emitZigMetadata(
     }
     try out.appendSlice(allocator,
         \\};
-        \\pub const goto_ranges = [_]TableRange{
+        \\const goto_ranges = [_]TableRange{
         \\
     );
     try emitTableRanges(allocator, &out, tables.states.len, tables.gotos, gotoState);
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const Conflict = struct { state: u16, terminal: u16, existing: ActionKind, candidate: ActionKind };
-        \\pub const conflicts = [_]Conflict{
+        \\const Conflict = struct { state: u16, terminal: u16, existing: ActionKind, candidate: ActionKind };
+        \\const conflicts = [_]Conflict{
         \\
     );
     for (tables.conflicts) |conflict| {
@@ -815,6 +817,11 @@ fn emitZigMetadata(
         \\pub const production_rhs_count = {d};
         \\pub const state_item_count = {d};
         \\pub const symbol_name_bytes = {d};
+        \\pub const action_entry_bytes = @sizeOf(Action);
+        \\pub const goto_entry_bytes = @sizeOf(Goto);
+        \\pub const table_range_entry_bytes = @sizeOf(TableRange);
+        \\pub const action_range_max = {d};
+        \\pub const goto_range_max = {d};
         \\pub const parse_table_static_bytes =
         \\    @sizeOf(@TypeOf(symbols)) +
         \\    @sizeOf(@TypeOf(production_rhs)) +
@@ -828,7 +835,7 @@ fn emitZigMetadata(
         \\    @sizeOf(@TypeOf(conflicts));
         \\pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;
         \\
-    , .{ production_rhs_count, state_item_count, symbol_name_bytes });
+    , .{ production_rhs_count, state_item_count, symbol_name_bytes, action_range_max, goto_range_max });
     try out.appendSlice(allocator,
         \\
         \\pub const ParseError = error{
@@ -1036,6 +1043,26 @@ fn emitTableRanges(
         while (cursor < entries.len and stateFn(entries[cursor]) == state) cursor += 1;
         try appendFmt(allocator, out, "    .{{ .start = {d}, .len = {d} }},\n", .{ start, cursor - start });
     }
+}
+
+fn maxTableRangeLen(state_count: usize, entries: anytype, comptime stateFn: fn (@TypeOf(entries[0])) u16) usize {
+    var cursor: usize = 0;
+    var max_len: usize = 0;
+    var state: usize = 0;
+    while (state < state_count) : (state += 1) {
+        const start = cursor;
+        while (cursor < entries.len and stateFn(entries[cursor]) == state) cursor += 1;
+        max_len = @max(max_len, cursor - start);
+    }
+    return max_len;
+}
+
+fn maxActionRangeLen(state_count: usize, actions: []const Action) usize {
+    return maxTableRangeLen(state_count, actions, actionState);
+}
+
+fn maxGotoRangeLen(state_count: usize, gotos: []const Goto) usize {
+    return maxTableRangeLen(state_count, gotos, gotoState);
 }
 
 fn actionState(action: Action) u16 {
@@ -1279,10 +1306,17 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     const second = try generateZigMetadata(arena, "fixture.y", source);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const state_count = ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub const actions = [_]Action") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub const conflicts = [_]Conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const actions = [_]Action") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const conflicts = [_]Conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const actions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const conflicts") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const expected_conflict_count: ?usize = 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbol_name_bytes = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const action_entry_bytes = @sizeOf(Action);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const goto_entry_bytes = @sizeOf(Goto);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const table_range_entry_bytes = @sizeOf(TableRange);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const action_range_max = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const goto_range_max = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_static_bytes =") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbols") == null);

@@ -543,8 +543,8 @@ const symbols = [_]Symbol{
     .{ .name = "diagnostic_token", .kind = .nonterminal },
 };
 
-pub const Production = struct { lhs: u16, rhs_start: u16, rhs_len: u16 };
-pub const production_rhs = [_]u16{
+const Production = struct { lhs: u16, rhs_start: u16, rhs_len: u16 };
+const production_rhs = [_]u16{
     278,
     279,
     280,
@@ -2643,7 +2643,7 @@ pub const production_rhs = [_]u16{
     246,
     264,
 };
-pub const productions = [_]Production{
+const productions = [_]Production{
     .{ .lhs = 277, .rhs_start = 0, .rhs_len = 1 },
     .{ .lhs = 278, .rhs_start = 1, .rhs_len = 1 },
     .{ .lhs = 278, .rhs_start = 2, .rhs_len = 1 },
@@ -3620,8 +3620,8 @@ pub const productions = [_]Production{
     .{ .lhs = 510, .rhs_start = 2096, .rhs_len = 1 },
 };
 
-pub const Item = struct { production: u16, dot: u16 };
-pub const state_items = [_]Item{
+const Item = struct { production: u16, dot: u16 };
+const state_items = [_]Item{
     .{ .production = 0, .dot = 0 },
     .{ .production = 1, .dot = 0 },
     .{ .production = 2, .dot = 0 },
@@ -60473,8 +60473,8 @@ pub const state_items = [_]Item{
     .{ .production = 535, .dot = 9 },
     .{ .production = 435, .dot = 4 },
 };
-pub const State = struct { item_start: u32, item_len: u16 };
-pub const states = [_]State{
+const State = struct { item_start: u32, item_len: u16 };
+const states = [_]State{
     .{ .item_start = 0, .item_len = 232 },
     .{ .item_start = 232, .item_len = 90 },
     .{ .item_start = 322, .item_len = 2 },
@@ -62254,10 +62254,10 @@ pub const states = [_]State{
     .{ .item_start = 56849, .item_len = 1 },
 };
 
-pub const ActionKind = enum { shift, reduce, accept };
-pub const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
-pub const TableRange = struct { start: u32, len: u16 };
-pub const actions = [_]Action{
+const ActionKind = enum { shift, reduce, accept };
+const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
+const TableRange = struct { start: u32, len: u16 };
+const actions = [_]Action{
     .{ .terminal = 43, .kind = .shift, .target = 1 },
     .{ .terminal = 44, .kind = .shift, .target = 2 },
     .{ .terminal = 51, .kind = .shift, .target = 3 },
@@ -195046,7 +195046,7 @@ pub const actions = [_]Action{
     .{ .terminal = 241, .kind = .reduce, .target = 535 },
     .{ .terminal = 10, .kind = .reduce, .target = 435 },
 };
-pub const action_ranges = [_]TableRange{
+const action_ranges = [_]TableRange{
     .{ .start = 0, .len = 50 },
     .{ .start = 50, .len = 74 },
     .{ .start = 124, .len = 2 },
@@ -196826,8 +196826,8 @@ pub const action_ranges = [_]TableRange{
     .{ .start = 132786, .len = 1 },
 };
 
-pub const Goto = struct { nonterminal: u16, target: u16 };
-pub const gotos = [_]Goto{
+const Goto = struct { nonterminal: u16, target: u16 };
+const gotos = [_]Goto{
     .{ .nonterminal = 278, .target = 51 },
     .{ .nonterminal = 279, .target = 52 },
     .{ .nonterminal = 280, .target = 53 },
@@ -199459,7 +199459,7 @@ pub const gotos = [_]Goto{
     .{ .nonterminal = 500, .target = 751 },
     .{ .nonterminal = 503, .target = 473 },
 };
-pub const goto_ranges = [_]TableRange{
+const goto_ranges = [_]TableRange{
     .{ .start = 0, .len = 53 },
     .{ .start = 53, .len = 2 },
     .{ .start = 55, .len = 1 },
@@ -201239,8 +201239,8 @@ pub const goto_ranges = [_]TableRange{
     .{ .start = 2630, .len = 0 },
 };
 
-pub const Conflict = struct { state: u16, terminal: u16, existing: ActionKind, candidate: ActionKind };
-pub const conflicts = [_]Conflict{
+const Conflict = struct { state: u16, terminal: u16, existing: ActionKind, candidate: ActionKind };
+const conflicts = [_]Conflict{
     .{ .state = 4, .terminal = 5, .existing = .shift, .candidate = .reduce },
     .{ .state = 4, .terminal = 10, .existing = .shift, .candidate = .reduce },
     .{ .state = 4, .terminal = 79, .existing = .shift, .candidate = .reduce },
@@ -213237,6 +213237,11 @@ pub const Rule = enum {
 pub const production_rhs_count = 2097;
 pub const state_item_count = 56850;
 pub const symbol_name_bytes = 6227;
+pub const action_entry_bytes = @sizeOf(Action);
+pub const goto_entry_bytes = @sizeOf(Goto);
+pub const table_range_entry_bytes = @sizeOf(TableRange);
+pub const action_range_max = 220;
+pub const goto_range_max = 54;
 pub const parse_table_static_bytes =
     @sizeOf(@TypeOf(symbols)) +
     @sizeOf(@TypeOf(production_rhs)) +
