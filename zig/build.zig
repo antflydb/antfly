@@ -3899,6 +3899,22 @@ pub fn build(b: *std.Build) void {
     const sql_parser_bench_step = b.step("sql-parser-bench", "Benchmark generated SQL parser corpus throughput");
     sql_parser_bench_step.dependOn(&run_sql_parser_bench.step);
 
+    const sql_parser_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql/parser_fuzz.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const sql_parser_fuzz = b.addExecutable(.{
+        .name = "sql_parser_fuzz",
+        .root_module = sql_parser_fuzz_mod,
+    });
+    const run_sql_parser_fuzz = b.addRunArtifact(sql_parser_fuzz);
+    if (b.args) |args| {
+        run_sql_parser_fuzz.addArgs(args);
+    }
+    const sql_parser_fuzz_step = b.step("sql-parser-fuzz", "Run deterministic generated SQL parser fuzzing");
+    sql_parser_fuzz_step.dependOn(&run_sql_parser_fuzz.step);
+
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);

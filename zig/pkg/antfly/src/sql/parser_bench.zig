@@ -25,6 +25,7 @@ const corpus = generated_parser.first_family_corpus ++
     generated_parser.simple_ddl_corpus ++
     generated_parser.simple_dml_corpus ++
     generated_parser.simple_read_corpus ++
+    generated_parser.antfly_extension_read_corpus ++
     generated_parser.simple_graph_corpus ++
     generated_parser.unsupported_corpus;
 

@@ -1105,14 +1105,14 @@ Important performance requirements:
   paths so production requests parse once.
 
 `zig build sql-parser-bench -- <iterations>` runs the first parser-only
-microbenchmark over the generated SQL compatibility corpus. It pre-tokenizes the
-corpus and measures generated parse throughput, token throughput, latency
-percentiles, gross allocated bytes per statement, peak live parser bytes,
-generated table counts, generated RHS/state item counts, and generated parse
-table byte estimates. Track generated Zig compile time and binary size impact
-with build-system metrics around that target. Add larger end-to-end SQL
-benchmarks only after a statement family actually switches to the generated
-parser.
+microbenchmark over the generated SQL compatibility corpus, including
+Antfly-specific table-function reads. It pre-tokenizes the corpus and measures
+generated parse throughput, token throughput, latency percentiles, gross
+allocated bytes per statement, peak live parser bytes, generated table counts,
+generated RHS/state item counts, and generated parse table byte estimates.
+Track generated Zig compile time and binary size impact with build-system
+metrics around that target. Add larger end-to-end SQL benchmarks only after a
+statement family actually switches to the generated parser.
 
 ## Parser Shape
 
@@ -1382,11 +1382,13 @@ Generated grammar work needs evidence at multiple levels:
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
   recovery. A deterministic malformed SQL corpus now exercises generated
   source-aware diagnostics for incomplete read, CTE, DDL, DML, and unsupported
-  statement shapes. A seeded deterministic scanner/parser fuzz pass now mutates
-  accepted statement seeds and random SQL-token streams, requiring every case to
-  parse, reject as an unsupported token shape, or produce a bounded generated
-  parser diagnostic. Longer-running corpus-scale fuzzing remains future
-  evidence.
+  statement shapes. The default unit-test pass keeps a short seeded deterministic
+  scanner/parser mutation loop over accepted statement seeds and random
+  SQL-token streams. Longer generated parser fuzzing now lives behind
+  `zig build sql-parser-fuzz -- --cases <count> [--seed <seed>]`, mutates the
+  full generated compatibility corpus including Antfly-specific reads, and
+  requires every case to parse, reject as an unsupported token shape, or produce
+  a bounded generated parser diagnostic.
 - Parser microbenchmarks for corpus throughput, allocation count, parse-table
   size, generated-code compile time, and binary size. The initial
   `sql-parser-bench` target now reports generated parser corpus throughput,
