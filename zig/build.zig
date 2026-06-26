@@ -3523,89 +3523,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
     lib_metadata_sim_public_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
 
-    const public_api_parity_default_filters = [_][]const u8{
-        "public openapi contract module is generated and wired",
-        "admin openapi contract module is generated and wired",
-        "internal openapi contract module is generated and wired",
-        "metadata openapi module generates extractor surface for routed endpoints",
-        "usermgr openapi module generates extractor surface for routed endpoints",
-        "client openapi module resolves shared refs through owner modules",
-        "public api routes compile",
-        "mcp table tools expose catalog fields and route supported catalog lifecycle targets",
-        "internal group write routes expose unique integrity",
-        "internal group write routes expose foreign key action job requeue",
-        "batch parser accepts Go transform op spelling",
-        "public table contract exposes migration metadata",
-        "table contract accepts public field scoped full text create index",
-        "api http client round-trips public table management routes",
-        "api http server serves status",
-        "api http server returns json eval and query builder validation errors",
-        "api http server returns json not found for missing query builder table",
-        "api http server serves eval response envelope",
-        "api http server serves query builder response envelope",
-        "api http server query builder infers semantic indexes from table metadata",
-        "api http server query builder handles tree graph indexes",
-        "api http server query builder replays clarification decisions",
-        "api http server serves secrets crud when backed by a local store",
-        "api http server lists secrets status without a local secret store",
-        "api http server rejects secret writes without a local secret store",
-        "api http server serves table lookup with version header",
-        "api http server serves table scan as ndjson",
-        "api http server routes table query through read schema full text index",
-        "api http server serves table query response envelope",
-        "api http server serves retrieval agent response envelope",
-        "api http server serves table batch writes",
-        "api http server exposes relational foreign key integrity repair",
-        "api http server exposes relational unique integrity repair",
-        "auto bulk max-window session rolls without a following write",
-        "auto bulk group writes release leases so idle finish can publish",
-        "auto bulk max-window rolls publish all threshold aligned docs",
-        "provisioned table write source seeds doc identity namespace from table range",
-        "provisioned table write source cached runtime status does not fetch catalog coverage",
-        "managed startup catch-up uses provided indexes json without catalog fetch",
-        "api http server serves table batch transforms",
-        "api http server updates local table schema through bound write source",
-        "api http server serves public transaction commit route",
-        "api http server surfaces structured participant diagnostics for unavailable transaction commits",
-        "api http server surfaces structured decision conflicts for transaction commits",
-        "api http server surfaces structured torn-state conflicts when txn record is missing",
-        "api http server surfaces structured torn-state conflicts when txn record is corrupted",
-        "api http server serves transaction session cleanup route",
-        "api http server serves table metadata list and detail",
-        "api http server serves runtime schema debug on table and index detail",
-        "api http server serves table index metadata routes",
-        "api index status prefers best-effort write runtime status",
-        "api index status prefers cached read runtime status before write status",
-        "api index status does not fall through to write runtime status when read cache is empty",
-        "api index status uses propagated remote store runtime status",
-        "api index status ignores propagated runtime status from removed owner",
-        "api index status reports missing remote shard as not ready",
-        "single embeddings index encoder keeps backfill active while enrichment replay lags",
-        "api http server serves local index runtime backfill status",
-        "api http server graph metric action endpoint returns updated status",
-        "api http server serves provisioned index runtime backfill status across shards",
-        "api http server derives public SQL DDL command tags from parsed statements",
-        "optional pgwire listener rejects host without port",
-        "api http server serves database and namespace catalog routes",
-        "explicit catalog routes declare qualified namespace and table permissions",
-        "api http server serves table create and drop",
-        "api http server serves table metadata routes against real metadata service",
-        "api http server create table with replication sources returns encoded table detail",
-        "api http server exposes relational foreign key integrity repair",
-        "api http server exposes relational unique integrity repair",
-        "api http server lists cluster backups through public route",
-        "api http server backs up and restores a table through public routes",
-        "api http server prefers metadata-owned restore over inline write-source restore",
-        "public API request body limit matches Go linear merge contract",
-        "public api smoke e2e creates table inserts and queries documents",
-        "public api e2e supports graph queries",
-        "public api e2e recreates managed embeddings index after corrupt artifact",
-        "public api split e2e uses distributed global text stats for bm25 and significant_terms",
-        "public api multi-node e2e routes CRUD from a non-host node",
-    };
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .filters = selectTestFilters(b, &APITestFilters.public_api_parity),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3618,25 +3538,14 @@ pub fn build(b: *std.Build) void {
 
     const public_api_graph_metric_e2e_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "public index contract exposes runtime status metadata",
-            "indexes openapi parses graph metric runtime summary",
-            "client openapi parses graph metric runtime summary",
-            "client openapi module resolves shared refs through owner modules",
-            "api http server graph metric action endpoint returns updated status",
-            "public api e2e supports graph queries",
-        },
+        .filters = &APITestFilters.public_api_graph_metric_e2e,
     });
     const run_public_api_graph_metric_e2e_tests = b.addRunArtifact(public_api_graph_metric_e2e_tests);
     run_public_api_graph_metric_e2e_tests.step.dependOn(&openapi_root_check.step);
 
     const lib_resolution_source_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "DistributedCandidateSource",
-            "prefixUpperBoundAlloc",
-            "DistributedEntitySink",
-        },
+        .filters = &APITestFilters.resolution_source,
     });
     const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
     const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
@@ -3766,9 +3675,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_swarm_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "public api swarm-like e2e backs up drops and restores a table",
-        },
+        .filters = &APITestFilters.swarm_backup_restore,
     });
     const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
     const lib_api_swarm_backup_restore_test_step = b.step("lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test");
