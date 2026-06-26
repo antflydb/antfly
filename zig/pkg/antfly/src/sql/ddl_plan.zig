@@ -10534,7 +10534,6 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .lock => .lock_not_planned_by_generated_parser,
         .move => .move_not_planned_by_generated_parser,
         .notify => .notify_not_planned_by_generated_parser,
-        .refresh => .refresh_not_planned_by_generated_parser,
         .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
         .reindex => .reindex_not_planned_by_generated_parser,
         .release => .release_not_planned_by_generated_parser,

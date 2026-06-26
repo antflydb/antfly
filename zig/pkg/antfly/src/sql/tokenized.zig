@@ -2561,7 +2561,6 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .import_foreign_schema,
         .load,
         .move,
-        .refresh,
         .reassign_owned,
         .security_label,
         => false,
