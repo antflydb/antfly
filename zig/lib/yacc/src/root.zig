@@ -838,7 +838,7 @@ fn emitZigMetadata(
     , .{ production_rhs_count, state_item_count, symbol_name_bytes, action_range_max, goto_range_max });
     try out.appendSlice(allocator,
         \\
-        \\pub const ParseError = error{
+        \\const ParseError = error{
         \\    InvalidGoto,
         \\    StackOverflow,
         \\    StackUnderflow,
@@ -887,7 +887,7 @@ fn emitZigMetadata(
         \\    }
         \\}
         \\
-        \\pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!void {
+        \\pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void {
         \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
         \\    var stack_len: usize = 1;
         \\    stack_buffer[0] = 0;
@@ -1360,7 +1360,9 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".sql_y = \"https://example.test/cockroach/sql.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "ParseError!void") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseDiagnostic = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnostic(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnosticWithStackBuffer(") != null);

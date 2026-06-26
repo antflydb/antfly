@@ -213255,7 +213255,7 @@ pub const parse_table_static_bytes =
     @sizeOf(@TypeOf(conflicts));
 pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;
 
-pub const ParseError = error{
+const ParseError = error{
     InvalidGoto,
     StackOverflow,
     StackUnderflow,
@@ -213304,7 +213304,7 @@ pub fn parse(allocator: std.mem.Allocator, token_ids: []const u16) !void {
     }
 }
 
-pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!void {
+pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void {
     if (stack_buffer.len == 0) return ParseError.StackOverflow;
     var stack_len: usize = 1;
     stack_buffer[0] = 0;
