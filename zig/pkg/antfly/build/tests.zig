@@ -183,6 +183,12 @@ pub const APIDocIdTestModules = struct {
     raft_transition_runtime_docid: *std.Build.Module,
 };
 
+pub const APIDocIdTestRootOptions = struct {
+    root: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+};
+
 pub const APIDocIdTestRuns = struct {
     docid: *std.Build.Step.Run,
     serverless_docid: *std.Build.Step.Run,
@@ -471,6 +477,17 @@ fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     }
 }
 
+fn assertBuildZigDoesNotOwnManifestTestRoots(source: []const u8) void {
+    inline for (api_docid_test_roots) |root| {
+        if (std.mem.indexOf(u8, source, root.path)) |start| {
+            std.debug.panic(
+                "build.zig references manifest-owned test root '{s}' at line {}; move focused API test roots to pkg/antfly/build/tests.zig",
+                .{ root.path, lineNumberForOffset(source, start) },
+            );
+        }
+    }
+}
+
 fn assertBuildZigOnlyDeclaresOwnedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
@@ -501,6 +518,7 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     assertBuildZigTestFiltersReferenceManifest(source);
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
+    assertBuildZigDoesNotOwnManifestTestRoots(source);
     assertBuildZigOnlyDeclaresOwnedTestSteps(source);
 }
 
@@ -3439,6 +3457,73 @@ pub fn addAPIDocIdTestSteps(
         .internal_group_write_routes = internal_group_write_routes,
         .raft_transition_runtime_docid = raft_transition_runtime_docid,
     };
+}
+
+const api_docid_test_roots = .{
+    .{
+        .field = "transactions_docid",
+        .path = "pkg/antfly/src/api_transactions_test_root.zig",
+    },
+    .{
+        .field = "table_writes_docid",
+        .path = "pkg/antfly/src/api_table_writes_test_root.zig",
+    },
+    .{
+        .field = "table_reads_docid",
+        .path = "pkg/antfly/src/api_table_reads_test_root.zig",
+    },
+    .{
+        .field = "public_table_http_docid",
+        .path = "pkg/antfly/src/api_public_table_http_test_root.zig",
+    },
+    .{
+        .field = "rows",
+        .path = "pkg/antfly/src/api_rows_test_root.zig",
+    },
+    .{
+        .field = "internal_group_write_routes",
+        .path = "pkg/antfly/src/api_internal_group_write_routes_test_root.zig",
+    },
+    .{
+        .field = "raft_transition_runtime_docid",
+        .path = "pkg/antfly/src/raft_transition_runtime_test_root.zig",
+    },
+};
+
+fn makeAPIDocIdTestModule(
+    b: *std.Build,
+    root_path: []const u8,
+    options: APIDocIdTestRootOptions,
+    imports: anytype,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path(root_path),
+        .target = options.target,
+        .optimize = options.optimize,
+    });
+    imports.configure(b, module, true, true);
+    return module;
+}
+
+pub fn makeAPIDocIdTestModules(
+    b: *std.Build,
+    options: APIDocIdTestRootOptions,
+    imports: anytype,
+) APIDocIdTestModules {
+    var modules: APIDocIdTestModules = undefined;
+    modules.root = options.root;
+    inline for (api_docid_test_roots) |root| {
+        @field(modules, root.field) = makeAPIDocIdTestModule(b, root.path, options, imports);
+    }
+    return modules;
+}
+
+pub fn addAPIDocIdTestRootSteps(
+    b: *std.Build,
+    options: APIDocIdTestRootOptions,
+    imports: anytype,
+) APIDocIdTestRuns {
+    return addAPIDocIdTestSteps(b, makeAPIDocIdTestModules(b, options, imports));
 }
 
 pub fn addAPIDocIdAggregateTestStep(

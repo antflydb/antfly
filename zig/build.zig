@@ -534,7 +534,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_platform", .field = "platform" },
     };
 
-    fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+    pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
@@ -2999,61 +2999,14 @@ pub fn build(b: *std.Build) void {
     const run_lib_api_auth_tests = api_focused_tests.auth.run;
     const run_lib_api_logic_tests = api_focused_tests.logic.run;
 
-    const api_transactions_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_transactions_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_transactions_docid_test_mod, true, true);
-    const api_table_writes_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_table_writes_docid_test_mod, true, true);
-    const api_table_reads_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_table_reads_docid_test_mod, true, true);
-    const api_public_table_http_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
-    const api_rows_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_rows_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_rows_test_mod, true, true);
-    const api_internal_group_write_routes_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_internal_group_write_routes_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_internal_group_write_routes_test_mod, true, true);
-    const raft_transition_runtime_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/raft_transition_runtime_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
     // Keep API tests wired at stable suite granularity. Leaf implementation
     // tests should join these roots via pkg/antfly/build/tests.zig filters,
     // not by adding one top-level build step per regression.
-    const api_docid_tests = antfly_tests_build.addAPIDocIdTestSteps(b, .{
+    const api_docid_tests = antfly_tests_build.addAPIDocIdTestRootSteps(b, .{
         .root = lib_test_mod,
-        .transactions_docid = api_transactions_docid_test_mod,
-        .table_writes_docid = api_table_writes_docid_test_mod,
-        .table_reads_docid = api_table_reads_docid_test_mod,
-        .public_table_http_docid = api_public_table_http_docid_test_mod,
-        .rows = api_rows_test_mod,
-        .internal_group_write_routes = api_internal_group_write_routes_test_mod,
-        .raft_transition_runtime_docid = raft_transition_runtime_docid_test_mod,
-    });
+        .target = target,
+        .optimize = optimize,
+    }, antfly_imports);
     unit_test_step.dependOn(&api_docid_tests.provisioned_query_visibility.step);
     const run_lib_docid_lifecycle_tests = api_focused_tests.docid_lifecycle.run;
     const docid_lifecycle_test_step = api_focused_tests.docid_lifecycle.step.?;

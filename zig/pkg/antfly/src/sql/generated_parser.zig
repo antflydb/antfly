@@ -254,14 +254,19 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_conversion,
     drop_event_trigger,
     drop_language,
+    drop_collation_multi,
+    drop_domain_multi,
     drop_extension_multi,
     drop_index_multi,
     drop_materialized_view_multi,
     drop_owned,
     drop_operator_class,
     drop_operator_family,
+    drop_publication_multi,
     drop_routine,
+    drop_role_multi,
     drop_schema_multi,
+    drop_sequence_multi,
     drop_statistics,
     drop_table_multi,
     drop_text_search_configuration,
@@ -269,6 +274,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_text_search_parser,
     drop_text_search_template,
     drop_transform,
+    drop_type_multi,
     drop_user_mapping,
     drop_view_multi,
     explain,
@@ -369,14 +375,19 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_conversion_not_planned_by_generated_parser,
     drop_event_trigger_not_planned_by_generated_parser,
     drop_language_not_planned_by_generated_parser,
+    drop_collation_multi_not_planned_by_generated_parser,
+    drop_domain_multi_not_planned_by_generated_parser,
     drop_extension_multi_not_planned_by_generated_parser,
     drop_index_multi_not_planned_by_generated_parser,
     drop_materialized_view_multi_not_planned_by_generated_parser,
     drop_owned_not_planned_by_generated_parser,
     drop_operator_class_not_planned_by_generated_parser,
     drop_operator_family_not_planned_by_generated_parser,
+    drop_publication_multi_not_planned_by_generated_parser,
     drop_routine_not_planned_by_generated_parser,
+    drop_role_multi_not_planned_by_generated_parser,
     drop_schema_multi_not_planned_by_generated_parser,
+    drop_sequence_multi_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
     drop_table_multi_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
@@ -384,6 +395,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_text_search_parser_not_planned_by_generated_parser,
     drop_text_search_template_not_planned_by_generated_parser,
     drop_transform_not_planned_by_generated_parser,
+    drop_type_multi_not_planned_by_generated_parser,
     drop_user_mapping_not_planned_by_generated_parser,
     drop_view_multi_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
@@ -2150,6 +2162,8 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP ACCESS METHOD IF EXISTS usage_am", .kind = .unsupported },
     .{ .sql = "DROP CONVERSION IF EXISTS usage_conv", .kind = .unsupported },
     .{ .sql = "DROP EVENT TRIGGER IF EXISTS usage_ddl_start", .kind = .unsupported },
+    .{ .sql = "DROP COLLATION case_insensitive, accent_insensitive", .kind = .unsupported },
+    .{ .sql = "DROP DOMAIN positive_amount, nonempty_text CASCADE", .kind = .unsupported },
     .{ .sql = "DROP EXTENSION vector, postgis", .kind = .unsupported },
     .{ .sql = "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE", .kind = .unsupported },
     .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
@@ -2157,8 +2171,11 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree", .kind = .unsupported },
+    .{ .sql = "DROP PUBLICATION usage_pub, old_usage_pub", .kind = .unsupported },
     .{ .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP ROLE app_writer, app_reader", .kind = .unsupported },
     .{ .sql = "DROP SCHEMA analytics, reporting", .kind = .unsupported },
+    .{ .sql = "DROP SEQUENCE order_id_seq, old_order_id_seq CASCADE", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
     .{ .sql = "DROP TABLE usage_records, archived_usage_records", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
@@ -2166,6 +2183,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP TEXT SEARCH PARSER IF EXISTS usage_parser", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template", .kind = .unsupported },
     .{ .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql", .kind = .unsupported },
+    .{ .sql = "DROP TYPE usage_status, archived_status CASCADE", .kind = .unsupported },
     .{ .sql = "DROP VIEW active_usage, archived_usage", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
@@ -2719,11 +2737,23 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_view_multi };
             return .{ .ddl = .drop_view };
         }
-        if (second.matchesKeywordTag(.domain)) return .{ .ddl = .drop_domain };
-        if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .drop_sequence };
-        if (second.matchesKeywordTag(.type)) return .{ .ddl = .drop_enum_type };
+        if (second.matchesKeywordTag(.domain)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_domain_multi };
+            return .{ .ddl = .drop_domain };
+        }
+        if (second.matchesKeywordTag(.sequence)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_sequence_multi };
+            return .{ .ddl = .drop_sequence };
+        }
+        if (second.matchesKeywordTag(.type)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_type_multi };
+            return .{ .ddl = .drop_enum_type };
+        }
         if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .drop_tablespace };
-        if (second.matchesKeywordTag(.publication)) return .{ .ddl = .drop_publication };
+        if (second.matchesKeywordTag(.publication)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_publication_multi };
+            return .{ .ddl = .drop_publication };
+        }
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .drop_subscription };
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .drop_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .drop_procedure };
@@ -2753,8 +2783,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
-        if (isGeneratedRoleAliasKeyword(second)) return .{ .ddl = .drop_role };
-        if (second.matchesKeywordTag(.collation)) return .{ .ddl = .drop_collation };
+        if (isGeneratedRoleAliasKeyword(second)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_role_multi };
+            return .{ .ddl = .drop_role };
+        }
+        if (second.matchesKeywordTag(.collation)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_collation_multi };
+            return .{ .ddl = .drop_collation };
+        }
         if (second.matchesKeywordTag(.operator)) {
             if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .drop_operator_class };
             if (tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .drop_operator_family };
@@ -3041,14 +3077,19 @@ fn buildUnsupportedAst(
             .drop_conversion => .drop_conversion_not_planned_by_generated_parser,
             .drop_event_trigger => .drop_event_trigger_not_planned_by_generated_parser,
             .drop_language => .drop_language_not_planned_by_generated_parser,
+            .drop_collation_multi => .drop_collation_multi_not_planned_by_generated_parser,
+            .drop_domain_multi => .drop_domain_multi_not_planned_by_generated_parser,
             .drop_extension_multi => .drop_extension_multi_not_planned_by_generated_parser,
             .drop_index_multi => .drop_index_multi_not_planned_by_generated_parser,
             .drop_materialized_view_multi => .drop_materialized_view_multi_not_planned_by_generated_parser,
             .drop_owned => .drop_owned_not_planned_by_generated_parser,
             .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
             .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
+            .drop_publication_multi => .drop_publication_multi_not_planned_by_generated_parser,
             .drop_routine => .drop_routine_not_planned_by_generated_parser,
+            .drop_role_multi => .drop_role_multi_not_planned_by_generated_parser,
             .drop_schema_multi => .drop_schema_multi_not_planned_by_generated_parser,
+            .drop_sequence_multi => .drop_sequence_multi_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
             .drop_table_multi => .drop_table_multi_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
@@ -3056,6 +3097,7 @@ fn buildUnsupportedAst(
             .drop_text_search_parser => .drop_text_search_parser_not_planned_by_generated_parser,
             .drop_text_search_template => .drop_text_search_template_not_planned_by_generated_parser,
             .drop_transform => .drop_transform_not_planned_by_generated_parser,
+            .drop_type_multi => .drop_type_multi_not_planned_by_generated_parser,
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
@@ -7393,14 +7435,20 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_conversion }, (try parseSqlAlloc(alloc, "DROP CONVERSION IF EXISTS usage_conv")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_collation_multi }, (try parseSqlAlloc(alloc, "DROP COLLATION case_insensitive, accent_insensitive")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_domain_multi }, (try parseSqlAlloc(alloc, "DROP DOMAIN positive_amount, nonempty_text CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_extension_multi }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector, postgis")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_index_multi }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_materialized_view_multi }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_publication_multi }, (try parseSqlAlloc(alloc, "DROP PUBLICATION usage_pub, old_usage_pub")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_routine }, (try parseSqlAlloc(alloc, "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_role_multi }, (try parseSqlAlloc(alloc, "DROP ROLE app_writer, app_reader")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_schema_multi }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics, reporting")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_sequence_multi }, (try parseSqlAlloc(alloc, "DROP SEQUENCE order_id_seq, old_order_id_seq CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_statistics }, (try parseSqlAlloc(alloc, "DROP STATISTICS IF EXISTS usage_stats")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_table_multi }, (try parseSqlAlloc(alloc, "DROP TABLE usage_records, archived_usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_type_multi }, (try parseSqlAlloc(alloc, "DROP TYPE usage_status, archived_status CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_configuration }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
@@ -11442,6 +11490,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "DROP COLLATION case_insensitive, accent_insensitive",
+            .kind = .drop_collation_multi,
+            .reason = .drop_collation_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "DROP DOMAIN positive_amount, nonempty_text CASCADE",
+            .kind = .drop_domain_multi,
+            .reason = .drop_domain_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "DROP EXTENSION vector, postgis",
             .kind = .drop_extension_multi,
             .reason = .drop_extension_multi_not_planned_by_generated_parser,
@@ -11484,16 +11544,34 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
+            .sql = "DROP PUBLICATION usage_pub, old_usage_pub",
+            .kind = .drop_publication_multi,
+            .reason = .drop_publication_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
             .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE",
             .kind = .drop_routine,
             .reason = .drop_routine_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
+            .sql = "DROP ROLE app_writer, app_reader",
+            .kind = .drop_role_multi,
+            .reason = .drop_role_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
             .sql = "DROP SCHEMA analytics, reporting",
             .kind = .drop_schema_multi,
             .reason = .drop_schema_multi_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "DROP SEQUENCE order_id_seq, old_order_id_seq CASCADE",
+            .kind = .drop_sequence_multi,
+            .reason = .drop_sequence_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",
@@ -11535,6 +11613,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql",
             .kind = .drop_transform,
             .reason = .drop_transform_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP TYPE usage_status, archived_status CASCADE",
+            .kind = .drop_type_multi,
+            .reason = .drop_type_multi_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
