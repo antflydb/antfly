@@ -11845,7 +11845,7 @@ pub fn planGeneratedLogicalDdlAstAlloc(
     return null;
 }
 
-pub fn logicalPlanFromLoweredDdlPlan(plan: *LoweredDdlPlan) binder.LogicalSqlPlan {
+fn logicalPlanFromLoweredDdlPlan(plan: *LoweredDdlPlan) binder.LogicalSqlPlan {
     return switch (plan.*) {
         .adapter_noop => |payload| blk: {
             plan.* = undefined;
