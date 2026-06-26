@@ -20,9 +20,11 @@ const relational_rows_api = @import("../relational_rows.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../table_catalog.zig");
-const table_reads = @import("../table_reads.zig");
+const table_read_core = @import("../table_reads/core.zig");
+const table_read_relational_rows = @import("../table_reads/relational_rows.zig");
 const table_write_core = @import("core.zig");
 
+const TableReadSource = table_read_core.TableReadSource;
 const TableWriteSource = table_write_core.TableWriteSource;
 
 pub fn mutateRowsJoinedFromSourceRowsOnDb(
@@ -81,7 +83,7 @@ pub fn mergeRowsFromSourceRowsOnDb(
 
 pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     default_table_name: []const u8,
@@ -106,7 +108,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
 
 pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
@@ -119,7 +121,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
     if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
 
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+    var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
         catalog,
@@ -156,7 +158,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
 
 pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     default_table_name: []const u8,
@@ -181,7 +183,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc(
 
 pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
@@ -194,7 +196,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
     const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
     if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
 
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+    var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
         catalog,
@@ -232,7 +234,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
 
 pub fn mergeRowsFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     default_table_name: []const u8,
@@ -257,7 +259,7 @@ pub fn mergeRowsFromRecursiveCtePlanAlloc(
 
 pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
     alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
+    read_source: TableReadSource,
     write_source: TableWriteSource,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
@@ -269,7 +271,7 @@ pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
 ) !?relational_rows_api.OwnedRowsBatchRequest {
     if (!std.mem.eql(u8, lowered.merge.source.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
 
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+    var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
         catalog,

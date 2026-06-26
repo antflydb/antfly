@@ -1638,6 +1638,17 @@ pub fn lowerInsertWithResolverParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredInsert {
+    return try lowerInsertWithResolverAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, unique_resolver, .{});
+}
+
+fn lowerInsertWithResolverAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
 
@@ -1647,6 +1658,7 @@ pub fn lowerInsertWithResolverParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseInsert(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1705,6 +1717,17 @@ fn lowerInsertSourceWithResolverParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredInsertSource {
+    return try lowerInsertSourceWithResolverAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, unique_resolver, .{});
+}
+
+fn lowerInsertSourceWithResolverAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredInsertSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
 
@@ -1714,6 +1737,7 @@ fn lowerInsertSourceWithResolverParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return sql_adapter.parseInsertSourceAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.insertSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1742,6 +1766,18 @@ fn lowerInsertSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredInsertSource {
+    return try lowerInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver, .{});
+}
+
+fn lowerInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredInsertSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -1754,6 +1790,7 @@ fn lowerInsertSourceWithSchemasParsedSqlAlloc(
         .insert_source_allows_different_table = true,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return sql_adapter.parseInsertSourceAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.insertSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1782,6 +1819,18 @@ fn lowerRecursiveInsertSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredRecursiveInsertSource {
+    return try lowerRecursiveInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver, .{});
+}
+
+fn lowerRecursiveInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRecursiveInsertSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -1794,6 +1843,7 @@ fn lowerRecursiveInsertSourceWithSchemasParsedSqlAlloc(
         .insert_source_allows_different_table = true,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseRecursiveInsertSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1822,6 +1872,18 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredRecursiveJoinedMutationSource {
+    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim, .{});
+}
+
+fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRecursiveJoinedMutationSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
@@ -1834,6 +1896,7 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(
         .joined_source_schema = source_schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1862,6 +1925,18 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredRecursiveJoinedMutationSource {
+    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim, .{});
+}
+
+fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRecursiveJoinedMutationSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
@@ -1874,6 +1949,7 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(
         .joined_source_schema = source_schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1900,6 +1976,17 @@ pub fn lowerUpdateParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredMutation {
+    return try lowerUpdateWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, unique_resolver, .{});
+}
+
+fn lowerUpdateWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
 
@@ -1909,6 +1996,7 @@ pub fn lowerUpdateParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseUpdate(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -1967,6 +2055,17 @@ pub fn lowerDeleteParsedSqlAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredMutation {
+    return try lowerDeleteWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, unique_resolver, .{});
+}
+
+fn lowerDeleteWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: SqlFunctionBindings,
+) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
 
@@ -1976,6 +2075,7 @@ pub fn lowerDeleteParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseDelete(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -2002,6 +2102,17 @@ pub fn lowerUpdateMutationSourceParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredMutationSource {
+    return try lowerUpdateMutationSourceWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, row_claim, .{});
+}
+
+fn lowerUpdateMutationSourceWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredMutationSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
     const tokens = parsed_sql.items();
@@ -2012,6 +2123,7 @@ pub fn lowerUpdateMutationSourceParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseUpdateMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
@@ -2038,6 +2150,17 @@ fn lowerDeleteMutationSourceParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredMutationSource {
+    return try lowerDeleteMutationSourceWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, row_claim, .{});
+}
+
+fn lowerDeleteMutationSourceWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredMutationSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
     const tokens = parsed_sql.items();
@@ -2048,6 +2171,7 @@ fn lowerDeleteMutationSourceParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseDeleteMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
@@ -2107,6 +2231,17 @@ pub fn lowerMergeMutationPlanParsedSqlAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredMergeMutationPlan {
+    return try lowerMergeMutationPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, .{});
+}
+
+fn lowerMergeMutationPlanWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredMergeMutationPlan {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -2117,6 +2252,7 @@ pub fn lowerMergeMutationPlanParsedSqlAlloc(
         .schema = target_schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .function_bindings = function_bindings,
     };
     return try sql_adapter.parseMergeMutationPlanAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.mergeMutationParserOptions(&parser));
 }
@@ -2140,6 +2276,17 @@ fn lowerRecursiveMergeMutationWithSchemasParsedSqlAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredRecursiveMergeMutation {
+    return try lowerRecursiveMergeMutationWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, .{});
+}
+
+fn lowerRecursiveMergeMutationWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRecursiveMergeMutation {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -2150,6 +2297,7 @@ fn lowerRecursiveMergeMutationWithSchemasParsedSqlAlloc(
         .schema = target_schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .function_bindings = function_bindings,
     };
     return Parser.ContextAccessors.parseRecursiveMergeMutation(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -2275,6 +2423,18 @@ pub fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredJoinedMutationSource {
+    return try lowerUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim, .{});
+}
+
+fn lowerUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredJoinedMutationSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
@@ -2287,6 +2447,7 @@ pub fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(
         .joined_source_schema = source_schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => error.UnsupportedRowsQuery,
@@ -2325,6 +2486,18 @@ pub fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(
     params: []const SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredJoinedMutationSource {
+    return try lowerDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim, .{});
+}
+
+fn lowerDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: SqlFunctionBindings,
+) !LoweredJoinedMutationSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
@@ -2337,6 +2510,7 @@ pub fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(
         .joined_source_schema = source_schema,
         .params = params,
         .mutation_claim = row_claim,
+        .function_bindings = function_bindings,
     };
     return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
@@ -2363,29 +2537,41 @@ pub fn lowerWritePlanParsedSqlAlloc(
     params: []const SqlValue,
     options: LowerWritePlanOptions,
 ) !LoweredWritePlan {
+    return try lowerWritePlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, options, .{});
+}
+
+fn lowerWritePlanWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    function_bindings: SqlFunctionBindings,
+) !LoweredWritePlan {
     var context = sql_adapter.WritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
+        .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_generated_dml = sql_adapter.lowerWritePlanFromGeneratedDmlAstDirectAlloc,
-            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlAlloc,
-            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc,
-            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc,
-            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlAlloc,
-            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlAlloc,
-            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlAlloc,
-            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlAlloc,
-            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc,
+            .lower_generated_dml = sql_adapter.lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc,
+            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_insert_with_resolver = lowerInsertWithResolverAndFunctionBindingsParsedSqlAlloc,
+            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverAndFunctionBindingsParsedSqlAlloc,
+            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
             .classify_update_selector = sql_adapter.classifyUpdateSelectorParsedSqlAlloc,
-            .lower_update_with_resolver = lowerUpdateParsedSqlAlloc,
-            .lower_update_source = lowerUpdateMutationSourceParsedSqlAlloc,
-            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc,
+            .lower_update_with_resolver = lowerUpdateWithFunctionBindingsParsedSqlAlloc,
+            .lower_update_source = lowerUpdateMutationSourceWithFunctionBindingsParsedSqlAlloc,
+            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc,
             .classify_delete_selector = sql_adapter.classifyDeleteSelectorParsedSqlAlloc,
-            .lower_delete_with_resolver = lowerDeleteParsedSqlAlloc,
-            .lower_delete_source = lowerDeleteMutationSourceParsedSqlAlloc,
+            .lower_delete_with_resolver = lowerDeleteWithFunctionBindingsParsedSqlAlloc,
+            .lower_delete_source = lowerDeleteMutationSourceWithFunctionBindingsParsedSqlAlloc,
             .lower_truncate_source = lowerTruncateMutationSourceParsedSqlAlloc,
-            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlAlloc,
+            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql, options);
@@ -2436,13 +2622,27 @@ pub fn lowerWritePlanWithCatalogSessionParsedSqlAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, session, .{});
+}
+
+pub fn lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: SqlFunctionBindings,
+) !LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = sql_adapter.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
+        .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlAlloc,
+            .lower_with_options = lowerWritePlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
     return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
@@ -2455,13 +2655,25 @@ pub fn lowerWritePlanWithBoundStatementAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredWritePlan {
+    return try lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(alloc, parsed_sql, bound, schema, params, .{});
+}
+
+pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    bound: *sql_adapter.BoundSqlStatement,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = sql_adapter.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
+        .function_bindings = function_bindings,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlAlloc,
+            .lower_with_options = lowerWritePlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
     return try context.lowerBoundParsed(parsed_sql, bound);

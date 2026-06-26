@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const Grammar = struct {
     start_symbol: []const u8 = "",
+    expected_conflicts: ?usize = null,
     postgres_major: []const u8 = "",
     postgres_branch: []const u8 = "",
     postgres_commit: []const u8 = "",
@@ -107,6 +108,9 @@ pub fn generateZigMetadata(
     const grammar = try parseGrammar(allocator, source);
     try validateGrammar(grammar);
     const tables = try buildSlrTables(allocator, grammar);
+    if (grammar.expected_conflicts) |expected_conflicts| {
+        if (tables.conflicts.len != expected_conflicts) return error.ConflictCountMismatch;
+    }
     return try emitZigMetadata(allocator, input_path, source, grammar, tables);
 }
 
@@ -122,6 +126,12 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
 
         if (std.mem.startsWith(u8, line, "%reference ")) {
             try parseReference(&grammar, line);
+            active_rule = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "%expect ")) {
+            const value = std.mem.trim(u8, line["%expect ".len..], " \t\r");
+            grammar.expected_conflicts = try std.fmt.parseUnsigned(usize, value, 10);
             active_rule = null;
             continue;
         }
@@ -586,6 +596,7 @@ fn emitZigMetadata(
         \\pub const action_count = {d};
         \\pub const goto_count = {d};
         \\pub const conflict_count = {d};
+        \\pub const expected_conflict_count: ?usize = {s};
         \\
         \\pub const SymbolKind = enum {{ terminal, nonterminal }};
         \\pub const Symbol = struct {{ name: []const u8, kind: SymbolKind }};
@@ -609,6 +620,10 @@ fn emitZigMetadata(
         tables.actions.len,
         tables.gotos.len,
         tables.conflicts.len,
+        if (grammar.expected_conflicts) |expected_conflicts|
+            try std.fmt.allocPrint(allocator, "{d}", .{expected_conflicts})
+        else
+            "null",
     });
     for (tables.symbols) |symbol| {
         try appendFmt(allocator, &out, "    .{{ .name = \"{s}\", .kind = .{s} }},\n", .{ symbol.name, @tagName(symbol.kind) });
@@ -1024,6 +1039,7 @@ test "parseGrammar preserves reference URLs while stripping real comments" {
     const arena = arena_impl.allocator();
     const source =
         \\// leading comment
+        \\%expect 0
         \\%reference postgres_major 19
         \\%reference postgres_gram_y https://github.com/postgres/postgres/blob/hash/src/backend/parser/gram.y
         \\%reference postgres_scan_l https://github.com/postgres/postgres/blob/hash/src/backend/parser/scan.l // trailing comment
@@ -1035,6 +1051,7 @@ test "parseGrammar preserves reference URLs while stripping real comments" {
         \\  ;
     ;
     const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(?usize, 0), grammar.expected_conflicts);
     try std.testing.expectEqualStrings("19", grammar.postgres_major);
     try std.testing.expectEqualStrings("https://github.com/postgres/postgres/blob/hash/src/backend/parser/gram.y", grammar.postgres_gram_y);
     try std.testing.expectEqualStrings("https://github.com/postgres/postgres/blob/hash/src/backend/parser/scan.l", grammar.postgres_scan_l);
@@ -1087,6 +1104,7 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     const source =
+        \\%expect 0
         \\%reference postgres_major 19
         \\%reference postgres_commit abc
         \\%reference postgres_gram_y https://example.test/postgres/gram.y
@@ -1104,11 +1122,28 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const state_count = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const actions = [_]Action") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const conflicts = [_]Conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const expected_conflict_count: ?usize = 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".scan_l = \"https://example.test/postgres/scan.l\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".sql_y = \"https://example.test/cockroach/sql.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
+}
+
+test "generateZigMetadata rejects unexpected conflict count drift" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID PLUS
+        \\expr:
+        \\    expr PLUS expr
+        \\  | ID
+        \\  ;
+    ;
+    try std.testing.expectError(error.ConflictCountMismatch, generateZigMetadata(arena, "ambiguous.y", source));
 }
 
 test "validateGrammar rejects unknown symbols" {

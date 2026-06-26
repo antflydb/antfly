@@ -16,7 +16,7 @@ pub const cockroach_reference = .{
     .sql_y = "https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y",
 };
 
-pub const source_sha256_hex = "12a86e3045f9f63cfad075a25ce100bb6ca7b4dd30cd082fed627e0dd33b8d0b";
+pub const source_sha256_hex = "9e2bff3cd6b6c6ec5ce913a90420919481b7ecc81838389345429f41812235f4";
 pub const start_symbol = "statement";
 pub const token_count = 244;
 pub const rule_count = 216;
@@ -25,6 +25,7 @@ pub const state_count = 1582;
 pub const action_count = 111897;
 pub const goto_count = 2412;
 pub const conflict_count = 9673;
+pub const expected_conflict_count: ?usize = 9673;
 
 pub const SymbolKind = enum { terminal, nonterminal };
 pub const Symbol = struct { name: []const u8, kind: SymbolKind };

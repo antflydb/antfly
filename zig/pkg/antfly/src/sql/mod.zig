@@ -726,6 +726,7 @@ pub const lowerReadPlanWithHooks = plan.lowerReadPlanWithHooks;
 pub const lowerWritePlanWithParsedSqlAlloc = plan.lowerWritePlanWithParsedSqlAlloc;
 pub const lowerWritePlanAlloc = lower_dml.lowerWritePlanAlloc;
 pub const lowerWritePlanFromGeneratedDmlAstDirectAlloc = lower_dml.lowerWritePlanFromGeneratedDmlAstDirectAlloc;
+pub const lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc = lower_dml.lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc;
 pub const lowerWritePlanParsedSqlAlloc = lower_dml.lowerWritePlanParsedSqlAlloc;
 pub const lowerWritePlanWithCatalogAlloc = lower_dml.lowerWritePlanWithCatalogAlloc;
 pub const lowerWritePlanWithCatalogParsedSqlAlloc = lower_dml.lowerWritePlanWithCatalogParsedSqlAlloc;

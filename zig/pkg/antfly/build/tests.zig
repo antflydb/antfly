@@ -1302,6 +1302,260 @@ pub const RootTestFilters = struct {
     };
 };
 
+pub const RecallTestFilters = struct {
+    pub const hbc = [_][]const u8{
+        "HBC recall",
+    };
+};
+
+pub const RaftTestFilters = struct {
+    pub const root = [_][]const u8{
+        "raft.",
+    };
+
+    pub const transport = [_][]const u8{
+        "raft.transport.",
+    };
+
+    pub const sim = [_][]const u8{
+        "managed host simulation drives add and peer refresh through deterministic steps",
+        "managed host simulation restores through both raft state backends",
+        "managed host simulation keeps WAL replay debt bounded across repeated proposals",
+        "managed host simulation removes routes and replicas across deterministic steps",
+        "simulation harness module compiles",
+        "cluster simulation validates mirrored merge pair invariants",
+        "cluster simulation validates split transition enrichment invariants",
+        "cluster simulation validates merge transition enrichment invariants",
+        "cluster simulation drives split transition actions deterministically",
+        "cluster simulation drives merge transition actions deterministically",
+    };
+
+    pub const chaos = [_][]const u8{
+        "managed host simulation restores through both raft state backends",
+        "managed host simulation persists replica removal across restart for both raft state backends",
+        "managed host simulation drops queued metadata updates across restart for both raft state backends",
+        "managed host simulation does not persist proposals before a runtime round across both raft state backends",
+        "managed http host simulation starts listener and applies deterministic metadata updates",
+        "managed http host simulations elect and replicate over real HTTP",
+        "managed http host simulation can remove and rejoin from HTTP snapshot fetch",
+        "managed http cluster simulation",
+        "http host simulation drives queued split transitions through the service lane",
+        "http host simulation rolls back and retries queued split transitions through the service lane",
+        "http host simulation removes queued split transition mid-flight",
+        "http host simulation updates split transition to rollback mid-flight",
+        "cluster simulation drives queued split transitions through service-owned metadata updates",
+        "cluster simulation resumes queued split transitions after node restart",
+        "cluster simulation removes queued split transition mid-flight across node restart",
+        "cluster simulation rolls back queued split transition mid-flight across node restart",
+        "cluster simulation survives repeated same-id split overwrites across restart",
+        "cluster simulation drives queued merge transitions through service-owned metadata updates",
+        "http host simulation drives queued merge transitions through the service lane",
+        "http host simulation rolls back and retries queued merge transitions through the service lane",
+        "http host simulation removes queued merge transition mid-flight",
+        "http host simulation updates merge transition to rollback mid-flight",
+        "cluster simulation resumes queued merge transitions after node restart",
+        "cluster simulation rolls back queued merge transition mid-flight across node restart",
+        "cluster simulation survives repeated same-id merge overwrites across restart",
+        "cluster simulation isolates concurrent",
+        "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime",
+        "cluster simulation isolates overlapping same-id split overwrites while other transitions complete",
+        "cluster simulation removes queued merge transition mid-flight across node restart",
+    };
+};
+
+pub const HATestFilters = struct {
+    pub const chaos = [_][]const u8{
+        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
+        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
+        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.ha chaos crash after apply before ack reports durable progress on resume",
+        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
+        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
+        "storage.ha chaos network partition requires fence before standby promotion",
+    };
+
+    pub const compat = [_][]const u8{
+        "storage.ha compat decodes v1 replication record fixture",
+        "storage.ha compat keeps v1 replication record encoding stable",
+        "storage.ha compat decodes v1 timeline switch record fixture",
+        "storage.ha compat keeps v1 timeline switch encoding stable",
+        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
+        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
+        "storage.ha compat decodes v1 backup manifest fixture",
+        "storage.ha compat keeps v1 backup manifest encoding stable",
+        "storage.ha compat keeps v1 backup manifest file kind tags stable",
+        "storage.ha compat keeps v1 record kind tags stable",
+    };
+};
+
+pub const DataTestFilters = struct {
+    pub const runtime = [_][]const u8{
+        "data runtime status refresh publishes synthetic missing status for absent local group db",
+        "data runtime status refresh budget reuses cached group status instead of opening db",
+        "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
+        "data runtime keeps status refresh dirty for non-startup async index work",
+        "data runtime runRound does not refresh provisioned replica root inline while worker is active",
+        "data runtime data changes mark provisioned startup catch-up dirty",
+        "data runtime structural changes preserve writer-published runtime status",
+        "data runtime startup catch-up prefers cached admin snapshot",
+        "data runtime startup catch-up clears no-debt busy writer groups",
+        "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
+        "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime local split fallback preserves source identity namespace",
+        "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data runtime resolves extension package store env before local default",
+        "data runtime cli accepts ARD identity flags",
+        "data public API listener uses public API request body limit",
+        "data server can register a store without enabling data raft",
+        "data server registered data raft uses wal state backend by default",
+        "data server wires configured HA executors into API server",
+        "data server mirrors managed primary writes into HA replication log",
+        "data server fail-closed sync policy rejects primary writes before local commit",
+        "data server block sync policy waits for standby acknowledgement before commit returns",
+        "data server propagates standby HA write gate into provisioned write sources",
+        "storage.ha data server rejects writes and owner jobs after primary promotion fence",
+        "data server applies routed HA replication records through standby write gate",
+        "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server resumes HA standby replication from durable progress after restart",
+        "data runtime records HA standby replication round failures",
+        "data runtime records HA standby apply failures without stopping run round",
+    };
+
+    pub const storage = [_][]const u8{
+        "db split sync coordinator allocates destination identity namespace",
+        "db split status rejects stale destination identity namespace",
+        "db merge coordinator opt-in applies configured receiver identity namespace",
+        "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
+        "db merge coordinator bootstraps relational rows and column entries",
+        "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
+    };
+};
+
+pub const MetadataTestFilters = struct {
+    pub const root = [_][]const u8{
+        "metadata.mod.test.",
+        "metadata.api.test.",
+        "metadata.admin.test.",
+        "metadata.http_routes.test.",
+        "metadata.http_server.test.",
+        "metadata.http_client.test.",
+        "metadata.state.test.",
+        "metadata.storage.",
+        "metadata.service.test.",
+        "metadata.server.test.",
+        "metadata.runtime.test.",
+        "metadata.reconciler.test.",
+        "metadata.control_loop.test.",
+        "metadata.transition_driver.test.",
+        "metadata.replication_backfill.test.",
+    };
+
+    pub const foreign_key = [_][]const u8{
+        "metadata raft apply store preserves projected tables and ranges across reopen",
+        "metadata reconciler converges foreign key reference owner ranges",
+        "metadata reconciler derives foreign key reference owner ranges from table schemas",
+        "metadata reconciler derives primary key and unique owner ranges from table schemas",
+        "metadata reconciler derives secondary index rebuild ranges from building relational indexes",
+        "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys",
+        "metadata reconciler converges unique constraint owner ranges",
+        "metadata raft apply store persists secondary index rebuild work ranges across reopen",
+        "placement planner places foreign key reference owner ranges",
+        "placement planner places unique constraint owner ranges",
+        "placement planner places secondary index rebuild ranges",
+        "table manager applies foreign key reference range lifecycle operations",
+        "table manager applies secondary index rebuild lifecycle operations",
+        "table manager applies unique constraint range lifecycle operations",
+        "table manager owns foreign key reference owner ranges",
+        "table manager owns secondary index rebuild work ranges",
+        "table manager owns unique constraint owner ranges",
+    };
+
+    pub const table_workflow = [_][]const u8{
+        "table workflow can reconcile foreign key reference owner ranges",
+        "table workflow drives foreign key reference range lifecycle commands",
+        "metadata http server accepts internal foreign key reference range lifecycle routes",
+        "table workflow can drive real metadata service topology and split setup",
+        "table workflow can drive placement intents through the real metadata control loop",
+    };
+
+    pub const sim = [_][]const u8{
+        "metadata http cluster simulation",
+    };
+
+    pub const sim_core = [_][]const u8{
+        "metadata http cluster simulation drives table placement convergence",
+        "metadata http cluster simulation converges placement after candidate churn",
+        "metadata http cluster simulation drives split intent through the control loop",
+        "metadata http cluster simulation drives merge intent through the control loop",
+        "metadata http cluster simulation drives automatic split through the control loop",
+        "metadata http cluster simulation drives automatic merge through the control loop",
+        "metadata http cluster simulation uses live median key for automatic split planning",
+        "metadata http cluster simulation uses remote live median key when metadata leader is not a shard replica",
+        "metadata http cluster simulation publishes split topology after finalize",
+        "metadata http cluster simulation publishes merge topology after finalize",
+        "metadata http cluster simulation provisions split destination replicas across nodes",
+        "metadata http cluster simulation retires merge donor replicas across nodes",
+    };
+
+    pub const sim_smoke = [_][]const u8{
+        "metadata sim split runtime preserves source identity namespace",
+        "metadata sim merge runtime records doc identity reassignment opt-in",
+        "metadata http cluster simulation drives table placement convergence",
+        "metadata http cluster simulation drives split intent through the control loop",
+    };
+
+    pub const vopr = [_][]const u8{
+        "metadata VOPR seeded smoke campaign",
+    };
+
+    pub const vopr_chaos = [_][]const u8{
+        "metadata VOPR expanded generated workload campaign",
+        "metadata VOPR relational identity owner topology campaign",
+    };
+
+    pub const transition_chaos = [_][]const u8{
+        "metadata http cluster simulation completes automatic split after metadata leader restart",
+        "metadata http cluster simulation completes automatic split after metadata leader partition",
+        "metadata http cluster simulation completes automatic split under delayed raft transport",
+        "metadata http cluster simulation completes automatic split after leader restart under delayed raft transport",
+        "metadata http cluster simulation completes automatic split after source group leader restart",
+        "metadata http cluster simulation completes automatic split after destination group leader restart",
+        "metadata http cluster simulation completes automatic split after leader partition under delayed raft transport",
+        "metadata http cluster simulation completes automatic merge after metadata leader restart",
+        "metadata http cluster simulation completes automatic merge after donor group leader restart",
+        "metadata http cluster simulation completes automatic merge after receiver group leader restart",
+        "metadata http cluster simulation completes automatic merge after metadata leader partition",
+        "metadata http cluster simulation completes automatic merge under delayed raft transport",
+        "metadata http cluster simulation completes automatic merge after leader restart under delayed raft transport",
+        "metadata http cluster simulation completes automatic merge after leader partition under delayed raft transport",
+        "metadata http cluster simulation survives leader restart before forced automatic split reconcile",
+    };
+
+    pub const public_chaos = [_][]const u8{
+        "metadata http cluster simulation serves public traffic across automatic split under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic split after leader restart under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic split after source leader restart under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic split after leader partition under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic split after metadata leader partition",
+        "metadata http cluster simulation serves public traffic across automatic merge under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic merge after leader restart under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport",
+        "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition",
+        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
+    };
+
+    pub const relational_public_chaos = [_][]const u8{
+        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
+    };
+
+    pub const placement_chaos = [_][]const u8{
+        "metadata http cluster simulation survives metadata leader restart during placement reconcile",
+        "metadata http cluster simulation drops table topology across leader restart",
+    };
+};
+
 pub const GraphMetricTestFilters = struct {
     pub const lifecycle = [_][]const u8{
         "graph degree planned build publishes scores matching local runner",

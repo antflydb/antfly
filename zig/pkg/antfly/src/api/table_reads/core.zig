@@ -26,9 +26,35 @@ const serverless_query = @import("../../serverless/query/mod.zig");
 const distributed_graph = @import("../distributed_graph.zig");
 const runtime_status = @import("../runtime_status.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const table_router = @import("../table_router.zig");
 
 pub const LookupResponse = document_sql_runtime.LookupResponse;
 pub const ScanResponse = document_sql_runtime.ScanResponse;
+
+pub fn appendScanLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    key: []const u8,
+    projected_json: ?[]const u8,
+) !void {
+    const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
+    defer alloc.free(escaped_key);
+
+    try out.appendSlice(alloc, "{\"key\":");
+    try out.appendSlice(alloc, escaped_key);
+    if (projected_json) |json| {
+        if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
+        if (json.len > 2) {
+            try out.append(alloc, ',');
+            try out.appendSlice(alloc, json[1..]);
+        } else {
+            try out.append(alloc, '}');
+        }
+    } else {
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, '\n');
+}
 
 pub const TextStatsResponse = struct {
     fields: []const distributed_stats_mod.TextFieldStats,
@@ -81,6 +107,13 @@ pub const HAReadGate = struct {
         }
     }
 };
+
+pub fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_router.RoutePolicy {
+    return switch (consistency) {
+        .stale => .any_active,
+        .leader_lease, .read_index => .prefer_leader,
+    };
+}
 
 pub const ReadPreparation = struct {
     ptr: *anyopaque,

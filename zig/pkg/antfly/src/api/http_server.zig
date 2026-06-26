@@ -5729,12 +5729,19 @@ pub const ApiHttpServer = struct {
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var lowered = sql_adapter_runtime.lowerWritePlanWithBoundStatementAlloc(
+        const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
+        defer sql_routines.freeExpressionRoutineBindings(self.alloc, routine_bindings);
+        const function_bindings: sql_adapter.SqlFunctionBindings = .{
+            .routine_expressions = routine_bindings,
+        };
+
+        var lowered = sql_adapter_runtime.lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             &bound,
             schema,
             params,
+            function_bindings,
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
             error.DocumentSqlWriteUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_write_unsupported") },

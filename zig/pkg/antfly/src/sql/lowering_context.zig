@@ -6734,6 +6734,7 @@ pub const CatalogWritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         plan.LowerWritePlanOptions,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredWritePlan,
 };
 
@@ -6742,6 +6743,7 @@ pub const CatalogWritePlanLoweringContext = struct {
     sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
     callbacks: CatalogWritePlanLoweringCallbacks,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
@@ -6796,7 +6798,7 @@ pub const CatalogWritePlanLoweringContext = struct {
 
     fn lowerWithOptions(ptr: *anyopaque, resolved_options: plan.LowerWritePlanOptions) anyerror!plan.LoweredWritePlan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.callbacks.lower_with_options(self.alloc, self.parsed_sql.?, self.schema, self.params, resolved_options);
+        return try self.callbacks.lower_with_options(self.alloc, self.parsed_sql.?, self.schema, self.params, resolved_options, self.function_bindings);
     }
 };
 
@@ -6808,6 +6810,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         plan.LowerWritePlanOptions,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredWritePlan,
     lower_recursive_insert_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6816,6 +6819,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveInsertSource,
     lower_recursive_update_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6824,6 +6828,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
     lower_recursive_delete_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6832,6 +6837,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
     lower_recursive_merge_mutation_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6839,6 +6845,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveMergeMutation,
     lower_insert_with_resolver: *const fn (
         std.mem.Allocator,
@@ -6846,6 +6853,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsert,
     lower_insert_source_with_resolver: *const fn (
         std.mem.Allocator,
@@ -6853,6 +6861,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsertSource,
     lower_insert_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6861,6 +6870,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsertSource,
     lower_update_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6869,6 +6879,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredJoinedMutationSource,
     classify_update_selector: *const fn (
         std.mem.Allocator,
@@ -6883,6 +6894,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutation,
     lower_update_source: *const fn (
         std.mem.Allocator,
@@ -6890,6 +6902,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutationSource,
     lower_delete_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -6898,6 +6911,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredJoinedMutationSource,
     classify_delete_selector: *const fn (
         std.mem.Allocator,
@@ -6912,6 +6926,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutation,
     lower_delete_source: *const fn (
         std.mem.Allocator,
@@ -6919,6 +6934,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutationSource,
     lower_truncate_source: *const fn (
         std.mem.Allocator,
@@ -6932,6 +6948,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
+        lower_expr.SqlFunctionBindings,
     ) anyerror!plan.LoweredMergeMutationPlan,
 };
 
@@ -6940,6 +6957,7 @@ pub const WritePlanLoweringContext = struct {
     sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
     callbacks: WritePlanLoweringCallbacks,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
@@ -6954,7 +6972,7 @@ pub const WritePlanLoweringContext = struct {
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
         if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-            return try self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options);
+            return try self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options, self.function_bindings);
         }
         return try plan.lowerWritePlanWithParsedSqlAlloc(parsed_sql, self.schema, options, self.hooks());
     }
@@ -6988,42 +7006,42 @@ pub const WritePlanLoweringContext = struct {
 
     fn lowerRecursiveInsertSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredRecursiveInsertSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver);
+        return try self.callbacks.lower_recursive_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerRecursiveUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredRecursiveJoinedMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim);
+        return try self.callbacks.lower_recursive_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
     }
 
     fn lowerRecursiveDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredRecursiveJoinedMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim);
+        return try self.callbacks.lower_recursive_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
     }
 
     fn lowerRecursiveMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!plan.LoweredRecursiveMergeMutation {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_recursive_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params);
+        return try self.callbacks.lower_recursive_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, self.function_bindings);
     }
 
     fn lowerInsert(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsert {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
+        return try self.callbacks.lower_insert_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerInsertSource(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsertSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_source_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
+        return try self.callbacks.lower_insert_source_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerInsertSourceWithSchema(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredInsertSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver);
+        return try self.callbacks.lower_insert_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredJoinedMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim);
+        return try self.callbacks.lower_update_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
     }
 
     fn classifyUpdateSelector(ptr: *anyopaque, resolver: ?relational_rows.UniqueSelectorResolver) anyerror!plan.MutationSelectorKind {
@@ -7033,17 +7051,17 @@ pub const WritePlanLoweringContext = struct {
 
     fn lowerUpdate(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredMutation {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
+        return try self.callbacks.lower_update_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerUpdateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_update_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim);
+        return try self.callbacks.lower_update_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim, self.function_bindings);
     }
 
     fn lowerDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredJoinedMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim);
+        return try self.callbacks.lower_delete_joined_source_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, row_claim, self.function_bindings);
     }
 
     fn classifyDeleteSelector(ptr: *anyopaque, resolver: ?relational_rows.UniqueSelectorResolver) anyerror!plan.MutationSelectorKind {
@@ -7053,12 +7071,12 @@ pub const WritePlanLoweringContext = struct {
 
     fn lowerDelete(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredMutation {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver);
+        return try self.callbacks.lower_delete_with_resolver(self.alloc, self.parsed_sql.?, self.schema, self.params, resolver, self.function_bindings);
     }
 
     fn lowerDeleteSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_delete_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim);
+        return try self.callbacks.lower_delete_source(self.alloc, self.parsed_sql.?, self.schema, self.params, row_claim, self.function_bindings);
     }
 
     fn lowerTruncateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!plan.LoweredMutationSource {
@@ -7068,7 +7086,7 @@ pub const WritePlanLoweringContext = struct {
 
     fn lowerMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!plan.LoweredMergeMutationPlan {
         const self = fromPtr(ptr);
-        return try self.callbacks.lower_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params);
+        return try self.callbacks.lower_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params, self.function_bindings);
     }
 };
 

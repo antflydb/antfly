@@ -12430,27 +12430,201 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
-            .lower_generated_dml = lowerWritePlanFromGeneratedDmlAstDirectAlloc,
-            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestAlloc,
-            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc,
-            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_generated_dml = lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc,
+            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
             .classify_update_selector = classifyUpdateSelectorParsedSqlAlloc,
-            .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestAlloc,
-            .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
             .classify_delete_selector = classifyDeleteSelectorParsedSqlAlloc,
-            .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestAlloc,
-            .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestAlloc,
+            .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestWithFunctionBindingsAlloc,
+            .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc,
             .lower_truncate_source = lowerTruncateMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlForDmlTestAlloc,
+            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlForDmlTestWithFunctionBindingsAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql, options);
+}
+
+fn lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredRecursiveInsertSource {
+    _ = function_bindings;
+    return try lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
+}
+
+fn lowerInsertWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredInsert {
+    _ = function_bindings;
+    return try lowerInsertWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerInsertSourceWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredInsertSource {
+    _ = function_bindings;
+    return try lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredInsertSource {
+    _ = function_bindings;
+    return try lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
+}
+
+fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredJoinedMutationSource {
+    _ = function_bindings;
+    return try lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+}
+
+fn lowerUpdateParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredMutation {
+    _ = function_bindings;
+    return try lowerUpdateParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerUpdateMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredMutationSource {
+    _ = function_bindings;
+    return try lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
+}
+
+fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredJoinedMutationSource {
+    _ = function_bindings;
+    return try lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+}
+
+fn lowerDeleteParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredMutation {
+    _ = function_bindings;
+    return try lowerDeleteParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerDeleteMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredMutationSource {
+    _ = function_bindings;
+    return try lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
+}
+
+fn lowerMergeMutationPlanParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredMergeMutationPlan {
+    _ = function_bindings;
+    return try lowerMergeMutationPlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
+}
+
+fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    _ = function_bindings;
+    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+}
+
+fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    _ = function_bindings;
+    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
+}
+
+fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredRecursiveMergeMutation {
+    _ = function_bindings;
+    return try lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
 }
 
 pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
@@ -12461,13 +12635,25 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(alloc, parsed_sql, dml_ast, schema, params, options, .{});
+}
+
+pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredWritePlan {
     const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
     if (dml_ast.cte_recursive) {
         return try lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind);
     }
     if (dml_ast.kind == .insert_values) {
-        if (insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |insert| {
+        if (insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options, function_bindings)) |insert| {
             return .{ .insert = insert };
         } else |err| switch (err) {
             error.UnsupportedSqlShape => {},
@@ -12855,6 +13041,18 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredInsert {
+    return try insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(alloc, tokens, ast, schema, params, options, .{});
+}
+
+fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredInsert {
     if (ast.kind != .insert_values) return error.UnsupportedSqlShape;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (ast.source_tokens != null) return error.UnsupportedSqlShape;
@@ -12932,6 +13130,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
             .schema = schema,
             .params = params,
             .unique_resolver = options.unique_resolver,
+            .function_bindings = function_bindings,
         };
         const insert_options = parser_context.ParserState.ContextAccessors.insertParserOptions(&parser_state);
         const conflict_qualifiers = [_][]const u8{table_name};
@@ -12972,6 +13171,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
             .tokens = tokens,
             .schema = schema,
             .params = params,
+            .function_bindings = function_bindings,
         };
         returning = try generatedReturningProjectionAlloc(
             alloc,

@@ -86,16 +86,7 @@ const table_read_remote_wire = @import("table_reads/remote_wire.zig");
 const table_read_fanout = @import("table_reads/fanout.zig");
 const table_read_graph = @import("table_reads/graph.zig");
 
-fn nativeCatalogTableNameAlloc(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    target: catalog_resources.TableTarget,
-) ![]u8 {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
-    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
-}
+const nativeCatalogTableNameAlloc = table_catalog.nativeTableNameForCatalogTargetAlloc;
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
@@ -169,12 +160,14 @@ pub const LoweredRelationPopulationRowsResult = table_read_relational_rows.Lower
 
 pub const LsmStorageStats = table_read_core.LsmStorageStats;
 pub const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
+const appendScanLine = table_read_core.appendScanLine;
 pub const HAReadGate = table_read_core.HAReadGate;
 pub const ReadPreparation = table_read_core.ReadPreparation;
 pub const backend_current_root_generation = table_read_core.backend_current_root_generation;
 pub const GroupVisibleRootGenerationSource = table_read_core.GroupVisibleRootGenerationSource;
 pub const PrimaryLookupDbLease = table_read_core.PrimaryLookupDbLease;
 pub const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
+const routePolicyForConsistency = table_read_core.routePolicyForConsistency;
 
 pub const testing = if (builtin.is_test) struct {
     pub fn rejectResolvedDocFilterForCrossGroup(req: db_mod.types.SearchRequest, group_count: usize) !void {
@@ -3432,13 +3425,6 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 };
-
-fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_router.RoutePolicy {
-    return switch (consistency) {
-        .stale => .any_active,
-        .leader_lease, .read_index => .prefer_leader,
-    };
-}
 
 const DocumentSqlRuntimeSourceAdapter = table_read_document_sql.RuntimeSourceAdapter;
 
@@ -14040,31 +14026,6 @@ fn queryRemote(
         req,
         vector_worker_body,
     );
-}
-
-fn appendScanLine(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    key: []const u8,
-    projected_json: ?[]const u8,
-) !void {
-    const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
-    defer alloc.free(escaped_key);
-
-    try out.appendSlice(alloc, "{\"key\":");
-    try out.appendSlice(alloc, escaped_key);
-    if (projected_json) |json| {
-        if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
-        if (json.len > 2) {
-            try out.append(alloc, ',');
-            try out.appendSlice(alloc, json[1..]);
-        } else {
-            try out.append(alloc, '}');
-        }
-    } else {
-        try out.append(alloc, '}');
-    }
-    try out.append(alloc, '\n');
 }
 
 test "routed rows query plan executes over scanned owner rows with ctes" {

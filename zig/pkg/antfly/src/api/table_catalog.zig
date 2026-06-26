@@ -23,6 +23,7 @@ const metadata_reconciler = @import("../metadata/reconciler.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const tables_api = @import("tables.zig");
 
 pub const CatalogSource = struct {
@@ -217,6 +218,24 @@ fn emptyAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
 }
 
 fn emptyFreeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+pub fn nativeTableNameForCatalogTargetAlloc(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
+}
+
+pub fn nativeTableNameForCatalogCreateTargetAlloc(
+    alloc: std.mem.Allocator,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
+}
 
 pub const TableRangeRef = struct {
     group_id: u64,

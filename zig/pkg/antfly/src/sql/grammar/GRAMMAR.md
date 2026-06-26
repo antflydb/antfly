@@ -38,6 +38,10 @@ grammar parsing, production validation, nullable/FIRST/FOLLOW sets, LR(0)
 states, indexed action/goto tables, source-aware syntax diagnostics, and
 structured conflict reporting. Generator tests cover URL-bearing reference
 metadata so `https://` references are not confused with grammar comments. The
+grammar seed uses `%expect` to record the current broad-grammar conflict count;
+regeneration fails if the parser table conflict count drifts without an
+intentional grammar update, and the checked-in generated metadata records both
+actual and expected conflict counts. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. The
 first runtime integration observes the generated parser on the `ParsedSql` path
