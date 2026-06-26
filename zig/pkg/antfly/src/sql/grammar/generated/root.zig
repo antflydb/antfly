@@ -212993,9 +212993,8 @@ pub fn tokenId(token: Token) u16 {
 }
 
 pub fn terminalIdByName(name: []const u8) ?u16 {
-    var idx: usize = 1;
-    while (idx < token_count + 1) : (idx += 1) {
-        if (std.mem.eql(u8, symbols[idx].name, name)) return @intCast(idx);
+    inline for (std.meta.fields(Token)) |field| {
+        if (std.mem.eql(u8, field.name, name)) return @intFromEnum(@field(Token, field.name)) + 1;
     }
     return null;
 }

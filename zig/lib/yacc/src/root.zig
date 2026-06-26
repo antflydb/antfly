@@ -797,9 +797,8 @@ fn emitZigMetadata(
         \\}
         \\
         \\pub fn terminalIdByName(name: []const u8) ?u16 {
-        \\    var idx: usize = 1;
-        \\    while (idx < token_count + 1) : (idx += 1) {
-        \\        if (std.mem.eql(u8, symbols[idx].name, name)) return @intCast(idx);
+        \\    inline for (std.meta.fields(Token)) |field| {
+        \\        if (std.mem.eql(u8, field.name, name)) return @intFromEnum(@field(Token, field.name)) + 1;
         \\    }
         \\    return null;
         \\}
@@ -1296,6 +1295,7 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenId(token: Token) u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn terminalIdByName(name: []const u8) ?u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenIdByName") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "symbols[idx]") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalCountForState(state: u16) usize") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn actionsForState") == null);
