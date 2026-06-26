@@ -2725,7 +2725,8 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
             expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
             expression.over_order_tokens != null or expression.over_order_items.count != 0 or
             expression.over_frame_tokens != null or expression.over_frame_start_expression_tokens != null or
-            expression.over_frame_start_expression != null or expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_start_expression_kind != null or expression.over_frame_start_expression != null or
+            expression.over_frame_end_expression_tokens != null or expression.over_frame_end_expression_kind != null or
             expression.over_frame_end_expression != null)
         {
             return error.UnsupportedSqlShape;
@@ -2736,11 +2737,14 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
     if (expression.over_name_tokens == null and expression.over_definition_tokens == null) return error.UnsupportedSqlShape;
     const over_tokens = expression.over_tokens.?;
     if (expression.over_name_tokens) |name_tokens| {
-        if (name_tokens.start <= over_tokens.start or name_tokens.end != over_tokens.end) return error.UnsupportedSqlShape;
+        if (name_tokens.start != over_tokens.start + 1 or name_tokens.end != over_tokens.end or name_tokens.start >= name_tokens.end) {
+            return error.UnsupportedSqlShape;
+        }
         if (expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
             expression.over_order_tokens != null or expression.over_order_items.count != 0 or
             expression.over_frame_tokens != null or expression.over_frame_start_expression_tokens != null or
-            expression.over_frame_start_expression != null or expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_start_expression_kind != null or expression.over_frame_start_expression != null or
+            expression.over_frame_end_expression_tokens != null or expression.over_frame_end_expression_kind != null or
             expression.over_frame_end_expression != null)
         {
             return error.UnsupportedSqlShape;
@@ -2748,7 +2752,7 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         return;
     }
     if (expression.over_definition_tokens) |definition_tokens| {
-        if (definition_tokens.start <= over_tokens.start or definition_tokens.end >= over_tokens.end) return error.UnsupportedSqlShape;
+        if (definition_tokens.start != over_tokens.start + 2 or definition_tokens.end != over_tokens.end - 1) return error.UnsupportedSqlShape;
     }
     if (expression.over_partition_tokens) |_| {
         if (expression.over_partition_items.count == 0) return error.UnsupportedSqlShape;
@@ -2762,7 +2766,8 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
     }
     if (expression.over_frame_tokens == null) {
         if (expression.over_frame_start_expression_tokens != null or expression.over_frame_start_expression != null or
-            expression.over_frame_end_expression_tokens != null or expression.over_frame_end_expression != null)
+            expression.over_frame_start_expression_kind != null or expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_end_expression_kind != null or expression.over_frame_end_expression != null)
         {
             return error.UnsupportedSqlShape;
         }
@@ -2870,6 +2875,22 @@ fn validateGeneratedFunctionCallClauseMetadata(
 
     if (expression.over_tokens) |over_tokens| {
         if (over_tokens.start != cursor or over_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
+        if (over_tokens.start >= over_tokens.end or over_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        if (!tokens[over_tokens.start].matchesKeywordTag(.over)) return error.UnsupportedSqlShape;
+        if (expression.over_name_tokens) |over_name_tokens| {
+            if (over_name_tokens.start != over_tokens.start + 1 or over_name_tokens.end != over_tokens.end or over_name_tokens.start >= over_name_tokens.end) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (expression.over_definition_tokens) |definition_tokens| {
+            if (over_tokens.start + 2 > over_tokens.end or tokens[over_tokens.start + 1].kind != .lparen or tokens[over_tokens.end - 1].kind != .rparen) {
+                return error.UnsupportedSqlShape;
+            }
+            if (definition_tokens.start != over_tokens.start + 2 or definition_tokens.end != over_tokens.end - 1) {
+                return error.UnsupportedSqlShape;
+            }
+        } else {
+            return error.UnsupportedSqlShape;
+        }
     } else if (cursor != expression_tokens.end) {
         return error.UnsupportedSqlShape;
     }
@@ -5944,6 +5965,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_inline_window_parsed_sql, malformed_inline_window_read_ast),
+    );
+    malformed_inline_window_read_ast = switch (malformed_inline_window_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_inline_window_definition_tokens = malformed_inline_window_read_ast.projection_items.expressions[1].over_definition_tokens orelse return error.UnsupportedSqlShape;
+    malformed_inline_window_read_ast.projection_items.expressions[1].over_definition_tokens = .{
+        .start = malformed_inline_window_definition_tokens.start - 1,
+        .end = malformed_inline_window_definition_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_inline_window_parsed_sql.items(), &malformed_inline_window_read_ast),
     );
 
     var malformed_inline_window_frame_parsed_sql = try tokenized.ParsedSql.initAlloc(

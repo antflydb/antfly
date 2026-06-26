@@ -1075,10 +1075,11 @@ contract until storage and API row plans grow those outer-join semantics.
    name/definition, partition list, order list, and frame expression spans
    before the typed window lowerer accepts a consumed `WINDOW` tail.
    Generated inline window `OVER` expressions now validate the generated
-   `OVER` span, named-window reference or inline definition, partition list,
-   order list, frame expression spans, and typed window-function argument
-   arity/ranges before the typed window-spec lowerer accepts the consumed
-   projection expression.
+   `OVER` span, exact `OVER name` or `OVER (...)` token layout,
+   named-window reference or inline definition, partition list, order list,
+   frame expression spans, and typed window-function argument arity/ranges
+   before the typed window-spec lowerer accepts the consumed projection
+   expression.
    Generated aggregate projection functions now validate retained function
    name, argument, `DISTINCT`, ordered-argument, `WITHIN GROUP`, and `FILTER`
    predicate spans before the typed aggregate lowerer accepts supported

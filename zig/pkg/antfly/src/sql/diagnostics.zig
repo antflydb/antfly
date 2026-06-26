@@ -28,6 +28,141 @@ pub const SqlDiagnostic = struct {
     }
 };
 
+pub const SqlDiagnosticPhase = enum {
+    parse,
+    bind,
+    plan,
+    execute,
+};
+
+pub const SqlDiagnosticCode = enum {
+    current_transaction_aborted,
+    document_sql_view_mapping_unsupported,
+    invalid_role_setting,
+    invalid_sql_catalog,
+    invalid_sql_request,
+    invalid_sql_session,
+    invalid_sql_write,
+    prepared_statement_already_exists,
+    prepared_statement_argument_mismatch,
+    prepared_statement_not_found,
+    read_only_transaction,
+    role_setting_not_found,
+    sql_read_backpressured,
+    statement_timeout,
+    table_not_found,
+    topology_changed,
+    unique_owner_unavailable,
+    unsupported_sql_statement,
+};
+
+pub const SqlDiagnosticEnvelope = struct {
+    phase: SqlDiagnosticPhase,
+    code: SqlDiagnosticCode,
+    message: []const u8,
+    span: SourceSpan = .{},
+    hint: ?[]const u8 = null,
+    missing_native_model: ?[]const u8 = null,
+
+    pub fn init(phase: SqlDiagnosticPhase, code: SqlDiagnosticCode) SqlDiagnosticEnvelope {
+        return .{
+            .phase = phase,
+            .code = code,
+            .message = diagnosticCodeDefaultMessage(code),
+            .missing_native_model = diagnosticCodeMissingNativeModel(code),
+        };
+    }
+
+    pub fn withMessage(self: SqlDiagnosticEnvelope, message: []const u8) SqlDiagnosticEnvelope {
+        var copy = self;
+        copy.message = message;
+        return copy;
+    }
+
+    pub fn withSpan(self: SqlDiagnosticEnvelope, span: SourceSpan) SqlDiagnosticEnvelope {
+        var copy = self;
+        copy.span = span;
+        return copy;
+    }
+
+    pub fn withHint(self: SqlDiagnosticEnvelope, hint: []const u8) SqlDiagnosticEnvelope {
+        var copy = self;
+        copy.hint = hint;
+        return copy;
+    }
+
+    pub fn withMissingNativeModel(self: SqlDiagnosticEnvelope, missing_native_model: []const u8) SqlDiagnosticEnvelope {
+        var copy = self;
+        copy.missing_native_model = missing_native_model;
+        return copy;
+    }
+};
+
+pub fn diagnosticPhaseToken(phase: SqlDiagnosticPhase) []const u8 {
+    return @tagName(phase);
+}
+
+pub fn diagnosticCodeToken(code: SqlDiagnosticCode) []const u8 {
+    return @tagName(code);
+}
+
+pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
+    return switch (code) {
+        .current_transaction_aborted => "current transaction is aborted",
+        .document_sql_view_mapping_unsupported => "document_sql_view_mapping_unsupported",
+        .invalid_role_setting => "invalid sql setting",
+        .invalid_sql_catalog => "invalid sql catalog",
+        .invalid_sql_request => "invalid sql request",
+        .invalid_sql_session => "invalid sql session",
+        .invalid_sql_write => "invalid sql write",
+        .prepared_statement_already_exists => "prepared statement already exists",
+        .prepared_statement_argument_mismatch => "prepared statement argument mismatch",
+        .prepared_statement_not_found => "prepared statement not found",
+        .read_only_transaction => "cannot execute statement in a read-only transaction",
+        .role_setting_not_found => "role setting not found",
+        .sql_read_backpressured => "sql read backpressured",
+        .statement_timeout => "sql statement timeout",
+        .table_not_found => "table not found",
+        .topology_changed => "topology changed",
+        .unique_owner_unavailable => "unique owner unavailable",
+        .unsupported_sql_statement => "unsupported sql statement",
+    };
+}
+
+pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
+    return switch (code) {
+        .document_sql_view_mapping_unsupported => "document-to-SQL view mapping execution",
+        .unsupported_sql_statement => "typed Antfly logical plan for this SQL shape",
+        else => null,
+    };
+}
+
+pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagnosticEnvelope {
+    const code: SqlDiagnosticCode = switch (err) {
+        error.DocumentSqlViewMappingUnsupported => .document_sql_view_mapping_unsupported,
+        error.InvalidRoleSetting => .invalid_role_setting,
+        error.InvalidSqlCatalog => .invalid_sql_catalog,
+        error.InvalidSqlSession => .invalid_sql_session,
+        error.PreparedStatementAlreadyExists => .prepared_statement_already_exists,
+        error.PreparedStatementArgumentMismatch => .prepared_statement_argument_mismatch,
+        error.PreparedStatementNotFound => .prepared_statement_not_found,
+        error.RoleSettingNotFound => .role_setting_not_found,
+        error.SqlReadOnlyTransaction => .read_only_transaction,
+        error.StatementTimeout => .statement_timeout,
+        error.TableNotFound => .table_not_found,
+        error.TopologyChanged => .topology_changed,
+        error.UniqueOwnerTopologyUnavailable,
+        error.DocIdentityNamespaceMismatch,
+        => .unique_owner_unavailable,
+        error.UnsupportedOperation,
+        error.UnsupportedRowsQuery,
+        error.UnsupportedSqlShape,
+        => .unsupported_sql_statement,
+        else => return null,
+    };
+    return SqlDiagnosticEnvelope.init(phase, code);
+}
+
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
     bulk_io_plan,
@@ -224,4 +359,21 @@ test "sql adapter diagnostics map unsupported classifications to native requirem
         const reason: SqlAdapterClassificationReason = @enumFromInt(field.value);
         _ = nativeExecutionRequirement(reason);
     }
+}
+
+test "sql diagnostics expose stable phase code and native model fields" {
+    const unsupported = SqlDiagnosticEnvelope.init(.plan, .unsupported_sql_statement).withSpan(.{ .start = 7, .end = 19 });
+    try std.testing.expectEqual(SqlDiagnosticPhase.plan, unsupported.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.unsupported_sql_statement, unsupported.code);
+    try std.testing.expectEqualStrings("plan", diagnosticPhaseToken(unsupported.phase));
+    try std.testing.expectEqualStrings("unsupported_sql_statement", diagnosticCodeToken(unsupported.code));
+    try std.testing.expectEqualStrings("unsupported sql statement", unsupported.message);
+    try std.testing.expectEqualStrings("typed Antfly logical plan for this SQL shape", unsupported.missing_native_model.?);
+    try std.testing.expectEqual(@as(usize, 7), unsupported.span.start);
+    try std.testing.expectEqual(@as(usize, 19), unsupported.span.end);
+
+    const readonly = knownErrorDiagnostic(.execute, error.SqlReadOnlyTransaction) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticPhase.execute, readonly.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.read_only_transaction, readonly.code);
+    try std.testing.expect(readonly.missing_native_model == null);
 }

@@ -44,8 +44,10 @@ testdata/            Shared checked-in fixture data
 
 Root-level Markdown files are design and operating notes for active AntflyDB
 areas. Library-specific design docs live next to their libraries, for example
-`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Inference-specific design docs
+`lib/image/IMAGE.md` and `lib/audio/AUDIO.md`. Inference-specific design docs
 currently live under `pkg/inference/`.
+See [DOCUMENTATION.md](DOCUMENTATION.md) for a curated index of first-party
+Markdown docs in this tree.
 
 ## Build Requirements
 

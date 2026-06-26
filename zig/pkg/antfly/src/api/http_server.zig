@@ -5743,19 +5743,19 @@ pub const ApiHttpServer = struct {
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         if (try self.publicSqlReadOnlyActive(session)) {
-            return .{ .response = try textResponse(self.alloc, 400, "cannot execute write statement in a read-only transaction") };
+            return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .read_only_transaction).withMessage("cannot execute write statement in a read-only transaction")) };
         }
 
-        const statement_kind = parsed_sql.writeStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const statement_kind = parsed_sql.writeStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         switch (statement_kind) {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
 
         const write_catalog = switch (logical_plan.*) {
             .catalog_write => |*catalog_write| catalog_write,
-            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        const target_binding = write_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const target_binding = write_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
         const target = target_binding.target();
         const target_table = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table);
@@ -5778,12 +5778,12 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => {
                 std.log.err("public sql write lower not found table={s} err={}", .{ target_table, err });
-                return .{ .response = try textResponse(self.alloc, 404, "not found") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
-            error.DocumentSqlWriteUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_write_unsupported") },
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
-            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
+            error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .invalid_sql_write).withMessage("document_sql_write_unsupported").withMissingNativeModel("document SQL write execution")) },
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
+            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.plan, .unique_owner_unavailable)) },
             else => return err,
         };
         var lowered_owned = true;
@@ -5792,7 +5792,7 @@ pub const ApiHttpServer = struct {
 
         if (lowered == .insert_source) {
             const returning_columns = self.publicSqlInsertSourceRequestReturningColumnsAlloc(schema, lowered.insert_source.insert_source.req) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5821,7 +5821,7 @@ pub const ApiHttpServer = struct {
                 else => unreachable,
             };
             const returning_columns = self.publicSqlMutationRequestReturningColumnsAlloc(schema, mutation_source.mutation.req) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5845,7 +5845,7 @@ pub const ApiHttpServer = struct {
 
         if (lowered == .truncate_source) {
             if (lowered.truncate_source.additional_table_names.len != 0 or lowered.truncate_source.truncate_cascade or lowered.truncate_source.restart_identity) {
-                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
             }
             const truncate_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, &lowered.truncate_source, authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
@@ -5867,13 +5867,13 @@ pub const ApiHttpServer = struct {
                 else => unreachable,
             };
             const owned_source_schema = self.publicSqlSourceSchemaForWriteAlloc(target_table, joined_mutation_source.source_table_name, session.session()) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 else => return err,
             };
             defer if (owned_source_schema) |source_schema| runtime_schema_mod.freeSchema(self.alloc, source_schema);
             const joined_source_schema = owned_source_schema orelse schema;
             const returning_columns = self.publicSqlJoinedMutationRequestReturningColumnsAlloc(schema, joined_source_schema, joined_mutation_source.mutation.req) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5904,7 +5904,7 @@ pub const ApiHttpServer = struct {
             var recursive_source_schema = schema;
             recursive_source_schema.relational_columns = recursive_joined_mutation_source.recursive.output_columns;
             const returning_columns = self.publicSqlJoinedMutationRequestReturningColumnsAlloc(schema, recursive_source_schema, recursive_joined_mutation_source.mutation.mutation.req) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5928,13 +5928,13 @@ pub const ApiHttpServer = struct {
 
         if (lowered == .merge_mutation) {
             const owned_source_schema = self.publicSqlSourceSchemaForWriteAlloc(target_table, lowered.merge_mutation.source_table_name, session.session()) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 else => return err,
             };
             defer if (owned_source_schema) |source_schema| runtime_schema_mod.freeSchema(self.alloc, source_schema);
             const merge_source_schema = owned_source_schema orelse schema;
             const returning_columns = self.publicSqlReturningColumnsAlloc(schema, merge_source_schema, lowered.merge_mutation.returning) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5960,7 +5960,7 @@ pub const ApiHttpServer = struct {
             var recursive_source_schema = schema;
             recursive_source_schema.relational_columns = lowered.recursive_merge_mutation.recursive.output_columns;
             const returning_columns = self.publicSqlReturningColumnsAlloc(schema, recursive_source_schema, lowered.recursive_merge_mutation.merge.returning) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
                 else => return err,
             };
             var returning_columns_owned = true;
@@ -5986,10 +5986,10 @@ pub const ApiHttpServer = struct {
             .insert => |*insert| insert.returning,
             .update => |*update| update.returning,
             .delete => |*delete| delete.returning,
-            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
         const returning_columns = self.publicSqlReturningColumnsAlloc(schema, null, returning_projection) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
             else => return err,
         };
         var returning_columns_owned = true;
@@ -5998,7 +5998,7 @@ pub const ApiHttpServer = struct {
             .insert => |*insert| &insert.batch,
             .update => |*update| &update.batch,
             .delete => |*delete| &delete.batch,
-            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
         if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -6046,15 +6046,15 @@ pub const ApiHttpServer = struct {
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
-        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
-        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
 
         const read_catalog = switch (logical_plan.*) {
             .catalog_read => |*catalog_read| catalog_read,
-            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        const target_binding = read_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
@@ -6080,17 +6080,17 @@ pub const ApiHttpServer = struct {
             params,
             function_bindings,
         ) catch |err| {
-            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
+            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .invalid_sql_request).withMessage(message).withMissingNativeModel("document SQL read shape")) };
             switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
-                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
                 else => return err,
             }
         };
         defer lowered.deinit(self.alloc);
         self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
-            error.InvalidQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -6102,7 +6102,7 @@ pub const ApiHttpServer = struct {
             lowered,
             session.session(),
         ) catch |err| switch (err) {
-            error.InvalidRowsRequest, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidRowsRequest, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         var result_columns_owned = true;
@@ -6118,16 +6118,16 @@ pub const ApiHttpServer = struct {
             lowered,
             .read_index,
         ) catch |err| {
-            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
+            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .invalid_sql_request).withMessage(message).withMissingNativeModel("document SQL read execution")) };
             switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
-                error.RelationalRowsCteSpillRequired => return .{ .response = try textResponse(self.alloc, 429, "sql read backpressured") },
-                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-                error.TopologyChanged => return .{ .response = try textResponse(self.alloc, 503, "topology changed") },
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
+                error.RelationalRowsCteSpillRequired => return .{ .response = try self.publicSqlDiagnosticResponse(429, .init(.execute, .sql_read_backpressured)) },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
+                error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
                 else => return err,
             }
-        }) orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        }) orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         result_columns_owned = false;
@@ -6158,19 +6158,19 @@ pub const ApiHttpServer = struct {
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
-        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
-        _ = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        _ = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
 
         var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
             else => return err,
         };
         defer bound.deinit(self.alloc);
         const read_catalog = bound.readCatalog() catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
         };
-        const target_binding = read_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
@@ -6196,17 +6196,17 @@ pub const ApiHttpServer = struct {
             params,
             function_bindings,
         ) catch |err| {
-            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
+            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .invalid_sql_request).withMessage(message).withMissingNativeModel("document SQL read shape")) };
             switch (err) {
-                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
-                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
                 else => return err,
             }
         };
         defer lowered.deinit(self.alloc);
         self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
-            error.InvalidQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -6218,7 +6218,7 @@ pub const ApiHttpServer = struct {
             lowered,
             session.session(),
         ) catch |err| switch (err) {
-            error.InvalidRowsRequest, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidRowsRequest, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         var result_columns_owned = true;
@@ -6435,15 +6435,15 @@ pub const ApiHttpServer = struct {
         };
         var lowered = sql_adapter.lowerAntflyQueryFunctionReadParsedSqlAlloc(self.alloc, self.semanticResolver(&semantic_resolver), parsed_sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return null,
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
             else => return err,
         };
         defer lowered.deinit(self.alloc);
 
-        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
         const target = session.session().tableTargetFromObjectName(lowered.table_name) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
         };
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
@@ -6451,12 +6451,12 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         self.maybeRouteCatalogQueryToReadSchema(target, &lowered.request.req) catch |err| switch (err) {
-            error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) },
+            error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         if (row_filter_json) |value| {
-            injectRowFilterIntoSearchRequest(self.alloc, &lowered.request.req, value) catch return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+            injectRowFilterIntoSearchRequest(self.alloc, &lowered.request.req, value) catch return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) };
         }
 
         var query_response = query_blk: {
@@ -6464,22 +6464,22 @@ pub const ApiHttpServer = struct {
                 break :query_blk result;
             } else |err| switch (err) {
                 error.UnsupportedOperation => {},
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
                 error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
-                error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-                error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "doc identity unavailable") },
+                error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
+                error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unique_owner_unavailable).withMessage("doc identity unavailable")) },
                 else => return err,
             }
             const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, target);
             defer self.alloc.free(native_table_name);
             break :query_blk (read_source.query(self.alloc, native_table_name, lowered.request.req, .read_index) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
                 error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
-                error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-                error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "doc identity unavailable") },
+                error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
+                error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unique_owner_unavailable).withMessage("doc identity unavailable")) },
                 else => return err,
             });
-        } orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        } orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) };
         defer query_response.deinit(self.alloc);
 
         const rows_result = try sqlQueryFunctionRowsFromQueryResponseAlloc(self.alloc, query_response.json, lowered.projection_columns);
@@ -6783,9 +6783,9 @@ pub const ApiHttpServer = struct {
         var parsed = std.json.parseFromSlice(PublicSqlJsonRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
-        }) catch return try textResponse(self.alloc, 400, "invalid sql request");
+        }) catch return try self.publicSqlDiagnosticResponse(400, .init(.parse, .invalid_sql_request));
         defer parsed.deinit();
-        var params = publicSqlParamsFromJsonAlloc(self.alloc, parsed.value.params) catch return try textResponse(self.alloc, 400, "invalid sql request");
+        var params = publicSqlParamsFromJsonAlloc(self.alloc, parsed.value.params) catch return try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request));
         defer params.deinit(self.alloc);
         return try self.handlePublicSqlRequest(.{
             .sql = parsed.value.sql,
@@ -6795,6 +6795,14 @@ pub const ApiHttpServer = struct {
             .read_only = parsed.value.read_only,
             .params = params.values,
         }, authenticated_identity);
+    }
+
+    fn publicSqlDiagnosticResponse(
+        self: *ApiHttpServer,
+        status: u16,
+        diagnostic: sql_adapter.diagnostics.SqlDiagnosticEnvelope,
+    ) !http_common.HttpResponse {
+        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, .{ .@"error" = diagnostic });
     }
 
     pub fn handlePublicSqlRequest(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
@@ -7837,10 +7845,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn executePublicSqlRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
-        if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+        if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.parse, .invalid_sql_request)) };
 
         var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(request) catch |err| switch (err) {
-            error.InvalidSqlRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         defer session.deinit(self.alloc);
@@ -7849,7 +7857,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedSqlShape => {
                 self.markPublicSqlTransactionFailedIfActive(&session);
                 try self.savePublicSqlSession(session);
-                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.parse, .unsupported_sql_statement)) };
             },
             else => return err,
         };
@@ -7909,14 +7917,14 @@ pub const ApiHttpServer = struct {
         defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
         if (write_statement_kind) |statement_kind| {
             if (try self.publicSqlReadOnlyActive(session)) {
-                return .{ .response = try textResponse(self.alloc, 400, "cannot execute write statement in a read-only transaction") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .read_only_transaction).withMessage("cannot execute write statement in a read-only transaction")) };
             }
             switch (statement_kind) {
                 .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
             }
 
             const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
-                error.InvalidRoleSetting => return .{ .response = try textResponse(self.alloc, 400, "invalid sql setting") },
+                error.InvalidRoleSetting => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_role_setting)) },
             };
             const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
                 .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
@@ -7944,17 +7952,17 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => {
                 if (write_statement_kind != null) std.log.err("public sql write bind not found err={}", .{err});
-                return .{ .response = try textResponse(self.alloc, 404, "not found") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => {
-                if (write_statement_kind != null) return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") };
-                return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+                if (write_statement_kind != null) return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) };
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) };
             },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
                 if (write_statement_kind == null and parsed_sql.readStatementKind() == null and try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
-                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
             },
-            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.plan, .unique_owner_unavailable)) },
             else => return err,
         };
         errdefer logical_plan.deinit(self.alloc);
@@ -7971,7 +7979,7 @@ pub const ApiHttpServer = struct {
         const session = request.session;
 
         if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
-            return .{ .response = try textResponse(self.alloc, 400, "current transaction is aborted") };
+            return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .current_transaction_aborted)) };
         }
         if (try self.handlePublicSqlPostgresCompatibilityRead(parsed_sql, session)) |outcome_value| {
             var outcome = outcome_value;
@@ -7996,19 +8004,19 @@ pub const ApiHttpServer = struct {
         var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_view_mapping_unsupported)) };
             },
             error.SqlReadOnlyTransaction => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .read_only_transaction)) };
             },
             error.UnsupportedSqlShape => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
             },
             error.StatementTimeout => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(408, .init(.execute, .statement_timeout)) };
             },
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
@@ -8019,7 +8027,7 @@ pub const ApiHttpServer = struct {
             error.RoleSettingNotFound,
             => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
             },
             else => return err,
         };
@@ -8037,24 +8045,24 @@ pub const ApiHttpServer = struct {
                 var outcome: PublicSqlResultOrResponse = switch (planned.logical_plan) {
                     .catalog_write => try self.handlePublicSqlWrite(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                     .catalog_read => try self.handlePublicSqlRead(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
-                    .read, .write => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                    .read, .write => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
                     else => ddl_blk: {
                         const applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, &planned.logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
                             error.DocumentSqlViewMappingUnsupported => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
+                                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_view_mapping_unsupported)) };
                             },
                             error.SqlReadOnlyTransaction => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") };
+                                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .read_only_transaction)) };
                             },
                             error.UnsupportedSqlShape => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
                             },
                             error.StatementTimeout => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") };
+                                return .{ .response = try self.publicSqlDiagnosticResponse(408, .init(.execute, .statement_timeout)) };
                             },
                             error.InvalidSqlSession,
                             error.PreparedStatementAlreadyExists,
@@ -8065,7 +8073,7 @@ pub const ApiHttpServer = struct {
                             error.RoleSettingNotFound,
                             => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+                                return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
                             },
                             else => return err,
                         };
@@ -8092,16 +8100,16 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicSqlDescribeRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {
-        if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+        if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.parse, .invalid_sql_request)) };
 
         var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(request) catch |err| switch (err) {
-            error.InvalidSqlRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
         defer session.deinit(self.alloc);
 
         var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, request.sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.parse, .unsupported_sql_statement)) },
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
