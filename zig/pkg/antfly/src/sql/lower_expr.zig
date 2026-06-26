@@ -4292,6 +4292,7 @@ pub fn parseScalarNotWhereAlloc(
                 defer_row_expression_field_validation,
                 params,
                 realtime_ns,
+                null,
             );
             var predicate_transferred = false;
             errdefer if (!predicate_transferred) plan_mod.freeRelationalCheck(alloc, predicate);
@@ -4368,6 +4369,7 @@ pub fn parseScalarOrWhereAlloc(
                     defer_row_expression_field_validation,
                     params,
                     realtime_ns,
+                    null,
                 );
                 defer plan_mod.freeRelationalCheck(alloc, predicate);
                 try appendRelationalCheckCloneToScalarOrBranches(alloc, &branches, predicate);
@@ -10698,6 +10700,10 @@ pub fn parseAggregateSpecAlloc(
     }
     const filter_start = if (parser.peekKeyword(tokens, pos.*, "filter")) pos.* else null;
     const filter_predicate_start = if (filter_start != null) pos.* + 3 else null;
+    const generated_filter_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (filter_start != null) blk: {
+        const generated_expression = options.generated_expression_ast orelse break :blk null;
+        break :blk generated_expression.filter_expression;
+    } else null;
     const filter = try parseAggregateFilterAlloc(
         alloc,
         tokens,
@@ -10712,6 +10718,7 @@ pub fn parseAggregateSpecAlloc(
         options.expression_conditions,
         options.fixed_binary,
         options.realtime_ns,
+        generated_filter_expression,
     );
     var filter_transferred = false;
     errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
@@ -12114,6 +12121,7 @@ pub fn parseAggregateFilterBooleanIsNotGroupsAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
     const parsed_field = parseRowExpressionFieldOwnedAlloc(
@@ -12156,6 +12164,8 @@ pub fn parseAggregateFilterBooleanIsNotGroupsAlloc(
     defer alloc.free(field);
     const column = binder.relationalColumnForField(schema, field, .boolean) orelse return error.InvalidSqlCatalog;
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
+    const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
+    try validateGeneratedExpressionPredicateKind(generated_expression_ast, expected_kind);
     try appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
     return true;
 }
@@ -12173,11 +12183,15 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
     alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_hooks: ExpressionWhereConditionAlternativesParserOptions,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
         try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
+    const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+    var expression_hooks_with_generated = expression_hooks;
+    expression_hooks_with_generated.generated_expression_ast = generated_condition_expression;
 
     if (try parseAggregateFilterBooleanIsNotGroupsAlloc(
         alloc,
@@ -12188,6 +12202,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
         returning_expression_qualifiers,
         defer_row_expression_field_validation,
         alternatives,
+        generated_condition_expression,
     )) {
         return;
     }
@@ -12201,7 +12216,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
             type_context,
             defer_row_expression_field_validation,
             alternatives,
-            expression_hooks,
+            expression_hooks_with_generated,
         );
         return;
     }
@@ -12216,6 +12231,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
         defer_row_expression_field_validation,
         params,
         realtime_ns,
+        generated_condition_expression,
     );
     const condition = try expressionConditionFromOwnedRelationalCheckAlloc(alloc, predicate);
     var condition_transferred = false;
@@ -12237,8 +12253,12 @@ pub fn parseAggregateFilterNotGroupAlloc(
     not_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_hooks: ExpressionWhereConditionAlternativesParserOptions,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     try parser.expectKeyword(tokens, pos, "not");
+    if (generated_expression_ast) |expression| {
+        if (expression.kind != .logical_not) return error.UnsupportedSqlShape;
+    }
     try parser.expectToken(tokens, pos, .lparen);
     var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
     var groups_transferred = false;
@@ -12265,6 +12285,7 @@ pub fn parseAggregateFilterNotGroupAlloc(
             &alternatives,
             expression_hooks,
             realtime_ns,
+            generated_expression_ast,
         );
         try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -12290,6 +12311,7 @@ pub fn parseAggregateFilterOrGroupsAlloc(
     any_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_hooks: ExpressionWhereConditionAlternativesParserOptions,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
         const parenthesized = matchBooleanGroupOpen(tokens, pos);
@@ -12318,6 +12340,7 @@ pub fn parseAggregateFilterOrGroupsAlloc(
                 &alternatives,
                 expression_hooks,
                 realtime_ns,
+                generated_expression_ast,
             );
             try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -12351,6 +12374,7 @@ fn parseAggregateFilterAtomAlloc(
     json_path_exists: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate),
     text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
     defer {
@@ -12379,7 +12403,7 @@ fn parseAggregateFilterAtomAlloc(
         &or_predicates,
         false,
         realtime_ns,
-        null,
+        generated_expression_ast,
     );
 
     if (or_predicates.items.len > 0) return error.UnsupportedSqlShape;
@@ -12399,6 +12423,7 @@ pub fn parseAggregateFilterAlloc(
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
     fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !AggregateFilter {
     if (!parser.matchKeyword(tokens, pos, "filter")) return .{};
     try parser.expectToken(tokens, pos, .lparen);
@@ -12485,10 +12510,12 @@ pub fn parseAggregateFilterAlloc(
             &any_groups,
             expression_hooks,
             realtime_ns,
+            generated_expression_ast,
         );
     } else {
         while (true) {
             if (canParseAggregateFilterNot(tokens, pos.*)) {
+                const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
                 try parseAggregateFilterNotGroupAlloc(
                     alloc,
                     tokens,
@@ -12502,22 +12529,13 @@ pub fn parseAggregateFilterAlloc(
                     &not_groups,
                     expression_hooks,
                     realtime_ns,
+                    generated_condition_expression,
                 );
             } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
                 saw_boolean_constant = true;
                 if (!enabled) try appendBooleanConstantExpressionCondition(alloc, &expressions, false);
-            } else if (try parseAggregateFilterBooleanIsNotGroupsAlloc(
-                alloc,
-                tokens,
-                pos,
-                schema,
-                field_expression_qualifiers,
-                returning_expression_qualifiers,
-                defer_row_expression_field_validation,
-                &any_groups,
-            )) {
-                // Expanded as native expression OR groups.
             } else if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
+                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast), .contains);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -12531,8 +12549,10 @@ pub fn parseAggregateFilterAlloc(
                 try expression_array_contains.append(alloc, predicate);
                 predicate_transferred = true;
             } else if (aggregateJsonPathEqFilterCanStartAt(tokens, pos.*)) {
-                try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns);
+                try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns, try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast));
             } else if (peekAggregateExpressionFilter(tokens, pos.*)) {
+                var expression_condition_hooks_with_generated = expression_condition_hooks;
+                expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
                 try parseExpressionWhereConditionsAlloc(
                     alloc,
                     tokens,
@@ -12543,10 +12563,25 @@ pub fn parseAggregateFilterAlloc(
                     &expressions,
                     &any_groups,
                     &not_groups,
-                    expression_condition_hooks,
+                    expression_condition_hooks_with_generated,
                 );
             } else {
-                try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns);
+                const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                if (try parseAggregateFilterBooleanIsNotGroupsAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    schema,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                    &any_groups,
+                    generated_condition_expression,
+                )) {
+                    // Expanded as native expression OR groups.
+                } else {
+                    try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns, generated_condition_expression);
+                }
             }
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -14301,6 +14336,10 @@ pub fn parseWindowSpecAlloc(
     var default_transferred = false;
     errdefer if (!default_transferred) if (default_json.len > 0) alloc.free(default_json);
     try parser.expectToken(tokens, pos, .rparen);
+    const generated_filter_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (parser.peekKeyword(tokens, pos.*, "filter")) blk: {
+        const generated_expression = options.generated_expression_ast orelse break :blk null;
+        break :blk generated_expression.filter_expression;
+    } else null;
     const filter = try parseAggregateFilterAlloc(
         alloc,
         tokens,
@@ -14315,6 +14354,7 @@ pub fn parseWindowSpecAlloc(
         options.expression_conditions,
         options.fixed_binary,
         options.realtime_ns,
+        generated_filter_expression,
     );
     var filter_transferred = false;
     errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
@@ -26579,6 +26619,7 @@ pub fn parseScalarWherePredicateAlloc(
     defer_row_expression_field_validation: bool,
     params: []const value_mod.SqlValue,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !runtime_schema.RelationalCheck {
     const parsed_field = try parseRowExpressionFieldOwnedAlloc(
         alloc,
@@ -26616,6 +26657,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_unknown => {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 field_transferred = true;
                 return .{
@@ -26626,6 +26668,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_literal => {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 var value_transferred = false;
@@ -26641,6 +26684,7 @@ pub fn parseScalarWherePredicateAlloc(
             },
             .null_test => {},
         }
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(is_tail.op));
         field_transferred = true;
         return .{
             .name = "",
@@ -26651,6 +26695,7 @@ pub fn parseScalarWherePredicateAlloc(
     }
 
     if (matchPostfixNullTest(tokens, pos)) |op| {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
         field_transferred = true;
         return .{
             .name = "",
@@ -26663,6 +26708,7 @@ pub fn parseScalarWherePredicateAlloc(
     if (parser.peekKeywordTag(tokens, pos.*, .in) or parser.peekKeywordTag(tokens, pos.*, .not)) return error.UnsupportedSqlShape;
     if (parser.peekKeywordTag(tokens, pos.*, .between)) return error.UnsupportedSqlShape;
     const op = try parseComparisonOp(tokens, pos);
+    try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
     if (parser.peekKeywordTag(tokens, pos.*, .any) or parser.peekKeywordTag(tokens, pos.*, .some)) return error.UnsupportedSqlShape;
     const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
     var value_transferred = false;
@@ -30720,6 +30766,19 @@ test "sql adapter lower expr lowers grouped aggregate queries" {
     try std.testing.expectEqual(@as(usize, 1), filtered_direct_order.aggregate.order_by.len);
     try std.testing.expectEqualStrings("open_count", filtered_direct_order.aggregate.order_by[0].field);
 
+    var malformed_filter_expression_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records GROUP BY customer",
+    );
+    defer malformed_filter_expression_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFilterExpressionKind(&malformed_filter_expression_kind, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_filter_expression_kind,
+        schema,
+        &.{},
+    ));
+
     var boolean_filter = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, COUNT(*) FILTER (WHERE status = 'open' OR amount > 10) AS active_count FROM usage_records GROUP BY customer HAVING COUNT(*) FILTER (WHERE status = 'open' OR amount > 10) > 0",
@@ -32394,6 +32453,26 @@ fn corruptGeneratedReadFirstProjectionExpressionKind(
                 .read => |read| {
                     if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
                     read.projection_items.expressions[0].kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFilterExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    const filter_expression = read.projection_items.expressions[0].filter_expression orelse return error.TestUnexpectedResult;
+                    filter_expression.kind = kind;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
@@ -40290,6 +40369,20 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectEqualStrings("status", boolean_windows.plan.window.windows[0].filter_predicates[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.bool_and, boolean_windows.plan.window.windows[1].function);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, boolean_windows.plan.window.windows[1].value_expression.?.kind);
+
+    var malformed_window_filter_expression_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC) AS any_enabled FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5",
+    );
+    defer malformed_window_filter_expression_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFilterExpressionKind(&malformed_window_filter_expression_kind, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_window_filter_expression_kind,
+        schema,
+        &.{},
+    ));
+
     try std.testing.expectEqual(@as(usize, 1), boolean_windows.plan.window.windows[1].filter_expressions.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, boolean_windows.plan.window.windows[1].filter_expressions[0].lhs.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, boolean_windows.plan.window.windows[1].filter_expressions[0].lhs.operands[0].kind);

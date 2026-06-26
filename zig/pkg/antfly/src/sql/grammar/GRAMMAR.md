@@ -1008,7 +1008,9 @@ Unsupported DDL remains on the existing parser until
    Generated aggregate projection functions now validate retained function
    name, argument, `DISTINCT`, ordered-argument, `WITHIN GROUP`, and `FILTER`
    predicate spans before the typed aggregate lowerer accepts supported
-   aggregate specs.
+   aggregate specs, and aggregate/window `FILTER (WHERE ...)` lowering now
+   threads retained generated filter predicate metadata into typed scalar,
+   expression, boolean-group, and containment filter branches.
    Generated `WHERE` and aggregate `HAVING` predicates now recursively validate
    retained quantified-comparison, `EXISTS`, grouped, subquery, set-operation
    subquery, array-constructor, and boolean condition-chain boundary payloads
