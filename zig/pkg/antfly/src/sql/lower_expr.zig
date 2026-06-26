@@ -413,6 +413,119 @@ fn validateGeneratedSetOperationPayloads(
     }
 }
 
+fn validateGeneratedReadListBoundaryExpressions(
+    tokens: []const Token,
+    list: generated_parser.GeneratedSqlListAst,
+    first_expression: generated_parser.GeneratedSqlExpressionAst,
+    last_expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (list.count == 0) {
+        if (first_expression.tokens != null or last_expression.tokens != null) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (list.expression_items.len != list.count) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(first_expression.tokens orelse return error.UnsupportedSqlShape, list.expression_items[0])) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(last_expression.tokens orelse return error.UnsupportedSqlShape, list.expression_items[list.count - 1])) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionPayloads(tokens, first_expression);
+    try validateGeneratedExpressionPayloads(tokens, last_expression);
+}
+
+fn validateGeneratedOptionalReadExpression(
+    tokens: []const Token,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (range) |expression_range| {
+        if (expression_range.start >= expression_range.end or expression_range.end > tokens.len) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, expression);
+    } else if (expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn validateGeneratedReadAstPayloads(
+    tokens: []const Token,
+    read: generated_parser.GeneratedSqlReadAst,
+) !void {
+    if (read.distinct_tokens) |range| {
+        _ = try validateGeneratedDistinctClause(tokens, range, read.distinct_on_items);
+    } else if (read.distinct_on_items.count != 0 or read.distinct_on_items.items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.projection_tokens) |range| {
+        try validateGeneratedProjectionListForClause(tokens, range, read.projection_items);
+        try validateGeneratedReadListBoundaryExpressions(tokens, read.projection_items, read.projection_first_expression, read.projection_last_expression);
+    } else if (read.projection_items.count != 0 or read.projection_items.items.len != 0 or read.projection_first_expression.tokens != null or read.projection_last_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.source_tokens) |range| {
+        if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    } else if (read.source_antfly_function_count != 0 or read.source_antfly_function_items.len != 0 or read.source_graph_function_count != 0 or read.source_graph_function_items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.join_tokens) |range| {
+        if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinExecutableContract(&read, tokens, read.kind);
+    } else if (read.join_items.len != 0 or read.join_predicate_tokens != null or read.join_predicate_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    try validateGeneratedOptionalReadExpression(tokens, read.where_tokens, read.where_expression);
+
+    if (read.group_tokens) |range| {
+        try validateGeneratedExpressionListForClause(tokens, range, read.group_items);
+        try validateGeneratedReadListBoundaryExpressions(tokens, read.group_items, read.group_first_expression, read.group_last_expression);
+    } else if (read.group_items.count != 0 or read.group_items.items.len != 0 or read.group_first_expression.tokens != null or read.group_last_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    try validateGeneratedOptionalReadExpression(tokens, read.having_tokens, read.having_expression);
+
+    if (read.window_tokens) |range| {
+        if (read.window_items.len != read.window_count) return error.UnsupportedSqlShape;
+        try validateGeneratedWindowListForClause(tokens, range, read.window_items);
+    } else if (read.window_count != 0 or read.window_items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.order_tokens) |range| {
+        try validateGeneratedOrderListForClause(tokens, range, read.order_items);
+        try validateGeneratedReadListBoundaryExpressions(tokens, read.order_items, read.order_first_expression, read.order_last_expression);
+    } else if (read.order_items.count != 0 or read.order_items.items.len != 0 or read.order_first_expression.tokens != null or read.order_last_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.limit_tokens) |range| {
+        if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+        if (read.limit_all) {
+            if (range.end != range.start + 1 or !tokens[range.start].matchesKeywordTag(.all) or read.limit_expression.tokens != null) return error.UnsupportedSqlShape;
+        } else {
+            try validateGeneratedOptionalReadExpression(tokens, range, read.limit_expression);
+        }
+    } else if (read.limit_all or read.limit_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    try validateGeneratedOptionalReadExpression(tokens, read.offset_tokens, read.offset_expression);
+
+    if (read.fetch_tokens) |range| {
+        if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+        try validateGeneratedOptionalReadExpression(tokens, read.fetch_count_tokens, read.fetch_count_expression);
+    } else if (read.fetch_count_tokens != null or read.fetch_count_expression.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.set_operation_tokens) |range| {
+        try validateGeneratedSetOperationPayloads(tokens, range, read.set_operation);
+    } else if (read.set_operation.tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedSubqueryTailPayloads(
     tokens: []const Token,
     inner_tokens: generated_parser.GeneratedSqlTokenRange,
@@ -36705,6 +36818,50 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_cte_body_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_cte_body_group_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH grouped_orders AS (SELECT status FROM orders GROUP BY status) SELECT status FROM grouped_orders",
+    );
+    defer malformed_generated_cte_body_group_expression.deinit(alloc);
+    if (malformed_generated_cte_body_group_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                read.cte_items[0].body_group_first_expression.tokens = read.cte_items[0].body_projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_body_group_expression,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_cte_body_order_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH ordered_orders AS (SELECT id, status FROM orders ORDER BY status) SELECT id FROM ordered_orders",
+    );
+    defer malformed_generated_cte_body_order_expression.deinit(alloc);
+    if (malformed_generated_cte_body_order_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                read.cte_items[0].body_order_first_expression.tokens = read.cte_items[0].body_projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_body_order_expression,
         schema,
         &.{},
         .{},

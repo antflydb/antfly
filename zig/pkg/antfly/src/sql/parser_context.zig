@@ -1300,7 +1300,10 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 if (body.end - body.start != tokens.len) continue;
                 if (ptr.tokens[body.start].source_start != tokens[0].source_start) continue;
                 if (ptr.tokens[body.end - 1].source_end != tokens[tokens.len - 1].source_end) continue;
-                return try generated_parser.cloneCteBodyReadAstAlloc(ptr.alloc, parent.statement_span, cte);
+                var cloned = try generated_parser.cloneCteBodyReadAstAlloc(ptr.alloc, parent.statement_span, cte);
+                errdefer cloned.deinit(ptr.alloc);
+                try lower_expr.validateGeneratedReadAstPayloads(tokens, cloned);
+                return cloned;
             }
             return error.UnsupportedSqlShape;
         }

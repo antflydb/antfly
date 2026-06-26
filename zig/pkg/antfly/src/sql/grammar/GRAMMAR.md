@@ -387,7 +387,10 @@ payloads before dispatch; CTE body sub-parsers now receive a body-local
 generated read AST cloned from the generated CTE metadata, so typed body
 planning consumes generated body projection, predicate, ordering, pagination,
 join, window, set-operation, row-lock, and table-function source ranges
-instead of relying only on outer CTE pre-validation;
+instead of relying only on outer CTE pre-validation. The clone boundary now
+revalidates the complete body-local generated read payload, including
+projection, group, and order list boundary expressions, so corrupted CTE body
+metadata fails closed before the typed body planner can consume token fallback;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
 CTE reads now validate generated recursive CTE metadata before dispatching to
