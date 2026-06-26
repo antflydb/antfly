@@ -18,6 +18,7 @@ const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_conformance_build = @import("pkg/antfly/build/conformance.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_generated_build = @import("pkg/antfly/build/generated.zig");
+const antfly_lite_build = @import("pkg/antfly/build/lite.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
@@ -1414,136 +1415,13 @@ pub fn build(b: *std.Build) void {
     });
     _ = lib;
 
-    const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+    const capi_steps = antfly_lite_build.addCApiSteps(.{
+        .b = b,
         .target = target,
         .optimize = optimize,
+        .lib_mod = lib_mod,
+        .structlog_mod = structlog_mod,
     });
-    capi_mod.addImport("antfly-zig", lib_mod);
-    capi_mod.addImport("structlog", structlog_mod);
-
-    const capi_lib = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly_zig_capi",
-        .root_module = capi_mod,
-    });
-    const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
-
-    const lite_capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lite_capi_mod.addImport("antfly-zig", lib_mod);
-    lite_capi_mod.addImport("structlog", structlog_mod);
-
-    const lite_capi_lib = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly",
-        .root_module = lite_capi_mod,
-    });
-    const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
-    const install_lite_capi_header = b.addInstallFileWithDir(
-        b.path("pkg/antfly/include/antfly.h"),
-        .header,
-        "antfly.h",
-    );
-
-    const capi_step = b.step("capi", "Build the Zig C API shared libraries");
-    capi_step.dependOn(&install_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_header.step);
-
-    const lite_capi_step = b.step("lite-capi", "Build the libantfly C ABI shared library");
-    lite_capi_step.dependOn(&install_lite_capi_lib.step);
-    lite_capi_step.dependOn(&install_lite_capi_header.step);
-
-    const lite_capi_smoke_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    lite_capi_smoke_mod.link_libc = true;
-    lite_capi_smoke_mod.addIncludePath(b.path("pkg/antfly/include"));
-    lite_capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_lite_c_smoke.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
-    });
-    const lite_capi_smoke = b.addExecutable(.{
-        .name = "antfly-lite-c-smoke",
-        .root_module = lite_capi_smoke_mod,
-    });
-    lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
-    const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
-    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantfly");
-    lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
-
-    const run_lite_go_tests = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "test",
-        "-tags",
-        "antflylite_capi",
-        "-count=1",
-        "./...",
-    });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
-    run_lite_go_tests.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_tests.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
-    lite_go_test_step.dependOn(&run_lite_go_tests.step);
-
-    const run_lite_go_example = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
-    });
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
-    run_lite_go_example.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_example.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
-    lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
-
-    const run_cabi_packaging_tests = b.addSystemCommand(&.{
-        "env",
-        "PYTHONPYCACHEPREFIX=/tmp/antfly-pycache",
-        "python3",
-        "scripts/packaging/test_cabi_packaging.py",
-    });
-    run_cabi_packaging_tests.setCwd(b.path(".."));
-    const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
-    lite_package_test_step.dependOn(&run_cabi_packaging_tests.step);
-
-    const capi_test = antfly_tests_build.addModuleTestStep(b, capi_mod, "capi-test", "Run C API tests", .{
-        .filters = &antfly_tests_build.capi_default_filters,
-        .simple_runner = true,
-    });
-    const run_capi_tests = capi_test.run;
 
     const fuzz_tabular_loader_mod = b.createModule(.{
         .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
@@ -1922,14 +1800,14 @@ pub fn build(b: *std.Build) void {
     // Keep API tests wired at stable suite granularity. Leaf implementation
     // tests should join these roots via pkg/antfly/build/tests.zig filters,
     // not by adding one top-level build step per regression.
-    const api_docid_tests = antfly_tests_build.addAPIDocIdTestRootSteps(b, .{
+    const api_table_tests = antfly_tests_build.addAPITableTestRootSteps(b, .{
         .root = lib_test_mod,
         .target = target,
         .optimize = optimize,
     }, antfly_imports);
     const docid_lifecycle_test_step = antfly_tests_build.addAPIDocIdLifecycleDependencies(
         api_focused_tests.docid_lifecycle,
-        api_docid_tests,
+        api_table_tests,
         lib_db_module_tests.result_shape,
     );
 
@@ -1939,7 +1817,7 @@ pub fn build(b: *std.Build) void {
     docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
     docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
 
-    _ = antfly_tests_build.addAPIDocIdAggregateTestStep(b, api_docid_tests, .{
+    _ = antfly_tests_build.addAPITableAggregateTestStep(b, api_table_tests, .{
         .data_storage = run_lib_data_storage_tests,
         .data_runtime = run_lib_data_runtime_tests,
         .metadata_sim_smoke = run_lib_metadata_sim_smoke_tests,
@@ -1950,7 +1828,7 @@ pub fn build(b: *std.Build) void {
         .db_result_shape = lib_db_module_tests.result_shape,
     });
 
-    antfly_tests_build.dependOnAPIGeneratedChecks(generated_steps.generated_check, api_docid_tests);
+    antfly_tests_build.dependOnAPIGeneratedChecks(generated_steps.generated_check, api_table_tests);
 
     const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
     const run_lib_metadata_service_tests = metadata_tests.service.run;
@@ -2095,7 +1973,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&standalone_module_tests.usermgr.run.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    unit_test_step.dependOn(&run_capi_tests.step);
+    unit_test_step.dependOn(&capi_steps.run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&lib_db_test.run.step);
@@ -2105,7 +1983,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
-    antfly_tests_build.dependOnAPIDocIdUnitTestRuns(unit_test_step, api_docid_tests);
+    antfly_tests_build.dependOnAPITableUnitTestRuns(unit_test_step, api_table_tests);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -2472,23 +2350,23 @@ pub fn build(b: *std.Build) void {
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_test_step.dependOn(&run_lite_cli_tests.step);
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
-    lite_core_test_step.dependOn(&run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&run_lite_go_example.step);
-    lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_core_test_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
+    lite_core_test_step.dependOn(&capi_steps.run_lite_go_tests.step);
+    lite_core_test_step.dependOn(&capi_steps.run_lite_go_example.step);
+    lite_core_test_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
     lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
 
     const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
     lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&install_lite_capi_lib.step);
-    lite_core_step.dependOn(&install_lite_capi_header.step);
+    lite_core_step.dependOn(&capi_steps.install_lite_capi_lib.step);
+    lite_core_step.dependOn(&capi_steps.install_lite_capi_header.step);
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&run_lite_capi_smoke.step);
-    lite_core_step.dependOn(&run_lite_go_tests.step);
-    lite_core_step.dependOn(&run_lite_go_example.step);
-    lite_core_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_core_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
+    lite_core_step.dependOn(&capi_steps.run_lite_go_tests.step);
+    lite_core_step.dependOn(&capi_steps.run_lite_go_example.step);
+    lite_core_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
     lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
@@ -2497,15 +2375,15 @@ pub fn build(b: *std.Build) void {
         lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
     }
     lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&install_lite_capi_lib.step);
-    lite_full_step.dependOn(&install_lite_capi_header.step);
+    lite_full_step.dependOn(&capi_steps.install_lite_capi_lib.step);
+    lite_full_step.dependOn(&capi_steps.install_lite_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
     lite_full_step.dependOn(&run_lite_cli_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&run_lite_capi_smoke.step);
-    lite_full_step.dependOn(&run_lite_go_tests.step);
-    lite_full_step.dependOn(&run_lite_go_example.step);
-    lite_full_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_full_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
+    lite_full_step.dependOn(&capi_steps.run_lite_go_tests.step);
+    lite_full_step.dependOn(&capi_steps.run_lite_go_example.step);
+    lite_full_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
     lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
@@ -2540,22 +2418,22 @@ pub fn build(b: *std.Build) void {
 
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
     lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&install_lite_capi_lib.step);
-    lite_dev_step.dependOn(&install_lite_capi_header.step);
+    lite_dev_step.dependOn(&capi_steps.install_lite_capi_lib.step);
+    lite_dev_step.dependOn(&capi_steps.install_lite_capi_header.step);
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
     lite_dev_step.dependOn(&run_lite_cli_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&run_lite_capi_smoke.step);
-    lite_dev_step.dependOn(&run_lite_go_tests.step);
-    lite_dev_step.dependOn(&run_lite_go_example.step);
-    lite_dev_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_dev_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
+    lite_dev_step.dependOn(&capi_steps.run_lite_go_tests.step);
+    lite_dev_step.dependOn(&capi_steps.run_lite_go_example.step);
+    lite_dev_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
     lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_dev_step.dependOn(&install_lite_wasm_profile.step);
     lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
-    lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
-    lite_dev_step.dependOn(&run_capi_tests.step);
+    lite_dev_step.dependOn(&capi_steps.run_cabi_packaging_tests.step);
+    lite_dev_step.dependOn(&capi_steps.run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);

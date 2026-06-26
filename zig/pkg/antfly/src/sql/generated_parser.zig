@@ -289,6 +289,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_view_multi,
     explain,
     fetch,
+    graph_query,
     grant,
     import_foreign_schema,
     listen,
@@ -410,6 +411,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_view_multi_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
+    graph_query_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
     import_foreign_schema_not_planned_by_generated_parser,
     listen_not_planned_by_generated_parser,
@@ -2244,6 +2246,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
     .{ .sql = "LOAD 'auto_explain'", .kind = .unsupported },
     .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
+    .{ .sql = "MATCH (doc) RETURN doc", .kind = .unsupported },
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
@@ -2963,6 +2966,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.listen)) return .{ .unsupported = .listen };
     if (first.matchesKeywordTag(.load)) return .{ .unsupported = .load };
     if (first.matchesKeywordTag(.lock)) return .{ .unsupported = .lock };
+    if (first.matchesKeywordTag(.match)) return .{ .unsupported = .graph_query };
     if (first.matchesKeywordTag(.notify)) return .{ .unsupported = .notify };
     if (first.matchesKeywordTag(.refresh) and tokens.len > 2 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
         return .{ .ddl = .refresh_materialized_view };
@@ -3235,6 +3239,7 @@ fn buildUnsupportedAst(
             .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
+            .graph_query => .graph_query_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
             .import_foreign_schema => .import_foreign_schema_not_planned_by_generated_parser,
             .listen => .listen_not_planned_by_generated_parser,
@@ -7824,6 +7829,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .listen }, (try parseSqlAlloc(alloc, "LISTEN usage_events")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .load }, (try parseSqlAlloc(alloc, "LOAD 'auto_explain'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .graph_query }, (try parseSqlAlloc(alloc, "MATCH (doc) RETURN doc")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_statistics }, (try parseSqlAlloc(alloc, "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records")).statement);
@@ -12249,6 +12255,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "LOCK TABLE usage_records IN SHARE MODE",
             .kind = .lock,
             .reason = .lock_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "MATCH (doc) RETURN doc",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{

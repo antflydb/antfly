@@ -172,30 +172,30 @@ pub const DBStorageTestSteps = struct {
     sim: *std.Build.Step.Run,
 };
 
-pub const APIDocIdTestModules = struct {
+pub const APITableTestModules = struct {
     root: *std.Build.Module,
     transactions_docid: *std.Build.Module,
-    table_writes_docid: *std.Build.Module,
-    table_reads_docid: *std.Build.Module,
+    table_writes: *std.Build.Module,
+    table_reads: *std.Build.Module,
     public_table_http_docid: *std.Build.Module,
     rows: *std.Build.Module,
     internal_group_write_routes: *std.Build.Module,
     raft_transition_runtime_docid: *std.Build.Module,
 };
 
-pub const APIDocIdTestRootOptions = struct {
+pub const APITableTestRootOptions = struct {
     root: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 };
 
-pub const APIDocIdTestRuns = struct {
+pub const APITableTestRuns = struct {
     docid: *std.Build.Step.Run,
     serverless_docid: *std.Build.Step.Run,
     transactions_docid: *std.Build.Step.Run,
-    table_writes_docid: *std.Build.Step.Run,
+    table_writes: *std.Build.Step.Run,
     provisioned_query_visibility: *std.Build.Step.Run,
-    table_reads_docid: *std.Build.Step.Run,
+    table_reads: *std.Build.Step.Run,
     table_reads_graph_metric: *std.Build.Step.Run,
     public_table_http_docid: *std.Build.Step.Run,
     rows: *std.Build.Step.Run,
@@ -206,7 +206,7 @@ pub const APIDocIdTestRuns = struct {
     raft_transition_runtime_docid: *std.Build.Step.Run,
 };
 
-pub const APIDocIdAggregateDependencies = struct {
+pub const APITableAggregateDependencies = struct {
     data_storage: *std.Build.Step.Run,
     data_runtime: *std.Build.Step.Run,
     metadata_sim_smoke: *std.Build.Step.Run,
@@ -370,7 +370,7 @@ fn assertBuildZigDoesNotPassDirectTestFilterArgs(source: []const u8) void {
 }
 
 fn assertBuildZigDoesNotOwnManifestTestRoots(source: []const u8) void {
-    inline for (api_docid_test_roots) |root| {
+    inline for (api_table_test_roots) |root| {
         if (std.mem.indexOf(u8, source, root.path)) |start| {
             std.debug.panic(
                 "build.zig references manifest-owned test root '{s}' at line {}; move focused API test roots to pkg/antfly/build/tests.zig",
@@ -1608,11 +1608,11 @@ pub const APITestFilters = struct {
         "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
     };
 
-    const table_writes_docid_prefix = "api.table_writes.docid ";
-    const table_reads_docid_prefix = "api.table_reads.docid ";
+    const table_writes_prefix = "api.table_writes.docid ";
+    const table_reads_prefix = "api.table_reads.docid ";
     const table_writes_query_visibility_prefix = "api.table_writes.query_visibility ";
 
-    pub const table_writes_docid = [_][]const u8{
+    pub const table_writes = [_][]const u8{
         // Prefer owner-module and suite-name prefixes. Exact test names should
         // move with their owner module instead of accumulating here.
         "api.table_writes.backup_restore.test.",
@@ -1626,14 +1626,14 @@ pub const APITestFilters = struct {
         "api.table_writes.remote_wire.test.",
         "api.table_writes.schema_jobs.test.",
         "api.table_writes.sources.test.",
-        table_writes_docid_prefix,
+        table_writes_prefix,
     };
 
     pub const provisioned_query_visibility = [_][]const u8{
         table_writes_query_visibility_prefix,
     };
 
-    pub const table_reads_docid = [_][]const u8{
+    pub const table_reads = [_][]const u8{
         // Prefer owner-module and suite-name prefixes. Exact test names should
         // move with their owner module instead of accumulating here.
         "api.table_reads.cache.test.",
@@ -1645,7 +1645,7 @@ pub const APITestFilters = struct {
         "api.table_reads.relational_rows.test.",
         "api.table_reads.remote_wire.test.",
         "api.http_internal_group_read_routes.test.",
-        table_reads_docid_prefix,
+        table_reads_prefix,
     };
 
     pub const table_reads_graph_metric = [_][]const u8{
@@ -3447,17 +3447,17 @@ pub fn addGraphMetricTestSteps(
     };
 }
 
-pub fn addAPIDocIdTestSteps(
+pub fn addAPITableTestSteps(
     b: *std.Build,
-    modules: APIDocIdTestModules,
-) APIDocIdTestRuns {
+    modules: APITableTestModules,
+) APITableTestRuns {
     const docid = addSimpleAPITestRun(b, modules.root, &APITestFilters.docid, false);
     const serverless_docid = addSimpleAPITestRun(b, modules.root, &APITestFilters.serverless_docid, false);
     const transactions_docid = addSimpleAPITestRun(b, modules.transactions_docid, &APITestFilters.transactions_docid, false);
-    const table_writes_docid = addSimpleAPITestRun(b, modules.table_writes_docid, &APITestFilters.table_writes_docid, true);
-    const provisioned_query_visibility = addSimpleAPITestRun(b, modules.table_writes_docid, &APITestFilters.provisioned_query_visibility, true);
-    const table_reads_docid = addSimpleAPITestRun(b, modules.table_reads_docid, &APITestFilters.table_reads_docid, false);
-    const table_reads_graph_metric = addSimpleAPITestRun(b, modules.table_reads_docid, &APITestFilters.table_reads_graph_metric, false);
+    const table_writes = addSimpleAPITestRun(b, modules.table_writes, &APITestFilters.table_writes, true);
+    const provisioned_query_visibility = addSimpleAPITestRun(b, modules.table_writes, &APITestFilters.provisioned_query_visibility, true);
+    const table_reads = addSimpleAPITestRun(b, modules.table_reads, &APITestFilters.table_reads, false);
+    const table_reads_graph_metric = addSimpleAPITestRun(b, modules.table_reads, &APITestFilters.table_reads_graph_metric, false);
     const public_table_http_docid = addSimpleAPITestRun(b, modules.public_table_http_docid, &APITestFilters.public_table_http_docid, false);
     const rows = addSimpleAPITestRun(b, modules.rows, &APITestFilters.rows, true);
     const sql_api_parity = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity, false);
@@ -3469,9 +3469,9 @@ pub fn addAPIDocIdTestSteps(
     const raft_transition_runtime_docid = addSimpleAPITestRun(b, modules.raft_transition_runtime_docid, &APITestFilters.raft_transition_runtime_docid, false);
 
     addFocusedAPITestStep(b, "api-transactions-test", "Run focused API transaction coordinator tests", transactions_docid);
-    addFocusedAPITestStep(b, "api-table-writes-docid-test", "Run focused API table write DOCID tests", table_writes_docid);
+    addFocusedAPITestStep(b, "api-table-writes-docid-test", "Run focused API table write DOCID tests", table_writes);
     addFocusedAPITestStep(b, "provisioned-query-visibility-test", "Run focused provisioned query visibility tests", provisioned_query_visibility);
-    addFocusedAPITestStep(b, "api-table-reads-docid-test", "Run focused API table read DOCID tests", table_reads_docid);
+    addFocusedAPITestStep(b, "api-table-reads-docid-test", "Run focused API table read DOCID tests", table_reads);
     addFocusedAPITestStep(b, "api-internal-group-write-routes-test", "Run focused internal group write route tests", internal_group_write_routes);
     addFocusedAPITestStep(b, "api-rows-test", "Run focused relational row API tests", rows);
     addFocusedAPITestStep(b, "sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests", sql_api_parity);
@@ -3483,9 +3483,9 @@ pub fn addAPIDocIdTestSteps(
         .docid = docid,
         .serverless_docid = serverless_docid,
         .transactions_docid = transactions_docid,
-        .table_writes_docid = table_writes_docid,
+        .table_writes = table_writes,
         .provisioned_query_visibility = provisioned_query_visibility,
-        .table_reads_docid = table_reads_docid,
+        .table_reads = table_reads,
         .table_reads_graph_metric = table_reads_graph_metric,
         .public_table_http_docid = public_table_http_docid,
         .rows = rows,
@@ -3497,17 +3497,17 @@ pub fn addAPIDocIdTestSteps(
     };
 }
 
-const api_docid_test_roots = .{
+const api_table_test_roots = .{
     .{
         .field = "transactions_docid",
         .path = "pkg/antfly/src/api_transactions_test_root.zig",
     },
     .{
-        .field = "table_writes_docid",
+        .field = "table_writes",
         .path = "pkg/antfly/src/api_table_writes_test_root.zig",
     },
     .{
-        .field = "table_reads_docid",
+        .field = "table_reads",
         .path = "pkg/antfly/src/api_table_reads_test_root.zig",
     },
     .{
@@ -3528,10 +3528,10 @@ const api_docid_test_roots = .{
     },
 };
 
-fn makeAPIDocIdTestModule(
+fn makeAPITableTestModule(
     b: *std.Build,
     root_path: []const u8,
-    options: APIDocIdTestRootOptions,
+    options: APITableTestRootOptions,
     imports: anytype,
 ) *std.Build.Module {
     const module = b.createModule(.{
@@ -3543,38 +3543,38 @@ fn makeAPIDocIdTestModule(
     return module;
 }
 
-pub fn makeAPIDocIdTestModules(
+pub fn makeAPITableTestModules(
     b: *std.Build,
-    options: APIDocIdTestRootOptions,
+    options: APITableTestRootOptions,
     imports: anytype,
-) APIDocIdTestModules {
-    var modules: APIDocIdTestModules = undefined;
+) APITableTestModules {
+    var modules: APITableTestModules = undefined;
     modules.root = options.root;
-    inline for (api_docid_test_roots) |root| {
-        @field(modules, root.field) = makeAPIDocIdTestModule(b, root.path, options, imports);
+    inline for (api_table_test_roots) |root| {
+        @field(modules, root.field) = makeAPITableTestModule(b, root.path, options, imports);
     }
     return modules;
 }
 
-pub fn addAPIDocIdTestRootSteps(
+pub fn addAPITableTestRootSteps(
     b: *std.Build,
-    options: APIDocIdTestRootOptions,
+    options: APITableTestRootOptions,
     imports: anytype,
-) APIDocIdTestRuns {
-    return addAPIDocIdTestSteps(b, makeAPIDocIdTestModules(b, options, imports));
+) APITableTestRuns {
+    return addAPITableTestSteps(b, makeAPITableTestModules(b, options, imports));
 }
 
-pub fn addAPIDocIdAggregateTestStep(
+pub fn addAPITableAggregateTestStep(
     b: *std.Build,
-    runs: APIDocIdTestRuns,
-    deps: APIDocIdAggregateDependencies,
+    runs: APITableTestRuns,
+    deps: APITableAggregateDependencies,
 ) *std.Build.Step {
     const step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
     step.dependOn(&runs.docid.step);
     step.dependOn(&runs.serverless_docid.step);
     step.dependOn(&runs.transactions_docid.step);
-    step.dependOn(&runs.table_reads_docid.step);
-    step.dependOn(&runs.table_writes_docid.step);
+    step.dependOn(&runs.table_reads.step);
+    step.dependOn(&runs.table_writes.step);
     step.dependOn(&runs.public_table_http_docid.step);
     step.dependOn(&runs.rows.step);
     step.dependOn(&runs.internal_group_write_routes.step);
@@ -3592,24 +3592,24 @@ pub fn addAPIDocIdAggregateTestStep(
 
 pub fn addAPIDocIdLifecycleDependencies(
     focused: APIFocusedTestRun,
-    runs: APIDocIdTestRuns,
+    runs: APITableTestRuns,
     db_result_shape: *std.Build.Step.Run,
 ) *std.Build.Step {
     const step = focused.step orelse
         @panic("DOCID lifecycle focused run must expose a build step");
     step.dependOn(&focused.run.step);
     step.dependOn(&runs.transactions_docid.step);
-    step.dependOn(&runs.table_reads_docid.step);
-    step.dependOn(&runs.table_writes_docid.step);
+    step.dependOn(&runs.table_reads.step);
+    step.dependOn(&runs.table_writes.step);
     step.dependOn(&runs.public_table_http_docid.step);
     step.dependOn(&runs.raft_transition_runtime_docid.step);
     step.dependOn(&db_result_shape.step);
     return step;
 }
 
-pub fn dependOnAPIDocIdUnitTestRuns(
+pub fn dependOnAPITableUnitTestRuns(
     step: *std.Build.Step,
-    runs: APIDocIdTestRuns,
+    runs: APITableTestRuns,
 ) void {
     step.dependOn(&runs.provisioned_query_visibility.step);
     step.dependOn(&runs.docid.step);
@@ -3621,7 +3621,7 @@ pub fn dependOnAPIDocIdUnitTestRuns(
 
 pub fn dependOnAPIGeneratedChecks(
     step: *std.Build.Step,
-    runs: APIDocIdTestRuns,
+    runs: APITableTestRuns,
 ) void {
     step.dependOn(&runs.sql_api_parity_fixture_check.step);
 }

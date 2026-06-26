@@ -469,6 +469,7 @@ fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatem
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
+        tokenMatchesKeyword(first, .match) or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
         tokenMatchesKeyword(first, .revoke) or
@@ -1306,6 +1307,7 @@ fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
+        tokenMatchesKeyword(first, .match) or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
         tokenMatchesKeyword(first, .revoke) or
@@ -3212,6 +3214,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "GRANT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "LISTEN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "LOCK"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "NOTIFY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REINDEX"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REVOKE"));
@@ -4037,6 +4040,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "LOCK TABLE usage_records IN SHARE MODE",
             .kind = .lock,
             .reason = .lock_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "MATCH (doc) RETURN doc",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
         },
         .{
             .sql = "NOTIFY usage_events, 'changed'",
