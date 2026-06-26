@@ -150,6 +150,13 @@ parser success at SQL ingress so malformed generated-owned catalog statements
 do not fall back to the permissive legacy DDL classifier; unsupported
 type-system variants such as operator class/family and aggregate/operator
 `ALTER` forms continue through the generated unsupported diagnostic path.
+Extended generated-owned catalog DDL heads now follow the same strict ingress
+rule for `CREATE`/`ALTER`/`DROP` view, domain, sequence, enum type,
+tablespace, publication, subscription, and policy statements, plus materialized
+view create/drop/refresh and routine create/drop statements. Malformed
+complete-looking catalog statements in those families fail through generated
+parser diagnostics instead of falling back to the legacy permissive DDL
+classifier.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and

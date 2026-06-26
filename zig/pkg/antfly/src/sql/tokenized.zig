@@ -328,6 +328,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedExtendedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -508,6 +509,58 @@ fn isGeneratedTypeSystemDdlHead(tokens: []const Token, raw_statement: RawSqlStat
             tokenMatchesKeyword(second, .cast);
     }
     return false;
+}
+
+fn isGeneratedExtendedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    if (tokenMatchesKeyword(first, .create)) {
+        if (tokenMatchesKeyword(tokens[start + 1], .@"or")) {
+            return start + 3 < end and
+                tokenMatchesKeyword(tokens[start + 2], .replace) and
+                (tokenMatchesKeyword(tokens[start + 3], .view) or tokenMatchesKeyword(tokens[start + 3], .function));
+        }
+        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .create);
+    }
+    if (tokenMatchesKeyword(first, .alter)) {
+        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .alter);
+    }
+    if (tokenMatchesKeyword(first, .drop)) {
+        return isGeneratedExtendedCatalogObject(tokens, start + 1, end, .drop);
+    }
+    if (tokenMatchesKeyword(first, .refresh)) {
+        return start + 2 < end and
+            tokenMatchesKeyword(tokens[start + 1], .materialized) and
+            tokenMatchesKeyword(tokens[start + 2], .view);
+    }
+    return false;
+}
+
+const GeneratedExtendedCatalogOperation = enum { create, alter, drop };
+
+fn isGeneratedExtendedCatalogObject(tokens: []const Token, object_index: usize, end: usize, operation: GeneratedExtendedCatalogOperation) bool {
+    if (object_index >= end or end > tokens.len) return false;
+    const object = tokens[object_index];
+    if (tokenMatchesKeyword(object, .materialized)) {
+        return object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .view);
+    }
+    if (tokenMatchesKeyword(object, .view) or
+        tokenMatchesKeyword(object, .domain) or
+        tokenMatchesKeyword(object, .sequence) or
+        tokenMatchesKeyword(object, .type) or
+        tokenMatchesKeyword(object, .tablespace) or
+        tokenMatchesKeyword(object, .publication) or
+        tokenMatchesKeyword(object, .subscription) or
+        tokenMatchesKeyword(object, .policy))
+    {
+        return true;
+    }
+    return switch (operation) {
+        .create, .drop => tokenMatchesKeyword(object, .function) or tokenMatchesKeyword(object, .procedure),
+        .alter => false,
+    };
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -2515,8 +2568,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMPORARY TABLE usage_session_records ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE VIEW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE VIEW active_usage"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OR REPLACE VIEW active_usage AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER VIEW active_usage RENAME TO"));
@@ -2525,6 +2580,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW usage_summary WITH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN positive_amount"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN positive_amount AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DOMAIN positive_amount SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DOMAIN IF EXISTS"));
@@ -2537,13 +2593,16 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TYPE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLESPACE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLESPACE fastspace"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLESPACE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PUBLICATION"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER PUBLICATION usage_pub ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP PUBLICATION IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION usage_sub"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SUBSCRIPTION usage_sub"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS"));
@@ -2561,6 +2620,11 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP AGGREGATE first_value_text"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE CAST"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP CAST ("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE FUNCTION touch_updated_at"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PROCEDURE rotate_usage"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP FUNCTION IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP PROCEDURE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
