@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const corpus = @import("corpus.zig");
 const ddl_plan = @import("ddl.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -335,7 +336,89 @@ fn transactionDeferrableName(deferrable: ?bool) []const u8 {
     return if (deferrable) |value| if (value) "true" else "false" else "none";
 }
 
-pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 {
+pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, logical: binder.LogicalSqlPlan) ![]u8 {
+    return switch (logical) {
+        .table_ddl => |plan| try tableDdlFingerprintAlloc(alloc, plan),
+        .catalog_ddl => |plan| try catalogDdlFingerprintAlloc(alloc, plan),
+        .other_ddl => |plan| try otherDdlFingerprintAlloc(alloc, plan),
+        .session => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .session_catalog = plan }),
+        .transaction => |plan| try transactionDdlFingerprintAlloc(alloc, plan),
+        .prepared_statement => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .prepared_statement = plan }),
+        .cursor => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .cursor_portal = plan }),
+        .notification => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .notification_channel = plan }),
+        .routine => |plan| try routineDdlFingerprintAlloc(alloc, plan),
+        .auth => |plan| try authDdlFingerprintAlloc(alloc, plan),
+        .extension => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .extension_catalog = plan }),
+        .maintenance => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .maintenance_job = plan }),
+        .bulk_io => |plan| try loweredDdlFingerprintAlloc(alloc, .{ .bulk_io = plan }),
+        .read, .write, .catalog_read, .catalog_write => error.UnsupportedSqlShape,
+    };
+}
+
+fn tableDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.TableDdlLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .moved => error.UnsupportedSqlShape,
+        .create_table => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .create_table = payload }),
+        .table_clone => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .table_clone = payload }),
+        .view_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .view_catalog = payload }),
+        .materialized_view_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .materialized_view_catalog = payload }),
+        .relation_lifetime => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .relation_lifetime = payload }),
+        .table_partition_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .table_partition_catalog = payload }),
+        .create_index => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .create_index = payload }),
+        .drop_index => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .drop_index = payload }),
+        .drop_table => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .drop_table = payload }),
+        .alter_table => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .alter_table = payload }),
+        .create_update_policy => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .create_update_policy = payload }),
+    };
+}
+
+fn catalogDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.CatalogDdlLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .moved => error.UnsupportedSqlShape,
+        .enum_type_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .enum_type_catalog = payload }),
+        .domain_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .domain_catalog = payload }),
+        .sequence_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .sequence_catalog = payload }),
+        .identity_allocator_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .identity_allocator_catalog = payload }),
+        .schema_namespace_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .schema_namespace_catalog = payload }),
+        .database_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .database_catalog = payload }),
+        .tablespace_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .tablespace_catalog = payload }),
+        .logical_replication => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .logical_replication = payload }),
+        .type_system_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .type_system_catalog = payload }),
+        .comment_metadata => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .comment_metadata = payload }),
+    };
+}
+
+fn otherDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.OtherDdlLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .moved => error.UnsupportedSqlShape,
+        .adapter_noop => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .adapter_noop = payload }),
+    };
+}
+
+fn transactionDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.TransactionLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .control => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .transaction_control = payload }),
+        .prepared => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .prepared_transaction = payload }),
+        .savepoint => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .savepoint_transaction = payload }),
+    };
+}
+
+fn routineDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.RoutineLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .function_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .function_catalog = payload }),
+        .trigger_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .trigger_catalog = payload }),
+        .procedure_call => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .procedure_call = payload }),
+    };
+}
+
+fn authDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.AuthorizationLogicalPlan) ![]u8 {
+    return switch (plan) {
+        .authorization_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .authorization_catalog = payload }),
+        .row_security_catalog => |payload| try loweredDdlFingerprintAlloc(alloc, .{ .row_security_catalog = payload }),
+    };
+}
+
+fn loweredDdlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 {
     return switch (lowered) {
         .adapter_noop => |plan| try adapterNoopFingerprintAlloc(alloc, "ddl", @tagName(plan.reason)),
         .session_catalog => |plan| switch (plan) {
@@ -1996,7 +2079,7 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2133,7 +2216,7 @@ test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2209,7 +2292,7 @@ test "sql adapter ddl fingerprint owns authorization catalog ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2294,14 +2377,14 @@ test "sql adapter ddl fingerprint owns partition and row security catalog ddl su
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
 
     var expression_policy = try lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
     defer expression_policy.deinit(alloc);
-    const expression_fingerprint = try ddlFingerprintAlloc(alloc, expression_policy);
+    const expression_fingerprint = try loweredDdlFingerprintAlloc(alloc, expression_policy);
     defer alloc.free(expression_fingerprint);
     try std.testing.expect(std.mem.indexOf(u8, expression_fingerprint, "ddl:create_row_policy:policy=usage_records_lower_policy:table=usage_records:kind=expression:json_hex=") != null);
 }
@@ -2353,7 +2436,7 @@ test "sql adapter ddl fingerprint owns namespace database and tablespace catalog
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2410,7 +2493,7 @@ test "sql adapter ddl fingerprint owns notification and logical replication ddl 
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2475,7 +2558,7 @@ test "sql adapter ddl fingerprint owns type system ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2508,7 +2591,7 @@ test "sql adapter ddl fingerprint owns maintenance job ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2541,7 +2624,7 @@ test "sql adapter ddl fingerprint owns bulk io ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2575,7 +2658,7 @@ test "sql adapter ddl fingerprint owns session catalog ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2648,7 +2731,7 @@ test "sql adapter ddl fingerprint owns transaction protocol ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2677,7 +2760,7 @@ test "sql adapter ddl fingerprint owns prepared transaction ddl surfaces" {
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
@@ -2790,7 +2873,7 @@ test "sql adapter ddl fingerprint owns prepared statement cursor and savepoint d
     for (cases) |case| {
         var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
-        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        const fingerprint = try loweredDdlFingerprintAlloc(alloc, lowered);
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }

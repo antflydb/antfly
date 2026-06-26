@@ -2844,11 +2844,13 @@ fn generatedFunctionNameMatchesRowExpressionKind(
 
 fn validateGeneratedRowExpressionFunctionIdentity(
     tokens: []const Token,
-    range: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
     parsed_expression: db_mod.types.RelationalRowsExpression,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const root = generated_expression_ast orelse return;
+    const range: generated_parser.GeneratedSqlTokenRange = .{ .start = start, .end = end };
     const generated_expression = generatedExpressionForExactRange(root, range) orelse return;
     if (generated_expression.kind != .function_call) return;
     const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
@@ -2877,7 +2879,8 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
     errdefer freeExpression(alloc, expression);
     try validateGeneratedRowExpressionFunctionIdentity(
         tokens,
-        .{ .start = start, .end = pos.* },
+        start,
+        pos.*,
         expression,
         options.generated_expression_ast,
     );
@@ -23298,9 +23301,17 @@ pub fn parseOrderExpressionAlloc(
         if (options.generated_expression_ast) |generated_expression| {
             if (generated_expression.kind != .function_call) return error.UnsupportedSqlShape;
         }
+        const expression_start = pos.*;
         const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try validateGeneratedRowExpressionFunctionIdentity(
+            tokens,
+            expression_start,
+            pos.*,
+            expression,
+            options.generated_expression_ast,
+        );
         try type_context.validateOrderableRowExpression(expression);
         expression_transferred = true;
         return .{ .expression = expression };
@@ -23330,17 +23341,33 @@ pub fn parseOrderExpressionAlloc(
             return .{ .field = field, .null_test = null_test };
         },
         .parenthesized => {
+            const expression_start = pos.*;
             const expression = try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, options.parenthesized);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             try type_context.validateOrderableRowExpression(expression);
             expression_transferred = true;
             return .{ .expression = expression };
         },
         .pipe_concat => {
+            const expression_start = pos.*;
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             try type_context.validateTextRowExpression(expression);
             expression_transferred = true;
             return .{ .expression = expression };
@@ -23355,9 +23382,17 @@ pub fn parseOrderExpressionAlloc(
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
             )) |field| return .{ .field = field };
+            const expression_start = pos.*;
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             try type_context.validateOrderableRowExpression(expression);
             expression_transferred = true;
             return .{ .expression = expression };
@@ -23372,6 +23407,7 @@ pub fn parseOrderExpressionAlloc(
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
             )) |field| return .{ .field = field };
+            const expression_start = pos.*;
             const expression = try parseCaseFoldRowExpressionAlloc(
                 alloc,
                 tokens,
@@ -23386,6 +23422,13 @@ pub fn parseOrderExpressionAlloc(
             );
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             if (expression.kind == .field and expression.field.len != 0) {
                 expression_transferred = true;
                 return .{ .field = expression.field };
@@ -23403,16 +23446,32 @@ pub fn parseOrderExpressionAlloc(
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
             )) |field| return .{ .field = field };
+            const expression_start = pos.*;
             const expression = try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, options.fixed_unary);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             expression_transferred = true;
             return .{ .expression = expression };
         },
         .unary_negative => {
+            const expression_start = pos.*;
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try validateGeneratedRowExpressionFunctionIdentity(
+                tokens,
+                expression_start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
             try type_context.validateNumericRowExpression(expression);
             expression_transferred = true;
             return .{ .expression = expression };
@@ -23429,9 +23488,17 @@ pub fn parseOrderExpressionAlloc(
     if (peekArithmeticOperator(tokens, pos.*)) |_| {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         field_transferred = true;
+        const expression_start = pos.* - 1;
         const expression = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, .{ .kind = .field, .field = field }, 0, type_context, options.arithmetic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try validateGeneratedRowExpressionFunctionIdentity(
+            tokens,
+            expression_start,
+            pos.*,
+            expression,
+            options.generated_expression_ast,
+        );
         try type_context.validateNumericRowExpression(expression);
         expression_transferred = true;
         return .{ .expression = expression };
@@ -33431,6 +33498,24 @@ fn corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(parsed_sql:
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstOrderFunctionNameToSecondProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.order_items.expressions.len == 0 or read.projection_items.expressions.len < 2) return error.TestUnexpectedResult;
+                    _ = read.order_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
+                    const second_name_tokens = read.projection_items.expressions[1].function_name_tokens orelse return error.TestUnexpectedResult;
+                    read.order_items.expressions[0].function_name_tokens = second_name_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadWhereLeftFunctionNameToFirstProjection(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -35076,6 +35161,20 @@ test "sql adapter lower expr lowers jsonb containment existence and extraction p
     try std.testing.expectEqual(@as(usize, 1), to_jsonb_order.plan.query.order_by.len);
     try std.testing.expect(to_jsonb_order.plan.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.to_jsonb, to_jsonb_order.plan.query.order_by[0].expression.?.kind);
+
+    var malformed_generated_order_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, lower(status) AS status_lower FROM usage_records WHERE id = $1 ORDER BY to_jsonb(id) ASC LIMIT 5",
+    );
+    defer malformed_generated_order_function_name.deinit(alloc);
+    try corruptGeneratedReadFirstOrderFunctionNameToSecondProjection(&malformed_generated_order_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_order_function_name,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
 
     var malformed_generated_function_name = try tokenized.ParsedSql.initAlloc(
         alloc,

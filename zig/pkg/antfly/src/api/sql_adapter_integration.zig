@@ -98,11 +98,11 @@ fn expectAppliedDdlCorpusPlan(
 fn expectDdlExecutionCorpusPlan(
     alloc: std.mem.Allocator,
     entry: AppParityCorpusEntry,
-    lowered: LoweredDdlPlan,
+    logical: sql_adapter.LogicalSqlPlan,
 ) !void {
     if (entry.execution_plan.len == 0) return;
     if (std.mem.startsWith(u8, entry.execution_plan, "unsupported:")) {
-        switch (lowered) {
+        switch (logical) {
             .bulk_io => |plan| try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(plan)),
             else => return error.TestUnexpectedResult,
         }
@@ -111,14 +111,17 @@ fn expectDdlExecutionCorpusPlan(
         try expectAppParityPlan(entry.execution_plan, fingerprint);
         return;
     }
-    const fingerprint = switch (lowered) {
+    const fingerprint = switch (logical) {
         .bulk_io => |plan| blk: {
             const execution_plan = try bulkSqlIoExecutionPlanFromDdlPlan(plan);
             break :blk try bulkSqlIoExecutionFingerprintAlloc(alloc, execution_plan);
         },
-        .prepared_transaction => |plan| blk: {
-            const intent = preparedTransactionRecoveryIntentFromPlan(plan);
-            break :blk try preparedTransactionRecoveryFingerprintAlloc(alloc, intent);
+        .transaction => |transaction| switch (transaction) {
+            .prepared => |plan| blk: {
+                const intent = preparedTransactionRecoveryIntentFromPlan(plan);
+                break :blk try preparedTransactionRecoveryFingerprintAlloc(alloc, intent);
+            },
+            else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     };
@@ -152,7 +155,82 @@ fn schemaJsonFromSetupSqlAlloc(
 
 const expectCombinedQuerySourceSummary = sql_adapter.expectCombinedQuerySourceSummary;
 
-fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !void {
+fn expectDdlSummary(summary: AppParityPlanSummary, logical: sql_adapter.LogicalSqlPlan) !void {
+    switch (logical) {
+        .table_ddl => |plan| return try expectTableDdlSummary(summary, plan),
+        .catalog_ddl => |plan| return try expectCatalogDdlSummary(summary, plan),
+        .other_ddl => return error.TestUnexpectedResult,
+        .session => |plan| return try expectLoweredDdlSummary(summary, .{ .session_catalog = plan }),
+        .transaction => |plan| return try expectTransactionDdlSummary(summary, plan),
+        .prepared_statement => |plan| return try expectLoweredDdlSummary(summary, .{ .prepared_statement = plan }),
+        .cursor => |plan| return try expectLoweredDdlSummary(summary, .{ .cursor_portal = plan }),
+        .notification => |plan| return try expectLoweredDdlSummary(summary, .{ .notification_channel = plan }),
+        .routine => |plan| return try expectRoutineDdlSummary(summary, plan),
+        .auth => |plan| return try expectAuthDdlSummary(summary, plan),
+        .extension => |plan| return try expectLoweredDdlSummary(summary, .{ .extension_catalog = plan }),
+        .maintenance => |plan| return try expectLoweredDdlSummary(summary, .{ .maintenance_job = plan }),
+        .bulk_io => |plan| return try expectLoweredDdlSummary(summary, .{ .bulk_io = plan }),
+        .read, .write, .catalog_read, .catalog_write => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectTableDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.TableDdlLogicalPlan) !void {
+    switch (plan) {
+        .moved => return error.TestUnexpectedResult,
+        .create_table => |payload| return try expectLoweredDdlSummary(summary, .{ .create_table = payload }),
+        .table_clone => |payload| return try expectLoweredDdlSummary(summary, .{ .table_clone = payload }),
+        .view_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .view_catalog = payload }),
+        .materialized_view_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .materialized_view_catalog = payload }),
+        .relation_lifetime => |payload| return try expectLoweredDdlSummary(summary, .{ .relation_lifetime = payload }),
+        .table_partition_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .table_partition_catalog = payload }),
+        .create_index => |payload| return try expectLoweredDdlSummary(summary, .{ .create_index = payload }),
+        .drop_index => |payload| return try expectLoweredDdlSummary(summary, .{ .drop_index = payload }),
+        .drop_table => |payload| return try expectLoweredDdlSummary(summary, .{ .drop_table = payload }),
+        .alter_table => |payload| return try expectLoweredDdlSummary(summary, .{ .alter_table = payload }),
+        .create_update_policy => |payload| return try expectLoweredDdlSummary(summary, .{ .create_update_policy = payload }),
+    }
+}
+
+fn expectCatalogDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.CatalogDdlLogicalPlan) !void {
+    switch (plan) {
+        .moved => return error.TestUnexpectedResult,
+        .enum_type_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .enum_type_catalog = payload }),
+        .domain_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .domain_catalog = payload }),
+        .sequence_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .sequence_catalog = payload }),
+        .identity_allocator_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .identity_allocator_catalog = payload }),
+        .schema_namespace_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .schema_namespace_catalog = payload }),
+        .database_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .database_catalog = payload }),
+        .tablespace_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .tablespace_catalog = payload }),
+        .logical_replication => |payload| return try expectLoweredDdlSummary(summary, .{ .logical_replication = payload }),
+        .type_system_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .type_system_catalog = payload }),
+        .comment_metadata => |payload| return try expectLoweredDdlSummary(summary, .{ .comment_metadata = payload }),
+    }
+}
+
+fn expectTransactionDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.TransactionLogicalPlan) !void {
+    switch (plan) {
+        .control => |payload| return try expectLoweredDdlSummary(summary, .{ .transaction_control = payload }),
+        .prepared => |payload| return try expectLoweredDdlSummary(summary, .{ .prepared_transaction = payload }),
+        .savepoint => |payload| return try expectLoweredDdlSummary(summary, .{ .savepoint_transaction = payload }),
+    }
+}
+
+fn expectRoutineDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.RoutineLogicalPlan) !void {
+    switch (plan) {
+        .function_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .function_catalog = payload }),
+        .trigger_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .trigger_catalog = payload }),
+        .procedure_call => |payload| return try expectLoweredDdlSummary(summary, .{ .procedure_call = payload }),
+    }
+}
+
+fn expectAuthDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.AuthorizationLogicalPlan) !void {
+    switch (plan) {
+        .authorization_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .authorization_catalog = payload }),
+        .row_security_catalog => |payload| return try expectLoweredDdlSummary(summary, .{ .row_security_catalog = payload }),
+    }
+}
+
+fn expectLoweredDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !void {
     const expected = summary.ddl_tag orelse return;
     switch (lowered) {
         .adapter_noop => return error.TestUnexpectedResult,
@@ -1112,14 +1190,12 @@ fn expectAppParityCorpusEntry(
         .ddl => {
             var logical = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
             defer logical.deinit(alloc);
-            var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
-            defer lowered.deinit(alloc);
-            try expectDdlSummary(entry.summary, lowered);
-            const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+            try expectDdlSummary(entry.summary, logical);
+            const fingerprint = try ddlFingerprintAlloc(alloc, logical);
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
             try expectAppliedDdlCorpusPlan(alloc, base_schema_json, entry, logical);
-            try expectDdlExecutionCorpusPlan(alloc, entry, lowered);
+            try expectDdlExecutionCorpusPlan(alloc, entry, logical);
         },
         .query_function => return error.TestUnexpectedResult,
         .read => {
@@ -2791,7 +2867,6 @@ const createIndexPlanGeneratedExpressionCount = sql_adapter.createIndexPlanGener
 const ddlAppliedFingerprintAlloc = sql_adapter.ddlAppliedFingerprintAlloc;
 const ddlFingerprintAlloc = sql_adapter.ddlFingerprintAlloc;
 const lowerDeleteParsedSqlAlloc = sql_adapter_runtime.lowerDeleteParsedSqlAlloc;
-const lowerDdlPlanParsedSqlAlloc = ddl_plan.lowerDdlPlanParsedSqlAlloc;
 const lowerDeleteJoinedMutationSourceWithSchemasAlloc = sql_adapter_runtime.lowerDeleteJoinedMutationSourceWithSchemasAlloc;
 const lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter_runtime.lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc;
 const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc;

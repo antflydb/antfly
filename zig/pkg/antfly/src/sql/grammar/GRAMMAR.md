@@ -1111,7 +1111,8 @@ contract until storage and API row plans grow those outer-join semantics.
    retained generated expression payload to be internally valid at the lookup
    boundary before the broad start-kind check is accepted, and generated
    order-expression function starts validate the retained function identity for
-   case-fold, `md5`, and concat branches. Aggregate
+   case-fold, `md5`, concat, routine/extension, and general row-expression
+   branches. Aggregate
    `GROUP BY` lowering now applies the same generated item lookup for simple
    group fields, ordinals, and expression group keys, so corrupted group item
    expression kinds also fail closed during typed group planning. Query,
