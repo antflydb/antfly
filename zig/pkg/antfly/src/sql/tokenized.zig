@@ -398,10 +398,18 @@ fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement
 fn isGeneratedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
     const start = raw_statement.token_start;
     if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
-    if (!tokenMatchesKeyword(tokens[start], .create) and !tokenMatchesKeyword(tokens[start], .drop)) return false;
-    return tokenMatchesKeyword(tokens[start + 1], .database) or
-        tokenMatchesKeyword(tokens[start + 1], .schema) or
-        tokenMatchesKeyword(tokens[start + 1], .extension);
+    const first = tokens[start];
+    const second = tokens[start + 1];
+    if (tokenMatchesKeyword(first, .create) or tokenMatchesKeyword(first, .drop)) {
+        return tokenMatchesKeyword(second, .database) or
+            tokenMatchesKeyword(second, .schema) or
+            tokenMatchesKeyword(second, .extension);
+    }
+    if (tokenMatchesKeyword(first, .alter)) {
+        return tokenMatchesKeyword(second, .database) or
+            tokenMatchesKeyword(second, .extension);
+    }
+    return false;
 }
 
 fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -2429,6 +2437,8 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SCHEMA analytics AUTHORIZATION app_user"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER EXTENSION vector UPDATE TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SCHEMA analytics, reporting"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
