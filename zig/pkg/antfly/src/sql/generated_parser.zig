@@ -2213,6 +2213,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "REASSIGN OWNED BY old_role TO new_role", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SET ROLE app_user", .kind = .unsupported },
+    .{ .sql = "SET ROLE DEFAULT", .kind = .unsupported },
     .{ .sql = "RESET ROLE", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
