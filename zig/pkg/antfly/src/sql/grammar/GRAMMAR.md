@@ -547,7 +547,8 @@ supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
 diagnostics also cover rich PostgreSQL catalog shapes under otherwise supported
 heads, including `CREATE DATABASE ...` option tails, `CREATE SCHEMA ...`
-authorization/definition tails, and multi-target `DROP SCHEMA`, so those
+authorization/definition tails, and multi-target `DROP TABLE`, `DROP INDEX`,
+`DROP EXTENSION`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, and `DROP SCHEMA`, so those
 valid-but-unplanned forms become explicit unsupported statements rather than
 generic syntax failures. Generated unsupported
 heads that already have typed catalog/runtime support now enter the parsed DDL
@@ -1248,7 +1249,8 @@ Generated grammar work needs evidence at multiple levels:
   large-object administration, rule, trigger, conversion, event-trigger, extended
   statistics, operator/aggregate ALTER forms, operator class/family, and text-search
   configuration/dictionary/parser/template DDL, rich catalog option shapes for
-  `CREATE DATABASE`, `CREATE SCHEMA`, and multi-target `DROP SCHEMA`, and bare, simple, optioned,
+  `CREATE DATABASE` and `CREATE SCHEMA`, multi-target `DROP TABLE`, `DROP INDEX`,
+  `DROP EXTENSION`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, and `DROP SCHEMA`, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata, explain-option payloads, and subject ranges where
   available.

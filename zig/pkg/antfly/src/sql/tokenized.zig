@@ -2527,9 +2527,12 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_access_method,
         .drop_conversion,
         .drop_event_trigger,
+        .drop_extension_multi,
         .drop_foreign_data_wrapper,
         .drop_foreign_table,
+        .drop_index_multi,
         .drop_language,
+        .drop_materialized_view_multi,
         .drop_materialized_view,
         .drop_owned,
         .drop_operator_class,
@@ -2540,12 +2543,14 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_schema_multi,
         .drop_server,
         .drop_statistics,
+        .drop_table_multi,
         .drop_text_search_configuration,
         .drop_text_search_dictionary,
         .drop_text_search_parser,
         .drop_text_search_template,
         .drop_transform,
         .drop_user_mapping,
+        .drop_view_multi,
         .import_foreign_schema,
         .load,
         .move,
@@ -2901,7 +2906,6 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER USER"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP GROUP IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CALL"));
@@ -3563,9 +3567,24 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_event_trigger_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DROP EXTENSION vector, postgis",
+            .kind = .drop_extension_multi,
+            .reason = .drop_extension_multi_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE",
+            .kind = .drop_index_multi,
+            .reason = .drop_index_multi_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE",
+            .kind = .drop_materialized_view_multi,
+            .reason = .drop_materialized_view_multi_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP OWNED BY usage_role CASCADE",
@@ -3598,6 +3617,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_statistics_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DROP TABLE usage_records, archived_usage_records",
+            .kind = .drop_table_multi,
+            .reason = .drop_table_multi_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search",
             .kind = .drop_text_search_configuration,
             .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
@@ -3621,6 +3645,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql",
             .kind = .drop_transform,
             .reason = .drop_transform_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP VIEW active_usage, archived_usage",
+            .kind = .drop_view_multi,
+            .reason = .drop_view_multi_not_planned_by_generated_parser,
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",

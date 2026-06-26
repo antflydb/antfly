@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 9775
+%expect 9780
 
 %start statement
 
@@ -633,6 +633,11 @@ unsupported_statement:
   | DROP ACCESS METHOD diagnostic_tail_opt
   | DROP FOREIGN DATA identifier_name diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
+  | DROP TABLE if_exists_opt qualified_name COMMA diagnostic_tail
+  | DROP INDEX if_exists_opt qualified_name COMMA diagnostic_tail
+  | DROP EXTENSION if_exists_opt qualified_name COMMA diagnostic_tail
+  | DROP VIEW if_exists_opt qualified_name COMMA diagnostic_tail
+  | DROP MATERIALIZED VIEW if_exists_opt qualified_name COMMA diagnostic_tail
   | DROP identifier_name TRIGGER diagnostic_tail_opt
   | DROP identifier_name diagnostic_tail_opt
   | DROP identifier_name identifier_name diagnostic_tail_opt

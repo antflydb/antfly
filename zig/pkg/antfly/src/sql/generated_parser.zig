@@ -254,18 +254,23 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_conversion,
     drop_event_trigger,
     drop_language,
+    drop_extension_multi,
+    drop_index_multi,
+    drop_materialized_view_multi,
     drop_owned,
     drop_operator_class,
     drop_operator_family,
     drop_routine,
     drop_schema_multi,
     drop_statistics,
+    drop_table_multi,
     drop_text_search_configuration,
     drop_text_search_dictionary,
     drop_text_search_parser,
     drop_text_search_template,
     drop_transform,
     drop_user_mapping,
+    drop_view_multi,
     explain,
     fetch,
     grant,
@@ -364,18 +369,23 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_conversion_not_planned_by_generated_parser,
     drop_event_trigger_not_planned_by_generated_parser,
     drop_language_not_planned_by_generated_parser,
+    drop_extension_multi_not_planned_by_generated_parser,
+    drop_index_multi_not_planned_by_generated_parser,
+    drop_materialized_view_multi_not_planned_by_generated_parser,
     drop_owned_not_planned_by_generated_parser,
     drop_operator_class_not_planned_by_generated_parser,
     drop_operator_family_not_planned_by_generated_parser,
     drop_routine_not_planned_by_generated_parser,
     drop_schema_multi_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
+    drop_table_multi_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
     drop_text_search_dictionary_not_planned_by_generated_parser,
     drop_text_search_parser_not_planned_by_generated_parser,
     drop_text_search_template_not_planned_by_generated_parser,
     drop_transform_not_planned_by_generated_parser,
     drop_user_mapping_not_planned_by_generated_parser,
+    drop_view_multi_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
@@ -2140,18 +2150,23 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP ACCESS METHOD IF EXISTS usage_am", .kind = .unsupported },
     .{ .sql = "DROP CONVERSION IF EXISTS usage_conv", .kind = .unsupported },
     .{ .sql = "DROP EVENT TRIGGER IF EXISTS usage_ddl_start", .kind = .unsupported },
+    .{ .sql = "DROP EXTENSION vector, postgis", .kind = .unsupported },
+    .{ .sql = "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE", .kind = .unsupported },
     .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree", .kind = .unsupported },
     .{ .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE", .kind = .unsupported },
     .{ .sql = "DROP SCHEMA analytics, reporting", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
+    .{ .sql = "DROP TABLE usage_records, archived_usage_records", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH PARSER IF EXISTS usage_parser", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template", .kind = .unsupported },
     .{ .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql", .kind = .unsupported },
+    .{ .sql = "DROP VIEW active_usage, archived_usage", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -2696,8 +2711,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
-        if (second.matchesKeywordTag(.table)) return .{ .ddl = .drop_table };
-        if (second.matchesKeywordTag(.view)) return .{ .ddl = .drop_view };
+        if (second.matchesKeywordTag(.table)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_table_multi };
+            return .{ .ddl = .drop_table };
+        }
+        if (second.matchesKeywordTag(.view)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_view_multi };
+            return .{ .ddl = .drop_view };
+        }
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .drop_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .drop_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .drop_enum_type };
@@ -2706,20 +2727,29 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .drop_subscription };
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .drop_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .drop_procedure };
-        if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
+        if (second.matchesKeywordTag(.index)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_index_multi };
+            return .{ .extension_index = .drop_index };
+        }
         if (second.matchesKeywordTag(.schema)) {
-            if (generatedDropSchemaHasMultipleTargets(tokens)) return .{ .unsupported = .drop_schema_multi };
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_schema_multi };
             return .{ .ddl = .drop_schema };
         }
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
-        if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
+        if (second.matchesKeywordTag(.extension)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_extension_multi };
+            return .{ .extension_index = .drop_extension };
+        }
         if (second.matchesKeywordTag(.access) and tokens.len > 2 and tokens[2].matchesKeywordTag(.method)) return .{ .unsupported = .drop_access_method };
         if (second.matchesKeyword("conversion")) return .{ .unsupported = .drop_conversion };
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_event_trigger };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 3 and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) return .{ .unsupported = .drop_foreign_data_wrapper };
         if (second.matchesKeyword("language")) return .{ .unsupported = .drop_language };
-        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) {
+            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 3)) return .{ .unsupported = .drop_materialized_view_multi };
+            return .{ .ddl = .drop_materialized_view };
+        }
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
@@ -2892,9 +2922,9 @@ fn generatedCreateCatalogHeadHasUnsupportedTail(tokens: []const token_mod.Token,
     return name.end < end;
 }
 
-fn generatedDropSchemaHasMultipleTargets(tokens: []const token_mod.Token) bool {
+fn generatedDropCatalogHeadHasMultipleTargets(tokens: []const token_mod.Token, name_start: usize) bool {
     const end = statementTokenEnd(tokens);
-    var index: usize = 2;
+    var index = name_start;
     _ = consumeGeneratedIfExists(tokens, &index, end);
     const first = generatedQualifiedNameRange(tokens, index, end) orelse return false;
     return first.end < end and tokens[first.end].kind == .comma;
@@ -3011,18 +3041,23 @@ fn buildUnsupportedAst(
             .drop_conversion => .drop_conversion_not_planned_by_generated_parser,
             .drop_event_trigger => .drop_event_trigger_not_planned_by_generated_parser,
             .drop_language => .drop_language_not_planned_by_generated_parser,
+            .drop_extension_multi => .drop_extension_multi_not_planned_by_generated_parser,
+            .drop_index_multi => .drop_index_multi_not_planned_by_generated_parser,
+            .drop_materialized_view_multi => .drop_materialized_view_multi_not_planned_by_generated_parser,
             .drop_owned => .drop_owned_not_planned_by_generated_parser,
             .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
             .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
             .drop_routine => .drop_routine_not_planned_by_generated_parser,
             .drop_schema_multi => .drop_schema_multi_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
+            .drop_table_multi => .drop_table_multi_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
             .drop_text_search_dictionary => .drop_text_search_dictionary_not_planned_by_generated_parser,
             .drop_text_search_parser => .drop_text_search_parser_not_planned_by_generated_parser,
             .drop_text_search_template => .drop_text_search_template_not_planned_by_generated_parser,
             .drop_transform => .drop_transform_not_planned_by_generated_parser,
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
+            .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
@@ -7358,10 +7393,14 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_conversion }, (try parseSqlAlloc(alloc, "DROP CONVERSION IF EXISTS usage_conv")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_extension_multi }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector, postgis")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_index_multi }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_materialized_view_multi }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_routine }, (try parseSqlAlloc(alloc, "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_schema_multi }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics, reporting")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_statistics }, (try parseSqlAlloc(alloc, "DROP STATISTICS IF EXISTS usage_stats")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_table_multi }, (try parseSqlAlloc(alloc, "DROP TABLE usage_records, archived_usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_configuration }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
@@ -7383,6 +7422,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_parser }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH PARSER IF EXISTS usage_parser")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_template }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_transform }, (try parseSqlAlloc(alloc, "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_view_multi }, (try parseSqlAlloc(alloc, "DROP VIEW active_usage, archived_usage")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .release_savepoint }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
@@ -11402,10 +11442,28 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "DROP EXTENSION vector, postgis",
+            .kind = .drop_extension_multi,
+            .reason = .drop_extension_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE",
+            .kind = .drop_index_multi,
+            .reason = .drop_index_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE",
+            .kind = .drop_materialized_view_multi,
+            .reason = .drop_materialized_view_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
             .sql = "DROP OWNED BY usage_role CASCADE",
@@ -11444,6 +11502,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
+            .sql = "DROP TABLE usage_records, archived_usage_records",
+            .kind = .drop_table_multi,
+            .reason = .drop_table_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
             .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search",
             .kind = .drop_text_search_configuration,
             .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
@@ -11472,6 +11536,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_transform,
             .reason = .drop_transform_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP VIEW active_usage, archived_usage",
+            .kind = .drop_view_multi,
+            .reason = .drop_view_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",

@@ -17,6 +17,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const db_query_search = @import("../../storage/db/query/search_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const json_helpers = @import("../json_helpers.zig");
+const regex_mod = @import("../../search/regex.zig");
 const search_analysis = @import("../../search/analysis.zig");
 const table_read_remote_wire = @import("remote_wire.zig");
 
@@ -670,6 +671,2862 @@ pub fn mergeRuntimePreflightSummaryNoFree(
     target.dense_search_width_max = @max(target.dense_search_width_max, extra.dense_search_width_max);
     target.dense_epsilon_max = @max(target.dense_epsilon_max, extra.dense_epsilon_max);
     db_mod.deriveRuntimePreflightEstimates(target);
+}
+
+pub fn algebraicConstraintsForRequestAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+) !?[]db_mod.aggregations.FixedConstraint {
+    var out = std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint).empty;
+    errdefer freeAlgebraicConstraints(alloc, out.items);
+
+    switch (req.query) {
+        .match_all => {},
+        .term => |term| {
+            if (!std.mem.startsWith(u8, term.field, "/")) return null;
+            const value_text = db_mod.algebraic.token.canonicalTupleAlloc(alloc, &.{ "string", term.term }) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, term.field, value_text) catch return null;
+        },
+        .match => |match| {
+            if (!std.mem.startsWith(u8, match.field, "/") or match.analyzer != null or match.text.len == 0) return null;
+            const value_text = db_mod.algebraic.index.pathFactStringMatchConstraintValueAlloc(alloc, match.text) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, match.field, value_text) catch return null;
+        },
+        .fuzzy => |fuzzy| {
+            if (!std.mem.startsWith(u8, fuzzy.field, "/") or fuzzy.auto_fuzzy or fuzzy.prefix_len == 0) return null;
+            const prefix_len: usize = @intCast(fuzzy.prefix_len);
+            if (fuzzy.term.len < prefix_len) return null;
+            const value_text = db_mod.algebraic.index.pathFactStringFuzzyConstraintValueAlloc(
+                alloc,
+                fuzzy.term,
+                fuzzy.max_edits,
+                fuzzy.prefix_len,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, fuzzy.field, value_text) catch return null;
+        },
+        .prefix => |prefix| {
+            if (!std.mem.startsWith(u8, prefix.field, "/")) return null;
+            const value_text = db_mod.algebraic.index.pathFactStringPrefixConstraintValueAlloc(alloc, prefix.prefix) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, prefix.field, value_text) catch return null;
+        },
+        .wildcard => |wildcard| {
+            if (!std.mem.startsWith(u8, wildcard.field, "/")) return null;
+            const literal_prefix = algebraicWildcardLiteralPrefix(wildcard.pattern);
+            if (literal_prefix.len == 0 and algebraicWildcardPatternHasMeta(wildcard.pattern)) return null;
+            const value_text = db_mod.algebraic.index.pathFactStringWildcardConstraintValueAlloc(alloc, wildcard.pattern) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, wildcard.field, value_text) catch return null;
+        },
+        .regexp => |regexp| {
+            if (!std.mem.startsWith(u8, regexp.field, "/")) return null;
+            if (algebraicRegexpLiteralPrefix(regexp.pattern).len == 0) return null;
+            var compiled = regex_mod.compile(alloc, regexp.pattern) catch return null;
+            defer compiled.deinit();
+            const value_text = db_mod.algebraic.index.pathFactStringRegexpConstraintValueAlloc(alloc, regexp.pattern) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, regexp.field, value_text) catch return null;
+        },
+        .bool_field => |field| {
+            const value_text = algebraicConstraintBoolValueAlloc(alloc, field.field, field.value) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, field.field, value_text) catch return null;
+        },
+        .numeric_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/")) return null;
+            const value_text = db_mod.algebraic.index.pathFactNumericRangeConstraintValueAlloc(
+                alloc,
+                range.min,
+                range.max,
+                range.inclusive_min,
+                range.inclusive_max,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, range.field, value_text) catch return null;
+        },
+        .term_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/") or (range.min == null and range.max == null)) return null;
+            const value_text = db_mod.algebraic.index.pathFactTermRangeConstraintValueAlloc(
+                alloc,
+                range.min,
+                range.max,
+                range.inclusive_min,
+                range.inclusive_max,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, range.field, value_text) catch return null;
+        },
+        .ip_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/") or !algebraicValidIpRange(range.cidr)) return null;
+            const value_text = db_mod.algebraic.index.pathFactIpRangeConstraintValueAlloc(alloc, range.cidr) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, range.field, value_text) catch return null;
+        },
+        .geo_bbox => |bbox| {
+            if (!std.mem.startsWith(u8, bbox.field, "/") or !algebraicValidGeoBBox(bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon)) return null;
+            const value_text = db_mod.algebraic.index.pathFactGeoBBoxConstraintValueAlloc(
+                alloc,
+                bbox.min_lat,
+                bbox.min_lon,
+                bbox.max_lat,
+                bbox.max_lon,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, bbox.field, value_text) catch return null;
+        },
+        .geo_distance => |distance| {
+            if (!std.mem.startsWith(u8, distance.field, "/") or !algebraicValidGeoDistance(distance.lat, distance.lon, distance.radius_meters)) return null;
+            const value_text = db_mod.algebraic.index.pathFactGeoDistanceConstraintValueAlloc(
+                alloc,
+                distance.lat,
+                distance.lon,
+                distance.radius_meters,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, distance.field, value_text) catch return null;
+        },
+        .geo_shape => |shape| {
+            if (!std.mem.startsWith(u8, shape.field, "/") or !algebraicGeoShapeRelationSupported(shape.relation)) return null;
+            const value_text = db_mod.algebraic.index.pathFactGeoShapeConstraintValueAlloc(
+                alloc,
+                @tagName(shape.relation),
+                shape.polygons,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, shape.field, value_text) catch return null;
+        },
+        .date_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/")) return null;
+            const start_text = if (range.start_ns) |ns| std.fmt.allocPrint(alloc, "{d}", .{ns}) catch return null else null;
+            defer if (start_text) |value| alloc.free(value);
+            const end_text = if (range.end_ns) |ns| std.fmt.allocPrint(alloc, "{d}", .{ns}) catch return null else null;
+            defer if (end_text) |value| alloc.free(value);
+            const value_text = db_mod.algebraic.index.pathFactDateRangeConstraintValueAlloc(
+                alloc,
+                start_text,
+                end_text,
+                range.inclusive_start,
+                range.inclusive_end,
+            ) catch return null;
+            defer alloc.free(value_text);
+            appendAlgebraicConstraint(&out, alloc, range.field, value_text) catch return null;
+        },
+        else => return null,
+    }
+
+    if (req.full_text) |text_query| {
+        if (!(collectAlgebraicTextQueryConstraints(alloc, text_query, &out) catch return null)) return null;
+    }
+
+    if (req.filter_query_json.len > 0) {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (!(collectAlgebraicFilterConstraints(alloc, parsed.value, &out) catch return null)) return null;
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn freeAlgebraicConstraints(
+    alloc: std.mem.Allocator,
+    constraints: []db_mod.aggregations.FixedConstraint,
+) void {
+    for (constraints) |constraint| {
+        alloc.free(@constCast(constraint.field));
+        alloc.free(@constCast(constraint.value));
+    }
+    if (constraints.len > 0) alloc.free(constraints);
+}
+
+const AlgebraicConstraintCollectError = std.mem.Allocator.Error || error{UnsupportedQueryRequest};
+
+fn collectAlgebraicTextBoolQueryConstraints(
+    alloc: std.mem.Allocator,
+    bool_query: db_mod.types.TextBoolQuery,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (bool_query.must_not.len > 0) return false;
+    if (bool_query.should.len > 0) {
+        if (bool_query.must.len > 0) {
+            if (bool_query.min_should != 0) return false;
+        } else {
+            if (bool_query.min_should != 0 and bool_query.min_should != 1) return false;
+            return try collectAlgebraicTextShouldTermConstraint(alloc, bool_query.should, out);
+        }
+    }
+    if (bool_query.min_should > 0) return false;
+    for (bool_query.must) |query| {
+        if (!(try collectAlgebraicTextQueryConstraints(alloc, query, out))) return false;
+    }
+    return true;
+}
+
+fn collectAlgebraicTextShouldTermConstraint(
+    alloc: std.mem.Allocator,
+    queries: []const db_mod.types.TextQuery,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (queries.len == 0) return false;
+    var field: ?[]const u8 = null;
+    const typed_values = try alloc.alloc([]const u8, queries.len);
+    defer alloc.free(typed_values);
+    var initialized: usize = 0;
+    defer {
+        for (typed_values[0..initialized]) |value| alloc.free(@constCast(value));
+    }
+
+    for (queries, 0..) |query, i| {
+        const term = switch (query) {
+            .term => |term| term,
+            else => return false,
+        };
+        if (!std.mem.startsWith(u8, term.field, "/")) return false;
+        if (field) |existing| {
+            if (!std.mem.eql(u8, existing, term.field)) return false;
+        } else {
+            field = term.field;
+        }
+        typed_values[i] = try db_mod.algebraic.token.canonicalTupleAlloc(alloc, &.{ "string", term.term });
+        initialized += 1;
+    }
+
+    try appendAlgebraicTypedAnyConstraint(out, alloc, field orelse return false, typed_values);
+    return true;
+}
+
+fn collectAlgebraicTextQueryConstraints(
+    alloc: std.mem.Allocator,
+    query: db_mod.types.TextQuery,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    switch (query) {
+        .match_all => return true,
+        .term => |term| {
+            if (!std.mem.startsWith(u8, term.field, "/")) return false;
+            const value_text = try db_mod.algebraic.token.canonicalTupleAlloc(alloc, &.{ "string", term.term });
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, term.field, value_text);
+            return true;
+        },
+        .match => |match| {
+            if (!std.mem.startsWith(u8, match.field, "/") or match.analyzer != null or match.text.len == 0) return false;
+            const value_text = try db_mod.algebraic.index.pathFactStringMatchConstraintValueAlloc(alloc, match.text);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, match.field, value_text);
+            return true;
+        },
+        .fuzzy => |fuzzy| {
+            if (!std.mem.startsWith(u8, fuzzy.field, "/") or fuzzy.auto_fuzzy or fuzzy.prefix_len == 0) return false;
+            const prefix_len: usize = @intCast(fuzzy.prefix_len);
+            if (fuzzy.term.len < prefix_len) return false;
+            const value_text = try db_mod.algebraic.index.pathFactStringFuzzyConstraintValueAlloc(
+                alloc,
+                fuzzy.term,
+                fuzzy.max_edits,
+                fuzzy.prefix_len,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, fuzzy.field, value_text);
+            return true;
+        },
+        .prefix => |prefix| {
+            if (!std.mem.startsWith(u8, prefix.field, "/")) return false;
+            const value_text = try db_mod.algebraic.index.pathFactStringPrefixConstraintValueAlloc(alloc, prefix.prefix);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, prefix.field, value_text);
+            return true;
+        },
+        .wildcard => |wildcard| {
+            if (!std.mem.startsWith(u8, wildcard.field, "/")) return false;
+            const literal_prefix = algebraicWildcardLiteralPrefix(wildcard.pattern);
+            if (literal_prefix.len == 0 and algebraicWildcardPatternHasMeta(wildcard.pattern)) return false;
+            const value_text = try db_mod.algebraic.index.pathFactStringWildcardConstraintValueAlloc(alloc, wildcard.pattern);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, wildcard.field, value_text);
+            return true;
+        },
+        .regexp => |regexp| {
+            if (!std.mem.startsWith(u8, regexp.field, "/")) return false;
+            if (algebraicRegexpLiteralPrefix(regexp.pattern).len == 0) return false;
+            var compiled = regex_mod.compile(alloc, regexp.pattern) catch return false;
+            defer compiled.deinit();
+            const value_text = try db_mod.algebraic.index.pathFactStringRegexpConstraintValueAlloc(alloc, regexp.pattern);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, regexp.field, value_text);
+            return true;
+        },
+        .bool_field => |field| {
+            const value_text = try algebraicConstraintBoolValueAlloc(alloc, field.field, field.value);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, field.field, value_text);
+            return true;
+        },
+        .numeric_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/")) return false;
+            const value_text = try db_mod.algebraic.index.pathFactNumericRangeConstraintValueAlloc(
+                alloc,
+                range.min,
+                range.max,
+                range.inclusive_min,
+                range.inclusive_max,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, range.field, value_text);
+            return true;
+        },
+        .date_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/")) return false;
+            const start_text = if (range.start_ns) |ns| try std.fmt.allocPrint(alloc, "{d}", .{ns}) else null;
+            defer if (start_text) |value| alloc.free(value);
+            const end_text = if (range.end_ns) |ns| try std.fmt.allocPrint(alloc, "{d}", .{ns}) else null;
+            defer if (end_text) |value| alloc.free(value);
+            const value_text = try db_mod.algebraic.index.pathFactDateRangeConstraintValueAlloc(
+                alloc,
+                start_text,
+                end_text,
+                range.inclusive_start,
+                range.inclusive_end,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, range.field, value_text);
+            return true;
+        },
+        .term_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/") or (range.min == null and range.max == null)) return false;
+            const value_text = try db_mod.algebraic.index.pathFactTermRangeConstraintValueAlloc(
+                alloc,
+                range.min,
+                range.max,
+                range.inclusive_min,
+                range.inclusive_max,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, range.field, value_text);
+            return true;
+        },
+        .ip_range => |range| {
+            if (!std.mem.startsWith(u8, range.field, "/") or !algebraicValidIpRange(range.cidr)) return false;
+            const value_text = try db_mod.algebraic.index.pathFactIpRangeConstraintValueAlloc(alloc, range.cidr);
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, range.field, value_text);
+            return true;
+        },
+        .geo_bbox => |bbox| {
+            if (!std.mem.startsWith(u8, bbox.field, "/") or !algebraicValidGeoBBox(bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon)) return false;
+            const value_text = db_mod.algebraic.index.pathFactGeoBBoxConstraintValueAlloc(
+                alloc,
+                bbox.min_lat,
+                bbox.min_lon,
+                bbox.max_lat,
+                bbox.max_lon,
+            ) catch return false;
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, bbox.field, value_text);
+            return true;
+        },
+        .geo_distance => |distance| {
+            if (!std.mem.startsWith(u8, distance.field, "/") or !algebraicValidGeoDistance(distance.lat, distance.lon, distance.radius_meters)) return false;
+            const value_text = db_mod.algebraic.index.pathFactGeoDistanceConstraintValueAlloc(
+                alloc,
+                distance.lat,
+                distance.lon,
+                distance.radius_meters,
+            ) catch return false;
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, distance.field, value_text);
+            return true;
+        },
+        .geo_shape => |shape| {
+            if (!std.mem.startsWith(u8, shape.field, "/") or !algebraicGeoShapeRelationSupported(shape.relation)) return false;
+            const value_text = db_mod.algebraic.index.pathFactGeoShapeConstraintValueAlloc(
+                alloc,
+                @tagName(shape.relation),
+                shape.polygons,
+            ) catch return false;
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, shape.field, value_text);
+            return true;
+        },
+        .bool_query => |nested| return try collectAlgebraicTextBoolQueryConstraints(alloc, nested, out),
+        else => return false,
+    }
+}
+
+fn appendAlgebraicConstraint(
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    value: []const u8,
+) AlgebraicConstraintCollectError!void {
+    for (out.items) |existing| {
+        if (!std.mem.eql(u8, existing.field, field)) continue;
+        if (std.mem.eql(u8, existing.value, value)) return;
+        return error.UnsupportedQueryRequest;
+    }
+    try out.append(alloc, .{
+        .field = try alloc.dupe(u8, field),
+        .value = try alloc.dupe(u8, value),
+    });
+}
+
+fn collectAlgebraicFilterConstraints(
+    alloc: std.mem.Allocator,
+    filter: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (filter != .object) return false;
+    if (filter.object.get("match_all") != null) return true;
+    if (filter.object.get("term")) |term| {
+        const predicate = algebraicFilterTermPredicate(term, filter.object.get("field") orelse filter.object.get("path")) orelse return false;
+        const value_text = try algebraicConstraintValueTextAlloc(alloc, predicate.field, predicate.value);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.field, value_text);
+        return true;
+    }
+    if (filter.object.get("terms")) |terms| {
+        if (!(try collectSingleValueTermsConstraint(alloc, terms, out))) return false;
+        return true;
+    }
+    if (filter.object.get("match")) |match| {
+        const predicate = algebraicPathMatchPredicate(match, filter.object.get("field")) orelse return false;
+        if (predicate.text.len == 0) return false;
+        const value_text = try db_mod.algebraic.index.pathFactStringMatchConstraintValueAlloc(alloc, predicate.text);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("bool_field")) |bool_field| {
+        if (bool_field != .object) return false;
+        const field = bool_field.object.get("field") orelse return false;
+        const value = bool_field.object.get("value") orelse return false;
+        if (field != .string or value != .bool) return false;
+        const value_text = try algebraicConstraintBoolValueAlloc(alloc, field.string, value.bool);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, field.string, value_text);
+        return true;
+    }
+    if (filter.object.get("exists")) |exists| {
+        const path = algebraicExistsPath(exists) orelse return false;
+        if (!std.mem.startsWith(u8, path, "/")) return false;
+        try appendAlgebraicConstraint(out, alloc, path, db_mod.algebraic.index.path_fact_exists_constraint_value);
+        return true;
+    }
+    if (filter.object.get("prefix")) |prefix| {
+        const predicate = algebraicPathPrefixPredicate(prefix, filter.object.get("field")) orelse return false;
+        const value_text = try db_mod.algebraic.index.pathFactStringPrefixConstraintValueAlloc(alloc, predicate.prefix);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("wildcard")) |wildcard| {
+        const predicate = algebraicPathPatternPredicate(wildcard, "pattern") orelse return false;
+        const literal_prefix = algebraicWildcardLiteralPrefix(predicate.text);
+        if (literal_prefix.len == 0 and algebraicWildcardPatternHasMeta(predicate.text)) return false;
+        const value_text = try db_mod.algebraic.index.pathFactStringWildcardConstraintValueAlloc(alloc, predicate.text);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("regexp")) |regexp| {
+        const predicate = algebraicPathPatternPredicate(regexp, "pattern") orelse return false;
+        if (algebraicRegexpLiteralPrefix(predicate.text).len == 0) return false;
+        var compiled = regex_mod.compile(alloc, predicate.text) catch return false;
+        defer compiled.deinit();
+        const value_text = try db_mod.algebraic.index.pathFactStringRegexpConstraintValueAlloc(alloc, predicate.text);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("fuzzy")) |fuzzy| {
+        const predicate = algebraicPathFuzzyPredicate(fuzzy) orelse return false;
+        if (predicate.query.prefix_len == 0) return false;
+        const prefix_len: usize = @intCast(predicate.query.prefix_len);
+        if (predicate.query.term.len < prefix_len) return false;
+        const value_text = try db_mod.algebraic.index.pathFactStringFuzzyConstraintValueAlloc(
+            alloc,
+            predicate.query.term,
+            predicate.query.max_edits,
+            predicate.query.prefix_len,
+        );
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("numeric_range")) |range| {
+        const predicate = algebraicPathNumericRangePredicate(range) orelse return false;
+        const value_text = try db_mod.algebraic.index.pathFactNumericRangeConstraintValueAlloc(
+            alloc,
+            predicate.min,
+            predicate.max,
+            predicate.inclusive_min,
+            predicate.inclusive_max,
+        );
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("date_range")) |range| {
+        const predicate = algebraicPathDateRangePredicate(range) orelse return false;
+        const start_text = try algebraicDateBoundTextAlloc(alloc, predicate.start);
+        defer if (start_text) |value| alloc.free(value);
+        const end_text = try algebraicDateBoundTextAlloc(alloc, predicate.end);
+        defer if (end_text) |value| alloc.free(value);
+        const value_text = try db_mod.algebraic.index.pathFactDateRangeConstraintValueAlloc(
+            alloc,
+            start_text,
+            end_text,
+            predicate.inclusive_start,
+            predicate.inclusive_end,
+        );
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("ip_range")) |range| {
+        const predicate = algebraicPathIpRangePredicate(range) orelse return false;
+        const value_text = try db_mod.algebraic.index.pathFactIpRangeConstraintValueAlloc(alloc, predicate.cidr);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("geo_bbox")) |bbox| {
+        const predicate = algebraicPathGeoBBoxPredicate(bbox) orelse return false;
+        const value_text = db_mod.algebraic.index.pathFactGeoBBoxConstraintValueAlloc(
+            alloc,
+            predicate.min_lat,
+            predicate.min_lon,
+            predicate.max_lat,
+            predicate.max_lon,
+        ) catch return false;
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("geo_distance")) |distance| {
+        const predicate = algebraicPathGeoDistancePredicate(distance) orelse return false;
+        const value_text = db_mod.algebraic.index.pathFactGeoDistanceConstraintValueAlloc(
+            alloc,
+            predicate.lat,
+            predicate.lon,
+            predicate.radius_meters,
+        ) catch return false;
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("geo_shape")) |shape| {
+        var predicate = (try algebraicPathGeoShapePredicateAlloc(alloc, shape)) orelse return false;
+        defer predicate.deinit(alloc);
+        const value_text = db_mod.algebraic.index.pathFactGeoShapeConstraintValueAlloc(
+            alloc,
+            @tagName(predicate.relation),
+            predicate.polygons,
+        ) catch return false;
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("term_range")) |range| {
+        const predicate = algebraicPathTermRangePredicate(range) orelse return false;
+        const value_text = try db_mod.algebraic.index.pathFactTermRangeConstraintValueAlloc(
+            alloc,
+            predicate.min,
+            predicate.max,
+            predicate.inclusive_min,
+            predicate.inclusive_max,
+        );
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+        return true;
+    }
+    if (filter.object.get("range")) |range| {
+        if (algebraicPathStandardNumericRangePredicate(range)) |predicate| {
+            const value_text = try db_mod.algebraic.index.pathFactNumericRangeConstraintValueAlloc(
+                alloc,
+                predicate.min,
+                predicate.max,
+                predicate.inclusive_min,
+                predicate.inclusive_max,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+            return true;
+        }
+        if (algebraicPathStandardDateRangePredicate(range)) |predicate| {
+            const start_text = try algebraicDateBoundTextAlloc(alloc, predicate.start);
+            defer if (start_text) |value| alloc.free(value);
+            const end_text = try algebraicDateBoundTextAlloc(alloc, predicate.end);
+            defer if (end_text) |value| alloc.free(value);
+            const value_text = try db_mod.algebraic.index.pathFactDateRangeConstraintValueAlloc(
+                alloc,
+                start_text,
+                end_text,
+                predicate.inclusive_start,
+                predicate.inclusive_end,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+            return true;
+        }
+        if (algebraicPathStandardTermRangePredicate(range)) |predicate| {
+            const value_text = try db_mod.algebraic.index.pathFactTermRangeConstraintValueAlloc(
+                alloc,
+                predicate.min,
+                predicate.max,
+                predicate.inclusive_min,
+                predicate.inclusive_max,
+            );
+            defer alloc.free(value_text);
+            try appendAlgebraicConstraint(out, alloc, predicate.path, value_text);
+            return true;
+        }
+        return false;
+    }
+    if (filter.object.get("conjuncts")) |conjuncts| {
+        if (conjuncts != .array) return false;
+        for (conjuncts.array.items) |item| {
+            if (!(try collectAlgebraicFilterConstraints(alloc, item, out))) return false;
+        }
+        return true;
+    }
+    if (filter.object.get("disjuncts")) |disjuncts| {
+        return try collectAlgebraicFilterShouldTermConstraint(alloc, disjuncts, out);
+    }
+    if (filter.object.get("bool")) |bool_query| {
+        if (bool_query != .object) return false;
+        if (bool_query.object.get("must_not") != null) return false;
+        const must = bool_query.object.get("must");
+        const filter_clause = bool_query.object.get("filter");
+        const should = bool_query.object.get("should");
+        if (should) |clause| {
+            const min_should_value = bool_query.object.get("minimum_should_match") orelse bool_query.object.get("min_should");
+            if (must != null or filter_clause != null) {
+                if (!algebraicBoolShouldMinIsOptional(min_should_value)) return false;
+            } else {
+                if (!algebraicBoolShouldMinIsOne(min_should_value)) return false;
+                return try collectAlgebraicFilterShouldTermConstraint(alloc, clause, out);
+            }
+        }
+        if (must == null and filter_clause == null) return false;
+        if (must) |clause| {
+            if (!(try collectAlgebraicFilterConstraintClause(alloc, clause, out))) return false;
+        }
+        if (filter_clause) |clause| {
+            if (!(try collectAlgebraicFilterConstraintClause(alloc, clause, out))) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn collectAlgebraicFilterConstraintClause(
+    alloc: std.mem.Allocator,
+    clause: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (clause == .array) {
+        if (clause.array.items.len == 0) return false;
+        for (clause.array.items) |item| {
+            if (!(try collectAlgebraicFilterConstraints(alloc, item, out))) return false;
+        }
+        return true;
+    }
+    return try collectAlgebraicFilterConstraints(alloc, clause, out);
+}
+
+fn algebraicBoolShouldMinIsOptional(value: ?std.json.Value) bool {
+    const actual = value orelse return true;
+    return switch (actual) {
+        .integer => |number| number == 0,
+        .float => |number| number == 0.0,
+        .string => |text| std.mem.eql(u8, text, "0"),
+        else => false,
+    };
+}
+
+fn algebraicBoolShouldMinIsOne(value: ?std.json.Value) bool {
+    const actual = value orelse return true;
+    return switch (actual) {
+        .integer => |number| number == 1,
+        .float => |number| number == 1.0,
+        .string => |text| std.mem.eql(u8, text, "1"),
+        else => false,
+    };
+}
+
+fn collectAlgebraicFilterShouldTermConstraint(
+    alloc: std.mem.Allocator,
+    clause: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    const items = switch (clause) {
+        .array => |array| array.items,
+        else => return try collectAlgebraicFilterShouldTermItemsConstraint(alloc, &.{clause}, out),
+    };
+    return try collectAlgebraicFilterShouldTermItemsConstraint(alloc, items, out);
+}
+
+fn collectAlgebraicFilterShouldTermItemsConstraint(
+    alloc: std.mem.Allocator,
+    items: []const std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (items.len == 0) return false;
+    var field: ?[]const u8 = null;
+    const typed_values = try alloc.alloc([]const u8, items.len);
+    defer alloc.free(typed_values);
+    var initialized: usize = 0;
+    defer {
+        for (typed_values[0..initialized]) |value| alloc.free(@constCast(value));
+    }
+
+    for (items, 0..) |item, i| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return false,
+        };
+        const predicate = algebraicFilterTermPredicate(object.get("term") orelse return false, object.get("field") orelse object.get("path")) orelse return false;
+        if (!std.mem.startsWith(u8, predicate.field, "/")) return false;
+        if (field) |existing| {
+            if (!std.mem.eql(u8, existing, predicate.field)) return false;
+        } else {
+            field = predicate.field;
+        }
+        typed_values[i] = try algebraicConstraintValueTextAlloc(alloc, predicate.field, predicate.value);
+        initialized += 1;
+    }
+
+    try appendAlgebraicTypedAnyConstraint(out, alloc, field orelse return false, typed_values);
+    return true;
+}
+
+const AlgebraicFilterTermPredicate = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+fn algebraicFilterTermPredicate(term: std.json.Value, sibling_field_value: ?std.json.Value) ?AlgebraicFilterTermPredicate {
+    if (term == .object) {
+        if (term.object.get("field") orelse term.object.get("path")) |field_value| {
+            const field = algebraicJsonString(field_value) orelse return null;
+            const value = term.object.get("term") orelse term.object.get("value") orelse return null;
+            return .{ .field = field, .value = value };
+        }
+        if (term.object.count() == 1) {
+            var it = term.object.iterator();
+            const entry = it.next() orelse return null;
+            return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
+        }
+    }
+    const field = algebraicJsonString(sibling_field_value orelse return null) orelse return null;
+    return .{ .field = field, .value = term };
+}
+
+fn algebraicExistsPath(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |field| field,
+        .object => |object| blk: {
+            const path = object.get("path") orelse object.get("field") orelse break :blk null;
+            if (path != .string) break :blk null;
+            break :blk path.string;
+        },
+        else => null,
+    };
+}
+
+const AlgebraicPathPrefixPredicate = struct {
+    path: []const u8,
+    prefix: []const u8,
+};
+
+const AlgebraicPathTextPredicate = struct {
+    path: []const u8,
+    text: []const u8,
+};
+
+const AlgebraicFuzzyQuery = struct {
+    term: []const u8,
+    max_edits: u8,
+    prefix_len: u8,
+};
+
+const AlgebraicPathFuzzyPredicate = struct {
+    path: []const u8,
+    query: AlgebraicFuzzyQuery,
+};
+
+const AlgebraicPathNumericRangePredicate = struct {
+    path: []const u8,
+    min: ?f64 = null,
+    max: ?f64 = null,
+    inclusive_min: bool = true,
+    inclusive_max: bool = false,
+};
+
+const AlgebraicPathTermRangePredicate = struct {
+    path: []const u8,
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: bool = true,
+    inclusive_max: bool = false,
+};
+
+const AlgebraicPathDateRangePredicate = struct {
+    path: []const u8,
+    start: ?std.json.Value = null,
+    end: ?std.json.Value = null,
+    inclusive_start: bool = true,
+    inclusive_end: bool = false,
+};
+
+const AlgebraicPathIpRangePredicate = struct {
+    path: []const u8,
+    cidr: []const u8,
+};
+
+const AlgebraicPathGeoBBoxPredicate = struct {
+    path: []const u8,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+};
+
+const AlgebraicPathGeoDistancePredicate = struct {
+    path: []const u8,
+    lat: f64,
+    lon: f64,
+    radius_meters: f64,
+};
+
+const AlgebraicPathGeoShapePredicate = struct {
+    path: []const u8,
+    relation: db_mod.types.GeoShapeRelation,
+    polygons: []const []const db_mod.types.GeoPoint,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.polygons) |polygon| {
+            if (polygon.len > 0) alloc.free(@constCast(polygon));
+        }
+        if (self.polygons.len > 0) alloc.free(@constCast(self.polygons));
+        self.* = undefined;
+    }
+};
+
+fn algebraicJsonString(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn algebraicPathPrefixPredicate(prefix_value: std.json.Value, sibling_field_value: ?std.json.Value) ?AlgebraicPathPrefixPredicate {
+    return switch (prefix_value) {
+        .object => |object| blk: {
+            if (object.get("path")) |path_value| {
+                const path = algebraicJsonString(path_value) orelse break :blk null;
+                if (!std.mem.startsWith(u8, path, "/")) break :blk null;
+                const prefix = algebraicJsonString(object.get("value") orelse object.get("prefix") orelse break :blk null) orelse break :blk null;
+                break :blk .{ .path = path, .prefix = prefix };
+            }
+            if (object.get("role") == null) {
+                if (object.get("field")) |field_value| {
+                    const field = algebraicJsonString(field_value) orelse break :blk null;
+                    if (std.mem.startsWith(u8, field, "/")) {
+                        const prefix = algebraicJsonString(object.get("value") orelse object.get("prefix") orelse break :blk null) orelse break :blk null;
+                        break :blk .{ .path = field, .prefix = prefix };
+                    }
+                }
+            }
+            if (object.count() == 1) {
+                var it = object.iterator();
+                const entry = it.next() orelse break :blk null;
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) break :blk null;
+                const prefix = algebraicJsonString(entry.value_ptr.*) orelse break :blk null;
+                break :blk .{ .path = entry.key_ptr.*, .prefix = prefix };
+            }
+            break :blk null;
+        },
+        .string => |prefix| blk: {
+            const field = algebraicJsonString(sibling_field_value orelse break :blk null) orelse break :blk null;
+            break :blk if (std.mem.startsWith(u8, field, "/")) .{ .path = field, .prefix = prefix } else null;
+        },
+        else => null,
+    };
+}
+
+fn algebraicPathFromPredicateObject(object: anytype) ?[]const u8 {
+    if (object.get("path")) |path_value| {
+        const path = algebraicJsonString(path_value) orelse return null;
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        return path;
+    }
+    return null;
+}
+
+fn algebraicPathPatternPredicate(value: std.json.Value, pattern_field: []const u8) ?AlgebraicPathTextPredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (algebraicPathFromPredicateObject(object)) |path| {
+        const text = algebraicJsonString(object.get(pattern_field) orelse object.get("value") orelse return null) orelse return null;
+        return .{ .path = path, .text = text };
+    }
+    if (object.get("role") == null) {
+        if (object.get("field")) |field_value| {
+            const field = algebraicJsonString(field_value) orelse return null;
+            if (std.mem.startsWith(u8, field, "/")) {
+                const text = algebraicJsonString(object.get(pattern_field) orelse object.get("value") orelse return null) orelse return null;
+                return .{ .path = field, .text = text };
+            }
+        }
+    }
+    if (object.count() == 1) {
+        var it = object.iterator();
+        const entry = it.next() orelse return null;
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+        const text = algebraicJsonString(entry.value_ptr.*) orelse return null;
+        return .{ .path = entry.key_ptr.*, .text = text };
+    }
+    return null;
+}
+
+fn algebraicPathMatchPredicate(value: std.json.Value, sibling_field_value: ?std.json.Value) ?AlgebraicPathTextPredicate {
+    return switch (value) {
+        .object => algebraicPathPatternPredicate(value, "query"),
+        .string => |text| blk: {
+            const field = algebraicJsonString(sibling_field_value orelse break :blk null) orelse break :blk null;
+            break :blk if (std.mem.startsWith(u8, field, "/")) .{ .path = field, .text = text } else null;
+        },
+        else => null,
+    };
+}
+
+fn algebraicWildcardLiteralPrefix(pattern: []const u8) []const u8 {
+    for (pattern, 0..) |ch, i| {
+        if (ch == '*' or ch == '?') return pattern[0..i];
+    }
+    return pattern;
+}
+
+fn algebraicWildcardPatternHasMeta(pattern: []const u8) bool {
+    return std.mem.indexOfAny(u8, pattern, "*?") != null;
+}
+
+fn algebraicRegexpLiteralPrefix(pattern: []const u8) []const u8 {
+    for (pattern, 0..) |ch, i| {
+        switch (ch) {
+            '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\' => return pattern[0..i],
+            else => {},
+        }
+    }
+    return pattern;
+}
+
+fn algebraicJsonU8(value: std.json.Value) ?u8 {
+    return switch (value) {
+        .integer => |number| std.math.cast(u8, number),
+        .float => |number| blk: {
+            if (!std.math.isFinite(number) or @round(number) != number) break :blk null;
+            const parsed: i64 = @intFromFloat(number);
+            break :blk std.math.cast(u8, parsed);
+        },
+        else => null,
+    };
+}
+
+fn algebraicParseFuzzyOptions(object: anytype, out: *AlgebraicFuzzyQuery) bool {
+    if (object.get("max_edits")) |edits| {
+        out.max_edits = algebraicJsonU8(edits) orelse return false;
+    }
+    if (object.get("prefix_length")) |prefix| {
+        out.prefix_len = algebraicJsonU8(prefix) orelse return false;
+    }
+    if (object.get("auto_fuzzy")) |auto| {
+        if (auto != .bool) return false;
+        if (auto.bool) out.max_edits = if (out.term.len > 5) 2 else if (out.term.len > 2) 1 else 0;
+    }
+    return true;
+}
+
+fn algebraicParseFuzzyQuery(value: std.json.Value) ?AlgebraicFuzzyQuery {
+    return switch (value) {
+        .string => |text| .{ .term = text, .max_edits = 1, .prefix_len = 0 },
+        .object => |object| blk: {
+            var out = AlgebraicFuzzyQuery{
+                .term = algebraicJsonString(object.get("query") orelse object.get("value") orelse break :blk null) orelse break :blk null,
+                .max_edits = 1,
+                .prefix_len = 0,
+            };
+            if (!algebraicParseFuzzyOptions(object, &out)) break :blk null;
+            break :blk out;
+        },
+        else => null,
+    };
+}
+
+fn algebraicPathFuzzyPredicate(value: std.json.Value) ?AlgebraicPathFuzzyPredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (algebraicPathFromPredicateObject(object)) |path| {
+        var query = AlgebraicFuzzyQuery{
+            .term = algebraicJsonString(object.get("query") orelse object.get("value") orelse return null) orelse return null,
+            .max_edits = 1,
+            .prefix_len = 0,
+        };
+        if (!algebraicParseFuzzyOptions(object, &query)) return null;
+        return .{ .path = path, .query = query };
+    }
+    if (object.get("role") == null) {
+        if (object.get("field")) |field_value| {
+            const field = algebraicJsonString(field_value) orelse return null;
+            if (std.mem.startsWith(u8, field, "/")) {
+                var query = AlgebraicFuzzyQuery{
+                    .term = algebraicJsonString(object.get("query") orelse object.get("value") orelse return null) orelse return null,
+                    .max_edits = 1,
+                    .prefix_len = 0,
+                };
+                if (!algebraicParseFuzzyOptions(object, &query)) return null;
+                return .{ .path = field, .query = query };
+            }
+        }
+    }
+    if (object.count() == 1) {
+        var it = object.iterator();
+        const entry = it.next() orelse return null;
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+        const query = algebraicParseFuzzyQuery(entry.value_ptr.*) orelse return null;
+        return .{ .path = entry.key_ptr.*, .query = query };
+    }
+    return null;
+}
+
+fn algebraicOptionalBool(value: ?std.json.Value) ?bool {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .bool => |flag| flag,
+        .null => null,
+        else => null,
+    };
+}
+
+fn algebraicOptionalF64(value: ?std.json.Value) ?f64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .null => null,
+        else => null,
+    };
+}
+
+fn algebraicOptionalString(value: ?std.json.Value) ?[]const u8 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .string => |text| text,
+        .null => null,
+        else => null,
+    };
+}
+
+fn algebraicNumericJsonValue(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float => true,
+        else => false,
+    };
+}
+
+fn algebraicStringJsonValue(value: std.json.Value) bool {
+    return switch (value) {
+        .string => true,
+        else => false,
+    };
+}
+
+fn algebraicDateJsonValue(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => |number| number >= 0,
+        .string => |text| (algebraicParseDateTimeOptionalToNs(text) catch null) != null,
+        else => false,
+    };
+}
+
+fn algebraicDateBoundTextAlloc(alloc: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| if (number >= 0) try std.fmt.allocPrint(alloc, "{d}", .{number}) else error.UnsupportedQueryRequest,
+        .string => |text| if ((try algebraicParseDateTimeOptionalToNs(text)) != null) try alloc.dupe(u8, text) else error.UnsupportedQueryRequest,
+        .null => null,
+        else => error.UnsupportedQueryRequest,
+    };
+}
+
+fn algebraicValidIpRange(text: []const u8) bool {
+    return algebraicParseIpCidr(text) != null or algebraicParseIPv4(text) != null;
+}
+
+fn algebraicValidLatitude(lat: f64) bool {
+    return std.math.isFinite(lat) and lat >= -90.0 and lat <= 90.0;
+}
+
+fn algebraicValidLongitude(lon: f64) bool {
+    return std.math.isFinite(lon) and lon >= -180.0 and lon <= 180.0;
+}
+
+fn algebraicValidGeoBBox(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) bool {
+    return algebraicValidLatitude(min_lat) and
+        algebraicValidLatitude(max_lat) and
+        algebraicValidLongitude(min_lon) and
+        algebraicValidLongitude(max_lon) and
+        min_lat <= max_lat;
+}
+
+fn algebraicValidGeoDistance(lat: f64, lon: f64, radius_meters: f64) bool {
+    return algebraicValidLatitude(lat) and
+        algebraicValidLongitude(lon) and
+        std.math.isFinite(radius_meters) and
+        radius_meters >= 0;
+}
+
+fn algebraicGeoShapeRelationSupported(relation: db_mod.types.GeoShapeRelation) bool {
+    return switch (relation) {
+        .intersects, .within => true,
+        .contains => false,
+    };
+}
+
+const AlgebraicIpCidr = struct {
+    network: [4]u8,
+    prefix_len: u8,
+};
+
+fn algebraicParseIpCidr(text: []const u8) ?AlgebraicIpCidr {
+    const slash_pos = std.mem.indexOfScalar(u8, text, '/') orelse return null;
+    const ip = algebraicParseIPv4(text[0..slash_pos]) orelse return null;
+    const prefix_len = std.fmt.parseInt(u8, text[slash_pos + 1 ..], 10) catch return null;
+    if (prefix_len > 32) return null;
+    const mask = algebraicIpMask(prefix_len);
+    return .{
+        .network = .{ ip[0] & mask[0], ip[1] & mask[1], ip[2] & mask[2], ip[3] & mask[3] },
+        .prefix_len = prefix_len,
+    };
+}
+
+fn algebraicParseIPv4(text: []const u8) ?[4]u8 {
+    var parts = std.mem.splitScalar(u8, text, '.');
+    var out: [4]u8 = undefined;
+    var i: usize = 0;
+    while (parts.next()) |part| {
+        if (i >= 4 or part.len == 0) return null;
+        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return out;
+}
+
+fn algebraicIpMask(prefix_len: u8) [4]u8 {
+    var mask = [_]u8{ 0, 0, 0, 0 };
+    var remaining = prefix_len;
+    for (&mask) |*byte| {
+        if (remaining >= 8) {
+            byte.* = 0xff;
+            remaining -= 8;
+        } else if (remaining > 0) {
+            byte.* = @as(u8, 0xff) << @intCast(8 - remaining);
+            remaining = 0;
+        }
+    }
+    return mask;
+}
+
+fn algebraicParseDateTimeOptionalToNs(text: []const u8) !?u64 {
+    if (try algebraicParseRfc3339ToNs(text)) |ts| return ts;
+    if (text.len != 10 or text[4] != '-' or text[7] != '-') return null;
+    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
+    return algebraicCivilDateTimeToNs(year, month, day, 0, 0, 0, 0);
+}
+
+fn algebraicParseRfc3339ToNs(text: []const u8) !?u64 {
+    if (text.len < 20) return null;
+    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
+    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
+    var idx: usize = 19;
+    var nanos: u64 = 0;
+    if (idx < text.len and text[idx] == '.') {
+        idx += 1;
+        const frac_start = idx;
+        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
+        const frac = text[frac_start..idx];
+        if (frac.len == 0 or frac.len > 9) return null;
+        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
+        var scale: usize = frac.len;
+        while (scale < 9) : (scale += 1) frac_ns *= 10;
+        nanos = frac_ns;
+    }
+    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
+    return algebraicCivilDateTimeToNs(year, month, day, hour, minute, second, nanos);
+}
+
+fn algebraicCivilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 60) return null;
+    const days = algebraicDaysFromCivil(year, month, day);
+    if (days < 0) return null;
+    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    if (secs < 0) return null;
+    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
+}
+
+fn algebraicDaysFromCivil(year: i64, month: i64, day: i64) i64 {
+    var y = year;
+    y -= if (month <= 2) 1 else 0;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+fn algebraicPathIpRangePredicate(value: std.json.Value) ?AlgebraicPathIpRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const cidr = algebraicJsonString(object.get("cidr") orelse return null) orelse return null;
+    if (!algebraicValidIpRange(cidr)) return null;
+    if (algebraicPathFromPredicateObject(object)) |path| {
+        return .{ .path = path, .cidr = cidr };
+    }
+    if (object.get("role") == null) {
+        if (object.get("field")) |field_value| {
+            const field = algebraicJsonString(field_value) orelse return null;
+            if (std.mem.startsWith(u8, field, "/")) return .{ .path = field, .cidr = cidr };
+        }
+    }
+    return null;
+}
+
+fn algebraicPathGeoBBoxPredicate(value: std.json.Value) ?AlgebraicPathGeoBBoxPredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("role") != null) return null;
+    const path = if (object.get("path")) |path_value|
+        algebraicJsonString(path_value) orelse return null
+    else if (object.get("field")) |field_value| blk: {
+        const field = algebraicJsonString(field_value) orelse return null;
+        if (!std.mem.startsWith(u8, field, "/")) return null;
+        break :blk field;
+    } else return null;
+    if (!std.mem.startsWith(u8, path, "/")) return null;
+    const min_lat = algebraicOptionalF64(object.get("min_lat")) orelse return null;
+    const min_lon = algebraicOptionalF64(object.get("min_lon")) orelse return null;
+    const max_lat = algebraicOptionalF64(object.get("max_lat")) orelse return null;
+    const max_lon = algebraicOptionalF64(object.get("max_lon")) orelse return null;
+    if (!algebraicValidGeoBBox(min_lat, min_lon, max_lat, max_lon)) return null;
+    return .{
+        .path = path,
+        .min_lat = min_lat,
+        .min_lon = min_lon,
+        .max_lat = max_lat,
+        .max_lon = max_lon,
+    };
+}
+
+fn algebraicPathGeoDistancePredicate(value: std.json.Value) ?AlgebraicPathGeoDistancePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("role") != null) return null;
+    const path = if (object.get("path")) |path_value|
+        algebraicJsonString(path_value) orelse return null
+    else if (object.get("field")) |field_value| blk: {
+        const field = algebraicJsonString(field_value) orelse return null;
+        if (!std.mem.startsWith(u8, field, "/")) return null;
+        break :blk field;
+    } else return null;
+    if (!std.mem.startsWith(u8, path, "/")) return null;
+    const lat = algebraicOptionalF64(object.get("lat")) orelse return null;
+    const lon = algebraicOptionalF64(object.get("lon")) orelse return null;
+    const radius_meters = algebraicOptionalF64(object.get("radius_meters")) orelse return null;
+    if (!algebraicValidGeoDistance(lat, lon, radius_meters)) return null;
+    return .{
+        .path = path,
+        .lat = lat,
+        .lon = lon,
+        .radius_meters = radius_meters,
+    };
+}
+
+fn algebraicPathGeoShapePredicateAlloc(alloc: std.mem.Allocator, value: std.json.Value) !?AlgebraicPathGeoShapePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("role") != null) return null;
+    const path = if (object.get("path")) |path_value|
+        algebraicJsonString(path_value) orelse return null
+    else if (object.get("field")) |field_value| blk: {
+        const field = algebraicJsonString(field_value) orelse return null;
+        if (!std.mem.startsWith(u8, field, "/")) return null;
+        break :blk field;
+    } else return null;
+    if (!std.mem.startsWith(u8, path, "/")) return null;
+    const relation_text = if (object.get("relation")) |relation_value|
+        algebraicJsonString(relation_value) orelse return null
+    else
+        "intersects";
+    const relation = std.meta.stringToEnum(db_mod.types.GeoShapeRelation, relation_text) orelse return null;
+    if (!algebraicGeoShapeRelationSupported(relation)) return null;
+    const polygons_value = object.get("polygons") orelse object.get("polygon") orelse return null;
+    const polygons = try algebraicGeoShapePolygonsAlloc(alloc, polygons_value);
+    errdefer {
+        for (polygons) |polygon| {
+            if (polygon.len > 0) alloc.free(@constCast(polygon));
+        }
+        if (polygons.len > 0) alloc.free(polygons);
+    }
+    return .{
+        .path = path,
+        .relation = relation,
+        .polygons = polygons,
+    };
+}
+
+fn algebraicGeoShapePolygonsAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const []const db_mod.types.GeoPoint {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.UnsupportedQueryRequest,
+    };
+    if (array.items.len == 0) return error.UnsupportedQueryRequest;
+    const first_is_point = array.items[0] == .object;
+    const polygon_count: usize = if (first_is_point) 1 else array.items.len;
+    var out = try alloc.alloc([]const db_mod.types.GeoPoint, polygon_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |polygon| {
+            if (polygon.len > 0) alloc.free(@constCast(polygon));
+        }
+        if (out.len > 0) alloc.free(out);
+    }
+    if (first_is_point) {
+        out[0] = try algebraicGeoShapePolygonAlloc(alloc, value);
+        initialized = 1;
+    } else {
+        for (array.items, 0..) |item, i| {
+            out[i] = try algebraicGeoShapePolygonAlloc(alloc, item);
+            initialized += 1;
+        }
+    }
+    return out;
+}
+
+fn algebraicGeoShapePolygonAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const db_mod.types.GeoPoint {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.UnsupportedQueryRequest,
+    };
+    if (array.items.len < 3) return error.UnsupportedQueryRequest;
+    var out = try alloc.alloc(db_mod.types.GeoPoint, array.items.len);
+    errdefer if (out.len > 0) alloc.free(out);
+    for (array.items, 0..) |item, i| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.UnsupportedQueryRequest,
+        };
+        const lat = algebraicOptionalF64(object.get("lat")) orelse return error.UnsupportedQueryRequest;
+        const lon = algebraicOptionalF64(object.get("lon")) orelse return error.UnsupportedQueryRequest;
+        if (!algebraicValidLatitude(lat) or !algebraicValidLongitude(lon)) return error.UnsupportedQueryRequest;
+        out[i] = .{ .lat = lat, .lon = lon };
+    }
+    return out;
+}
+
+fn algebraicPathNumericRangePredicate(value: std.json.Value) ?AlgebraicPathNumericRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const path = if (object.get("path")) |path_value|
+        algebraicJsonString(path_value) orelse return null
+    else if (object.get("field")) |field_value| blk: {
+        const field = algebraicJsonString(field_value) orelse return null;
+        if (!std.mem.startsWith(u8, field, "/")) return null;
+        break :blk field;
+    } else return null;
+    if (!std.mem.startsWith(u8, path, "/")) return null;
+    const min = algebraicOptionalF64(object.get("min"));
+    const max = algebraicOptionalF64(object.get("max"));
+    if (min == null and max == null) return null;
+    return .{
+        .path = path,
+        .min = min,
+        .max = max,
+        .inclusive_min = algebraicOptionalBool(object.get("inclusive_min")) orelse true,
+        .inclusive_max = algebraicOptionalBool(object.get("inclusive_max")) orelse false,
+    };
+}
+
+fn algebraicPathTermRangePredicate(value: std.json.Value) ?AlgebraicPathTermRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("path") != null or object.get("field") != null) {
+        const path = if (object.get("path")) |path_value|
+            algebraicJsonString(path_value) orelse return null
+        else blk: {
+            const field = algebraicJsonString(object.get("field").?) orelse return null;
+            if (!std.mem.startsWith(u8, field, "/")) return null;
+            break :blk field;
+        };
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        const min = algebraicOptionalString(object.get("min"));
+        const max = algebraicOptionalString(object.get("max"));
+        if (min == null and max == null) return null;
+        return .{
+            .path = path,
+            .min = min,
+            .max = max,
+            .inclusive_min = algebraicOptionalBool(object.get("inclusive_min")) orelse true,
+            .inclusive_max = algebraicOptionalBool(object.get("inclusive_max")) orelse false,
+        };
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+    return algebraicTermRangeFromBounds(entry.key_ptr.*, switch (entry.value_ptr.*) {
+        .object => |inner| inner,
+        else => return null,
+    });
+}
+
+fn algebraicPathDateRangePredicate(value: std.json.Value) ?AlgebraicPathDateRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("path") != null or object.get("field") != null) {
+        const path = if (object.get("path")) |path_value|
+            algebraicJsonString(path_value) orelse return null
+        else blk: {
+            const field = algebraicJsonString(object.get("field").?) orelse return null;
+            if (!std.mem.startsWith(u8, field, "/")) return null;
+            break :blk field;
+        };
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        const start = object.get("start_ns") orelse object.get("start");
+        const end = object.get("end_ns") orelse object.get("end");
+        if (start == null and end == null) return null;
+        if (start) |bound| if (!algebraicDateJsonValue(bound)) return null;
+        if (end) |bound| if (!algebraicDateJsonValue(bound)) return null;
+        return .{
+            .path = path,
+            .start = start,
+            .end = end,
+            .inclusive_start = algebraicOptionalBool(object.get("inclusive_start")) orelse true,
+            .inclusive_end = algebraicOptionalBool(object.get("inclusive_end")) orelse false,
+        };
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+    const range_object = switch (entry.value_ptr.*) {
+        .object => |inner| inner,
+        else => return null,
+    };
+    return algebraicDateRangeFromBounds(entry.key_ptr.*, range_object);
+}
+
+const AlgebraicRangeBound = struct {
+    value: std.json.Value,
+    inclusive: bool,
+};
+
+fn algebraicSetRangeBound(found: *?AlgebraicRangeBound, value: std.json.Value, inclusive: bool) ?void {
+    if (found.* != null) return null;
+    found.* = .{ .value = value, .inclusive = inclusive };
+}
+
+fn algebraicStandardRangeLowerBound(object: std.json.ObjectMap) ?AlgebraicRangeBound {
+    var found: ?AlgebraicRangeBound = null;
+    if (object.get("gt")) |value| algebraicSetRangeBound(&found, value, false) orelse return null;
+    if (object.get("gte")) |value| algebraicSetRangeBound(&found, value, true) orelse return null;
+    return found;
+}
+
+fn algebraicStandardRangeUpperBound(object: std.json.ObjectMap) ?AlgebraicRangeBound {
+    var found: ?AlgebraicRangeBound = null;
+    if (object.get("lt")) |value| algebraicSetRangeBound(&found, value, false) orelse return null;
+    if (object.get("lte")) |value| algebraicSetRangeBound(&found, value, true) orelse return null;
+    return found;
+}
+
+fn algebraicTermRangeFromBounds(path: []const u8, object: std.json.ObjectMap) ?AlgebraicPathTermRangePredicate {
+    const lower = algebraicStandardRangeLowerBound(object);
+    const upper = algebraicStandardRangeUpperBound(object);
+    if (lower == null and upper == null) return null;
+    if (lower) |bound| if (!algebraicStringJsonValue(bound.value)) return null;
+    if (upper) |bound| if (!algebraicStringJsonValue(bound.value)) return null;
+    return .{
+        .path = path,
+        .min = if (lower) |bound| algebraicOptionalString(bound.value) else null,
+        .max = if (upper) |bound| algebraicOptionalString(bound.value) else null,
+        .inclusive_min = if (lower) |bound| bound.inclusive else true,
+        .inclusive_max = if (upper) |bound| bound.inclusive else false,
+    };
+}
+
+fn algebraicDateRangeFromBounds(path: []const u8, object: std.json.ObjectMap) ?AlgebraicPathDateRangePredicate {
+    const lower = algebraicStandardRangeLowerBound(object);
+    const upper = algebraicStandardRangeUpperBound(object);
+    if (lower == null and upper == null) return null;
+    if (lower) |bound| if (!algebraicDateJsonValue(bound.value)) return null;
+    if (upper) |bound| if (!algebraicDateJsonValue(bound.value)) return null;
+    return .{
+        .path = path,
+        .start = if (lower) |bound| bound.value else null,
+        .end = if (upper) |bound| bound.value else null,
+        .inclusive_start = if (lower) |bound| bound.inclusive else true,
+        .inclusive_end = if (upper) |bound| bound.inclusive else false,
+    };
+}
+
+fn algebraicPathStandardNumericRangePredicate(value: std.json.Value) ?AlgebraicPathNumericRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("field") != null or object.get("path") != null) {
+        const path = if (object.get("path")) |path_value|
+            algebraicJsonString(path_value) orelse return null
+        else blk: {
+            const field = algebraicJsonString(object.get("field").?) orelse return null;
+            if (!std.mem.startsWith(u8, field, "/")) return null;
+            break :blk field;
+        };
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        const lower = algebraicStandardRangeLowerBound(object);
+        const upper = algebraicStandardRangeUpperBound(object);
+        if (lower == null and upper == null) return null;
+        if (lower) |bound| if (!algebraicNumericJsonValue(bound.value)) return null;
+        if (upper) |bound| if (!algebraicNumericJsonValue(bound.value)) return null;
+        return .{
+            .path = path,
+            .min = if (lower) |bound| algebraicOptionalF64(bound.value) else null,
+            .max = if (upper) |bound| algebraicOptionalF64(bound.value) else null,
+            .inclusive_min = if (lower) |bound| bound.inclusive else true,
+            .inclusive_max = if (upper) |bound| bound.inclusive else false,
+        };
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+    const range_object = switch (entry.value_ptr.*) {
+        .object => |inner| inner,
+        else => return null,
+    };
+    const lower = algebraicStandardRangeLowerBound(range_object);
+    const upper = algebraicStandardRangeUpperBound(range_object);
+    if (lower == null and upper == null) return null;
+    if (lower) |bound| if (!algebraicNumericJsonValue(bound.value)) return null;
+    if (upper) |bound| if (!algebraicNumericJsonValue(bound.value)) return null;
+    return .{
+        .path = entry.key_ptr.*,
+        .min = if (lower) |bound| algebraicOptionalF64(bound.value) else null,
+        .max = if (upper) |bound| algebraicOptionalF64(bound.value) else null,
+        .inclusive_min = if (lower) |bound| bound.inclusive else true,
+        .inclusive_max = if (upper) |bound| bound.inclusive else false,
+    };
+}
+
+fn algebraicPathStandardDateRangePredicate(value: std.json.Value) ?AlgebraicPathDateRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("field") != null or object.get("path") != null) {
+        const path = if (object.get("path")) |path_value|
+            algebraicJsonString(path_value) orelse return null
+        else blk: {
+            const field = algebraicJsonString(object.get("field").?) orelse return null;
+            if (!std.mem.startsWith(u8, field, "/")) return null;
+            break :blk field;
+        };
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        return algebraicDateRangeFromBounds(path, object);
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+    const range_object = switch (entry.value_ptr.*) {
+        .object => |inner| inner,
+        else => return null,
+    };
+    return algebraicDateRangeFromBounds(entry.key_ptr.*, range_object);
+}
+
+fn algebraicPathStandardTermRangePredicate(value: std.json.Value) ?AlgebraicPathTermRangePredicate {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("field") != null or object.get("path") != null) {
+        const path = if (object.get("path")) |path_value|
+            algebraicJsonString(path_value) orelse return null
+        else blk: {
+            const field = algebraicJsonString(object.get("field").?) orelse return null;
+            if (!std.mem.startsWith(u8, field, "/")) return null;
+            break :blk field;
+        };
+        if (!std.mem.startsWith(u8, path, "/")) return null;
+        return algebraicTermRangeFromBounds(path, object);
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    if (!std.mem.startsWith(u8, entry.key_ptr.*, "/")) return null;
+    const range_object = switch (entry.value_ptr.*) {
+        .object => |inner| inner,
+        else => return null,
+    };
+    return algebraicTermRangeFromBounds(entry.key_ptr.*, range_object);
+}
+
+fn collectSingleValueTermsConstraint(
+    alloc: std.mem.Allocator,
+    terms: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (terms != .object) return false;
+    if (terms.object.count() == 1) {
+        var it = terms.object.iterator();
+        const entry = it.next() orelse return false;
+        return try collectTermsValuesConstraint(alloc, entry.key_ptr.*, entry.value_ptr.*, out);
+    }
+    const field = terms.object.get("path") orelse terms.object.get("field") orelse return false;
+    const values = terms.object.get("values") orelse terms.object.get("terms") orelse return false;
+    if (field != .string) return false;
+    return try collectTermsValuesConstraint(alloc, field.string, values, out);
+}
+
+fn collectTermsValuesConstraint(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    values: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+) AlgebraicConstraintCollectError!bool {
+    if (values != .array or values.array.items.len == 0) return false;
+    if (!std.mem.startsWith(u8, field, "/")) {
+        if (values.array.items.len != 1) return false;
+        const value_text = try algebraicConstraintValueTextAlloc(alloc, field, values.array.items[0]);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, field, value_text);
+        return true;
+    }
+    if (values.array.items.len == 1) {
+        const value_text = try algebraicConstraintValueTextAlloc(alloc, field, values.array.items[0]);
+        defer alloc.free(value_text);
+        try appendAlgebraicConstraint(out, alloc, field, value_text);
+        return true;
+    }
+    const typed_values = try alloc.alloc([]const u8, values.array.items.len);
+    defer alloc.free(typed_values);
+    var initialized: usize = 0;
+    defer {
+        for (typed_values[0..initialized]) |value| alloc.free(@constCast(value));
+    }
+    for (values.array.items, 0..) |item, i| {
+        typed_values[i] = try algebraicConstraintValueTextAlloc(alloc, field, item);
+        initialized += 1;
+    }
+    try appendAlgebraicTypedAnyConstraint(out, alloc, field, typed_values);
+    return true;
+}
+
+fn appendAlgebraicTypedAnyConstraint(
+    out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint),
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    typed_values: []const []const u8,
+) AlgebraicConstraintCollectError!void {
+    if (typed_values.len == 0) return error.UnsupportedQueryRequest;
+    if (typed_values.len == 1) {
+        try appendAlgebraicConstraint(out, alloc, field, typed_values[0]);
+        return;
+    }
+    const any_value = db_mod.algebraic.index.pathFactAnyConstraintValueAlloc(alloc, typed_values) catch return error.UnsupportedQueryRequest;
+    defer alloc.free(any_value);
+    try appendAlgebraicConstraint(out, alloc, field, any_value);
+}
+
+fn algebraicConstraintValueTextAlloc(alloc: std.mem.Allocator, field: []const u8, value: std.json.Value) AlgebraicConstraintCollectError![]u8 {
+    const raw = switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .bool => |flag| try alloc.dupe(u8, if (flag) "true" else "false"),
+        .null => if (std.mem.startsWith(u8, field, "/")) try alloc.dupe(u8, "") else return error.UnsupportedQueryRequest,
+        else => return error.UnsupportedQueryRequest,
+    };
+    errdefer alloc.free(raw);
+    if (!std.mem.startsWith(u8, field, "/")) return raw;
+    const kind = switch (value) {
+        .string => "string",
+        .integer, .float => "number",
+        .bool => "bool",
+        .null => "null",
+        else => unreachable,
+    };
+    const typed = try db_mod.algebraic.token.canonicalTupleAlloc(alloc, &.{ kind, raw });
+    alloc.free(raw);
+    return typed;
+}
+
+fn algebraicConstraintBoolValueAlloc(alloc: std.mem.Allocator, field: []const u8, value: bool) AlgebraicConstraintCollectError![]u8 {
+    const raw = if (value) "true" else "false";
+    if (!std.mem.startsWith(u8, field, "/")) return try alloc.dupe(u8, raw);
+    return try db_mod.algebraic.token.canonicalTupleAlloc(alloc, &.{ "bool", raw });
+}
+
+test "algebraic constraints accept scalar bool query and structured filters" {
+    const alloc = std.testing.allocator;
+
+    const from_bool = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .bool_field = .{ .field = "published", .value = true } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_bool);
+    try std.testing.expectEqual(@as(usize, 1), from_bool.len);
+    try std.testing.expectEqualStrings("published", from_bool[0].field);
+    try std.testing.expectEqualStrings("true", from_bool[0].value);
+
+    const bool_must_queries = [_]db_mod.types.TextQuery{
+        .{ .term = .{ .field = "/tier", .term = "gold" } },
+        .{ .prefix = .{ .field = "/tenant", .prefix = "ac" } },
+    };
+    const from_path_bool_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .must = bool_must_queries[0..] } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_bool_query);
+    try std.testing.expectEqual(@as(usize, 2), from_path_bool_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_bool_query[0].field);
+    const top_level_bool_term_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_bool_query[0].value);
+    defer {
+        for (top_level_bool_term_parts) |part| alloc.free(part);
+        alloc.free(top_level_bool_term_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), top_level_bool_term_parts.len);
+    try std.testing.expectEqualStrings("string", top_level_bool_term_parts[0]);
+    try std.testing.expectEqualStrings("gold", top_level_bool_term_parts[1]);
+    try std.testing.expectEqualStrings("/tenant", from_path_bool_query[1].field);
+    const top_level_bool_prefix_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_bool_query[1].value);
+    defer {
+        for (top_level_bool_prefix_parts) |part| alloc.free(part);
+        alloc.free(top_level_bool_prefix_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_bool_prefix_parts.len);
+    try std.testing.expectEqualStrings("pathfact-prefix:v1", top_level_bool_prefix_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_bool_prefix_parts[1]);
+    try std.testing.expectEqualStrings("ac", top_level_bool_prefix_parts[2]);
+
+    const bool_optional_should_queries = [_]db_mod.types.TextQuery{
+        .{ .term = .{ .field = "/region", .term = "west" } },
+    };
+    const from_path_bool_optional_should_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .must = bool_must_queries[0..],
+            .should = bool_optional_should_queries[0..],
+            .min_should = 0,
+        } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_bool_optional_should_query);
+    try std.testing.expectEqual(@as(usize, 2), from_path_bool_optional_should_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_bool_optional_should_query[0].field);
+    try std.testing.expectEqualStrings("/tenant", from_path_bool_optional_should_query[1].field);
+
+    const required_optional_should_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .must = bool_must_queries[0..],
+            .should = bool_optional_should_queries[0..],
+            .min_should = 1,
+        } },
+    });
+    try std.testing.expect(required_optional_should_query == null);
+
+    const bool_should_queries = [_]db_mod.types.TextQuery{
+        .{ .term = .{ .field = "/tier", .term = "gold" } },
+        .{ .term = .{ .field = "/tier", .term = "silver" } },
+    };
+    const top_level_should_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .should = bool_should_queries[0..], .min_should = 1 } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, top_level_should_query);
+    try std.testing.expectEqual(@as(usize, 1), top_level_should_query.len);
+    try std.testing.expectEqualStrings("/tier", top_level_should_query[0].field);
+    const top_level_should_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, top_level_should_query[0].value);
+    defer {
+        for (top_level_should_parts) |part| alloc.free(part);
+        alloc.free(top_level_should_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_should_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", top_level_should_parts[0]);
+
+    const implicit_top_level_should_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .should = bool_should_queries[0..] } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, implicit_top_level_should_query);
+    try std.testing.expectEqual(@as(usize, 1), implicit_top_level_should_query.len);
+    try std.testing.expectEqualStrings("/tier", implicit_top_level_should_query[0].field);
+    const implicit_top_level_should_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, implicit_top_level_should_query[0].value);
+    defer {
+        for (implicit_top_level_should_parts) |part| alloc.free(part);
+        alloc.free(implicit_top_level_should_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), implicit_top_level_should_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", implicit_top_level_should_parts[0]);
+
+    const two_required_should_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .should = bool_should_queries[0..], .min_should = 2 } },
+    });
+    try std.testing.expect(two_required_should_query == null);
+
+    const mixed_field_should_queries = [_]db_mod.types.TextQuery{
+        .{ .term = .{ .field = "/tier", .term = "gold" } },
+        .{ .term = .{ .field = "/region", .term = "west" } },
+    };
+    const mixed_field_should_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .should = mixed_field_should_queries[0..], .min_should = 1 } },
+    });
+    try std.testing.expect(mixed_field_should_query == null);
+
+    const bool_must_not_queries = [_]db_mod.types.TextQuery{.{ .term = .{ .field = "/tier", .term = "gold" } }};
+    const top_level_must_not_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .full_text = .{ .bool_query = .{ .must_not = bool_must_not_queries[0..] } },
+    });
+    try std.testing.expect(top_level_must_not_query == null);
+
+    const from_path_term_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .term = .{ .field = "/tier", .term = "gold" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_term_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_term_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_term_query[0].field);
+    const top_level_term_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_term_query[0].value);
+    defer {
+        for (top_level_term_parts) |part| alloc.free(part);
+        alloc.free(top_level_term_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), top_level_term_parts.len);
+    try std.testing.expectEqualStrings("string", top_level_term_parts[0]);
+    try std.testing.expectEqualStrings("gold", top_level_term_parts[1]);
+
+    const from_path_match_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .match = .{ .field = "/tier", .text = "OLD" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_match_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_match_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_match_query[0].field);
+    const top_level_match_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_match_query[0].value);
+    defer {
+        for (top_level_match_parts) |part| alloc.free(part);
+        alloc.free(top_level_match_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_match_parts.len);
+    try std.testing.expectEqualStrings("pathfact-match:v1", top_level_match_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_match_parts[1]);
+    try std.testing.expectEqualStrings("OLD", top_level_match_parts[2]);
+
+    const analyzed_path_match_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .match = .{ .field = "/tier", .text = "gold", .analyzer = "default" } },
+    });
+    try std.testing.expect(analyzed_path_match_query == null);
+
+    const from_path_fuzzy_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .fuzzy = .{ .field = "/tier", .term = "gild", .max_edits = 1, .prefix_len = 1 } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_fuzzy_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_fuzzy_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_fuzzy_query[0].field);
+    const top_level_fuzzy_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_fuzzy_query[0].value);
+    defer {
+        for (top_level_fuzzy_parts) |part| alloc.free(part);
+        alloc.free(top_level_fuzzy_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 5), top_level_fuzzy_parts.len);
+    try std.testing.expectEqualStrings("pathfact-fuzzy:v1", top_level_fuzzy_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_fuzzy_parts[1]);
+    try std.testing.expectEqualStrings("gild", top_level_fuzzy_parts[2]);
+    try std.testing.expectEqualStrings("1", top_level_fuzzy_parts[3]);
+    try std.testing.expectEqualStrings("1", top_level_fuzzy_parts[4]);
+
+    const unbounded_path_fuzzy_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .fuzzy = .{ .field = "/tier", .term = "gold", .max_edits = 1 } },
+    });
+    try std.testing.expect(unbounded_path_fuzzy_query == null);
+
+    const auto_path_fuzzy_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .fuzzy = .{ .field = "/tier", .term = "gold", .auto_fuzzy = true, .prefix_len = 1 } },
+    });
+    try std.testing.expect(auto_path_fuzzy_query == null);
+
+    const non_path_fuzzy_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .fuzzy = .{ .field = "tier", .term = "gold", .max_edits = 1, .prefix_len = 1 } },
+    });
+    try std.testing.expect(non_path_fuzzy_query == null);
+
+    const from_path_prefix_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .prefix = .{ .field = "/tier", .prefix = "go" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_prefix_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_prefix_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_prefix_query[0].field);
+    const top_level_prefix_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_prefix_query[0].value);
+    defer {
+        for (top_level_prefix_parts) |part| alloc.free(part);
+        alloc.free(top_level_prefix_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_prefix_parts.len);
+    try std.testing.expectEqualStrings("pathfact-prefix:v1", top_level_prefix_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_prefix_parts[1]);
+    try std.testing.expectEqualStrings("go", top_level_prefix_parts[2]);
+
+    const non_path_prefix_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .prefix = .{ .field = "tier", .prefix = "go" } },
+    });
+    try std.testing.expect(non_path_prefix_query == null);
+
+    const from_path_wildcard_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .wildcard = .{ .field = "/tier", .pattern = "go*" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_wildcard_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_wildcard_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_wildcard_query[0].field);
+    const top_level_wildcard_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_wildcard_query[0].value);
+    defer {
+        for (top_level_wildcard_parts) |part| alloc.free(part);
+        alloc.free(top_level_wildcard_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_wildcard_parts.len);
+    try std.testing.expectEqualStrings("pathfact-wildcard:v1", top_level_wildcard_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_wildcard_parts[1]);
+    try std.testing.expectEqualStrings("go*", top_level_wildcard_parts[2]);
+
+    const leading_wildcard_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .wildcard = .{ .field = "/tier", .pattern = "*old" } },
+    });
+    try std.testing.expect(leading_wildcard_query == null);
+
+    const non_path_wildcard_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .wildcard = .{ .field = "tier", .pattern = "go*" } },
+    });
+    try std.testing.expect(non_path_wildcard_query == null);
+
+    const from_path_regexp_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .regexp = .{ .field = "/tier", .pattern = "go.*" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_regexp_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_regexp_query.len);
+    try std.testing.expectEqualStrings("/tier", from_path_regexp_query[0].field);
+    const top_level_regexp_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_regexp_query[0].value);
+    defer {
+        for (top_level_regexp_parts) |part| alloc.free(part);
+        alloc.free(top_level_regexp_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_regexp_parts.len);
+    try std.testing.expectEqualStrings("pathfact-regexp:v1", top_level_regexp_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_regexp_parts[1]);
+    try std.testing.expectEqualStrings("go.*", top_level_regexp_parts[2]);
+
+    const leading_regexp_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .regexp = .{ .field = "/tier", .pattern = ".*old" } },
+    });
+    try std.testing.expect(leading_regexp_query == null);
+
+    const invalid_regexp_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .regexp = .{ .field = "/tier", .pattern = "go(" } },
+    });
+    try std.testing.expect(invalid_regexp_query == null);
+
+    const non_path_regexp_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .regexp = .{ .field = "tier", .pattern = "go.*" } },
+    });
+    try std.testing.expect(non_path_regexp_query == null);
+
+    const from_path_numeric_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .numeric_range = .{ .field = "/amount", .min = 10, .max = 30, .inclusive_min = true, .inclusive_max = false } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_numeric_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_numeric_query.len);
+    try std.testing.expectEqualStrings("/amount", from_path_numeric_query[0].field);
+    const top_level_amount_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_numeric_query[0].value);
+    defer {
+        for (top_level_amount_range_parts) |part| alloc.free(part);
+        alloc.free(top_level_amount_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), top_level_amount_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-numeric-range:v1", top_level_amount_range_parts[0]);
+    try std.testing.expectEqualStrings("number", top_level_amount_range_parts[1]);
+    try std.testing.expectEqualStrings("10", top_level_amount_range_parts[2]);
+    try std.testing.expectEqualStrings("30", top_level_amount_range_parts[3]);
+    try std.testing.expectEqualStrings("1", top_level_amount_range_parts[4]);
+    try std.testing.expectEqualStrings("0", top_level_amount_range_parts[5]);
+
+    const non_path_numeric_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .numeric_range = .{ .field = "amount", .min = 10 } },
+    });
+    try std.testing.expect(non_path_numeric_query == null);
+
+    const from_path_term_range_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .term_range = .{ .field = "/status", .min = "active", .max = "archived", .inclusive_min = true, .inclusive_max = false } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_term_range_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_term_range_query.len);
+    try std.testing.expectEqualStrings("/status", from_path_term_range_query[0].field);
+    const top_level_term_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_term_range_query[0].value);
+    defer {
+        for (top_level_term_range_parts) |part| alloc.free(part);
+        alloc.free(top_level_term_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), top_level_term_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-term-range:v1", top_level_term_range_parts[0]);
+    try std.testing.expectEqualStrings("string", top_level_term_range_parts[1]);
+    try std.testing.expectEqualStrings("active", top_level_term_range_parts[2]);
+    try std.testing.expectEqualStrings("archived", top_level_term_range_parts[3]);
+    try std.testing.expectEqualStrings("1", top_level_term_range_parts[4]);
+    try std.testing.expectEqualStrings("0", top_level_term_range_parts[5]);
+
+    const unbounded_term_range_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .term_range = .{ .field = "/status" } },
+    });
+    try std.testing.expect(unbounded_term_range_query == null);
+
+    const non_path_term_range_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .term_range = .{ .field = "status", .min = "active" } },
+    });
+    try std.testing.expect(non_path_term_range_query == null);
+
+    const from_path_ip_range_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .ip_range = .{ .field = "/client_ip", .cidr = "10.1.0.0/16" } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_ip_range_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_ip_range_query.len);
+    try std.testing.expectEqualStrings("/client_ip", from_path_ip_range_query[0].field);
+    const top_level_ip_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_ip_range_query[0].value);
+    defer {
+        for (top_level_ip_range_parts) |part| alloc.free(part);
+        alloc.free(top_level_ip_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top_level_ip_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-ip-range:v1", top_level_ip_range_parts[0]);
+    try std.testing.expectEqualStrings("ipv4", top_level_ip_range_parts[1]);
+    try std.testing.expectEqualStrings("10.1.0.0/16", top_level_ip_range_parts[2]);
+
+    const invalid_ip_range_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .ip_range = .{ .field = "/client_ip", .cidr = "10.999.0.0/16" } },
+    });
+    try std.testing.expect(invalid_ip_range_query == null);
+
+    const non_path_ip_range_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .ip_range = .{ .field = "client_ip", .cidr = "10.1.0.0/16" } },
+    });
+    try std.testing.expect(non_path_ip_range_query == null);
+
+    const from_path_geo_bbox_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .geo_bbox = .{ .field = "/location", .min_lat = 37.70, .min_lon = -122.50, .max_lat = 37.80, .max_lon = -122.30 } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_geo_bbox_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_geo_bbox_query.len);
+    try std.testing.expectEqualStrings("/location", from_path_geo_bbox_query[0].field);
+    const top_level_geo_bbox_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_bbox_query[0].value);
+    defer {
+        for (top_level_geo_bbox_parts) |part| alloc.free(part);
+        alloc.free(top_level_geo_bbox_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), top_level_geo_bbox_parts.len);
+    try std.testing.expectEqualStrings("pathfact-geo-bbox:v1", top_level_geo_bbox_parts[0]);
+    try std.testing.expectEqualStrings("geo_point", top_level_geo_bbox_parts[1]);
+    try std.testing.expectEqualStrings("37.7", top_level_geo_bbox_parts[2]);
+    try std.testing.expectEqualStrings("-122.5", top_level_geo_bbox_parts[3]);
+    try std.testing.expectEqualStrings("37.8", top_level_geo_bbox_parts[4]);
+    try std.testing.expectEqualStrings("-122.3", top_level_geo_bbox_parts[5]);
+
+    const from_path_geo_distance_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .geo_distance = .{ .field = "/location", .lat = 37.7749, .lon = -122.4194, .radius_meters = 2000 } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_geo_distance_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_geo_distance_query.len);
+    try std.testing.expectEqualStrings("/location", from_path_geo_distance_query[0].field);
+    const top_level_geo_distance_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_distance_query[0].value);
+    defer {
+        for (top_level_geo_distance_parts) |part| alloc.free(part);
+        alloc.free(top_level_geo_distance_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 5), top_level_geo_distance_parts.len);
+    try std.testing.expectEqualStrings("pathfact-geo-distance:v1", top_level_geo_distance_parts[0]);
+    try std.testing.expectEqualStrings("geo_point", top_level_geo_distance_parts[1]);
+    try std.testing.expectEqualStrings("37.7749", top_level_geo_distance_parts[2]);
+    try std.testing.expectEqualStrings("-122.4194", top_level_geo_distance_parts[3]);
+    try std.testing.expectEqualStrings("2000", top_level_geo_distance_parts[4]);
+
+    const direct_shape_polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.0, .lon = -123.0 },
+        .{ .lat = 38.0, .lon = -123.0 },
+        .{ .lat = 38.0, .lon = -122.0 },
+        .{ .lat = 37.0, .lon = -122.0 },
+    };
+    const direct_shape_polygons = [_][]const db_mod.types.GeoPoint{direct_shape_polygon[0..]};
+    const from_path_geo_shape_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .geo_shape = .{
+            .field = "/location",
+            .relation = .intersects,
+            .polygons = direct_shape_polygons[0..],
+        } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_geo_shape_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_geo_shape_query.len);
+    try std.testing.expectEqualStrings("/location", from_path_geo_shape_query[0].field);
+    const top_level_geo_shape_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_shape_query[0].value);
+    defer {
+        for (top_level_geo_shape_parts) |part| alloc.free(part);
+        alloc.free(top_level_geo_shape_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 13), top_level_geo_shape_parts.len);
+    try std.testing.expectEqualStrings("pathfact-geo-shape:v1", top_level_geo_shape_parts[0]);
+    try std.testing.expectEqualStrings("geo_point", top_level_geo_shape_parts[1]);
+    try std.testing.expectEqualStrings("intersects", top_level_geo_shape_parts[2]);
+    try std.testing.expectEqualStrings("1", top_level_geo_shape_parts[3]);
+    try std.testing.expectEqualStrings("4", top_level_geo_shape_parts[4]);
+
+    const contains_geo_shape_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .geo_shape = .{
+            .field = "/location",
+            .relation = .contains,
+            .polygons = direct_shape_polygons[0..],
+        } },
+    });
+    try std.testing.expect(contains_geo_shape_query == null);
+
+    const non_path_geo_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .geo_bbox = .{ .field = "location", .min_lat = 37.70, .min_lon = -122.50, .max_lat = 37.80, .max_lon = -122.30 } },
+    });
+    try std.testing.expect(non_path_geo_query == null);
+
+    const from_path_date_query = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .date_range = .{ .field = "/published_at", .start_ns = 1767225600000000000, .end_ns = 1767312000000000000, .inclusive_start = true, .inclusive_end = false } },
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_date_query);
+    try std.testing.expectEqual(@as(usize, 1), from_path_date_query.len);
+    try std.testing.expectEqualStrings("/published_at", from_path_date_query[0].field);
+    const top_level_date_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_date_query[0].value);
+    defer {
+        for (top_level_date_range_parts) |part| alloc.free(part);
+        alloc.free(top_level_date_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), top_level_date_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-date-range:v1", top_level_date_range_parts[0]);
+    try std.testing.expectEqualStrings("datetime", top_level_date_range_parts[1]);
+    try std.testing.expectEqualStrings("1767225600000000000", top_level_date_range_parts[2]);
+    try std.testing.expectEqualStrings("1767312000000000000", top_level_date_range_parts[3]);
+    try std.testing.expectEqualStrings("1", top_level_date_range_parts[4]);
+    try std.testing.expectEqualStrings("0", top_level_date_range_parts[5]);
+
+    const non_path_date_query = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .date_range = .{ .field = "published_at", .start_ns = 1767225600000000000 } },
+    });
+    try std.testing.expect(non_path_date_query == null);
+
+    const from_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"t1\"}},{\"bool_field\":{\"field\":\"paid\",\"value\":false}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_filter.len);
+    try std.testing.expectEqualStrings("tenant", from_filter[0].field);
+    try std.testing.expectEqualStrings("t1", from_filter[0].value);
+    try std.testing.expectEqualStrings("paid", from_filter[1].field);
+    try std.testing.expectEqualStrings("false", from_filter[1].value);
+
+    const from_numeric_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term\":{\"amount\":42}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_numeric_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_numeric_filter.len);
+    try std.testing.expectEqualStrings("amount", from_numeric_filter[0].field);
+    try std.testing.expectEqualStrings("42", from_numeric_filter[0].value);
+
+    const from_path_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"term\":{\"/active\":true}},{\"term\":{\"/tier\":\"gold\"}},{\"term\":{\"/deleted_at\":null}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_filter);
+    try std.testing.expectEqual(@as(usize, 3), from_path_filter.len);
+    try std.testing.expectEqualStrings("/active", from_path_filter[0].field);
+    const active_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_filter[0].value);
+    defer {
+        for (active_parts) |part| alloc.free(part);
+        alloc.free(active_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), active_parts.len);
+    try std.testing.expectEqualStrings("bool", active_parts[0]);
+    try std.testing.expectEqualStrings("true", active_parts[1]);
+    try std.testing.expectEqualStrings("/tier", from_path_filter[1].field);
+    const tier_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_filter[1].value);
+    defer {
+        for (tier_parts) |part| alloc.free(part);
+        alloc.free(tier_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), tier_parts.len);
+    try std.testing.expectEqualStrings("string", tier_parts[0]);
+    try std.testing.expectEqualStrings("gold", tier_parts[1]);
+    try std.testing.expectEqualStrings("/deleted_at", from_path_filter[2].field);
+    const null_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_filter[2].value);
+    defer {
+        for (null_parts) |part| alloc.free(part);
+        alloc.free(null_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), null_parts.len);
+    try std.testing.expectEqualStrings("null", null_parts[0]);
+    try std.testing.expectEqualStrings("", null_parts[1]);
+
+    const from_direct_path_term_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term\":\"gold\",\"field\":\"/tier\"}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_direct_path_term_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_direct_path_term_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_direct_path_term_filter[0].field);
+    const direct_path_term_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_direct_path_term_filter[0].value);
+    defer {
+        for (direct_path_term_parts) |part| alloc.free(part);
+        alloc.free(direct_path_term_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), direct_path_term_parts.len);
+    try std.testing.expectEqualStrings("string", direct_path_term_parts[0]);
+    try std.testing.expectEqualStrings("gold", direct_path_term_parts[1]);
+
+    const from_direct_path_alias_term_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term\":\"gold\",\"path\":\"/tier\"}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_direct_path_alias_term_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_direct_path_alias_term_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_direct_path_alias_term_filter[0].field);
+    const direct_path_alias_term_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_direct_path_alias_term_filter[0].value);
+    defer {
+        for (direct_path_alias_term_parts) |part| alloc.free(part);
+        alloc.free(direct_path_alias_term_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), direct_path_alias_term_parts.len);
+    try std.testing.expectEqualStrings("string", direct_path_alias_term_parts[0]);
+    try std.testing.expectEqualStrings("gold", direct_path_alias_term_parts[1]);
+
+    const from_field_value_path_term_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term\":{\"field\":\"/tier\",\"value\":\"gold\"}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_field_value_path_term_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_field_value_path_term_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_field_value_path_term_filter[0].field);
+    const field_value_path_term_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_field_value_path_term_filter[0].value);
+    defer {
+        for (field_value_path_term_parts) |part| alloc.free(part);
+        alloc.free(field_value_path_term_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), field_value_path_term_parts.len);
+    try std.testing.expectEqualStrings("string", field_value_path_term_parts[0]);
+    try std.testing.expectEqualStrings("gold", field_value_path_term_parts[1]);
+
+    const from_wrapped_path_alias_term_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_wrapped_path_alias_term_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_wrapped_path_alias_term_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_wrapped_path_alias_term_filter[0].field);
+
+    const from_terms_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":{\"terms\":{\"tenant\":[\"t1\"]}},\"must\":{\"terms\":{\"field\":\"region\",\"values\":[\"west\"]}}}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_terms_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_terms_filter.len);
+    var saw_tenant_terms = false;
+    var saw_region_terms = false;
+    for (from_terms_filter) |constraint| {
+        if (std.mem.eql(u8, constraint.field, "tenant") and std.mem.eql(u8, constraint.value, "t1")) saw_tenant_terms = true;
+        if (std.mem.eql(u8, constraint.field, "region") and std.mem.eql(u8, constraint.value, "west")) saw_region_terms = true;
+    }
+    try std.testing.expect(saw_tenant_terms);
+    try std.testing.expect(saw_region_terms);
+
+    const from_optional_should_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":{\"terms\":{\"tenant\":[\"t1\"]}},\"should\":[{\"term\":{\"region\":\"west\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_optional_should_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_optional_should_filter.len);
+    try std.testing.expectEqualStrings("tenant", from_optional_should_filter[0].field);
+    try std.testing.expectEqualStrings("t1", from_optional_should_filter[0].value);
+
+    const from_explicit_optional_should_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"must\":{\"terms\":{\"field\":\"region\",\"values\":[\"west\"]}},\"should\":[{\"term\":{\"tenant\":\"t1\"}}],\"minimum_should_match\":0}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_explicit_optional_should_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_explicit_optional_should_filter.len);
+    try std.testing.expectEqualStrings("region", from_explicit_optional_should_filter[0].field);
+    try std.testing.expectEqualStrings("west", from_explicit_optional_should_filter[0].value);
+
+    const unsupported_required_optional_should_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"must\":{\"terms\":{\"field\":\"region\",\"values\":[\"west\"]}},\"should\":[{\"term\":{\"tenant\":\"t1\"}}],\"minimum_should_match\":1}}",
+    });
+    try std.testing.expect(unsupported_required_optional_should_filter == null);
+
+    const from_path_should_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"should\":[{\"term\":{\"/tier\":\"gold\"}},{\"term\":{\"/tier\":\"silver\"}}],\"minimum_should_match\":1}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_should_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_path_should_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_path_should_filter[0].field);
+    const filter_should_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_should_filter[0].value);
+    defer {
+        for (filter_should_parts) |part| alloc.free(part);
+        alloc.free(filter_should_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), filter_should_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", filter_should_parts[0]);
+
+    const from_path_disjuncts_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"disjuncts\":[{\"term\":{\"/tier\":\"gold\"}},{\"term\":{\"/tier\":\"bronze\"}}]}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_disjuncts_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_path_disjuncts_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_path_disjuncts_filter[0].field);
+    const disjuncts_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_disjuncts_filter[0].value);
+    defer {
+        for (disjuncts_parts) |part| alloc.free(part);
+        alloc.free(disjuncts_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), disjuncts_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", disjuncts_parts[0]);
+
+    const from_direct_path_disjuncts_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"disjuncts\":[{\"term\":\"gold\",\"field\":\"/tier\"},{\"term\":\"bronze\",\"field\":\"/tier\"}]}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_direct_path_disjuncts_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_direct_path_disjuncts_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_direct_path_disjuncts_filter[0].field);
+    const direct_disjuncts_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_direct_path_disjuncts_filter[0].value);
+    defer {
+        for (direct_disjuncts_parts) |part| alloc.free(part);
+        alloc.free(direct_disjuncts_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), direct_disjuncts_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", direct_disjuncts_parts[0]);
+
+    const from_field_value_path_disjuncts_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"disjuncts\":[{\"term\":{\"field\":\"/tier\",\"term\":\"gold\"}},{\"term\":{\"field\":\"/tier\",\"value\":\"bronze\"}}]}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_field_value_path_disjuncts_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_field_value_path_disjuncts_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_field_value_path_disjuncts_filter[0].field);
+    const field_value_disjuncts_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_field_value_path_disjuncts_filter[0].value);
+    defer {
+        for (field_value_disjuncts_parts) |part| alloc.free(part);
+        alloc.free(field_value_disjuncts_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), field_value_disjuncts_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", field_value_disjuncts_parts[0]);
+
+    const from_path_alias_disjuncts_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"disjuncts\":[{\"term\":\"gold\",\"path\":\"/tier\"},{\"term\":{\"path\":\"/tier\",\"value\":\"bronze\"}}]}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_alias_disjuncts_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_path_alias_disjuncts_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_path_alias_disjuncts_filter[0].field);
+    const path_alias_disjuncts_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_alias_disjuncts_filter[0].value);
+    defer {
+        for (path_alias_disjuncts_parts) |part| alloc.free(part);
+        alloc.free(path_alias_disjuncts_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), path_alias_disjuncts_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", path_alias_disjuncts_parts[0]);
+
+    const mixed_path_should_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"should\":[{\"term\":{\"/tier\":\"gold\"}},{\"term\":{\"/region\":\"west\"}}],\"minimum_should_match\":1}}",
+    });
+    try std.testing.expect(mixed_path_should_filter == null);
+
+    const from_path_terms_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"terms\":{\"path\":\"/tier\",\"values\":[\"gold\",\"silver\",null]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_terms_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_path_terms_filter.len);
+    try std.testing.expectEqualStrings("/tier", from_path_terms_filter[0].field);
+    const any_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_terms_filter[0].value);
+    defer {
+        for (any_parts) |part| alloc.free(part);
+        alloc.free(any_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 4), any_parts.len);
+    try std.testing.expectEqualStrings("pathfact-any:v1", any_parts[0]);
+    const any_first = try db_mod.algebraic.token.decodeTupleAlloc(alloc, any_parts[1]);
+    defer {
+        for (any_first) |part| alloc.free(part);
+        alloc.free(any_first);
+    }
+    try std.testing.expectEqualStrings("string", any_first[0]);
+    try std.testing.expectEqualStrings("gold", any_first[1]);
+    const any_null = try db_mod.algebraic.token.decodeTupleAlloc(alloc, any_parts[3]);
+    defer {
+        for (any_null) |part| alloc.free(part);
+        alloc.free(any_null);
+    }
+    try std.testing.expectEqualStrings("null", any_null[0]);
+    try std.testing.expectEqualStrings("", any_null[1]);
+
+    const non_path_multi_terms_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"terms\":{\"tenant\":[\"t1\",\"t2\"]}}",
+    });
+    try std.testing.expect(non_path_multi_terms_filter == null);
+
+    const from_path_exists_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"exists\":{\"path\":\"/metadata/tier\"}},{\"exists\":\"/tenant\"}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_exists_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_exists_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_exists_filter[0].field);
+    try std.testing.expectEqualStrings(db_mod.algebraic.index.path_fact_exists_constraint_value, from_path_exists_filter[0].value);
+    try std.testing.expectEqualStrings("/tenant", from_path_exists_filter[1].field);
+    try std.testing.expectEqualStrings(db_mod.algebraic.index.path_fact_exists_constraint_value, from_path_exists_filter[1].value);
+
+    const from_path_prefix_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"prefix\":{\"path\":\"/metadata/tier\",\"prefix\":\"go\"}},{\"prefix\":{\"/tenant\":\"ac\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_prefix_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_prefix_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_prefix_filter[0].field);
+    const tier_prefix_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_prefix_filter[0].value);
+    defer {
+        for (tier_prefix_parts) |part| alloc.free(part);
+        alloc.free(tier_prefix_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tier_prefix_parts.len);
+    try std.testing.expectEqualStrings("pathfact-prefix:v1", tier_prefix_parts[0]);
+    try std.testing.expectEqualStrings("string", tier_prefix_parts[1]);
+    try std.testing.expectEqualStrings("go", tier_prefix_parts[2]);
+    try std.testing.expectEqualStrings("/tenant", from_path_prefix_filter[1].field);
+    const tenant_prefix_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_prefix_filter[1].value);
+    defer {
+        for (tenant_prefix_parts) |part| alloc.free(part);
+        alloc.free(tenant_prefix_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tenant_prefix_parts.len);
+    try std.testing.expectEqualStrings("pathfact-prefix:v1", tenant_prefix_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_prefix_parts[1]);
+    try std.testing.expectEqualStrings("ac", tenant_prefix_parts[2]);
+
+    const non_path_prefix_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"prefix\":{\"tenant\":\"ac\"}}",
+    });
+    try std.testing.expect(non_path_prefix_filter == null);
+
+    const from_path_match_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"match\":{\"path\":\"/metadata/tier\",\"value\":\"OLD\"}},{\"match\":{\"/tenant\":\"ICE\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_match_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_match_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_match_filter[0].field);
+    const tier_match_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_match_filter[0].value);
+    defer {
+        for (tier_match_parts) |part| alloc.free(part);
+        alloc.free(tier_match_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tier_match_parts.len);
+    try std.testing.expectEqualStrings("pathfact-match:v1", tier_match_parts[0]);
+    try std.testing.expectEqualStrings("string", tier_match_parts[1]);
+    try std.testing.expectEqualStrings("OLD", tier_match_parts[2]);
+    try std.testing.expectEqualStrings("/tenant", from_path_match_filter[1].field);
+    const tenant_match_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_match_filter[1].value);
+    defer {
+        for (tenant_match_parts) |part| alloc.free(part);
+        alloc.free(tenant_match_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tenant_match_parts.len);
+    try std.testing.expectEqualStrings("pathfact-match:v1", tenant_match_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_match_parts[1]);
+    try std.testing.expectEqualStrings("ICE", tenant_match_parts[2]);
+
+    const sibling_path_match_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"match\":\"old\",\"field\":\"/metadata/tier\"}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, sibling_path_match_filter);
+    try std.testing.expectEqual(@as(usize, 1), sibling_path_match_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", sibling_path_match_filter[0].field);
+
+    const non_path_match_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"match\":{\"tenant\":\"ICE\"}}",
+    });
+    try std.testing.expect(non_path_match_filter == null);
+
+    const from_path_wildcard_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"wildcard\":{\"path\":\"/metadata/tier\",\"pattern\":\"go*\"}},{\"wildcard\":{\"/tenant\":\"ac?e\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_wildcard_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_wildcard_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_wildcard_filter[0].field);
+    const tier_wildcard_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_wildcard_filter[0].value);
+    defer {
+        for (tier_wildcard_parts) |part| alloc.free(part);
+        alloc.free(tier_wildcard_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tier_wildcard_parts.len);
+    try std.testing.expectEqualStrings("pathfact-wildcard:v1", tier_wildcard_parts[0]);
+    try std.testing.expectEqualStrings("string", tier_wildcard_parts[1]);
+    try std.testing.expectEqualStrings("go*", tier_wildcard_parts[2]);
+    try std.testing.expectEqualStrings("/tenant", from_path_wildcard_filter[1].field);
+    const tenant_wildcard_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_wildcard_filter[1].value);
+    defer {
+        for (tenant_wildcard_parts) |part| alloc.free(part);
+        alloc.free(tenant_wildcard_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tenant_wildcard_parts.len);
+    try std.testing.expectEqualStrings("pathfact-wildcard:v1", tenant_wildcard_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_wildcard_parts[1]);
+    try std.testing.expectEqualStrings("ac?e", tenant_wildcard_parts[2]);
+
+    const leading_wildcard_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"wildcard\":{\"/tenant\":\"*ice\"}}",
+    });
+    try std.testing.expect(leading_wildcard_filter == null);
+
+    const non_path_wildcard_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"wildcard\":{\"tenant\":\"ac*\"}}",
+    });
+    try std.testing.expect(non_path_wildcard_filter == null);
+
+    const from_path_regexp_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"regexp\":{\"path\":\"/metadata/tier\",\"pattern\":\"go.*\"}},{\"regexp\":{\"/tenant\":\"ac.e\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_regexp_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_regexp_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_regexp_filter[0].field);
+    const tier_regexp_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_regexp_filter[0].value);
+    defer {
+        for (tier_regexp_parts) |part| alloc.free(part);
+        alloc.free(tier_regexp_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tier_regexp_parts.len);
+    try std.testing.expectEqualStrings("pathfact-regexp:v1", tier_regexp_parts[0]);
+    try std.testing.expectEqualStrings("string", tier_regexp_parts[1]);
+    try std.testing.expectEqualStrings("go.*", tier_regexp_parts[2]);
+    try std.testing.expectEqualStrings("/tenant", from_path_regexp_filter[1].field);
+    const tenant_regexp_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_regexp_filter[1].value);
+    defer {
+        for (tenant_regexp_parts) |part| alloc.free(part);
+        alloc.free(tenant_regexp_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tenant_regexp_parts.len);
+    try std.testing.expectEqualStrings("pathfact-regexp:v1", tenant_regexp_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_regexp_parts[1]);
+    try std.testing.expectEqualStrings("ac.e", tenant_regexp_parts[2]);
+
+    const leading_regexp_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"regexp\":{\"/tenant\":\".*ice\"}}",
+    });
+    try std.testing.expect(leading_regexp_filter == null);
+
+    const invalid_regexp_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"regexp\":{\"/tenant\":\"ac(\"}}",
+    });
+    try std.testing.expect(invalid_regexp_filter == null);
+
+    const non_path_regexp_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"regexp\":{\"tenant\":\"ac.*\"}}",
+    });
+    try std.testing.expect(non_path_regexp_filter == null);
+
+    const from_path_fuzzy_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"fuzzy\":{\"path\":\"/metadata/tier\",\"query\":\"gild\",\"prefix_length\":1,\"max_edits\":1}},{\"fuzzy\":{\"/tenant\":{\"query\":\"alpine\",\"prefix_length\":2,\"max_edits\":1}}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_fuzzy_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_fuzzy_filter.len);
+    try std.testing.expectEqualStrings("/metadata/tier", from_path_fuzzy_filter[0].field);
+    const tier_fuzzy_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_fuzzy_filter[0].value);
+    defer {
+        for (tier_fuzzy_parts) |part| alloc.free(part);
+        alloc.free(tier_fuzzy_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 5), tier_fuzzy_parts.len);
+    try std.testing.expectEqualStrings("pathfact-fuzzy:v1", tier_fuzzy_parts[0]);
+    try std.testing.expectEqualStrings("string", tier_fuzzy_parts[1]);
+    try std.testing.expectEqualStrings("gild", tier_fuzzy_parts[2]);
+    try std.testing.expectEqualStrings("1", tier_fuzzy_parts[3]);
+    try std.testing.expectEqualStrings("1", tier_fuzzy_parts[4]);
+    try std.testing.expectEqualStrings("/tenant", from_path_fuzzy_filter[1].field);
+    const tenant_fuzzy_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_fuzzy_filter[1].value);
+    defer {
+        for (tenant_fuzzy_parts) |part| alloc.free(part);
+        alloc.free(tenant_fuzzy_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 5), tenant_fuzzy_parts.len);
+    try std.testing.expectEqualStrings("pathfact-fuzzy:v1", tenant_fuzzy_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_fuzzy_parts[1]);
+    try std.testing.expectEqualStrings("alpine", tenant_fuzzy_parts[2]);
+    try std.testing.expectEqualStrings("1", tenant_fuzzy_parts[3]);
+    try std.testing.expectEqualStrings("2", tenant_fuzzy_parts[4]);
+
+    const unbounded_fuzzy_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"fuzzy\":{\"/tenant\":{\"query\":\"alice\",\"max_edits\":1}}}",
+    });
+    try std.testing.expect(unbounded_fuzzy_filter == null);
+
+    const non_path_fuzzy_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"fuzzy\":{\"tenant\":{\"query\":\"alice\",\"prefix_length\":1}}}",
+    });
+    try std.testing.expect(non_path_fuzzy_filter == null);
+
+    const from_path_numeric_range_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"numeric_range\":{\"path\":\"/amount\",\"min\":10,\"max\":30,\"inclusive_min\":true,\"inclusive_max\":false}},{\"range\":{\"/score\":{\"gte\":7,\"lt\":9}}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_numeric_range_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_numeric_range_filter.len);
+    try std.testing.expectEqualStrings("/amount", from_path_numeric_range_filter[0].field);
+    const amount_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_numeric_range_filter[0].value);
+    defer {
+        for (amount_range_parts) |part| alloc.free(part);
+        alloc.free(amount_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), amount_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-numeric-range:v1", amount_range_parts[0]);
+    try std.testing.expectEqualStrings("number", amount_range_parts[1]);
+    try std.testing.expectEqualStrings("10", amount_range_parts[2]);
+    try std.testing.expectEqualStrings("30", amount_range_parts[3]);
+    try std.testing.expectEqualStrings("1", amount_range_parts[4]);
+    try std.testing.expectEqualStrings("0", amount_range_parts[5]);
+    try std.testing.expectEqualStrings("/score", from_path_numeric_range_filter[1].field);
+    const score_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_numeric_range_filter[1].value);
+    defer {
+        for (score_range_parts) |part| alloc.free(part);
+        alloc.free(score_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), score_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-numeric-range:v1", score_range_parts[0]);
+    try std.testing.expectEqualStrings("number", score_range_parts[1]);
+    try std.testing.expectEqualStrings("7", score_range_parts[2]);
+    try std.testing.expectEqualStrings("9", score_range_parts[3]);
+    try std.testing.expectEqualStrings("1", score_range_parts[4]);
+    try std.testing.expectEqualStrings("0", score_range_parts[5]);
+
+    const upper_only_path_range_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"range\":{\"field\":\"/score\",\"lte\":9}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, upper_only_path_range_filter);
+    try std.testing.expectEqual(@as(usize, 1), upper_only_path_range_filter.len);
+    const upper_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, upper_only_path_range_filter[0].value);
+    defer {
+        for (upper_range_parts) |part| alloc.free(part);
+        alloc.free(upper_range_parts);
+    }
+    try std.testing.expectEqualStrings("", upper_range_parts[2]);
+    try std.testing.expectEqualStrings("9", upper_range_parts[3]);
+    try std.testing.expectEqualStrings("1", upper_range_parts[4]);
+    try std.testing.expectEqualStrings("1", upper_range_parts[5]);
+
+    const non_path_numeric_range_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":10}}",
+    });
+    try std.testing.expect(non_path_numeric_range_filter == null);
+
+    const from_path_date_range_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2026-01-02T00:00:00Z\",\"end\":\"2026-01-03T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}},{\"range\":{\"/created_at\":{\"gte\":\"2026-01-04\",\"lt\":\"2026-01-05\"}}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_date_range_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_date_range_filter.len);
+    try std.testing.expectEqualStrings("/published_at", from_path_date_range_filter[0].field);
+    const published_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_date_range_filter[0].value);
+    defer {
+        for (published_range_parts) |part| alloc.free(part);
+        alloc.free(published_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), published_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-date-range:v1", published_range_parts[0]);
+    try std.testing.expectEqualStrings("datetime", published_range_parts[1]);
+    try std.testing.expectEqualStrings("2026-01-02T00:00:00Z", published_range_parts[2]);
+    try std.testing.expectEqualStrings("2026-01-03T00:00:00Z", published_range_parts[3]);
+    try std.testing.expectEqualStrings("1", published_range_parts[4]);
+    try std.testing.expectEqualStrings("0", published_range_parts[5]);
+    try std.testing.expectEqualStrings("/created_at", from_path_date_range_filter[1].field);
+    const created_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_date_range_filter[1].value);
+    defer {
+        for (created_range_parts) |part| alloc.free(part);
+        alloc.free(created_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), created_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-date-range:v1", created_range_parts[0]);
+    try std.testing.expectEqualStrings("datetime", created_range_parts[1]);
+    try std.testing.expectEqualStrings("2026-01-04", created_range_parts[2]);
+    try std.testing.expectEqualStrings("2026-01-05", created_range_parts[3]);
+    try std.testing.expectEqualStrings("1", created_range_parts[4]);
+    try std.testing.expectEqualStrings("0", created_range_parts[5]);
+
+    const non_path_date_range_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"date_range\":{\"field\":\"published_at\",\"start\":\"2026-01-02T00:00:00Z\"}}",
+    });
+    try std.testing.expect(non_path_date_range_filter == null);
+
+    const from_path_ip_range_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"ip_range\":{\"path\":\"/client_ip\",\"cidr\":\"10.1.0.0/16\"}},{\"ip_range\":{\"field\":\"/gateway_ip\",\"cidr\":\"192.168.1.10\"}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_ip_range_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_ip_range_filter.len);
+    try std.testing.expectEqualStrings("/client_ip", from_path_ip_range_filter[0].field);
+    const client_ip_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_ip_range_filter[0].value);
+    defer {
+        for (client_ip_parts) |part| alloc.free(part);
+        alloc.free(client_ip_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), client_ip_parts.len);
+    try std.testing.expectEqualStrings("pathfact-ip-range:v1", client_ip_parts[0]);
+    try std.testing.expectEqualStrings("ipv4", client_ip_parts[1]);
+    try std.testing.expectEqualStrings("10.1.0.0/16", client_ip_parts[2]);
+    try std.testing.expectEqualStrings("/gateway_ip", from_path_ip_range_filter[1].field);
+    const gateway_ip_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_ip_range_filter[1].value);
+    defer {
+        for (gateway_ip_parts) |part| alloc.free(part);
+        alloc.free(gateway_ip_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 3), gateway_ip_parts.len);
+    try std.testing.expectEqualStrings("pathfact-ip-range:v1", gateway_ip_parts[0]);
+    try std.testing.expectEqualStrings("ipv4", gateway_ip_parts[1]);
+    try std.testing.expectEqualStrings("192.168.1.10", gateway_ip_parts[2]);
+
+    const non_path_ip_range_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"ip_range\":{\"field\":\"client_ip\",\"cidr\":\"10.1.0.0/16\"}}",
+    });
+    try std.testing.expect(non_path_ip_range_filter == null);
+
+    const invalid_ip_range_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"ip_range\":{\"path\":\"/client_ip\",\"cidr\":\"10.999.0.0/16\"}}",
+    });
+    try std.testing.expect(invalid_ip_range_filter == null);
+
+    const from_path_geo_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"geo_bbox\":{\"path\":\"/location\",\"min_lat\":37.70,\"min_lon\":-122.50,\"max_lat\":37.80,\"max_lon\":-122.30}},{\"geo_distance\":{\"field\":\"/warehouse\",\"lat\":40.7128,\"lon\":-74.006,\"radius_meters\":5000}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_geo_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_geo_filter.len);
+    try std.testing.expectEqualStrings("/location", from_path_geo_filter[0].field);
+    const location_geo_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_filter[0].value);
+    defer {
+        for (location_geo_parts) |part| alloc.free(part);
+        alloc.free(location_geo_parts);
+    }
+    try std.testing.expectEqualStrings("pathfact-geo-bbox:v1", location_geo_parts[0]);
+    try std.testing.expectEqualStrings("/warehouse", from_path_geo_filter[1].field);
+    const warehouse_geo_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_filter[1].value);
+    defer {
+        for (warehouse_geo_parts) |part| alloc.free(part);
+        alloc.free(warehouse_geo_parts);
+    }
+    try std.testing.expectEqualStrings("pathfact-geo-distance:v1", warehouse_geo_parts[0]);
+
+    const from_path_geo_shape_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"geo_shape\":{\"path\":\"/location\",\"relation\":\"within\",\"polygons\":[[{\"lat\":37.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-122.0},{\"lat\":37.0,\"lon\":-122.0}]]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_geo_shape_filter);
+    try std.testing.expectEqual(@as(usize, 1), from_path_geo_shape_filter.len);
+    try std.testing.expectEqualStrings("/location", from_path_geo_shape_filter[0].field);
+    const location_geo_shape_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_geo_shape_filter[0].value);
+    defer {
+        for (location_geo_shape_parts) |part| alloc.free(part);
+        alloc.free(location_geo_shape_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 13), location_geo_shape_parts.len);
+    try std.testing.expectEqualStrings("pathfact-geo-shape:v1", location_geo_shape_parts[0]);
+    try std.testing.expectEqualStrings("geo_point", location_geo_shape_parts[1]);
+    try std.testing.expectEqualStrings("within", location_geo_shape_parts[2]);
+
+    const unsupported_geo_shape_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"geo_shape\":{\"path\":\"/location\",\"relation\":\"contains\",\"polygons\":[[{\"lat\":37.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-122.0}]]}}",
+    });
+    try std.testing.expect(unsupported_geo_shape_filter == null);
+
+    const non_path_geo_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"location\",\"min_lat\":37.70,\"min_lon\":-122.50,\"max_lat\":37.80,\"max_lon\":-122.30}}",
+    });
+    try std.testing.expect(non_path_geo_filter == null);
+
+    const invalid_geo_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"geo_distance\":{\"path\":\"/location\",\"lat\":95,\"lon\":-122.4194,\"radius_meters\":2000}}",
+    });
+    try std.testing.expect(invalid_geo_filter == null);
+
+    const from_path_term_range_filter = (try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"term_range\":{\"path\":\"/tenant\",\"min\":\"alpi\",\"max\":\"alpj\",\"inclusive_min\":true,\"inclusive_max\":false}},{\"range\":{\"/status\":{\"gte\":\"active\",\"lt\":\"archived\"}}}]}}",
+    })).?;
+    defer freeAlgebraicConstraints(alloc, from_path_term_range_filter);
+    try std.testing.expectEqual(@as(usize, 2), from_path_term_range_filter.len);
+    try std.testing.expectEqualStrings("/tenant", from_path_term_range_filter[0].field);
+    const tenant_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_term_range_filter[0].value);
+    defer {
+        for (tenant_range_parts) |part| alloc.free(part);
+        alloc.free(tenant_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), tenant_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-term-range:v1", tenant_range_parts[0]);
+    try std.testing.expectEqualStrings("string", tenant_range_parts[1]);
+    try std.testing.expectEqualStrings("alpi", tenant_range_parts[2]);
+    try std.testing.expectEqualStrings("alpj", tenant_range_parts[3]);
+    try std.testing.expectEqualStrings("1", tenant_range_parts[4]);
+    try std.testing.expectEqualStrings("0", tenant_range_parts[5]);
+    try std.testing.expectEqualStrings("/status", from_path_term_range_filter[1].field);
+    const status_range_parts = try db_mod.algebraic.token.decodeTupleAlloc(alloc, from_path_term_range_filter[1].value);
+    defer {
+        for (status_range_parts) |part| alloc.free(part);
+        alloc.free(status_range_parts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), status_range_parts.len);
+    try std.testing.expectEqualStrings("pathfact-term-range:v1", status_range_parts[0]);
+    try std.testing.expectEqualStrings("string", status_range_parts[1]);
+    try std.testing.expectEqualStrings("active", status_range_parts[2]);
+    try std.testing.expectEqualStrings("archived", status_range_parts[3]);
+    try std.testing.expectEqualStrings("1", status_range_parts[4]);
+    try std.testing.expectEqualStrings("0", status_range_parts[5]);
+
+    const non_path_term_range_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"term_range\":{\"field\":\"tenant\",\"min\":\"a\"}}",
+    });
+    try std.testing.expect(non_path_term_range_filter == null);
+
+    const non_path_exists_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"exists\":\"tenant\"}",
+    });
+    try std.testing.expect(non_path_exists_filter == null);
+
+    const multi_terms_filter = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .filter_query_json = "{\"terms\":{\"tenant\":[\"t1\",\"t2\"]}}",
+    });
+    try std.testing.expect(multi_terms_filter == null);
+}
+
+test "algebraic constraints reject top-level text term query" {
+    const alloc = std.testing.allocator;
+    const constraints = try algebraicConstraintsForRequestAlloc(alloc, .{
+        .query = .{ .term = .{ .field = "body", .term = "published" } },
+    });
+    try std.testing.expect(constraints == null);
 }
 
 test "merge runtime preflight summary preserves structured filter exact counts only when every shard is exact" {

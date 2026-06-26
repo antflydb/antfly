@@ -10501,18 +10501,23 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .drop_conversion => .drop_conversion_not_planned_by_generated_parser,
         .drop_event_trigger => .drop_event_trigger_not_planned_by_generated_parser,
         .drop_language => .drop_language_not_planned_by_generated_parser,
+        .drop_extension_multi => .drop_extension_multi_not_planned_by_generated_parser,
+        .drop_index_multi => .drop_index_multi_not_planned_by_generated_parser,
+        .drop_materialized_view_multi => .drop_materialized_view_multi_not_planned_by_generated_parser,
         .drop_owned => .drop_owned_not_planned_by_generated_parser,
         .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
         .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
         .drop_routine => .drop_routine_not_planned_by_generated_parser,
         .drop_schema_multi => .drop_schema_multi_not_planned_by_generated_parser,
         .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
+        .drop_table_multi => .drop_table_multi_not_planned_by_generated_parser,
         .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
         .drop_text_search_dictionary => .drop_text_search_dictionary_not_planned_by_generated_parser,
         .drop_text_search_parser => .drop_text_search_parser_not_planned_by_generated_parser,
         .drop_text_search_template => .drop_text_search_template_not_planned_by_generated_parser,
         .drop_transform => .drop_transform_not_planned_by_generated_parser,
         .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
+        .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
         .explain => .explain_not_planned_by_generated_parser,
         .fetch => .fetch_not_planned_by_generated_parser,
         .grant => .grant_not_planned_by_generated_parser,
@@ -18052,6 +18057,14 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         alloc,
         "DROP TABLE usage_records, archived_usage_records",
     ));
+    var drop_multi_table = try tokenized.ParsedSql.initAlloc(alloc, "DROP TABLE usage_records, archived_usage_records");
+    defer drop_multi_table.deinit(alloc);
+    switch (drop_multi_table.statement) {
+        .unsupported => |statement| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_table_multi, statement.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter ddl plan rejects mistyped expression checks during catalog validation" {
