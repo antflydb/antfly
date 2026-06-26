@@ -213380,7 +213380,7 @@ pub fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) Pa
     }
 }
 
-pub fn actionsForState(state: u16) []const Action {
+fn actionsForState(state: u16) []const Action {
     if (state >= action_ranges.len) return &.{};
     const range = action_ranges[state];
     const start: usize = @intCast(range.start);
@@ -213397,7 +213397,7 @@ pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8 {
     return symbolName(state_actions[index].terminal);
 }
 
-pub fn symbolName(id: u16) []const u8 {
+fn symbolName(id: u16) []const u8 {
     if (id >= symbols.len) return "";
     return symbols[id].name;
 }
