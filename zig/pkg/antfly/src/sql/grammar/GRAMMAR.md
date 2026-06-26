@@ -410,7 +410,11 @@ order-list span. Generated projection, grouping, generic expression, and
 ordering lists now recursively validate each owned generated expression
 payload before typed lowering can consume the list, including generic
 function-call argument, ordered-argument, `WITHIN GROUP`, `FILTER`, and `OVER`
-payload ranges. Generated CTE read lowering now derives non-recursive final read-family
+payload ranges. Query, aggregate, window, join, lateral, and CTE body read
+entry points now also validate the whole generated read payload before typed
+planning starts, so list boundary expressions, optional clause payloads,
+pagination expressions, set-operation payloads, and join metadata cannot drift
+from the generated AST while token fallback still exists. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
 direct CTE query-plan lowering also preserves generated final set-operation

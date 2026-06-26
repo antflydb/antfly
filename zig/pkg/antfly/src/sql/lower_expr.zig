@@ -16979,6 +16979,7 @@ pub fn parseSelectAlloc(
     pos: *usize,
     options: SelectParserOptions,
 ) !plan_mod.LoweredSelect {
+    if (options.generated_read_ast) |read| try validateGeneratedReadAstPayloads(tokens, read.*);
     try parser.expectKeyword(tokens, pos, "select");
 
     const initial_context = options.context_hooks.get_context(options.context_hooks.ptr);
@@ -17339,6 +17340,7 @@ pub fn parseAggregateAlloc(
     pos: *usize,
     options: AggregateParserOptions,
 ) !plan_mod.LoweredAggregate {
+    if (options.generated_read_ast) |read| try validateGeneratedReadAstPayloads(tokens, read.*);
     try parser.expectKeyword(tokens, pos, "select");
 
     const initial_context = options.context_hooks.get_context(options.context_hooks.ptr);
@@ -17783,6 +17785,7 @@ pub fn parseWindowSelectAlloc(
     pos: *usize,
     options: WindowParserOptions,
 ) !plan_mod.LoweredWindowPlan {
+    if (options.generated_read_ast) |read| try validateGeneratedReadAstPayloads(tokens, read.*);
     try parser.expectKeyword(tokens, pos, "select");
 
     const initial_context = options.context_hooks.get_context(options.context_hooks.ptr);
@@ -18157,6 +18160,7 @@ pub fn parseJoinAlloc(
     pos: *usize,
     options: JoinParserOptions,
 ) !plan_mod.LoweredJoin {
+    if (options.generated_read_ast) |read| try validateGeneratedReadAstPayloads(tokens, read.*);
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .join);
     try parser.expectKeyword(tokens, pos, "select");
 
@@ -18936,6 +18940,7 @@ pub fn parseLateralAlloc(
     pos: *usize,
     options: LateralParserOptions,
 ) !plan_mod.LoweredLateralPlan {
+    if (options.generated_read_ast) |read| try validateGeneratedReadAstPayloads(tokens, read.*);
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .lateral);
     try parser.expectKeyword(tokens, pos, "select");
 
@@ -30515,6 +30520,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
         &.{},
     ));
 
+    var malformed_generated_aggregate_group_boundary = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status",
+    );
+    defer malformed_generated_aggregate_group_boundary.deinit(alloc);
+    if (malformed_generated_aggregate_group_boundary.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.projection_items.expression_items.len < 2 or read.group_first_expression.tokens == null) return error.TestUnexpectedResult;
+                read.group_first_expression.tokens = read.projection_items.expression_items[1];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_aggregate_group_boundary,
+        schema,
+        &.{},
+    ));
+
     var window = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rn FROM usage_records WHERE status = 'open' ORDER BY rn ASC OFFSET 4 ROWS FETCH FIRST 2 ROWS ONLY",
@@ -30541,6 +30567,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
         alloc,
         &malformed_generated_window_pagination,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_window_order_boundary = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id) AS rn FROM usage_records ORDER BY rn ASC",
+    );
+    defer malformed_generated_window_order_boundary.deinit(alloc);
+    if (malformed_generated_window_order_boundary.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.projection_items.expression_items.len == 0 or read.order_first_expression.tokens == null) return error.TestUnexpectedResult;
+                read.order_first_expression.tokens = read.projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_window_order_boundary,
         schema,
         &.{},
     ));
