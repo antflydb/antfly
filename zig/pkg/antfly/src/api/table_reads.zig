@@ -253,57 +253,6 @@ pub const searchRequestFromVectorWorkerEnvelope = table_read_remote_wire.searchR
 pub const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
 pub const TableReadSource = table_read_core.TableReadSource;
 
-const AlgebraicVectorWorkerCandidate = struct {
-    index_name: []const u8,
-    layout: algebraic_ir.PhysicalLayout,
-    query: query_contract.AlgebraicVectorWorkerQuery,
-    k: u32,
-};
-
-fn algebraicVectorWorkerCandidateForSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ?AlgebraicVectorWorkerCandidate {
-    if (req.aggregations_json.len != 0 or
-        req.full_text != null or
-        req.full_text_queries.len != 0 or
-        req.dense_queries.len != 0 or
-        req.sparse_queries.len != 0 or
-        req.graph_queries.len != 0 or
-        req.merge_config != null or
-        req.reranker != null or
-        req.pruner != null or
-        req.expand_strategy != null or
-        req.distributed_text_stats.len != 0 or
-        searchRequestHasUnserializableResolvedDocFilter(req))
-    {
-        return null;
-    }
-    if (req.filter_query_json.len != 0 and !algebraicVectorWorkerFilterJsonSupported(alloc, req.filter_query_json)) return null;
-    if (req.exclusion_query_json.len != 0 and !algebraicVectorWorkerFilterJsonSupported(alloc, req.exclusion_query_json)) return null;
-
-    if (req.dense) |dense| {
-        if (req.sparse != null) return null;
-        if (req.query != .match_all) return null;
-        const index_name = req.index_name orelse return null;
-        return .{ .index_name = index_name, .layout = .dense_vector, .query = .{ .dense = dense }, .k = dense.k };
-    }
-    if (req.sparse) |sparse| {
-        if (req.query != .match_all) return null;
-        const index_name = req.index_name orelse return null;
-        return .{ .index_name = index_name, .layout = .sparse_vector, .query = .{ .sparse = sparse }, .k = sparse.k };
-    }
-
-    switch (req.query) {
-        .dense_knn => |dense| {
-            const index_name = req.index_name orelse return null;
-            return .{ .index_name = index_name, .layout = .dense_vector, .query = .{ .dense = dense }, .k = dense.k };
-        },
-        .sparse_knn => |sparse| {
-            const index_name = req.index_name orelse return null;
-            return .{ .index_name = index_name, .layout = .sparse_vector, .query = .{ .sparse = sparse }, .k = sparse.k };
-        },
-        else => return null,
-    }
-}
-
 fn algebraicVectorWorkerFilterJsonSupported(alloc: std.mem.Allocator, filter_query_json: []const u8) bool {
     if (filter_query_json.len == 0) return true;
     const constraints = algebraicConstraintsForRequestAlloc(alloc, .{
@@ -320,82 +269,14 @@ fn annotateVectorWorkerPreflight(
     summary: *db_mod.RuntimePreflightSummary,
     req: db_mod.types.SearchRequest,
 ) void {
-    if (!searchRequestHasSingleVectorWorkerKnn(req)) return;
-    summary.vector_worker_filter_constraint_count +|= vectorWorkerFilterConstraintCount(req);
-    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) {
-        summary.vector_worker_requires_algebraic_filter_resolution = true;
-    }
-    if (algebraicVectorWorkerCandidateForSearchRequest(alloc, req) != null) {
-        summary.vector_worker_candidate_count +|= 1;
-    } else {
-        summary.vector_worker_fallback_count +|= 1;
-    }
-}
-
-fn searchRequestHasSingleVectorWorkerKnn(req: db_mod.types.SearchRequest) bool {
-    var count: u32 = 0;
-    if (req.dense != null) count += 1;
-    if (req.sparse != null) count += 1;
-    switch (req.query) {
-        .dense_knn, .sparse_knn => count += 1,
-        else => {},
-    }
-    return count == 1;
-}
-
-fn vectorWorkerFilterConstraintCount(req: db_mod.types.SearchRequest) u32 {
-    var count: u32 = 0;
-    if (req.filter_query_json.len > 0) count += 1;
-    if (req.exclusion_query_json.len > 0) count += 1;
-    if (req.filter_ids.len > 0) count += 1;
-    if (req.exclude_ids.len > 0) count += 1;
-    if (req.filter_doc_ids_positive or req.filter_doc_ids.len > 0) count += 1;
-    if (req.exclude_doc_ids.len > 0) count += 1;
-    if (searchRequestHasResolvedDocFilter(req)) count += 1;
-    return count;
+    table_read_remote_wire.annotateVectorWorkerPreflight(alloc, summary, req, algebraicVectorWorkerFilterJsonSupported);
 }
 
 fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
 ) !?[]u8 {
-    const candidate = algebraicVectorWorkerCandidateForSearchRequest(alloc, req) orelse return null;
-    const constraints = query_contract.nativeDocIdConstraintEnvelopeFromSearchRequest(req);
-    var tensor_program = (try algebraic_planner.planVectorSearchTensorProgramAlloc(alloc, candidate.index_name, candidate.layout, constraints.hasConstraints())) orelse return null;
-    defer tensor_program.deinit(alloc);
-    return try query_contract.encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        candidate.index_name,
-        candidate.layout,
-        candidate.query,
-        .{
-            .limit = req.limit,
-            .offset = req.offset,
-            .count_only = req.count_only,
-            .profile = req.profile,
-            .include_stored = req.include_stored,
-            .fields = @constCast(req.fields),
-            .filter_query_json = req.filter_query_json,
-            .exclusion_query_json = req.exclusion_query_json,
-            .filter_prefix = req.filter_prefix,
-            .filter_ids = req.filter_ids,
-            .exclude_ids = req.exclude_ids,
-            .require_algebraic_filter_resolution = req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0,
-            .include_all_fields = req.include_all_fields,
-            .defer_stored_projection = req.defer_stored_projection,
-            .search_effort = req.search_effort,
-            .distance_over = req.distance_over,
-            .distance_under = req.distance_under,
-            .return_mode = req.return_mode,
-            .max_chunks_per_parent = req.max_chunks_per_parent,
-            .identity_read_generation = req.identity_read_generation,
-        },
-        constraints,
-        req.resolved_doc_filter,
-        req.resolved_doc_filter_wire_context,
-        tensor_program.access_paths,
-        tensor_program.asProgram(),
-    );
+    return table_read_remote_wire.encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req, algebraicVectorWorkerFilterJsonSupported);
 }
 
 pub const BoundTableReadSource = struct {
@@ -14756,140 +14637,6 @@ test "distributed table reads reject stale doc identity before multigroup fanout
     }));
 }
 
-test "simple vector shard request lowers to vector worker envelope" {
-    const alloc = std.testing.allocator;
-    const body = (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
-        .index_name = "dense_idx",
-        .limit = 11,
-        .offset = 3,
-        .count_only = true,
-        .profile = true,
-        .include_stored = false,
-        .fields = &.{ "title", "score" },
-        .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
-        .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
-        .filter_prefix = "tenant/a/",
-        .filter_ids = &.{ 99, 42 },
-        .exclude_ids = &.{7},
-        .include_all_fields = false,
-        .defer_stored_projection = true,
-        .search_effort = 0.5,
-        .distance_under = 0.9,
-        .return_mode = .parent_with_chunks,
-        .max_chunks_per_parent = 2,
-        .identity_read_generation = 54321,
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .filter_doc_ids_positive = true,
-        .filter_doc_ids = &.{ "doc:b", "doc:a" },
-        .exclude_doc_ids = &.{"doc:c"},
-    })).?;
-    defer alloc.free(body);
-
-    var envelope = try query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, body);
-    defer envelope.deinit(alloc);
-    try std.testing.expectEqualStrings("dense_idx", envelope.index_name);
-    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.dense_vector, envelope.layout);
-    try std.testing.expectEqual(@as(u32, 11), envelope.options.limit);
-    try std.testing.expectEqual(@as(u32, 3), envelope.options.offset);
-    try std.testing.expect(envelope.options.count_only);
-    try std.testing.expect(envelope.options.profile);
-    try std.testing.expect(!envelope.options.include_stored);
-    try std.testing.expect(!envelope.options.include_all_fields);
-    try std.testing.expect(envelope.options.defer_stored_projection);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}", envelope.options.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", envelope.options.exclusion_query_json);
-    try std.testing.expect(envelope.options.require_algebraic_filter_resolution);
-    try std.testing.expectEqualStrings("tenant/a/", envelope.options.filter_prefix);
-    try std.testing.expectEqual(@as(usize, 2), envelope.options.filter_ids.len);
-    try std.testing.expectEqual(@as(u64, 99), envelope.options.filter_ids[0]);
-    try std.testing.expectEqual(@as(u64, 42), envelope.options.filter_ids[1]);
-    try std.testing.expectEqual(@as(usize, 1), envelope.options.exclude_ids.len);
-    try std.testing.expectEqual(@as(u64, 7), envelope.options.exclude_ids[0]);
-    try std.testing.expectEqual(@as(usize, 2), envelope.options.fields.len);
-    try std.testing.expectEqualStrings("title", envelope.options.fields[0]);
-    try std.testing.expectEqualStrings("score", envelope.options.fields[1]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), envelope.options.search_effort.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), envelope.options.distance_under.?, 0.0001);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, envelope.options.return_mode);
-    try std.testing.expectEqual(@as(u32, 2), envelope.options.max_chunks_per_parent);
-    try std.testing.expectEqual(@as(?u64, 54321), envelope.options.identity_read_generation);
-    try std.testing.expect(envelope.native_doc_id_constraints.constraints.positive_filter);
-    try std.testing.expectEqualStrings("doc:a", envelope.native_doc_id_constraints.constraints.include_doc_ids[0]);
-    try std.testing.expectEqualStrings("doc:b", envelope.native_doc_id_constraints.constraints.include_doc_ids[1]);
-    try std.testing.expectEqualStrings("doc:c", envelope.native_doc_id_constraints.constraints.exclude_doc_ids[0]);
-    try std.testing.expect((try envelope.proveTensorProgramAlloc(alloc)).safe());
-
-    const supported_filter = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
-        .index_name = "dense_idx",
-        .limit = 7,
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
-        .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
-    });
-    try std.testing.expect(supported_filter != null);
-    if (supported_filter) |body_supported| alloc.free(body_supported);
-
-    const unsupported = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
-        .index_name = "dense_idx",
-        .limit = 7,
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .filter_query_json = "{\"wildcard\":{\"/tenant\":\"*ice\"}}",
-    });
-    try std.testing.expect(unsupported == null);
-}
-
-test "vector worker preflight annotation tracks eligibility and symbolic filters" {
-    const alloc = std.testing.allocator;
-
-    var supported: db_mod.RuntimePreflightSummary = .{};
-    defer supported.deinit(alloc);
-    annotateVectorWorkerPreflight(alloc, &supported, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
-        .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
-        .filter_ids = &.{42},
-        .exclude_ids = &.{7},
-        .filter_doc_ids_positive = true,
-        .filter_doc_ids = &.{"doc:a"},
-        .exclude_doc_ids = &.{"doc:b"},
-    });
-    try std.testing.expectEqual(@as(u32, 1), supported.vector_worker_candidate_count);
-    try std.testing.expectEqual(@as(u32, 0), supported.vector_worker_fallback_count);
-    try std.testing.expectEqual(@as(u32, 6), supported.vector_worker_filter_constraint_count);
-    try std.testing.expect(supported.vector_worker_requires_algebraic_filter_resolution);
-
-    var unsupported: db_mod.RuntimePreflightSummary = .{};
-    defer unsupported.deinit(alloc);
-    annotateVectorWorkerPreflight(alloc, &unsupported, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .filter_query_json = "{\"wildcard\":{\"/tenant\":\"*ice\"}}",
-    });
-    try std.testing.expectEqual(@as(u32, 0), unsupported.vector_worker_candidate_count);
-    try std.testing.expectEqual(@as(u32, 1), unsupported.vector_worker_fallback_count);
-    try std.testing.expectEqual(@as(u32, 1), unsupported.vector_worker_filter_constraint_count);
-    try std.testing.expect(unsupported.vector_worker_requires_algebraic_filter_resolution);
-
-    var sentinel: u8 = 0;
-    var resolved_filter: db_mod.RuntimePreflightSummary = .{};
-    defer resolved_filter.deinit(alloc);
-    annotateVectorWorkerPreflight(alloc, &resolved_filter, .{
-        .index_name = "dense_idx",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .resolved_doc_filter = &sentinel,
-    });
-    try std.testing.expectEqual(@as(u32, 0), resolved_filter.vector_worker_candidate_count);
-    try std.testing.expectEqual(@as(u32, 1), resolved_filter.vector_worker_fallback_count);
-    try std.testing.expectEqual(@as(u32, 1), resolved_filter.vector_worker_filter_constraint_count);
-
-    var non_vector: db_mod.RuntimePreflightSummary = .{};
-    defer non_vector.deinit(alloc);
-    annotateVectorWorkerPreflight(alloc, &non_vector, .{ .query = .{ .match_all = {} } });
-    try std.testing.expectEqual(@as(u32, 0), non_vector.vector_worker_candidate_count);
-    try std.testing.expectEqual(@as(u32, 0), non_vector.vector_worker_fallback_count);
-}
-
 test "remote simple vector query uses vector worker route" {
     const alloc = std.testing.allocator;
 
@@ -15053,75 +14800,6 @@ test "remote preflight rejects resolved doc filters before query encoding" {
         .resolved_doc_filter = &filter,
     }, 0));
     try std.testing.expectEqual(@as(usize, 0), state.calls);
-}
-
-test "encode query request serializes internal resolved doc filters with wire context" {
-    const alloc = std.testing.allocator;
-    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 3 }) };
-    defer filter.deinit(alloc);
-
-    const encoded = try encodeQueryRequest(alloc, .{
-        .query = .{ .match_all = {} },
-        .identity_read_generation = 42,
-        .resolved_doc_filter = &filter,
-        .resolved_doc_filter_wire_context = .{
-            .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
-            .identity_read_generation = 42,
-        },
-    });
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"_resolved_doc_filter\"") != null);
-
-    var parsed = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(parsed.req.resolved_doc_filter != null);
-    try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
-    try std.testing.expect(parsed.req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
-
-    const stats_body = try encodeQueryTextStatsRequest(alloc, .{
-        .query = .{ .match = .{ .field = "body", .text = "hello" } },
-        .identity_read_generation = 42,
-        .resolved_doc_filter = &filter,
-        .resolved_doc_filter_wire_context = .{
-            .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
-            .identity_read_generation = 42,
-        },
-    });
-    defer alloc.free(stats_body);
-    try std.testing.expect(std.mem.indexOf(u8, stats_body, "\"_resolved_doc_filter\"") != null);
-
-    var stats_parsed = try parseTextStatsRequest(alloc, "docs", stats_body);
-    defer stats_parsed.deinit(alloc);
-    const stats_query = stats_parsed.query_request.req;
-    try std.testing.expect(stats_query.resolved_doc_filter != null);
-    try std.testing.expectEqual(@as(?u64, 42), stats_query.identity_read_generation);
-    try std.testing.expect(stats_query.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
-}
-
-test "simple vector shard request carries serializable resolved doc filter" {
-    const alloc = std.testing.allocator;
-    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 3 }) };
-    defer filter.deinit(alloc);
-
-    const body = (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
-        .index_name = "dense_idx",
-        .identity_read_generation = 42,
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
-        .resolved_doc_filter = &filter,
-        .resolved_doc_filter_wire_context = .{
-            .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
-            .identity_read_generation = 42,
-        },
-    })) orelse return error.TestUnexpectedResult;
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"_resolved_doc_filter\"") != null);
-
-    var envelope = try query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, body);
-    defer envelope.deinit(alloc);
-    const req = searchRequestFromVectorWorkerEnvelope(&envelope);
-    try std.testing.expect(req.resolved_doc_filter != null);
-    try std.testing.expectEqual(@as(?u64, 42), req.identity_read_generation);
-    try std.testing.expect(req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
 }
 
 test "explicit text stats requests preserve identity generation" {
