@@ -149,22 +149,20 @@ pub const HttpServer = struct {
                     return error.InvalidSnapshotUploadHeaders;
                 }
 
-                var live_upload: ?SnapshotUpload = null;
-                errdefer if (live_upload) |*upload| upload.snapshot.deinit(self.alloc);
-                if (self.snapshot_upload_handler != null and header_state == .complete) {
-                    live_upload = (try parseSnapshotUpload(self.alloc, req)) orelse unreachable;
-                }
-
-                if (self.snapshot_store) |store| {
-                    try store.putSnapshot(self.alloc, snapshot_id, req.body);
-                } else if (self.snapshot_upload_handler == null) {
-                    return error.MissingSnapshotStore;
-                }
                 if (self.snapshot_upload_handler) |handler| {
-                    if (live_upload) |upload| {
-                        live_upload = null;
+                    if (header_state == .complete) {
+                        var live_upload = (try parseSnapshotUpload(self.alloc, req)) orelse unreachable;
+                        errdefer live_upload.snapshot.deinit(self.alloc);
+                        const upload = live_upload;
+                        live_upload.snapshot = .{};
                         try handler.handleSnapshotUpload(upload);
+                    } else if (self.snapshot_store) |store| {
+                        try store.putSnapshot(self.alloc, snapshot_id, req.body);
                     }
+                } else if (self.snapshot_store) |store| {
+                    try store.putSnapshot(self.alloc, snapshot_id, req.body);
+                } else {
+                    return error.MissingSnapshotStore;
                 }
                 return .{
                     .status = 201,
@@ -440,10 +438,34 @@ test "http server dispatches live snapshot uploads to handler" {
         }
     };
 
+    const Store = struct {
+        put_calls: usize = 0,
+
+        fn iface(self: *@This()) SnapshotStore {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .put_snapshot = putSnapshot,
+                    .get_snapshot = getSnapshot,
+                },
+            };
+        }
+
+        fn putSnapshot(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.put_calls += 1;
+        }
+
+        fn getSnapshot(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFetch;
+        }
+    };
+
     var noop = Noop{};
+    var store = Store{};
     var handler = Handler{};
     defer handler.deinit();
-    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), null, handler.iface());
+    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface(), handler.iface());
 
     var voters = [_]u64{ 1, 2, 3 };
     const snapshot_body = try http_snapshot.HttpSnapshotTransport.encodeSnapshotEnvelope(std.testing.allocator, .{
@@ -480,6 +502,7 @@ test "http server dispatches live snapshot uploads to handler" {
     try std.testing.expectEqual(@as(u64, 8), handler.term);
     try std.testing.expectEqual(@as(u64, 42), handler.index);
     try std.testing.expectEqualStrings("live-snapshot", handler.data.?);
+    try std.testing.expectEqual(@as(usize, 0), store.put_calls);
 }
 
 test "http server rejects malformed live snapshot upload metadata" {
