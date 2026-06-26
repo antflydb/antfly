@@ -2501,6 +2501,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_transform,
         .alter_user_mapping,
         .checkpoint,
+        .discard,
         .create_access_method,
         .create_conversion,
         .create_database_options,
@@ -2891,7 +2892,6 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET LOCAL search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "RESET search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SHOW search_path EXTRA"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DISCARD TEMP"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt(text AS SELECT id FROM usage_records"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "EXECUTE read_stmt("));
@@ -3436,6 +3436,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
             .kind = .copy,
             .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DISCARD TEMP",
+            .kind = .discard,
+            .reason = .discard_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DISCARD PLANS",
+            .kind = .discard,
+            .reason = .discard_not_planned_by_generated_parser,
         },
         .{
             .sql = "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')",

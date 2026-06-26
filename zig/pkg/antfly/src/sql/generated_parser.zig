@@ -192,6 +192,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    discard,
     insert_overriding_value,
     alter_aggregate,
     alter_index,
@@ -312,6 +313,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    discard_not_planned_by_generated_parser,
     insert_overriding_value_not_planned_by_generated_parser,
     alter_aggregate_not_planned_by_generated_parser,
     alter_index_not_planned_by_generated_parser,
@@ -2141,6 +2143,8 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
+    .{ .sql = "DISCARD TEMP", .kind = .unsupported },
+    .{ .sql = "DISCARD PLANS", .kind = .unsupported },
     .{ .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler", .kind = .unsupported },
     .{ .sql = "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1", .kind = .unsupported },
     .{ .sql = "CREATE DATABASE tenant_ops WITH OWNER app", .kind = .unsupported },
@@ -2585,7 +2589,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
     if (first.matchesKeywordTag(.reset)) return .{ .session = .reset };
     if (first.matchesKeywordTag(.show)) return .{ .session = .show };
-    if (first.matchesKeywordTag(.discard)) return .{ .session = .discard_all };
+    if (first.matchesKeywordTag(.discard)) {
+        if (tokens.len > 1 and tokens[1].matchesKeywordTag(.all)) return .{ .session = .discard_all };
+        return .{ .unsupported = .discard };
+    }
     if (first.matchesKeyword("start")) return .{ .transaction = .start_transaction };
     if (first.matchesKeywordTag(.begin)) return .{ .transaction = .begin };
     if (first.matchesKeywordTag(.commit)) return .{ .transaction = .commit };
@@ -3040,6 +3047,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .discard => .discard_not_planned_by_generated_parser,
             .insert_overriding_value => .insert_overriding_value_not_planned_by_generated_parser,
             .alter_aggregate => .alter_aggregate_not_planned_by_generated_parser,
             .alter_index => .alter_index_not_planned_by_generated_parser,

@@ -72,6 +72,9 @@ for the generated-covered `SET`, `SET LOCAL`, `RESET`, `RESET ALL`, `SHOW`,
 `SET LOCAL ... TO ...` session values accept comma-separated expression lists
 so generated ingress covers PostgreSQL-style `search_path` updates before the
 typed session lowerer decides whether a setting is supported.
+PostgreSQL-compatible non-`ALL` `DISCARD` forms such as `DISCARD TEMP` and
+`DISCARD PLANS` are represented as explicit generated unsupported diagnostics
+instead of syntax errors or session-parser probes.
 Session command heads now require generated parser success at SQL ingress, so
 malformed multi-token session commands cannot fall back to the legacy session
 adapter. Parsed-statement classification validates retained session AST kind,
@@ -1273,7 +1276,7 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
-  `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`,
+  `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `DISCARD`, `LOAD`,
   `SECURITY LABEL`, `UNLISTEN`, cursor command `MOVE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, schema imports, servers, and user
   mappings, plus language, unsupported routine/language/transform DDL,

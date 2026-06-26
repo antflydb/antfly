@@ -3035,7 +3035,7 @@ pub const DB = struct {
     pub fn applyRelationalRowsClaimToSelectedCandidatesAlloc(
         self: *DB,
         alloc: Allocator,
-        rows: []const relational_rows.QueryCandidate,
+        rows: []const RelationalRowsQueryCandidate,
         selected_indexes: *std.ArrayListUnmanaged(usize),
         claim: types.RowClaimRequest,
         limit: ?u32,
@@ -3216,6 +3216,8 @@ pub const DB = struct {
     }
 
     pub const RelationalRowsMutationSourceCandidate = relational_rows.MutationSourceCandidate;
+
+    pub const RelationalRowsQueryCandidate = relational_rows.QueryCandidate;
 
     pub fn cloneRelationalRowsMutationSourceCandidateAlloc(
         alloc: Allocator,

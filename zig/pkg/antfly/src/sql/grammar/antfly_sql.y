@@ -666,6 +666,7 @@ unsupported_statement:
   | COPY diagnostic_tail_opt
   | CLUSTER diagnostic_tail_opt
   | COMMENT diagnostic_tail_opt
+  | DISCARD discard_unsupported_target
   | GRANT diagnostic_tail_opt
   | LISTEN diagnostic_tail_opt
   | LOAD diagnostic_tail_opt
@@ -686,6 +687,12 @@ explain_options_opt:
     /* empty */
   | ANALYZE
   | LPAREN explain_option_list RPAREN
+  ;
+
+discard_unsupported_target:
+    identifier_name
+  | TEMP
+  | TEMPORARY
   ;
 
 explain_option_list:

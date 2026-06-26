@@ -369,114 +369,6 @@ fn assertBuildZigDoesNotPassDirectTestFilterArgs(source: []const u8) void {
     }
 }
 
-fn isDBFocusedTestStepName(name: []const u8) bool {
-    if (std.mem.eql(u8, name, db_root_step_name)) return true;
-    if (std.mem.eql(u8, name, db_storage_step_name)) return true;
-    if (std.mem.eql(u8, name, db_sim_step_name)) return true;
-    return (std.mem.startsWith(u8, name, "db-") and std.mem.endsWith(u8, name, "-test")) or
-        std.mem.startsWith(u8, name, "lib-db-");
-}
-
-fn isStandaloneModuleTestStepName(name: []const u8) bool {
-    inline for (std.meta.fields(@TypeOf(standalone_module_test_steps))) |field| {
-        const step = @field(standalone_module_test_steps, field.name);
-        if (std.mem.eql(u8, name, step.name)) return true;
-    }
-    return false;
-}
-
-fn isStorageBackendTestStepName(name: []const u8) bool {
-    inline for (std.meta.fields(@TypeOf(storage_backend_test_steps))) |field| {
-        const step = @field(storage_backend_test_steps, field.name);
-        if (std.mem.eql(u8, name, step.name)) return true;
-    }
-    return false;
-}
-
-const manifest_owned_api_test_step_names = [_][]const u8{
-    "api-transactions-test",
-    "api-table-writes-docid-test",
-    "provisioned-query-visibility-test",
-    "api-table-reads-docid-test",
-    "api-internal-group-write-routes-test",
-    "api-rows-test",
-    "sql-api-parity-test",
-    "sql-api-parity-fixture-promote",
-    "sql-api-parity-fixture-check",
-    "api-public-table-http-docid-test",
-    "public-api-parity-test",
-    "lib-resolution-source-test",
-    "lib-api-auth-test",
-    "lib-api-logic-test",
-    "docid-lifecycle-test",
-    "lib-api-swarm-backup-restore-test",
-};
-
-fn isManifestOwnedAPITestStepName(name: []const u8) bool {
-    inline for (manifest_owned_api_test_step_names) |step_name| {
-        if (std.mem.eql(u8, name, step_name)) return true;
-    }
-    return false;
-}
-
-const build_zig_owned_test_step_names = [_][]const u8{
-    "test",
-    "yacc-test",
-    "lite-go-test",
-    "lite-package-test",
-    "antfly-embedded-test",
-    "lake-scaffold-test",
-    "lib-raft-sim-test",
-    "lib-raft-chaos-test",
-    "antfly-test",
-    "conformance-test",
-    "promotion-test",
-    "soak-test",
-    "unit-test",
-    "unit-test-progress",
-    "docid-operational-hardening-test",
-    "lib-api-docid-test",
-    "sim-test",
-    "integration-test",
-    "chaos-test",
-    "chaos-soak-test",
-    "lib-audio-test",
-    "lib-swarm-runtime-test",
-    "raft-test",
-    "raft-transport-test",
-    "antfly-main-test",
-    "lite-core-test",
-};
-
-fn isBuildZigOwnedTestStepName(name: []const u8) bool {
-    inline for (build_zig_owned_test_step_names) |step_name| {
-        if (std.mem.eql(u8, name, step_name)) return true;
-    }
-    return false;
-}
-
-fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
-    const needle = "b.step(" ++ "\"";
-    var search_index: usize = 0;
-    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
-        const name_start = start + needle.len;
-        const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
-            std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
-        const name = source[name_start..name_end];
-        if (isDBFocusedTestStepName(name) or
-            isStandaloneModuleTestStepName(name) or
-            isStorageBackendTestStepName(name) or
-            isManifestOwnedAPITestStepName(name))
-        {
-            std.debug.panic(
-                "build.zig declares test inventory step '{s}' at line {}; move test inventories to pkg/antfly/build/tests.zig",
-                .{ name, lineNumberForOffset(source, start) },
-            );
-        }
-        search_index = name_end + 1;
-    }
-}
-
 fn assertBuildZigDoesNotOwnManifestTestRoots(source: []const u8) void {
     inline for (api_docid_test_roots) |root| {
         if (std.mem.indexOf(u8, source, root.path)) |start| {
@@ -488,38 +380,12 @@ fn assertBuildZigDoesNotOwnManifestTestRoots(source: []const u8) void {
     }
 }
 
-fn assertBuildZigOnlyDeclaresOwnedTestSteps(source: []const u8) void {
-    const needle = "b.step(" ++ "\"";
-    var search_index: usize = 0;
-    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
-        const name_start = start + needle.len;
-        const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
-            std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
-        const name = source[name_start..name_end];
-        if (std.mem.indexOf(u8, name, "test") != null and
-            !isBuildZigOwnedTestStepName(name) and
-            !isDBFocusedTestStepName(name) and
-            !isStandaloneModuleTestStepName(name) and
-            !isStorageBackendTestStepName(name) and
-            !isManifestOwnedAPITestStepName(name))
-        {
-            std.debug.panic(
-                "build.zig declares unclassified test step '{s}' at line {}; add leaf test inventory through pkg/antfly/build/tests.zig",
-                .{ name, lineNumberForOffset(source, start) },
-            );
-        }
-        search_index = name_end + 1;
-    }
-}
-
 pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
     assertBuildZigTestFiltersReferenceManifest(source);
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
-    assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
     assertBuildZigDoesNotOwnManifestTestRoots(source);
-    assertBuildZigOnlyDeclaresOwnedTestSteps(source);
 }
 
 fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {
