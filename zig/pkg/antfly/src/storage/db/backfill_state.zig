@@ -182,7 +182,16 @@ fn renameAbsolutePortable(old_path: []const u8, new_path: []const u8) !void {
 }
 
 fn writeStateFile(io: std.Io, path: []const u8, key: []const u8) !void {
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    var attempts: u8 = 0;
+    var file = while (true) : (attempts += 1) {
+        if (std.fs.path.dirname(path)) |parent| {
+            try fs_paths.createDirPathPortable(io, parent);
+        }
+        break fs_paths.createFilePortable(io, path, .{ .truncate = true }) catch |err| switch (err) {
+            error.FileNotFound => if (attempts == 0) continue else return err,
+            else => return err,
+        };
+    };
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;
