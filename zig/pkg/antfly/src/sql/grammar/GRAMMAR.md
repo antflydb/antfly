@@ -136,7 +136,10 @@ planner.
 Role authorization DDL heads, including `CREATE ROLE`, `ALTER ROLE`, and
 `DROP ROLE`, now use the generated DDL boundary with retained role-name,
 operation-tail, and `IF EXISTS` metadata before delegating role setting
-semantics to the existing typed authorization catalog planner.
+semantics to the existing typed authorization catalog planner. The role
+boundary now also requires generated parser success at SQL ingress for
+`ROLE`, `USER`, and `GROUP` forms instead of falling back to the legacy
+permissive DDL adapter on malformed role catalog statements.
 Type-system catalog DDL heads, including `CREATE COLLATION`,
 `ALTER COLLATION`, `DROP COLLATION`, `CREATE OPERATOR`, `DROP OPERATOR`,
 `CREATE AGGREGATE`, `DROP AGGREGATE`, `CREATE CAST`, and `DROP CAST`, now use

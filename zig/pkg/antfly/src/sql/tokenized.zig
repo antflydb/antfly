@@ -326,6 +326,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
+    if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -465,6 +466,23 @@ fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatem
     if (tokenMatchesKeyword(first, .create)) return isGeneratedUnsupportedCreateHead(tokens, start, end);
     if (tokenMatchesKeyword(first, .drop)) return isGeneratedUnsupportedDropHead(tokens, start, end);
     return false;
+}
+
+fn isGeneratedRoleDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    if (!tokenMatchesKeyword(first, .create) and
+        !tokenMatchesKeyword(first, .alter) and
+        !tokenMatchesKeyword(first, .drop))
+    {
+        return false;
+    }
+    const second = tokens[start + 1];
+    return tokenMatchesKeyword(second, .role) or
+        tokenMatchesText(second, "user") or
+        tokenMatchesKeyword(second, .group);
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -2439,6 +2457,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER EXTENSION vector UPDATE TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE ROLE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER USER"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP GROUP IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SCHEMA analytics, reporting"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
