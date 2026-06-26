@@ -1843,6 +1843,9 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMIT", .kind = .transaction },
     .{ .sql = "COMMIT WORK", .kind = .transaction },
     .{ .sql = "COMMIT TRANSACTION", .kind = .transaction },
+    .{ .sql = "END", .kind = .transaction },
+    .{ .sql = "END WORK", .kind = .transaction },
+    .{ .sql = "END TRANSACTION", .kind = .transaction },
     .{ .sql = "ROLLBACK", .kind = .transaction },
     .{ .sql = "ROLLBACK WORK", .kind = .transaction },
     .{ .sql = "ROLLBACK TRANSACTION", .kind = .transaction },
@@ -2448,6 +2451,7 @@ fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: us
     if (first.matchesKeywordTag(.savepoint)) return true;
     if (first.matchesKeywordTag(.release)) return true;
     if (first.matchesKeywordTag(.commit)) return index <= 1;
+    if (first.matchesKeywordTag(.end)) return index <= 1;
     if (first.matchesKeywordTag(.rollback)) return index <= 3;
     if (!first.matchesKeywordTag(.set)) return false;
     if (tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return true;
@@ -2531,6 +2535,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeyword("start")) return .{ .transaction = .start_transaction };
     if (first.matchesKeywordTag(.begin)) return .{ .transaction = .begin };
     if (first.matchesKeywordTag(.commit)) return .{ .transaction = .commit };
+    if (first.matchesKeywordTag(.end)) return .{ .transaction = .commit };
     if (first.matchesKeywordTag(.rollback)) {
         if (tokens.len > 1 and tokens[1].matchesKeywordTag(.to)) return .{ .transaction = .rollback_to_savepoint };
         return .{ .transaction = .rollback };
@@ -7161,6 +7166,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     const alloc = arena.allocator();
 
     try std.testing.expectEqual(GeneratedSqlStatement{ .session = .set }, (try parseSqlAlloc(alloc, "SET search_path TO public")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .commit }, (try parseSqlAlloc(alloc, "END WORK")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .rollback }, (try parseSqlAlloc(alloc, "ROLLBACK")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .execute }, (try parseSqlAlloc(alloc, "EXECUTE read_stmt()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .deallocate }, (try parseSqlAlloc(alloc, "DEALLOCATE ALL")).statement);
@@ -7393,6 +7399,18 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTransactionKind.rollback, transaction.kind);
             try std.testing.expectEqualStrings("ROLLBACK TRANSACTION", spanText(transaction_sql, transaction.statement_span));
             try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, transaction.boundary_tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const end_transaction_sql = "END TRANSACTION;";
+    const end_transaction_result = try parseSqlAlloc(alloc, end_transaction_sql);
+    switch (end_transaction_result.ast.?) {
+        .transaction => |transaction| {
+            try std.testing.expectEqual(GeneratedSqlTransactionKind.commit, transaction.kind);
+            try std.testing.expectEqualStrings("END TRANSACTION", spanText(end_transaction_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("END", spanText(end_transaction_sql, transaction.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, transaction.boundary_tail_tokens.?);
         },
         else => return error.TestUnexpectedResult,

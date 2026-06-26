@@ -343,7 +343,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokenMatchesKeyword(first, .reset) or tokenMatchesKeyword(first, .show) or tokenMatchesKeyword(first, .discard)) return raw_statement.token_end > raw_statement.token_start + 1;
     if (tokenMatchesKeyword(first, .prepare)) return raw_statement.token_end > raw_statement.token_start + 2;
     if (tokenMatchesKeyword(first, .execute) or tokenMatchesKeyword(first, .deallocate)) return raw_statement.token_end > raw_statement.token_start + 1;
-    if (tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .rollback)) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .end) or tokenMatchesKeyword(first, .rollback)) return raw_statement.token_end > raw_statement.token_start + 1;
     if (tokenMatchesText(first, "start") or tokenMatchesText(first, "lock")) return raw_statement.token_end > raw_statement.token_start + 1;
     if (tokenMatchesKeyword(first, .begin)) return true;
     if (tokenMatchesKeyword(first, .savepoint)) return raw_statement.token_end > raw_statement.token_start + 1;
@@ -388,7 +388,7 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
             tokenMatchesKeyword(tokens[start + 2], .savepoint) and
             tokens[start + 3].kind == .identifier;
     }
-    return tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .rollback);
+    return tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .end) or tokenMatchesKeyword(first, .rollback);
 }
 
 fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -2557,7 +2557,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
 fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Token) ParsedStatement {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return .{ .unknown = raw_statement };
     if (tokens[0].isKeyword(.explain)) return .{ .explain = parseExplainStatement(raw_statement, tokens) catch .{ .raw = raw_statement } };
-    if (tokens[0].isKeyword(.begin) or tokens[0].isKeyword(.commit) or tokens[0].isKeyword(.rollback)) {
+    if (tokens[0].isKeyword(.begin) or tokens[0].isKeyword(.commit) or tokens[0].isKeyword(.end) or tokens[0].isKeyword(.rollback)) {
         return .{ .transaction = .{ .raw = raw_statement } };
     }
     if (tokens[0].isKeyword(.set) or tokens[0].isKeyword(.reset) or tokens[0].isKeyword(.show) or tokens[0].isKeyword(.discard)) {
@@ -3780,6 +3780,21 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (transaction.statement) {
+        .transaction => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var end_transaction = try ParsedSql.initAlloc(alloc, "END WORK");
+    defer end_transaction.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.transaction, end_transaction.generatedStatementKind().?);
+    switch (end_transaction.generated_statement.?.ast.?) {
+        .transaction => |generated_transaction| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.commit, generated_transaction.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_transaction.boundary_tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (end_transaction.statement) {
         .transaction => {},
         else => return error.TestUnexpectedResult,
     }

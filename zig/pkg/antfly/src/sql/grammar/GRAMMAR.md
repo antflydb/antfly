@@ -74,9 +74,10 @@ adapter. Parsed-statement classification validates retained session AST kind,
 statement/command spans, setting-name ranges, and value ranges before
 publishing the session family.
 Transaction boundary commands now dispatch through generated AST-to-plan
-lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
+lowering for generated-covered `BEGIN`, `COMMIT`, PostgreSQL `END` commit
+aliases, and `ROLLBACK`
 adapter-noop boundaries, including retained statement/command source-span and
-command-kind validation. `START`, `COMMIT`, and `ROLLBACK` command heads now
+command-kind validation. `START`, `COMMIT`/`END`, and `ROLLBACK` command heads now
 require generated parser success at SQL ingress, so malformed transaction
 tails cannot fall back to the legacy transaction adapter. Transaction mode and
 savepoint controls are also lowered from generated transaction ASTs: `SET TRANSACTION`,
@@ -1143,8 +1144,8 @@ variants for:
 - transaction statement, including a generated AST payload for command spans
   and optional `WORK`/`TRANSACTION` boundary-tail token ranges or transaction
   mode token ranges, plus generated AST-to-plan parity for generated-covered
-  transaction boundary commands and `SET TRANSACTION`, `START TRANSACTION`,
-  and `BEGIN` transaction-mode commands
+  transaction boundary commands, PostgreSQL `END` commit aliases, and
+  `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN` transaction-mode commands
 - prepared statement, including a generated AST payload for command, name,
   argument, and nested-statement token ranges, plus generated AST-to-plan parity
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`

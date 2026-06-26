@@ -71,6 +71,7 @@ transaction_statement:
   | START TRANSACTION start_transaction_tail_opt
   | BEGIN begin_transaction_tail_opt
   | COMMIT transaction_boundary_tail_opt
+  | END transaction_boundary_tail_opt
   | ROLLBACK transaction_boundary_tail_opt
   | ROLLBACK TO savepoint_keyword_opt identifier_name
   | SAVEPOINT identifier_name

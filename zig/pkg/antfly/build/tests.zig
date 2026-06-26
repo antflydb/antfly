@@ -1556,8 +1556,6 @@ pub const APITestFilters = struct {
         "provisioned table write source drop table does not hold local db mutex during background delete",
         "provisioned table write source drop table waits for in-flight group batch on same table",
         "unique schema controller maintenance",
-        "foreign key schema controller maintenance",
-        "foreign key schema controller maintenance resumes durable action job",
         "provisioned foreign key action job drains owner range page",
         "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
         "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
