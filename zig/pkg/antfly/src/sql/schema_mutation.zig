@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const ddl_plan = @import("ddl.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const value_mod = @import("value.zig");

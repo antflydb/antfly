@@ -13,7 +13,7 @@
 // limitations.
 
 const binder = @import("binder.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const ddl_plan = @import("ddl.zig");
 
 pub const DurableSqlPlan = union(enum) {
     table_ddl: binder.TableDdlLogicalPlan,

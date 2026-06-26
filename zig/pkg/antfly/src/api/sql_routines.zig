@@ -18,7 +18,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const ddl_plan = @import("../sql/ddl_plan.zig");
+const ddl_plan = @import("../sql/ddl.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,

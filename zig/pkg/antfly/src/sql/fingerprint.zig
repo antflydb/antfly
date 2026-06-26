@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const corpus = @import("corpus.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const ddl_plan = @import("ddl.zig");
 const diagnostics = @import("diagnostics.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser_context = @import("parser_context.zig");

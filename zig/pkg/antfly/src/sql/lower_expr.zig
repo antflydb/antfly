@@ -17,7 +17,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const ddl_plan = @import("ddl.zig");
 const grammar = @import("grammar.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
@@ -1767,13 +1767,17 @@ fn generatedWindowClauseEnd(
 }
 
 fn generatedProjectionExpressionAtItemStart(
+    tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?*const generated_parser.GeneratedSqlExpressionAst {
     const read = generated_read_ast orelse return null;
     if (read.projection_items.items.len != read.projection_items.count or read.projection_items.expressions.len != read.projection_items.count) return error.UnsupportedSqlShape;
     for (read.projection_items.items, 0..) |item, index| {
-        if (item.start == pos) return &read.projection_items.expressions[index];
+        if (item.start == pos) {
+            try validateGeneratedExpressionPayloads(tokens, read.projection_items.expressions[index]);
+            return &read.projection_items.expressions[index];
+        }
     }
     return null;
 }
@@ -1795,13 +1799,17 @@ fn generatedGroupExpressionAtItemStart(
 }
 
 fn generatedOrderExpressionAtItemStart(
+    tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?*const generated_parser.GeneratedSqlExpressionAst {
     const read = generated_read_ast orelse return null;
     if (read.order_items.items.len != read.order_items.count or read.order_items.expressions.len != read.order_items.count) return error.UnsupportedSqlShape;
     for (read.order_items.items, 0..) |item, index| {
-        if (item.start == pos) return &read.order_items.expressions[index];
+        if (item.start == pos) {
+            try validateGeneratedExpressionPayloads(tokens, read.order_items.expressions[index]);
+            return &read.order_items.expressions[index];
+        }
     }
     return null;
 }
@@ -13196,7 +13204,7 @@ pub fn parseAggregateOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, order_expression_options.generated_read_ast);
+        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, order_expression_options.generated_read_ast);
         if (generated_expression == null and order_expression_options.generated_read_ast != null) return error.UnsupportedSqlShape;
         var item_order_expression_options = order_expression_options;
         item_order_expression_options.order_expression_hooks.generated_expression_ast = generated_expression;
@@ -13239,7 +13247,7 @@ pub fn parseWindowOutputOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
         if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
         var item_options = options;
         item_options.order_expression_hooks.generated_expression_ast = generated_expression;
@@ -13286,7 +13294,7 @@ pub fn parseJoinOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
         if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
         var item_options = options;
         item_options.order_expression_hooks.generated_expression_ast = generated_expression;
@@ -13643,7 +13651,7 @@ pub fn parseAggregateSelectListAlloc(
     while (true) {
         if (nextIsAggregateFunction(tokens, pos.*)) {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, generated_read_ast);
+            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, generated_read_ast);
             if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
             var spec_options = aggregate_spec_options;
             spec_options.generated_expression_ast = generated_expression;
@@ -13685,7 +13693,7 @@ pub fn parseAggregateSelectListAlloc(
             spec_transferred = true;
         } else {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, generated_read_ast);
+            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, generated_read_ast);
             if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
             var item_options = select_item_options;
             item_options.generated_expression_ast = generated_expression;
@@ -13817,7 +13825,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, generated_read_ast);
+        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, generated_read_ast);
         if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
         var item_hooks = hooks;
         item_hooks.generated_expression_ast = generated_expression;
@@ -13855,7 +13863,7 @@ pub fn parseSelectOutputOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
         if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
         var order_expression_hooks = options.order_expression_hooks;
         order_expression_hooks.generated_expression_ast = generated_expression;
@@ -23573,7 +23581,7 @@ pub fn parseSelectListAlloc(
         }
 
         const item_start = pos.*;
-        const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, options.generated_read_ast);
+        const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
         if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
         var select_item_options = options.select_item_options;
         select_item_options.generated_expression_ast = generated_expression;
@@ -23881,7 +23889,7 @@ pub fn parseWindowSelectListAlloc(
     while (true) {
         if (peekWindowFunction(tokens, pos.*)) {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, options.generated_read_ast);
+            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
             if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
             var window_spec_options = options.window_spec_options;
             window_spec_options.generated_expression_ast = generated_expression;
@@ -23924,7 +23932,7 @@ pub fn parseWindowSelectListAlloc(
             spec_transferred = true;
         } else {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, options.generated_read_ast);
+            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
             if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
             if (generated_expression) |expression| {
                 if (expression.kind != .token_range) return error.UnsupportedSqlShape;

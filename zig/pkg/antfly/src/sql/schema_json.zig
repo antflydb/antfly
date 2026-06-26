@@ -16,7 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const ddl_plan = @import("ddl.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
