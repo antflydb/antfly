@@ -1848,6 +1848,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_foreign_data_wrapper,
         .alter_foreign_table,
         .alter_function,
+        .alter_large_object,
         .alter_language,
         .alter_materialized_view,
         .alter_operator,
@@ -1899,6 +1900,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_operator_class,
         .drop_operator_family,
         .drop_policy,
+        .drop_routine,
         .drop_rule,
         .drop_server,
         .drop_statistics,
@@ -2661,6 +2663,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_procedure_not_planned_by_generated_parser,
         },
         .{
+            .sql = "ALTER LARGE OBJECT 12345 OWNER TO app_role",
+            .kind = .alter_large_object,
+            .reason = .alter_large_object_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER ROUTINE normalize_status(text) OWNER TO app_role",
             .kind = .alter_routine,
             .reason = .alter_routine_not_planned_by_generated_parser,
@@ -2889,6 +2896,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree",
             .kind = .drop_operator_family,
             .reason = .drop_operator_family_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE",
+            .kind = .drop_routine,
+            .reason = .drop_routine_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",

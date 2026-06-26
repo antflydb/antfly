@@ -197,6 +197,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_foreign_table,
     alter_foreign_data_wrapper,
     alter_function,
+    alter_large_object,
     alter_language,
     alter_materialized_view,
     alter_operator,
@@ -251,6 +252,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_owned,
     drop_operator_class,
     drop_operator_family,
+    drop_routine,
     drop_statistics,
     drop_text_search_configuration,
     drop_text_search_dictionary,
@@ -302,6 +304,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
     alter_function_not_planned_by_generated_parser,
+    alter_large_object_not_planned_by_generated_parser,
     alter_language_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
     alter_operator_not_planned_by_generated_parser,
@@ -356,6 +359,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_owned_not_planned_by_generated_parser,
     drop_operator_class_not_planned_by_generated_parser,
     drop_operator_family_not_planned_by_generated_parser,
+    drop_routine_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
     drop_text_search_dictionary_not_planned_by_generated_parser,
@@ -2069,6 +2073,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
     .{ .sql = "ALTER FUNCTION normalize_status(text) OWNER TO app_role", .kind = .unsupported },
+    .{ .sql = "ALTER LARGE OBJECT 12345 OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER LANGUAGE usage_lang OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR === (text, text) OWNER TO app_role", .kind = .unsupported },
@@ -2122,6 +2127,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree", .kind = .unsupported },
+    .{ .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict", .kind = .unsupported },
@@ -2365,6 +2371,7 @@ fn appendTokenIds(
 
 fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
     _ = prev;
+    if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.symbolId("ROUTINE") orelse error.UnsupportedSqlShape;
     if (!generatedTransactionControlContext(tokens, index)) return null;
     if (tok.matchesKeyword("characteristics")) return generated.symbolId("CHARACTERISTICS") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("committed")) return generated.symbolId("COMMITTED") orelse error.UnsupportedSqlShape;
@@ -2403,6 +2410,12 @@ fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: us
         tokens[2].matchesKeyword("characteristics") and
         tokens[3].matchesKeywordTag(.as) and
         tokens[4].matchesKeyword("transaction");
+}
+
+fn generatedRoutineKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or tokens.len == 0) return false;
+    if (index != 1) return false;
+    return tokens[0].matchesKeywordTag(.drop);
 }
 
 fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
@@ -2588,6 +2601,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_event_trigger };
         if (second.matchesKeywordTag(.function)) return .{ .unsupported = .alter_function };
         if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
+        if (second.matchesKeyword("large") and tokens.len > 2 and tokens[2].matchesKeyword("object")) return .{ .unsupported = .alter_large_object };
         if (second.matchesKeyword("language")) return .{ .unsupported = .alter_language };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
         if (second.matchesKeywordTag(.operator)) {
@@ -2650,6 +2664,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .drop_operator_family };
             return .{ .ddl = .drop_operator };
         }
+        if (second.matchesKeyword("routine")) return .{ .unsupported = .drop_routine };
         if (second.matchesKeywordTag(.owned)) return .{ .unsupported = .drop_owned };
         if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .drop_aggregate };
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .drop_cast };
@@ -2860,6 +2875,7 @@ fn buildUnsupportedAst(
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
             .alter_function => .alter_function_not_planned_by_generated_parser,
+            .alter_large_object => .alter_large_object_not_planned_by_generated_parser,
             .alter_language => .alter_language_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
             .alter_operator => .alter_operator_not_planned_by_generated_parser,
@@ -2914,6 +2930,7 @@ fn buildUnsupportedAst(
             .drop_owned => .drop_owned_not_planned_by_generated_parser,
             .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
             .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
+            .drop_routine => .drop_routine_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
             .drop_text_search_dictionary => .drop_text_search_dictionary_not_planned_by_generated_parser,
@@ -7238,6 +7255,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_parser }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_template }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_trigger }, (try parseSqlAlloc(alloc, "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_large_object }, (try parseSqlAlloc(alloc, "ALTER LARGE OBJECT 12345 OWNER TO app_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .close }, (try parseSqlAlloc(alloc, "CLOSE usage_cursor")).statement);
@@ -7252,6 +7270,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_conversion }, (try parseSqlAlloc(alloc, "DROP CONVERSION IF EXISTS usage_conv")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_routine }, (try parseSqlAlloc(alloc, "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_statistics }, (try parseSqlAlloc(alloc, "DROP STATISTICS IF EXISTS usage_stats")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_configuration }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
@@ -10983,6 +11002,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
+            .sql = "ALTER LARGE OBJECT 12345 OWNER TO app_role",
+            .kind = .alter_large_object,
+            .reason = .alter_large_object_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
             .sql = "ALTER ROUTINE normalize_status(text) OWNER TO app_role",
             .kind = .alter_routine,
             .reason = .alter_routine_not_planned_by_generated_parser,
@@ -11245,6 +11270,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_operator_family,
             .reason = .drop_operator_family_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE",
+            .kind = .drop_routine,
+            .reason = .drop_routine_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",
