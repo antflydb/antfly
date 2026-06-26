@@ -5052,7 +5052,10 @@ pub const ApiHttpServer = struct {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
                 error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
                 error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
-                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.TableNotFound, error.UnknownGroup => {
+                    std.log.err("public sql write transaction not found table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 404, "not found");
+                },
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
                 error.UnsupportedOperation => null,
@@ -5072,7 +5075,10 @@ pub const ApiHttpServer = struct {
             _ = (source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
                 error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
-                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.TableNotFound => {
+                    std.log.err("public sql write batch not found table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 404, "not found");
+                },
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
                 else => {
@@ -5712,7 +5718,10 @@ pub const ApiHttpServer = struct {
             .row_claim = row_claim,
             .sync_level = sync_level,
         }, self.catalogSource(), session.session()) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+            error.InvalidSqlCatalog, error.TableNotFound => {
+                std.log.err("public sql write bind not found err={}", .{err});
+                return .{ .response = try textResponse(self.alloc, 404, "not found") };
+            },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
@@ -5743,7 +5752,10 @@ pub const ApiHttpServer = struct {
             params,
             function_bindings,
         ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+            error.InvalidSqlCatalog, error.TableNotFound => {
+                std.log.err("public sql write lower not found table={s} err={}", .{ target_table, err });
+                return .{ .response = try textResponse(self.alloc, 404, "not found") };
+            },
             error.DocumentSqlWriteUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_write_unsupported") },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },

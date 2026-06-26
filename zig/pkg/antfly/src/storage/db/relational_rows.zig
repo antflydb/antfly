@@ -99,20 +99,7 @@ pub fn freeQueryOrderKeys(alloc: Allocator, keys: []const QueryOrderKey) void {
     };
 }
 
-/// Project a relational document into its serialized typed-row KV value and
-/// track the buffer for cleanup. The row is always freshly allocated (the codec
-/// owns no input bytes), so it is appended to `owned_values` unconditionally.
-pub fn relationalStoreRowValueAlloc(
-    alloc: Allocator,
-    cleaned: []const u8,
-    relational_columns: []const schema_mod.RelationalColumn,
-    owned_values: *std.ArrayListUnmanaged([]u8),
-) ![]const u8 {
-    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, cleaned, relational_columns);
-    errdefer alloc.free(row_value);
-    try owned_values.append(alloc, row_value);
-    return row_value;
-}
+pub const relationalStoreRowValueAlloc = relational_store_mod.relationalStoreRowValueAlloc;
 
 pub fn freeQueryOrderKeySlice(alloc: Allocator, keys: []const QueryOrderKey) void {
     freeQueryOrderKeys(alloc, keys);
@@ -929,168 +916,19 @@ fn appendFixedHexU32(out: []u8, value: u32) void {
     }
 }
 
-pub const relational_identity_rewrite_intent_key_prefix = "\x00\x00__metadata__:txn_rel_identity_rewrite:";
-
-pub fn relationalIdentityRewriteIntentKeyAlloc(alloc: Allocator, txn_id: types.TxnId, rewrite: types.RelationalIdentityRewrite) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    try out.appendSlice(alloc, relational_identity_rewrite_intent_key_prefix);
-    try appendHexBytes(alloc, &out, txn_id[0..]);
-    try appendHexField(alloc, &out, rewrite.old_key);
-    try appendHexField(alloc, &out, rewrite.new_key);
-    return try out.toOwnedSlice(alloc);
-}
-
-pub fn isRelationalIdentityRewriteIntentKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, relational_identity_rewrite_intent_key_prefix);
-}
-
-pub fn encodeRelationalIdentityRewriteIntentValueAlloc(alloc: Allocator, rewrite: types.RelationalIdentityRewrite) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "{{\"old_key\":{f},\"new_key\":{f},\"value\":{f}}}",
-        .{
-            std.json.fmt(rewrite.old_key, .{}),
-            std.json.fmt(rewrite.new_key, .{}),
-            std.json.fmt(rewrite.value, .{}),
-        },
-    );
-}
-
-pub fn collectTransactionRelationalIdentityRewritesAlloc(
-    alloc: Allocator,
-    mutations: []const transactions_mod.OwnedIntentMutation,
-    skip_keys: *std.ArrayListUnmanaged([]const u8),
-) ![]types.RelationalIdentityRewrite {
-    var out = std.ArrayListUnmanaged(types.RelationalIdentityRewrite).empty;
-    errdefer {
-        for (out.items) |*rewrite| freeRelationalIdentityRewrite(alloc, rewrite);
-        out.deinit(alloc);
-    }
-    for (mutations) |mutation| {
-        if (!isRelationalIdentityRewriteIntentKey(mutation.key)) continue;
-        const raw = mutation.value orelse continue;
-        const rewrite = try parseRelationalIdentityRewriteIntentValueAlloc(alloc, raw);
-        var rewrite_owned = true;
-        errdefer if (rewrite_owned) {
-            var owned = rewrite;
-            freeRelationalIdentityRewrite(alloc, &owned);
-        };
-        const skip_key = try alloc.dupe(u8, mutation.key);
-        var skip_key_owned = true;
-        errdefer if (skip_key_owned) alloc.free(skip_key);
-        try skip_keys.append(alloc, skip_key);
-        skip_key_owned = false;
-        try out.append(alloc, rewrite);
-        rewrite_owned = false;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-pub fn parseRelationalIdentityRewriteIntentValueAlloc(alloc: Allocator, raw: []const u8) !types.RelationalIdentityRewrite {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    const obj = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidQueryRequest,
-    };
-    const old_key = try alloc.dupe(u8, jsonObjectString(obj, "old_key") orelse return error.InvalidQueryRequest);
-    errdefer alloc.free(old_key);
-    const new_key = try alloc.dupe(u8, jsonObjectString(obj, "new_key") orelse return error.InvalidQueryRequest);
-    errdefer alloc.free(new_key);
-    const value = try alloc.dupe(u8, jsonObjectString(obj, "value") orelse return error.InvalidQueryRequest);
-    errdefer alloc.free(value);
-    return .{
-        .old_key = old_key,
-        .new_key = new_key,
-        .value = value,
-    };
-}
-
-pub fn freeRelationalIdentityRewrites(alloc: Allocator, rewrites: []types.RelationalIdentityRewrite) void {
-    for (rewrites) |*rewrite| freeRelationalIdentityRewrite(alloc, rewrite);
-    if (rewrites.len > 0) alloc.free(rewrites);
-}
-
-pub fn freeRelationalIdentityRewrite(alloc: Allocator, rewrite: *types.RelationalIdentityRewrite) void {
-    alloc.free(@constCast(rewrite.old_key));
-    alloc.free(@constCast(rewrite.new_key));
-    alloc.free(@constCast(rewrite.value));
-    rewrite.* = undefined;
-}
-
-pub fn isRelationalIdentityRewriteEndpoint(rewrites: []const types.RelationalIdentityRewrite, key: []const u8) bool {
-    for (rewrites) |rewrite| {
-        if (std.mem.eql(u8, rewrite.old_key, key) or std.mem.eql(u8, rewrite.new_key, key)) return true;
-    }
-    return false;
-}
-
-fn appendHexField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    try out.append(alloc, ':');
-    try appendHexBytes(alloc, out, value);
-}
-
-fn appendHexBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const hex = "0123456789abcdef";
-    try out.ensureUnusedCapacity(alloc, value.len * 2);
-    for (value) |byte| {
-        out.appendAssumeCapacity(hex[byte >> 4]);
-        out.appendAssumeCapacity(hex[byte & 0x0f]);
-    }
-}
-
-pub const row_claim_intent_key_prefix = "\x00\x00__metadata__:txn_row_claim:";
-
-pub fn rowClaimIntentKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
-    return try std.mem.concat(alloc, u8, &.{ row_claim_intent_key_prefix, row_key });
-}
-
-pub fn rowClaimIntentValueAlloc(
-    alloc: Allocator,
-    txn_id: types.TxnId,
-    claim: types.RowClaimRequest,
-    now_ns: u64,
-) ![]u8 {
-    var txn_hex: [32]u8 = undefined;
-    const hex = "0123456789abcdef";
-    for (txn_id, 0..) |byte, i| {
-        txn_hex[i * 2] = hex[byte >> 4];
-        txn_hex[i * 2 + 1] = hex[byte & 0x0f];
-    }
-    const lease_ns = std.math.mul(u64, claim.lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-    return try std.json.Stringify.valueAlloc(alloc, .{
-        .version = @as(u32, 1),
-        .mode = switch (claim.mode) {
-            .for_update => "for_update",
-            .for_no_key_update => "for_no_key_update",
-            .for_share => "for_share",
-            .for_key_share => "for_key_share",
-        },
-        .wait_policy = switch (claim.effectiveWaitPolicy()) {
-            .wait => "wait",
-            .nowait => "nowait",
-            .skip_locked => "skip_locked",
-        },
-        .skip_locked = claim.effectiveSkipLocked(),
-        .owner_id = claim.owner_id,
-        .lease_ms = claim.lease_ms,
-        .expires_at_ns = now_ns +| lease_ns,
-        .txn_id = txn_hex[0..],
-    }, .{});
-}
-
-pub fn rowClaimIntentPayloadExpired(alloc: Allocator, payload: []const u8, now_ns: u64) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const version = parsed.value.object.get("version") orelse return false;
-    if (version != .integer or version.integer != 1) return false;
-    const expires_at = parsed.value.object.get("expires_at_ns") orelse return false;
-    if (expires_at != .integer) return false;
-    if (expires_at.integer < 0) return true;
-    return @as(u64, @intCast(expires_at.integer)) <= now_ns;
-}
+pub const relational_identity_rewrite_intent_key_prefix = relational_store_mod.relational_identity_rewrite_intent_key_prefix;
+pub const relationalIdentityRewriteIntentKeyAlloc = relational_store_mod.relationalIdentityRewriteIntentKeyAlloc;
+pub const isRelationalIdentityRewriteIntentKey = relational_store_mod.isRelationalIdentityRewriteIntentKey;
+pub const encodeRelationalIdentityRewriteIntentValueAlloc = relational_store_mod.encodeRelationalIdentityRewriteIntentValueAlloc;
+pub const collectTransactionRelationalIdentityRewritesAlloc = relational_store_mod.collectTransactionRelationalIdentityRewritesAlloc;
+pub const parseRelationalIdentityRewriteIntentValueAlloc = relational_store_mod.parseRelationalIdentityRewriteIntentValueAlloc;
+pub const freeRelationalIdentityRewrites = relational_store_mod.freeRelationalIdentityRewrites;
+pub const freeRelationalIdentityRewrite = relational_store_mod.freeRelationalIdentityRewrite;
+pub const isRelationalIdentityRewriteEndpoint = relational_store_mod.isRelationalIdentityRewriteEndpoint;
+pub const row_claim_intent_key_prefix = relational_store_mod.row_claim_intent_key_prefix;
+pub const rowClaimIntentKeyAlloc = relational_store_mod.rowClaimIntentKeyAlloc;
+pub const rowClaimIntentValueAlloc = relational_store_mod.rowClaimIntentValueAlloc;
+pub const rowClaimIntentPayloadExpired = relational_store_mod.rowClaimIntentPayloadExpired;
 
 pub fn freePendingIntentInfos(alloc: Allocator, items: []transactions_mod.PendingIntentInfo) void {
     for (items) |*item| item.deinit(alloc);
@@ -1105,12 +943,7 @@ pub fn appendRowClaimPredicatesForMutationKeys(
     deletes: []const []const u8,
     comptime is_user_row_mutation_key: fn ([]const u8) bool,
 ) !void {
-    for (writes) |write| {
-        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, write.key, is_user_row_mutation_key);
-    }
-    for (deletes) |key| {
-        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, key, is_user_row_mutation_key);
-    }
+    return try relational_store_mod.appendRowClaimPredicatesForMutationKeys(alloc, predicates, owned_keys, writes, deletes, is_user_row_mutation_key);
 }
 
 pub fn appendRowClaimPredicatesForIdentityRewrites(
@@ -1120,29 +953,7 @@ pub fn appendRowClaimPredicatesForIdentityRewrites(
     rewrites: []const types.RelationalIdentityRewrite,
     comptime is_user_row_mutation_key: fn ([]const u8) bool,
 ) !void {
-    for (rewrites) |rewrite| {
-        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, rewrite.old_key, is_user_row_mutation_key);
-        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, rewrite.new_key, is_user_row_mutation_key);
-    }
-}
-
-fn appendRowClaimPredicateForKey(
-    alloc: Allocator,
-    predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
-    owned_keys: *std.ArrayListUnmanaged([]u8),
-    row_key: []const u8,
-    comptime is_user_row_mutation_key: fn ([]const u8) bool,
-) !void {
-    if (!is_user_row_mutation_key(row_key)) return;
-    const claim_key = try rowClaimIntentKeyAlloc(alloc, row_key);
-    var claim_key_owned = true;
-    errdefer if (claim_key_owned) alloc.free(claim_key);
-    try owned_keys.append(alloc, claim_key);
-    claim_key_owned = false;
-    try predicates.append(alloc, .{
-        .key = claim_key,
-        .expected_version = 0,
-    });
+    return try relational_store_mod.appendRowClaimPredicatesForIdentityRewrites(alloc, predicates, owned_keys, rewrites, is_user_row_mutation_key);
 }
 
 pub fn validateRelationalIdentityRewriteRequest(
@@ -1151,36 +962,7 @@ pub fn validateRelationalIdentityRewriteRequest(
     deletes: []const []const u8,
     comptime is_user_row_mutation_key: fn ([]const u8) bool,
 ) !void {
-    for (rewrites, 0..) |rewrite, i| {
-        if (rewrite.old_key.len == 0 or rewrite.new_key.len == 0 or rewrite.value.len == 0) return error.InvalidQueryRequest;
-        if (std.mem.eql(u8, rewrite.old_key, rewrite.new_key)) return error.UnsupportedOperation;
-        if (!is_user_row_mutation_key(rewrite.old_key) or !is_user_row_mutation_key(rewrite.new_key)) return error.InvalidQueryRequest;
-        if (containsTransactionWriteKey(writes, rewrite.old_key) or containsTransactionWriteKey(writes, rewrite.new_key)) return error.InvalidQueryRequest;
-        if (containsKey(deletes, rewrite.old_key) or containsKey(deletes, rewrite.new_key)) return error.InvalidQueryRequest;
-        for (rewrites[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, rewrite.old_key, other.old_key) or
-                std.mem.eql(u8, rewrite.old_key, other.new_key) or
-                std.mem.eql(u8, rewrite.new_key, other.old_key) or
-                std.mem.eql(u8, rewrite.new_key, other.new_key))
-            {
-                return error.InvalidQueryRequest;
-            }
-        }
-    }
-}
-
-fn containsTransactionWriteKey(writes: []const types.TransactionWrite, key: []const u8) bool {
-    for (writes) |write| {
-        if (std.mem.eql(u8, write.key, key)) return true;
-    }
-    return false;
-}
-
-fn containsKey(list: []const []const u8, key: []const u8) bool {
-    for (list) |existing| {
-        if (std.mem.eql(u8, existing, key)) return true;
-    }
-    return false;
+    return try relational_store_mod.validateRelationalIdentityRewriteRequest(rewrites, writes, deletes, is_user_row_mutation_key);
 }
 
 pub const SystemVersionedHistoryEvent = struct {
@@ -1803,29 +1585,9 @@ pub fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?Sca
     return null;
 }
 
-pub fn jsonNumberAsF64(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
-}
-
-pub fn jsonNumberAsU64(value: std.json.Value) ?u64 {
-    return switch (value) {
-        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
-        else => null,
-    };
-}
-
-pub fn jsonNumberAsI64(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |integer| integer,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
+pub const jsonNumberAsF64 = relational_store_mod.jsonNumberAsF64;
+pub const jsonNumberAsU64 = relational_store_mod.jsonNumberAsU64;
+pub const jsonNumberAsI64 = relational_store_mod.jsonNumberAsI64;
 
 pub fn jsonValueAtPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
     if (root != .object) return null;
@@ -4188,29 +3950,9 @@ pub fn validateBaseQueryRequest(req: types.RelationalRowsQueryRequest) !void {
     try validateQueryProjectionOutputs(req);
 }
 
-pub const PredicateImplications = struct {
-    predicates: []const schema_mod.RelationalCheck = &.{},
-    expressions: []const types.RelationalRowsExpressionCondition = &.{},
-};
-
-pub const FilterCombineMode = enum {
-    intersect,
-    union_set,
-    difference,
-};
-
-pub fn combineFilterSetFastAlloc(
-    alloc: Allocator,
-    current: *const doc_set.ResolvedDocSet,
-    child: *const doc_set.ResolvedDocSet,
-    mode: FilterCombineMode,
-) !?doc_set.ResolvedDocSet {
-    return switch (mode) {
-        .intersect => try doc_set.intersectAlloc(alloc, current, child),
-        .union_set => try doc_set.unionAlloc(alloc, current, child),
-        .difference => try doc_set.differenceAlloc(alloc, current, child),
-    };
-}
+pub const PredicateImplications = relational_store_mod.PredicateImplications;
+pub const FilterCombineMode = relational_store_mod.FilterCombineMode;
+pub const combineFilterSetFastAlloc = relational_store_mod.combineFilterSetFastAlloc;
 
 pub fn columnIndexUsableForQuery(
     alloc: Allocator,
@@ -4220,35 +3962,11 @@ pub fn columnIndexUsableForQuery(
 ) !bool {
     if (!column.indexed) return false;
     if (column.index_lifecycle != .ready) return false;
-    if (!predicatesImplyUniqueWhere(implications.predicates, column.index_where)) return false;
+    if (!relational_store_mod.predicatesImplyUniqueWhere(implications.predicates, column.index_where)) return false;
     return try expressionPredicatesImply(alloc, implications, column.index_where_expressions, now_ns);
 }
 
-pub fn predicatesImplyUniqueWhere(
-    predicates: []const schema_mod.RelationalCheck,
-    where_predicates: []const schema_mod.UniquePredicate,
-) bool {
-    for (where_predicates) |where_predicate| {
-        if (!predicatesImplyUniquePredicate(predicates, where_predicate)) return false;
-    }
-    return true;
-}
-
-fn predicatesImplyUniquePredicate(
-    predicates: []const schema_mod.RelationalCheck,
-    where_predicate: schema_mod.UniquePredicate,
-) bool {
-    for (predicates) |predicate| {
-        if (!std.mem.eql(u8, predicate.field, where_predicate.field)) continue;
-        switch (where_predicate.op) {
-            .is_null => if (predicate.op == .is_null) return true,
-            .is_not_null => if (predicate.op == .is_not_null or (predicate.op == .eq and predicate.value_json != null and !std.mem.eql(u8, predicate.value_json.?, "null"))) return true,
-            .eq => if (predicate.op == .eq and optionalJsonTextEqual(predicate.value_json, where_predicate.value_json)) return true,
-            .ne => if (predicate.op == .ne and optionalJsonTextEqual(predicate.value_json, where_predicate.value_json)) return true,
-        }
-    }
-    return false;
-}
+pub const predicatesImplyUniqueWhere = relational_store_mod.predicatesImplyUniqueWhere;
 
 pub fn expressionPredicatesImply(
     alloc: Allocator,
@@ -4344,12 +4062,6 @@ fn predicateHasEqualityValueForField(
     return false;
 }
 
-fn optionalJsonTextEqual(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
-
 pub fn equalityPredicateObjectJsonAlloc(
     alloc: Allocator,
     predicates: []const schema_mod.RelationalCheck,
@@ -4432,31 +4144,20 @@ fn appendExpressionColumnsAlloc(
     for (expression.case_else) |fallback| try appendExpressionColumnsAlloc(alloc, runtime_schema, columns, fallback);
 }
 
-pub fn columnForField(runtime_schema: schema_mod.TableSchema, field: []const u8) ?schema_mod.RelationalColumn {
-    const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
-    for (runtime_schema.relational_columns) |column| {
-        if (std.mem.eql(u8, field, column.name) or
-            std.mem.eql(u8, field, column.path) or
-            std.mem.eql(u8, normalized, column.name) or
-            std.mem.eql(u8, normalized, column.path))
-        {
-            return column;
-        }
-    }
-    return null;
-}
+pub const columnForField = relational_store_mod.columnForField;
 
-pub const TemporalBound = union(enum) {
-    neg_infinity,
-    number: f64,
-    datetime_ns: i64,
-    pos_infinity,
-};
-
-pub const TemporalSpan = struct {
-    start: TemporalBound,
-    end: TemporalBound,
-};
+pub const TemporalBound = relational_store_mod.TemporalBound;
+pub const TemporalSpan = relational_store_mod.TemporalSpan;
+pub const temporalStartBoundFromJsonAlloc = relational_store_mod.temporalStartBoundFromJsonAlloc;
+pub const temporalEndBoundFromJsonAlloc = relational_store_mod.temporalEndBoundFromJsonAlloc;
+pub const temporalSpanValid = relational_store_mod.temporalSpanValid;
+pub const temporalSpansOverlap = relational_store_mod.temporalSpansOverlap;
+pub const temporalBoundLessThan = relational_store_mod.temporalBoundLessThan;
+pub const temporalBoundEqual = relational_store_mod.temporalBoundEqual;
+pub const temporalBoundMax = relational_store_mod.temporalBoundMax;
+pub const temporalBoundMin = relational_store_mod.temporalBoundMin;
+pub const findPeriod = relational_store_mod.findPeriod;
+pub const findTemporalColumn = relational_store_mod.findTemporalColumn;
 
 pub fn temporalSpanFromPortionJsonAlloc(
     alloc: Allocator,
@@ -4480,61 +4181,11 @@ pub fn temporalSpanFromRowJsonAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    const start = try temporalStartBoundFromJsonValue(parsed.value.object.get(start_column.path), start_column);
-    const end = try temporalEndBoundFromJsonValue(parsed.value.object.get(end_column.path), end_column);
+    const start = try relational_store_mod.temporalStartBoundFromJsonValue(parsed.value.object.get(start_column.path), start_column);
+    const end = try relational_store_mod.temporalEndBoundFromJsonValue(parsed.value.object.get(end_column.path), end_column);
     const span: TemporalSpan = .{ .start = start, .end = end };
     if (!temporalSpanValid(span)) return error.InvalidQueryRequest;
     return span;
-}
-
-pub fn temporalStartBoundFromJsonAlloc(
-    alloc: Allocator,
-    value_json: []const u8,
-    column: schema_mod.RelationalColumn,
-) !TemporalBound {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    return try temporalStartBoundFromJsonValue(parsed.value, column);
-}
-
-pub fn temporalEndBoundFromJsonAlloc(
-    alloc: Allocator,
-    value_json: []const u8,
-    column: schema_mod.RelationalColumn,
-) !TemporalBound {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    return try temporalEndBoundFromJsonValue(parsed.value, column);
-}
-
-fn temporalStartBoundFromJsonValue(value: ?std.json.Value, column: schema_mod.RelationalColumn) !TemporalBound {
-    if (value) |present| {
-        if (present != .null) return try temporalFiniteBoundFromJsonValue(present, column);
-    }
-    return if (column.nullable) .neg_infinity else error.InvalidQueryRequest;
-}
-
-fn temporalEndBoundFromJsonValue(value: ?std.json.Value, column: schema_mod.RelationalColumn) !TemporalBound {
-    if (value) |present| {
-        if (present != .null) return try temporalFiniteBoundFromJsonValue(present, column);
-    }
-    return if (column.nullable) .pos_infinity else error.InvalidQueryRequest;
-}
-
-fn temporalFiniteBoundFromJsonValue(value: std.json.Value, column: schema_mod.RelationalColumn) !TemporalBound {
-    if (value == .null) return error.InvalidQueryRequest;
-    return switch (column.field_type) {
-        .numeric => switch (value) {
-            .integer => |number| .{ .number = @floatFromInt(number) },
-            .float => |number| .{ .number = number },
-            else => error.InvalidQueryRequest,
-        },
-        .datetime => switch (value) {
-            .integer => |number| .{ .datetime_ns = number },
-            else => error.InvalidQueryRequest,
-        },
-        else => error.InvalidQueryRequest,
-    };
 }
 
 pub fn temporalRowWithSpanJsonAlloc(
@@ -4626,70 +4277,6 @@ fn temporalBoundJsonValue(bound: TemporalBound) std.json.Value {
         .number => |value| .{ .float = value },
         .datetime_ns => |value| .{ .integer = value },
     };
-}
-
-pub fn temporalSpanValid(span: TemporalSpan) bool {
-    return temporalBoundLessThan(span.start, span.end);
-}
-
-pub fn temporalSpansOverlap(left: TemporalSpan, right: TemporalSpan) bool {
-    return temporalBoundLessThan(left.start, right.end) and temporalBoundLessThan(right.start, left.end);
-}
-
-pub fn temporalBoundLessThan(left: TemporalBound, right: TemporalBound) bool {
-    return switch (left) {
-        .neg_infinity => right != .neg_infinity,
-        .number => |value| switch (right) {
-            .neg_infinity => false,
-            .number => |other| value < other,
-            .pos_infinity => true,
-            else => false,
-        },
-        .datetime_ns => |value| switch (right) {
-            .neg_infinity => false,
-            .datetime_ns => |other| value < other,
-            .pos_infinity => true,
-            else => false,
-        },
-        .pos_infinity => false,
-    };
-}
-
-pub fn temporalBoundEqual(left: TemporalBound, right: TemporalBound) bool {
-    return switch (left) {
-        .neg_infinity => right == .neg_infinity,
-        .number => |value| switch (right) {
-            .number => |other| value == other,
-            else => false,
-        },
-        .datetime_ns => |value| switch (right) {
-            .datetime_ns => |other| value == other,
-            else => false,
-        },
-        .pos_infinity => right == .pos_infinity,
-    };
-}
-
-pub fn temporalBoundMax(left: TemporalBound, right: TemporalBound) TemporalBound {
-    return if (temporalBoundLessThan(left, right)) right else left;
-}
-
-pub fn temporalBoundMin(left: TemporalBound, right: TemporalBound) TemporalBound {
-    return if (temporalBoundLessThan(left, right)) left else right;
-}
-
-pub fn findPeriod(periods: []const schema_mod.RelationalPeriod, name: []const u8) ?schema_mod.RelationalPeriod {
-    for (periods) |period| {
-        if (std.mem.eql(u8, period.name, name)) return period;
-    }
-    return null;
-}
-
-pub fn findTemporalColumn(columns: []const schema_mod.RelationalColumn, path: []const u8) ?schema_mod.RelationalColumn {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.path, path) or std.mem.eql(u8, column.name, path)) return column;
-    }
-    return null;
 }
 
 pub fn validateTemporalPortionRequest(
@@ -4833,88 +4420,9 @@ pub fn predicateSearchQuery(
     };
 }
 
-pub fn arrayColumnValueContains(
-    alloc: Allocator,
-    value: relational_store_mod.OwnedColumnValue,
-    wanted: std.json.Value,
-) !bool {
-    if (value.value_type != .bytes_val or !value.is_json) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value.bytes_val, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .array) return false;
-    for (parsed.value.array.items) |item| {
-        if (jsonValuesEqual(item, wanted)) return true;
-    }
-    return false;
-}
-
-pub fn arrayColumnValueContainsAll(
-    alloc: Allocator,
-    value: relational_store_mod.OwnedColumnValue,
-    wanted: std.json.Value,
-) !bool {
-    if (wanted != .array) return error.InvalidQueryRequest;
-    if (value.value_type != .bytes_val or !value.is_json) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value.bytes_val, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .array) return false;
-    return relational_store_mod.jsonValueContains(parsed.value, wanted);
-}
-
-pub fn arrayColumnValueEquals(
-    alloc: Allocator,
-    value: relational_store_mod.OwnedColumnValue,
-    wanted: std.json.Value,
-) !bool {
-    if (wanted != .array) return error.InvalidQueryRequest;
-    if (value.value_type != .bytes_val or !value.is_json) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value.bytes_val, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .array) return false;
-    return relational_store_mod.jsonValuesEqualExact(parsed.value, wanted);
-}
-
-fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
-    return switch (lhs) {
-        .null => rhs == .null,
-        .bool => |value| rhs == .bool and rhs.bool == value,
-        .integer => |value| switch (rhs) {
-            .integer => |other| other == value,
-            .float => |other| @as(f64, @floatFromInt(value)) == other,
-            else => false,
-        },
-        .float => |value| switch (rhs) {
-            .integer => |other| value == @as(f64, @floatFromInt(other)),
-            .float => |other| other == value,
-            else => false,
-        },
-        .number_string => |value| switch (rhs) {
-            .number_string => |other| std.mem.eql(u8, value, other),
-            .string => |other| std.mem.eql(u8, value, other),
-            else => false,
-        },
-        .string => |value| switch (rhs) {
-            .string => |other| std.mem.eql(u8, value, other),
-            .number_string => |other| std.mem.eql(u8, value, other),
-            else => false,
-        },
-        .array => |array| blk: {
-            if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
-            for (array.items, rhs.array.items) |lhs_item, rhs_item| {
-                if (!jsonValuesEqual(lhs_item, rhs_item)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |object| blk: {
-            if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
-            for (object.keys(), object.values()) |key, lhs_value| {
-                const rhs_value = rhs.object.get(key) orelse break :blk false;
-                if (!jsonValuesEqual(lhs_value, rhs_value)) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
+pub const arrayColumnValueContains = relational_store_mod.arrayColumnValueContains;
+pub const arrayColumnValueContainsAll = relational_store_mod.arrayColumnValueContainsAll;
+pub const arrayColumnValueEquals = relational_store_mod.arrayColumnValueEquals;
 
 pub fn queryHasDistinctOn(req: types.RelationalRowsQueryRequest) bool {
     return req.distinct_on.len > 0 or req.distinct_on_expressions.len > 0;

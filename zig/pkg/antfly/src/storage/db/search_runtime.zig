@@ -33,7 +33,6 @@ const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
-const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
@@ -2816,14 +2815,14 @@ pub fn Impl(comptime DB: type) type {
             current: *?doc_set.ResolvedDocSet,
             child: *const doc_set.ResolvedDocSet,
             generation: ?u64,
-            mode: relational_rows.FilterCombineMode,
+            mode: relational_store_mod.FilterCombineMode,
         ) !void {
             if (current.* == null) {
                 current.* = try doc_set.cloneAlloc(alloc, child);
                 return;
             }
 
-            if (try relational_rows.combineFilterSetFastAlloc(alloc, &current.*.?, child, mode)) |next| {
+            if (try relational_store_mod.combineFilterSetFastAlloc(alloc, &current.*.?, child, mode)) |next| {
                 var owned_next = next;
                 errdefer owned_next.deinit(alloc);
                 current.*.?.deinit(alloc);
@@ -2843,7 +2842,7 @@ pub fn Impl(comptime DB: type) type {
             left: *const doc_set.ResolvedDocSet,
             right: *const doc_set.ResolvedDocSet,
             generation: ?u64,
-            mode: relational_rows.FilterCombineMode,
+            mode: relational_store_mod.FilterCombineMode,
         ) !doc_set.ResolvedDocSet {
             const left_ids = try Self.relationalFilterDocIdsForSetAlloc(self, alloc, left, generation);
             defer freeConstDocIdsAlloc(alloc, left_ids);
@@ -2907,10 +2906,12 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             alloc: Allocator,
             column: schema_mod.RelationalColumn,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
         ) !bool {
-            _ = self;
-            return try relational_rows.columnIndexUsableForQuery(alloc, column, implications, platform_time.realtimeNs());
+            if (!column.indexed) return false;
+            if (column.index_lifecycle != .ready) return false;
+            if (!relational_store_mod.predicatesImplyUniqueWhere(implications.predicates, column.index_where)) return false;
+            return try self.relationalRowsExpressionPredicatesImply(alloc, implications, column.index_where_expressions);
         }
 
         pub fn resolveRelationalFilterQueryDocSetAlloc(
@@ -2928,7 +2929,7 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             query: search_mod.SearchQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) anyerror!?doc_set.ResolvedDocSet {
             if (!Self.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
@@ -2955,10 +2956,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             term: search_mod.TermQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, term.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, term.field) orelse return null;
             if (column.field_type != .keyword) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 wanted: []const u8,
@@ -2974,10 +2975,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             array_any: search_mod.ArrayAnyQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, array_any.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, array_any.field) orelse return null;
             if (column.field_type != .array) return null;
 
             var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
@@ -3007,7 +3008,7 @@ pub fn Impl(comptime DB: type) type {
                         .is_json = cell.is_json,
                         .value = cell.value,
                     };
-                    if (!(try relational_rows.arrayColumnValueContains(alloc, value, array_any.value))) continue;
+                    if (!(try relational_store_mod.arrayColumnValueContains(alloc, value, array_any.value))) continue;
                     const owned_doc_id = try alloc.dupe(u8, row.doc_key);
                     errdefer alloc.free(owned_doc_id);
                     try doc_ids.append(alloc, owned_doc_id);
@@ -3024,10 +3025,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             json_contains: search_mod.JsonContainsQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, json_contains.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, json_contains.field) orelse return null;
             if (column.field_type != .json) return null;
 
             var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
@@ -3066,10 +3067,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             range: search_mod.TermRangeQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .keyword) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 min: ?[]const u8,
@@ -3103,10 +3104,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             range: search_mod.NumericRangeQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .numeric) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 min: ?f64,
@@ -3134,10 +3135,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             range: search_mod.DateRangeQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .datetime) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 start_ns: ?u64,
@@ -3165,10 +3166,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             bool_query: search_mod.BoolFieldQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, bool_query.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, bool_query.field) orelse return null;
             if (column.field_type != .boolean) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 wanted: bool,
@@ -3184,10 +3185,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             geo_query: search_mod.GeoDistanceQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, geo_query.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 center: search_mod.GeoPoint,
@@ -3212,10 +3213,10 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             geo_query: search_mod.GeoBBoxQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            const column = relational_rows.columnForField(runtime_schema, geo_query.field) orelse return null;
+            const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
             return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
                 min_lat: f64,
@@ -3242,7 +3243,7 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             runtime_schema: schema_mod.TableSchema,
             bool_query: search_mod.BoolQuery,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
         ) anyerror!?doc_set.ResolvedDocSet {
             if (bool_query.min_should > 1) return null;
@@ -3297,7 +3298,7 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             alloc: Allocator,
             column: schema_mod.RelationalColumn,
-            implications: relational_rows.PredicateImplications,
+            implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
             matcher: anytype,
         ) !doc_set.ResolvedDocSet {
@@ -7466,8 +7467,8 @@ test "db search runtime projection lookup includes embedding artifacts when _emb
     try std.testing.expectEqualStrings("alpha", parsed.value.object.get("title").?.string);
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), vector.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 3), relational_rows.jsonNumberAsF64(vector[2]) orelse return error.TestUnexpectedResult, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_store_mod.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), relational_store_mod.jsonNumberAsF64(vector[2]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db search runtime projection search includes embedding artifacts on hydrated hits when _embeddings is requested" {
@@ -7511,7 +7512,7 @@ test "db search runtime projection search includes embedding artifacts on hydrat
     defer parsed.deinit();
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), vector.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_store_mod.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db search runtime projection scan includes embedding artifacts when _embeddings is requested" {
@@ -7609,7 +7610,7 @@ test "db search runtime projection lookup loads embeddings for _embeddings.* sel
     defer parsed.deinit();
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), vector.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_store_mod.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db search runtime projection field selection plan only enables chunk special field for explicit include-all selectors" {

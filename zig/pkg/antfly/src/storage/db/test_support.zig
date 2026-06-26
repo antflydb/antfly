@@ -15,7 +15,6 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mapper = @import("document_mapper.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
-const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -145,9 +144,9 @@ pub fn expectRelationalTemporalPriceRow(
     defer parsed.deinit();
     const object = parsed.value.object;
     try std.testing.expectEqualStrings(sku, object.get("sku").?.string);
-    try std.testing.expectEqual(valid_from, relational_rows.jsonNumberAsF64(object.get("valid_from").?) orelse return error.TestExpectedEqual);
-    try std.testing.expectEqual(valid_to, relational_rows.jsonNumberAsF64(object.get("valid_to").?) orelse return error.TestExpectedEqual);
-    try std.testing.expectEqual(price, relational_rows.jsonNumberAsF64(object.get("price").?) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(valid_from, relational_store_mod.jsonNumberAsF64(object.get("valid_from").?) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(valid_to, relational_store_mod.jsonNumberAsF64(object.get("valid_to").?) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(price, relational_store_mod.jsonNumberAsF64(object.get("price").?) orelse return error.TestExpectedEqual);
 }
 
 pub fn expectRelationalTemporalPrimarySelectorPriceRow(

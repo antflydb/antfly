@@ -19,7 +19,6 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
-const apply_state = @import("derived/apply_state.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
@@ -40,7 +39,7 @@ const embedder_mod = @import("enrichment/embedder.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_query_mod = @import("../../graph/query.zig");
-const ha_replication = @import("ha_replication.zig");
+const ha_types = @import("ha_types.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const internal_keys = @import("../internal_keys.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -147,15 +146,7 @@ pub fn probeDerivedReplayTargetSequence(
     );
 }
 
-pub const IndexStatusSnapshot = struct {
-    kind: types.IndexKind,
-    doc_count: u64 = 0,
-    term_count: u64 = 0,
-    edge_count: u64 = 0,
-    node_count: u64 = 0,
-    root_node: u64 = 0,
-    updated_at_ns: u64 = 0,
-};
+pub const IndexStatusSnapshot = db_internal.IndexStatusSnapshot;
 
 pub const DocIdentityCoverage = struct {
     scanned_primary_docs: u64 = 0,
@@ -249,28 +240,24 @@ pub const OpenOptions = struct {
     /// replication stream. The default policy is async/best-effort; configuring
     /// a non-async sync_policy makes normal DB writes evaluate the HA commit
     /// gate for the appended replication record.
-    ha_async_effect_mirror: ?ha_replication.AsyncEffectMirror = null,
+    ha_async_effect_mirror: ?ha_types.AsyncEffectMirror = null,
     /// Optional mirror for committed user batch mutations into the HA
     /// replication stream. This emits versioned `batch_mutation` envelopes for
     /// catch-up/read-replica apply and can be paired with sync_policy for
     /// remote-write/remote-apply gate decisions.
-    ha_async_batch_mirror: ?ha_replication.AsyncBatchMirror = null,
+    ha_async_batch_mirror: ?ha_types.AsyncBatchMirror = null,
     /// Optional mirror for committed metadata/catalog changes into the HA
     /// replication stream. The initial metadata mutation payload covers table
     /// schema changes; additional catalog mutation kinds should be nested under
     /// the stable HA `metadata_mutation` envelope.
-    ha_async_metadata_mirror: ?ha_replication.AsyncMetadataMirror = null,
+    ha_async_metadata_mirror: ?ha_types.AsyncMetadataMirror = null,
     /// Optional HA write ownership gate. Client/API writes are allowed only
     /// when this DB is attached to the current HA primary. Standby apply paths
     /// must use replicated-apply entry points that explicitly bypass this
     /// client-write guard. A standby gate also suppresses mutating background
     /// runtimes at open, even if the generic runtime defaults are enabled.
-    ha_write_gate: ?ha_replication.WriteGate = null,
+    ha_write_gate: ?ha_types.WriteGate = null,
 };
-
-const index_status_prefix = "\x00\x00__metadata__:index_status:";
-const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
-const index_status_encoded_len = 8 * 8;
 
 fn groupCreatedAtMetadataKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_created_at:{d}", .{group_id});
@@ -346,21 +333,10 @@ pub fn logOpenProfile(path: []const u8, open_mode: anytype, start_index_workers:
     );
 }
 
-pub fn openModeRequiresReadOnlyBackends(open_mode: anytype) bool {
-    return open_mode == .query_readonly or open_mode == .status_only;
-}
-
-pub fn openModeAllowsReplay(open_mode: anytype) bool {
-    return open_mode == .writer;
-}
-
-pub fn openModeAllowsIndexWorkers(open_mode: anytype) bool {
-    return open_mode == .writer or open_mode == .writer_no_replay;
-}
-
-pub fn openModeAllowsOptionalRuntimes(open_mode: anytype) bool {
-    return open_mode == .writer or open_mode == .writer_no_replay;
-}
+pub const openModeRequiresReadOnlyBackends = db_config.openModeRequiresReadOnlyBackends;
+pub const openModeAllowsReplay = db_config.openModeAllowsReplay;
+pub const openModeAllowsIndexWorkers = db_config.openModeAllowsIndexWorkers;
+pub const openModeAllowsOptionalRuntimes = db_config.openModeAllowsOptionalRuntimes;
 
 pub fn makeLsmOptionsReadOnly(options: *lsm_backend_mod.Options) void {
     options.backend.read_only = true;
@@ -401,188 +377,14 @@ pub fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_
     installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
 }
 
-pub fn indexStatusKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_status_prefix, index_name });
-}
-
-pub fn encodeIndexStatusSnapshot(status_snapshot: IndexStatusSnapshot, out: *[index_status_encoded_len]u8) void {
-    var offset: usize = 0;
-    inline for (.{
-        index_status_magic,
-        @as(u64, @intFromEnum(status_snapshot.kind)),
-        status_snapshot.doc_count,
-        status_snapshot.term_count,
-        status_snapshot.edge_count,
-        status_snapshot.node_count,
-        status_snapshot.root_node,
-        status_snapshot.updated_at_ns,
-    }) |value| {
-        std.mem.writeInt(u64, out[offset..][0..8], value, .little);
-        offset += 8;
-    }
-}
-
-pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
-    if (raw.len != index_status_encoded_len) return error.InvalidIndexStatusSnapshot;
-    var offset: usize = 0;
-    const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
-    offset += 8;
-    if (magic != index_status_magic) return error.InvalidIndexStatusSnapshot;
-    const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
-    offset += 8;
-    const kind: types.IndexKind = switch (kind_raw) {
-        @intFromEnum(types.IndexKind.full_text) => .full_text,
-        @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-        @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-        @intFromEnum(types.IndexKind.graph) => .graph,
-        @intFromEnum(types.IndexKind.algebraic) => .algebraic,
-        else => return error.InvalidIndexStatusSnapshot,
-    };
-    return .{
-        .kind = kind,
-        .doc_count = blk: {
-            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-            offset += 8;
-            break :blk value;
-        },
-        .term_count = blk: {
-            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-            offset += 8;
-            break :blk value;
-        },
-        .edge_count = blk: {
-            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-            offset += 8;
-            break :blk value;
-        },
-        .node_count = blk: {
-            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-            offset += 8;
-            break :blk value;
-        },
-        .root_node = blk: {
-            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-            offset += 8;
-            break :blk value;
-        },
-        .updated_at_ns = std.mem.readInt(u64, raw[offset..][0..8], .little),
-    };
-}
-
-pub fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
-    if (index_manager.textIndex(index_name)) |entry| {
-        const text_snapshot = entry.snapshot();
-        const term_count = textIndexTermCount(entry);
-        return .{
-            .kind = .full_text,
-            .doc_count = text_snapshot.global_doc_count,
-            .term_count = term_count,
-            .updated_at_ns = platform_time.monotonicNs(),
-        };
-    }
-    if (index_manager.denseIndex(index_name)) |entry| {
-        const dense_stats = entry.index.stats();
-        return .{
-            .kind = .dense_vector,
-            .doc_count = dense_stats.active_count,
-            .node_count = dense_stats.node_count,
-            .root_node = dense_stats.root_node,
-            .updated_at_ns = platform_time.monotonicNs(),
-        };
-    }
-    if (index_manager.sparseIndex(index_name)) |entry| {
-        const sparse_stats = entry.index.stats();
-        return .{
-            .kind = .sparse_vector,
-            .doc_count = sparse_stats.doc_count,
-            .term_count = sparse_stats.term_count,
-            .updated_at_ns = platform_time.monotonicNs(),
-        };
-    }
-    if (index_manager.graphIndex(index_name)) |entry| {
-        const graph_stats = entry.index.stats(index_manager.alloc) catch return null;
-        return .{
-            .kind = .graph,
-            .doc_count = graph_stats.node_count,
-            .edge_count = graph_stats.edge_count,
-            .node_count = graph_stats.node_count,
-            .updated_at_ns = platform_time.monotonicNs(),
-        };
-    }
-    return null;
-}
-
-pub fn textIndexTermCount(entry: anytype) u64 {
-    const snap = entry.acquireSnapshot();
-    defer snap.release();
-    var terms: u64 = 0;
-    for (snap.segments) |*seg| {
-        const layout = seg.layoutStats(true);
-        terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
-    }
-    return terms;
-}
-
-pub fn saveIndexStatusSnapshots(
-    alloc: std.mem.Allocator,
-    store: *docstore_mod.DocStore,
-    index_manager: *index_manager_mod.IndexManager,
-    updates: []const apply_state.AppliedSequenceUpdate,
-) !void {
-    if (updates.len == 0) return;
-
-    const PendingStatusWrite = struct {
-        key: []u8,
-        value: [index_status_encoded_len]u8,
-    };
-    var pending = std.ArrayListUnmanaged(PendingStatusWrite).empty;
-    defer {
-        for (pending.items) |item| alloc.free(item.key);
-        pending.deinit(alloc);
-    }
-
-    for (updates) |update| {
-        const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
-        const key = try indexStatusKeyAlloc(alloc, update.index_name);
-        var encoded: [index_status_encoded_len]u8 = undefined;
-        encodeIndexStatusSnapshot(status_snapshot, &encoded);
-        errdefer alloc.free(key);
-        try pending.append(alloc, .{
-            .key = key,
-            .value = encoded,
-        });
-    }
-
-    if (pending.items.len == 0) return;
-    var status_batch = try store.beginWriteBatch();
-    errdefer status_batch.abort();
-    for (pending.items) |item| try status_batch.put(item.key, &item.value);
-    try status_batch.commit();
-}
-
-pub fn loadIndexStatusSnapshot(
-    alloc: std.mem.Allocator,
-    store: *docstore_mod.DocStore,
-    index_name: []const u8,
-) !?IndexStatusSnapshot {
-    const key = try indexStatusKeyAlloc(alloc, index_name);
-    defer alloc.free(key);
-    const raw = store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    defer alloc.free(raw);
-    return decodeIndexStatusSnapshot(raw) catch null;
-}
-
-pub fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
-    if (status_snapshot.kind != item.kind) return;
-    item.doc_count = status_snapshot.doc_count;
-    item.term_count = status_snapshot.term_count;
-    item.edge_count = status_snapshot.edge_count;
-    item.node_count = status_snapshot.node_count;
-    item.root_node = status_snapshot.root_node;
-}
+pub const indexStatusKeyAlloc = db_internal.indexStatusKeyAlloc;
+pub const encodeIndexStatusSnapshot = db_internal.encodeIndexStatusSnapshot;
+pub const decodeIndexStatusSnapshot = db_internal.decodeIndexStatusSnapshot;
+pub const collectLiveIndexStatusSnapshot = db_internal.collectLiveIndexStatusSnapshot;
+pub const textIndexTermCount = db_internal.textIndexTermCount;
+pub const saveIndexStatusSnapshots = db_internal.saveIndexStatusSnapshots;
+pub const loadIndexStatusSnapshot = db_internal.loadIndexStatusSnapshot;
+pub const applyIndexStatusSnapshot = db_internal.applyIndexStatusSnapshot;
 
 fn finalizeDocIdentityRebuildRequired(identity_stats: *types.DocIdentityStats) void {
     identity_stats.rebuild_required = identity_stats.rebuild_required or
@@ -827,7 +629,7 @@ pub fn Impl(comptime DB: type) type {
                     .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                     .lmdb, .mem => {},
                 }
-                const ha_standby_role = ha_replication.writeGateIsStandby(opts.ha_write_gate);
+                const ha_standby_role = ha_types.writeGateIsStandby(opts.ha_write_gate);
                 const start_index_workers = openModeAllowsIndexWorkers(opts.open_mode) and opts.start_index_workers and !ha_standby_role;
 
                 var db = DB{

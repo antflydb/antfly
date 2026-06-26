@@ -31,6 +31,7 @@ const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
+const artifact_replay = @import("artifact_replay.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
@@ -3993,7 +3994,7 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
     try std.testing.expectError(
         error.MissingResolverArtifactContract,
-        @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(
+        artifact_replay.materializeGraphSourceArtifactsForIndex(
             alloc,
             db.core.store,
             db.core.index_manager,
@@ -4006,7 +4007,7 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     try db.core.store.delete(resolution_key);
     try std.testing.expectError(
         error.MissingResolverArtifactContract,
-        @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(
+        artifact_replay.materializeGraphSourceArtifactsForIndex(
             alloc,
             db.core.store,
             db.core.index_manager,
@@ -4748,8 +4749,8 @@ test "db resolution runtime async asset producer mention edges come from resolut
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
-    const changed = try @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
-    defer @import("derived_async.zig").freeOwnedKeySlice(alloc, changed);
+    const changed = try artifact_replay.materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
+    defer artifact_replay.freeOwnedKeySlice(alloc, changed);
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
     defer alloc.free(graph_edge_key);

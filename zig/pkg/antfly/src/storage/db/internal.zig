@@ -17,15 +17,17 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
+const derived_types = @import("derived/derived_types.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const doc_set = @import("doc_set.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
-const ha_replication = @import("ha_replication.zig");
+const ha_types = @import("ha_types.zig");
 const internal_keys = @import("../internal_keys.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
@@ -46,6 +48,253 @@ const platform_clock = @import("../../platform/clock.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
+
+pub const IndexStatusSnapshot = struct {
+    kind: types.IndexKind,
+    doc_count: u64 = 0,
+    term_count: u64 = 0,
+    edge_count: u64 = 0,
+    node_count: u64 = 0,
+    root_node: u64 = 0,
+    updated_at_ns: u64 = 0,
+};
+
+pub fn buildDerivedBatch(
+    alloc: Allocator,
+    req: types.BatchRequest,
+    extracted: []const mapper.ExtractedWrite,
+    deleted_artifact_keys: []const []u8,
+    changed_artifact_keys: []const []u8,
+) !derived_types.DerivedBatch {
+    var documents = try alloc.alloc(derived_types.DerivedDocument, req.writes.len);
+    var initialized: usize = 0;
+    errdefer {
+        var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized] };
+        derived_types.deinitDerivedBatch(alloc, &tmp);
+    }
+
+    for (req.writes, 0..) |write, i| {
+        var targets = std.ArrayListUnmanaged(derived_types.DerivedTargetRef).empty;
+        defer targets.deinit(alloc);
+
+        if (extracted[i].cleaned_value != null) {
+            try targets.append(alloc, .{
+                .kind = .full_text,
+                .index_name = try alloc.dupe(u8, "*"),
+            });
+        }
+        for (extracted[i].dense_embeddings) |embedding| {
+            try targets.append(alloc, .{
+                .kind = .dense_vector,
+                .index_name = try alloc.dupe(u8, embedding.index_name),
+            });
+        }
+        for (extracted[i].sparse_embeddings) |embedding| {
+            try targets.append(alloc, .{
+                .kind = .sparse_vector,
+                .index_name = try alloc.dupe(u8, embedding.index_name),
+            });
+        }
+        for (extracted[i].mentioned_graph_indexes) |index_name| {
+            try targets.append(alloc, .{
+                .kind = .graph,
+                .index_name = try alloc.dupe(u8, index_name),
+            });
+        }
+        for (req.graph_writes) |graph_write| {
+            if (std.mem.eql(u8, graph_write.source, write.key)) {
+                try targets.append(alloc, .{
+                    .kind = .graph,
+                    .index_name = try alloc.dupe(u8, graph_write.index_name),
+                });
+            }
+        }
+
+        documents[i] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .action = if (extracted[i].cleaned_value == null) .preserve_base_document else .upsert,
+            .cleaned_value = null,
+            .targets = try targets.toOwnedSlice(alloc),
+        };
+        initialized += 1;
+    }
+
+    var deleted_keys = try alloc.alloc([]const u8, req.deletes.len + deleted_artifact_keys.len);
+    var deleted_initialized: usize = 0;
+    errdefer {
+        for (deleted_keys[0..deleted_initialized]) |key| alloc.free(key);
+        alloc.free(deleted_keys);
+    }
+    for (req.deletes, 0..) |key, i| {
+        deleted_keys[i] = try alloc.dupe(u8, key);
+        deleted_initialized += 1;
+    }
+    for (deleted_artifact_keys) |key| {
+        deleted_keys[deleted_initialized] = try alloc.dupe(u8, key);
+        deleted_initialized += 1;
+    }
+
+    var overwritten_doc_keys_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer overwritten_doc_keys_list.deinit(alloc);
+    for (req.writes, 0..) |write, i| {
+        if (extracted[i].cleaned_value != null) {
+            try overwritten_doc_keys_list.append(alloc, try alloc.dupe(u8, write.key));
+        }
+    }
+
+    var changed_artifact_keys_list = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (changed_artifact_keys_list.items) |key| alloc.free(@constCast(key));
+        changed_artifact_keys_list.deinit(alloc);
+    }
+    for (changed_artifact_keys) |key| {
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+    }
+    for (deleted_artifact_keys) |key| {
+        if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+    }
+
+    var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
+    errdefer {
+        for (graph_doc_clears.items) |clear| {
+            alloc.free(clear.key);
+            for (clear.index_names) |index_name| alloc.free(index_name);
+            if (clear.index_names.len > 0) alloc.free(clear.index_names);
+        }
+        graph_doc_clears.deinit(alloc);
+    }
+    for (req.writes, 0..) |write, i| {
+        if (extracted[i].mentioned_graph_indexes.len == 0) continue;
+        var index_names = try alloc.alloc([]const u8, extracted[i].mentioned_graph_indexes.len);
+        for (extracted[i].mentioned_graph_indexes, 0..) |index_name, j| {
+            index_names[j] = try alloc.dupe(u8, index_name);
+        }
+        try graph_doc_clears.append(alloc, .{
+            .key = try alloc.dupe(u8, write.key),
+            .index_names = index_names,
+        });
+    }
+
+    var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer {
+        for (graph_writes.items) |write| {
+            alloc.free(@constCast(write.index_name));
+            alloc.free(@constCast(write.source));
+            alloc.free(@constCast(write.target));
+            alloc.free(@constCast(write.edge_type));
+            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+        }
+        graph_writes.deinit(alloc);
+    }
+    for (extracted) |item| {
+        for (item.graph_writes) |write| {
+            try graph_writes.append(alloc, .{
+                .index_name = try alloc.dupe(u8, write.index_name),
+                .source = try alloc.dupe(u8, write.source),
+                .target = try alloc.dupe(u8, write.target),
+                .edge_type = try alloc.dupe(u8, write.edge_type),
+                .weight = write.weight,
+                .created_at = write.created_at,
+                .updated_at = write.updated_at,
+                .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
+            });
+        }
+    }
+    for (req.graph_writes) |write| {
+        try graph_writes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, write.index_name),
+            .source = try alloc.dupe(u8, write.source),
+            .target = try alloc.dupe(u8, write.target),
+            .edge_type = try alloc.dupe(u8, write.edge_type),
+            .weight = write.weight,
+            .created_at = write.created_at,
+            .updated_at = write.updated_at,
+            .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
+        });
+    }
+
+    var graph_deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
+    errdefer {
+        for (graph_deletes.items) |delete| {
+            alloc.free(@constCast(delete.index_name));
+            alloc.free(@constCast(delete.source));
+            alloc.free(@constCast(delete.target));
+            alloc.free(@constCast(delete.edge_type));
+        }
+        graph_deletes.deinit(alloc);
+    }
+    for (req.graph_deletes) |delete| {
+        try graph_deletes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, delete.index_name),
+            .source = try alloc.dupe(u8, delete.source),
+            .target = try alloc.dupe(u8, delete.target),
+            .edge_type = try alloc.dupe(u8, delete.edge_type),
+        });
+    }
+
+    var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
+    errdefer {
+        for (dense_embeddings.items) |embedding| {
+            alloc.free(embedding.index_name);
+            if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+            alloc.free(embedding.doc_key);
+            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            if (embedding.vector.len > 0) alloc.free(embedding.vector);
+        }
+        dense_embeddings.deinit(alloc);
+    }
+    for (extracted) |item| {
+        for (item.dense_embeddings) |embedding| {
+            try dense_embeddings.append(alloc, .{
+                .index_name = try alloc.dupe(u8, embedding.index_name),
+                .doc_key = try alloc.dupe(u8, embedding.doc_key),
+                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
+                .vector = if (embedding.artifact_key != null) &.{} else try alloc.dupe(f32, embedding.vector),
+            });
+        }
+    }
+
+    var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
+    errdefer {
+        for (sparse_embeddings.items) |embedding| {
+            alloc.free(embedding.index_name);
+            alloc.free(embedding.doc_key);
+            if (embedding.indices.len > 0) alloc.free(embedding.indices);
+            if (embedding.values.len > 0) alloc.free(embedding.values);
+        }
+        sparse_embeddings.deinit(alloc);
+    }
+    for (extracted) |item| {
+        for (item.sparse_embeddings) |embedding| {
+            try sparse_embeddings.append(alloc, .{
+                .index_name = try alloc.dupe(u8, embedding.index_name),
+                .doc_key = try alloc.dupe(u8, embedding.doc_key),
+                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
+                .indices = try alloc.dupe(u32, embedding.indices),
+                .values = try alloc.dupe(f32, embedding.values),
+            });
+        }
+    }
+
+    return .{
+        .sequence = 0,
+        .documents = documents,
+        .deleted_keys = deleted_keys,
+        .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
+        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
+        .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
+        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
+        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
+        .generated_enrichment_refs = &.{},
+        .graph_writes = try graph_writes.toOwnedSlice(alloc),
+        .graph_deletes = try graph_deletes.toOwnedSlice(alloc),
+    };
+}
+
+const index_status_prefix = "\x00\x00__metadata__:index_status:";
+const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
+const index_status_encoded_len = 8 * 8;
 
 pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     if (comptime builtin.os.tag == .freestanding) return null;
@@ -72,6 +321,202 @@ pub fn readOptionalEnvUsize(name: [:0]const u8) ?usize {
 
 pub fn profileDelta(after: u64, before: u64) u64 {
     return after -| before;
+}
+
+pub fn indexStatusKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_status_prefix, index_name });
+}
+
+pub fn encodeIndexStatusSnapshot(status_snapshot: IndexStatusSnapshot, out: *[index_status_encoded_len]u8) void {
+    var offset: usize = 0;
+    inline for (.{
+        index_status_magic,
+        @as(u64, @intFromEnum(status_snapshot.kind)),
+        status_snapshot.doc_count,
+        status_snapshot.term_count,
+        status_snapshot.edge_count,
+        status_snapshot.node_count,
+        status_snapshot.root_node,
+        status_snapshot.updated_at_ns,
+    }) |value| {
+        std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+        offset += 8;
+    }
+}
+
+pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
+    if (raw.len != index_status_encoded_len) return error.InvalidIndexStatusSnapshot;
+    var offset: usize = 0;
+    const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
+    offset += 8;
+    if (magic != index_status_magic) return error.InvalidIndexStatusSnapshot;
+    const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
+    offset += 8;
+    const kind: types.IndexKind = switch (kind_raw) {
+        @intFromEnum(types.IndexKind.full_text) => .full_text,
+        @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
+        @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
+        @intFromEnum(types.IndexKind.graph) => .graph,
+        @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+        else => return error.InvalidIndexStatusSnapshot,
+    };
+    return .{
+        .kind = kind,
+        .doc_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .term_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .edge_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .node_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .root_node = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .updated_at_ns = std.mem.readInt(u64, raw[offset..][0..8], .little),
+    };
+}
+
+pub fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
+    if (index_manager.textIndex(index_name)) |entry| {
+        const text_snapshot = entry.snapshot();
+        const term_count = textIndexTermCount(entry);
+        return .{
+            .kind = .full_text,
+            .doc_count = text_snapshot.global_doc_count,
+            .term_count = term_count,
+            .updated_at_ns = platform.time.monotonicNs(),
+        };
+    }
+    if (index_manager.denseIndex(index_name)) |entry| {
+        const dense_stats = entry.index.stats();
+        return .{
+            .kind = .dense_vector,
+            .doc_count = dense_stats.active_count,
+            .node_count = dense_stats.node_count,
+            .root_node = dense_stats.root_node,
+            .updated_at_ns = platform.time.monotonicNs(),
+        };
+    }
+    if (index_manager.sparseIndex(index_name)) |entry| {
+        const sparse_stats = entry.index.stats();
+        return .{
+            .kind = .sparse_vector,
+            .doc_count = sparse_stats.doc_count,
+            .term_count = sparse_stats.term_count,
+            .updated_at_ns = platform.time.monotonicNs(),
+        };
+    }
+    if (index_manager.graphIndex(index_name)) |entry| {
+        const graph_stats = entry.index.stats(index_manager.alloc) catch return null;
+        return .{
+            .kind = .graph,
+            .doc_count = graph_stats.node_count,
+            .edge_count = graph_stats.edge_count,
+            .node_count = graph_stats.node_count,
+            .updated_at_ns = platform.time.monotonicNs(),
+        };
+    }
+    return null;
+}
+
+pub fn textIndexTermCount(entry: anytype) u64 {
+    const snap = entry.acquireSnapshot();
+    defer snap.release();
+    var terms: u64 = 0;
+    for (snap.segments) |*seg| {
+        const layout = seg.layoutStats(true);
+        terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+    }
+    return terms;
+}
+
+pub fn saveIndexStatusSnapshots(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+) !void {
+    if (updates.len == 0) return;
+
+    const PendingStatusWrite = struct {
+        key: []u8,
+        value: [index_status_encoded_len]u8,
+    };
+    var pending = std.ArrayListUnmanaged(PendingStatusWrite).empty;
+    defer {
+        for (pending.items) |item| alloc.free(item.key);
+        pending.deinit(alloc);
+    }
+
+    for (updates) |update| {
+        const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+        const key = try indexStatusKeyAlloc(alloc, update.index_name);
+        var encoded: [index_status_encoded_len]u8 = undefined;
+        encodeIndexStatusSnapshot(status_snapshot, &encoded);
+        errdefer alloc.free(key);
+        try pending.append(alloc, .{
+            .key = key,
+            .value = encoded,
+        });
+    }
+
+    if (pending.items.len == 0) return;
+    var status_batch = try store.beginWriteBatch();
+    errdefer status_batch.abort();
+    for (pending.items) |item| try status_batch.put(item.key, &item.value);
+    try status_batch.commit();
+}
+
+pub fn saveIndexStatusSnapshot(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    sequence: u64,
+) !void {
+    return try saveIndexStatusSnapshots(alloc, store, index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+        .index_name = index_name,
+        .sequence = sequence,
+    }});
+}
+
+pub fn loadIndexStatusSnapshot(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+) !?IndexStatusSnapshot {
+    const key = try indexStatusKeyAlloc(alloc, index_name);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return decodeIndexStatusSnapshot(raw) catch null;
+}
+
+pub fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
+    if (status_snapshot.kind != item.kind) return;
+    item.doc_count = status_snapshot.doc_count;
+    item.term_count = status_snapshot.term_count;
+    item.edge_count = status_snapshot.edge_count;
+    item.node_count = status_snapshot.node_count;
+    item.root_node = status_snapshot.root_node;
 }
 
 pub fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
@@ -524,10 +969,10 @@ pub fn BatchExecutionContext(comptime DB: type) type {
         async_context: ?*AsyncContext(DB) = null,
         dense_bulk_session_scope: DenseBulkSessionScope = .auto,
         relational_base_rows: bool = false,
-        ha_async_effect_mirror: ?ha_replication.AsyncEffectMirror = null,
-        ha_async_batch_mirror: ?ha_replication.AsyncBatchMirror = null,
-        ha_async_metadata_mirror: ?ha_replication.AsyncMetadataMirror = null,
-        ha_write_gate: ?ha_replication.WriteGate = null,
+        ha_async_effect_mirror: ?ha_types.AsyncEffectMirror = null,
+        ha_async_batch_mirror: ?ha_types.AsyncBatchMirror = null,
+        ha_async_metadata_mirror: ?ha_types.AsyncMetadataMirror = null,
+        ha_write_gate: ?ha_types.WriteGate = null,
     };
 }
 
@@ -544,10 +989,10 @@ pub fn EnrichmentAppendContext(comptime DB: type) type {
         executor: *derived_executor_mod.Executor,
         async_context: ?*AsyncContext(DB),
         log_mutex: *std.atomic.Mutex,
-        ha_async_effect_mirror: ?ha_replication.AsyncEffectMirror = null,
-        ha_async_batch_mirror: ?ha_replication.AsyncBatchMirror = null,
-        ha_async_metadata_mirror: ?ha_replication.AsyncMetadataMirror = null,
-        ha_write_gate: ?ha_replication.WriteGate = null,
+        ha_async_effect_mirror: ?ha_types.AsyncEffectMirror = null,
+        ha_async_batch_mirror: ?ha_types.AsyncBatchMirror = null,
+        ha_async_metadata_mirror: ?ha_types.AsyncMetadataMirror = null,
+        ha_write_gate: ?ha_types.WriteGate = null,
         resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
         promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -1146,6 +1591,15 @@ pub fn docIdsForOrdinalsAtGenerationTxnAlloc(
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        pub fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
+            const ctx: *AsyncContext(DB) = @ptrCast(@alignCast(ptr));
+            if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+        }
+
+        pub fn lockApply(db: *DB) void {
+            db.core.lockApply();
+        }
+
         pub fn resolveWriteTimestampNs(self: *DB, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
             const schema = self.core.schema orelse return fallback_timestamp_ns;
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
@@ -1440,24 +1894,7 @@ pub const ProfiledApplyLock = struct {
 };
 
 pub fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        if (attempts < 64) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        if (attempts < 128) {
-            spinOrYield();
-            continue;
-        }
-        const backoff_step = @min(attempts - 128, 5);
-        const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
-        sleepNs(sleep_ns);
-    }
+    platform.sync.lockYielding(mutex);
 }
 
 pub fn lockAtomicWithBackoffProfiled(

@@ -1287,6 +1287,10 @@ pub fn Impl(comptime DB: type) type {
             return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
         }
 
+        pub fn saveIndexStatusSnapshot(self: *DB, index_name: []const u8, sequence: u64) !void {
+            return try db_internal.saveIndexStatusSnapshot(self.alloc, self.core.store, self.core.index_manager, index_name, sequence);
+        }
+
         pub fn rebuildRelationalSecondaryIndexInRange(
             self: *DB,
             index_name: []const u8,

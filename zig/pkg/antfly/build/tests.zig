@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+pub const no_default_filters = [_][]const u8{};
+
 pub const DBTestStep = struct {
     name: []const u8,
     description: []const u8,
@@ -24,6 +26,18 @@ pub const DBTestStep = struct {
 pub const DBRootTestStep = struct {
     tests: *std.Build.Step.Compile,
     run: *std.Build.Step.Run,
+};
+
+pub const ModuleTestRun = struct {
+    tests: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+    step: *std.Build.Step,
+};
+
+pub const ModuleTestOptions = struct {
+    filters: ?[]const []const u8 = null,
+    select_filters: bool = true,
+    simple_runner: bool = false,
 };
 
 pub const DBRootModuleTestSteps = struct {
@@ -148,10 +162,23 @@ pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
 pub const db_sim_step_name = "db-sim-test";
 
+pub const capi_default_filters = [_][]const u8{
+    "capi lite opens exports imports checks and vacuums aflite",
+    "capi zero buffer helper wipes bytes before free",
+    "capi lite exposes hosted and status-only profiles",
+    "capi lite open options validate and configure ttl cleanup",
+    "capi execute graph queries honors identity read generation",
+    "capi search rejects stale identity generation before readable lease hook",
+    "capi search json returns stamped identity generation",
+    "packed dense response exposes public ids not doc ordinals",
+    "dense response identity generation footer",
+    "capi aggregate hits rejects stale identity generation before aggregation materialization",
+};
+
 pub const DBTestFilters = struct {
-    // Keep these buckets at module/category granularity. New DB tests should
-    // normally join an owning module or stable prefix instead of adding a
-    // one-off title here or in build.zig.
+    // Keep DB buckets at module/category granularity. build.zig wires coarse
+    // steps and aggregates only, so a DB regression should normally join an
+    // owning module or stable prefix instead of adding a one-off title.
     pub const root = [_][]const u8{
         "storage.db.db.test.",
     };
@@ -865,7 +892,6 @@ pub const APITestFilters = struct {
         "distributed graph edge reader carries identity generation",
         "query merge preserves common identity read generation",
         "query encoder does not expose internal doc ordinals",
-        "graph edge local read rejects stale identity generation",
         "catalog doc identity readiness checks table range health",
         "catalog resolved filter validation accepts preserved split identity domains",
         "metadata merge request validation rejects incompatible doc identity namespaces",
@@ -891,7 +917,6 @@ pub const APITestFilters = struct {
         "enrichment worker chunk cache keys preserve embedded separators",
         "search request text stats keys preserve embedded separators",
         "merge distributed background text stats keys preserve embedded separators",
-        "graph edge local read rejects stale identity namespace",
         "dense metadata keys preserve embedded index separators",
         "dense metadata lookups read legacy textual rows",
         "distributed txn participant ids preserve embedded group markers",
@@ -909,11 +934,6 @@ pub const APITestFilters = struct {
         "api http client preserves group doc identity conflicts",
         "aggregation context rejects non-current identity generation",
         "aggregation full-result rerun can reuse snapped result identity generation",
-        "explicit text stats requests preserve identity generation",
-        "explicit text stats requests carry resolved doc filters and apply exact projection",
-        "explicit text stats requests reject stale identity generation",
-        "algebraic partial request fails closed when lifecycle is stale",
-        "algebraic partial request accepts current identity generation and rejects stale",
         "provisioned distributed aggregations collect path terms nested cardinality",
         "algebraic distributed planner selects identity-stamped derived join tensor program",
         "algebraic derived join tensor reads subtract identity tombstones at generation",
@@ -1035,6 +1055,7 @@ pub const APITestFilters = struct {
 
     pub const table_writes_docid = [_][]const u8{
         "table write index parser keeps full text field metadata out of storage config",
+        "table write startup configured index parser supports object and array forms",
         "api auto bulk ingest does not open sessions for normal online writes",
         "weak sync levels do not drain managed db after batch",
         "provisioning detects model backed graph shorthand assets inside config_json strings",
@@ -1098,6 +1119,8 @@ pub const APITestFilters = struct {
         "merge distributed text stats sums shard corpus stats by field and term",
         "merge distributed background text stats keys preserve embedded separators",
         "graph hydrate resolved doc filter applies include and exclude sets",
+        "graph edge local read rejects stale identity generation",
+        "graph edge local read rejects stale identity namespace",
         "provisioned table read source executes relational row query plans across ranges",
         "routed rows query plan executes over scanned owner rows with ctes",
         "external lake rows query and aggregate plans route through lake scan hook",
@@ -1112,17 +1135,26 @@ pub const APITestFilters = struct {
         "lowered sql set operation plans preserve overlapping union all rows",
         "lowered sql set operation materialization admission distinguishes spill from hard caps",
         "lowered sql recursive cte materialization admission uses stream spill policy",
+        "lowered sql recursive cte plans execute bounded materialization",
         "lowered sql insert source plans build batches from routed scans",
         "lowered sql merge mutation plans build batches from routed scans",
+        "lowered sql recursive merge mutation plans build batches from routed scans",
         "lowered relation population plans execute routed typed read sources",
         "lowered document sql read plans execute native lookup and bounded scan",
         "document sql catalog read producers treat catalog misses as terminal",
         "lowered document sql aggregate executes native grouped avg materialization",
         "lowered document sql aggregate uses catalog target for non-default namespace materialization",
+        "explicit text stats requests preserve identity generation",
+        "explicit text stats requests carry resolved doc filters and apply exact projection",
+        "explicit text stats requests reject stale identity generation",
+        "api.table_reads.remote_wire.test.algebraic partial request ",
+        "algebraic partial request fails closed when lifecycle is stale",
+        "algebraic partial request accepts current identity generation and rejects stale",
         "remote document algebraic aggregate preserves typed unavailable and not found errors",
         "internal group document algebraic aggregate route preserves typed errors",
         "document algebraic aggregate fan-in merges raw grouped averages before applying limit",
         "document algebraic aggregate fan-in preserves empty scalar aggregate semantics",
+        "lowered relation population row transfer empties source result",
         "parseRemoteSearchResult preserves fused index scores",
         "hosted remote temporal unique owner lookup resolves point interval",
         "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
@@ -1329,7 +1361,6 @@ pub const RootTestFilters = struct {
         "query merge rejects ambiguous graph search fan-in metric status",
         "query merge preserves failed graph search metric status across shards",
         "query merge enforces graph search order and filter metric generations across shards",
-        "lowered sql recursive cte plans execute bounded materialization",
         "query profile reports merged graph search metric generation",
         "query merge requires comparable graph metric rerank generations across shards",
         "query merge rejects malformed graph metric rerank score details",
@@ -1447,6 +1478,74 @@ pub const HATestFilters = struct {
         "storage.ha compat keeps v1 backup manifest encoding stable",
         "storage.ha compat keeps v1 backup manifest file kind tags stable",
         "storage.ha compat keeps v1 record kind tags stable",
+    };
+};
+
+pub const PackageTestFilters = struct {
+    pub const image_conformance = [_][]const u8{
+        "conformance corpus",
+    };
+
+    pub const generating_runtime = [_][]const u8{
+        "generating backend factory executes fallback chain across providers",
+        "asset producer runtime",
+    };
+
+    pub const reranking_runtime = [_][]const u8{
+        "reranking runtime",
+    };
+
+    pub const common = [_][]const u8{
+        "provider registry",
+    };
+
+    pub const common_config = [_][]const u8{
+        "common config",
+    };
+
+    pub const embedded = [_][]const u8{
+        "embedded",
+    };
+
+    pub const antfly_embedded_root = [_][]const u8{
+        "pkg antfly embedded root",
+    };
+
+    pub const antfly_embedded_db = [_][]const u8{
+        "pkg antfly embedded db",
+    };
+
+    pub const antfly_embedded_api = [_][]const u8{
+        "pkg antfly embedded api",
+    };
+
+    pub const antfly_client = [_][]const u8{
+        "antfly client pkg compiles",
+    };
+
+    pub const lite_native = [_][]const u8{
+        "storage.lite.",
+    };
+
+    pub const lite_cli = [_][]const u8{
+        "cmd.lite",
+        "cmd.cli.backup",
+    };
+
+    pub const lsm_backend_sim = [_][]const u8{
+        "lsm backend simulation",
+    };
+
+    pub const lsm_backend_chaos = [_][]const u8{
+        "lsm backend compaction chaos campaign",
+    };
+
+    pub const serverless = [_][]const u8{
+        "serverless",
+    };
+
+    pub const lite_core_main = [_][]const u8{
+        "lite core main compiles",
     };
 };
 
@@ -1693,6 +1792,112 @@ pub const StorageTestFilters = struct {
     };
 };
 
+pub const ArtifactReprocessJobTestFilters = struct {
+    pub const store = [_][]const u8{
+        "artifact reprocess job store starts and updates a job",
+        "artifact reprocess job store recovers durable jobs and reseeds ids",
+        "artifact reprocess job cleanup removes recovered durable expired jobs",
+    };
+};
+
+pub const SwarmRuntimeTestFilters = struct {
+    pub const focused = [_][]const u8{
+        "swarm runtime module compiles",
+        "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
+        "swarm runtime registers internal group routes explicitly",
+        "swarm runtime registers mcp routes before antfarm catch-all",
+        "parse cli accepts config path",
+        "parse cli accepts secret store path",
+        "parse cli accepts ARD identity flags",
+        "parse cli accepts canonical host port and models dir flags",
+        "parse cli accepts HA primary runtime flags",
+        "parse cli accepts HA primary sync policy flags",
+        "parse cli accepts HA standby runtime flags",
+        "swarm HA standby replication flags require upstream and slot",
+        "swarm HA string classifier distinguishes missing padded and valid values",
+        "swarm HA runtime rejects ambiguous role flags",
+        "antfly config uses cli override before common config",
+        "swarm public api caps keep alive request reuse",
+        "swarm public api body limit matches common http listener",
+        "swarm public HTTP server uses public API request body limit",
+        "parse cli accepts inference budget overrides",
+        "inference config falls back to common config",
+        "swarm runtime resolves paths from common storage base dir",
+        "swarm local metadata drop table cascade removes child foreign keys",
+        "swarm runtime resolves extension package store env before local default",
+    };
+};
+
+pub const StorageBackendTestFilters = struct {
+    pub const lmdb_replay = [_][]const u8{
+        "LMDB replay fixtures stay green",
+    };
+
+    pub const lmdb_soak = [_][]const u8{
+        "LMDB sim soak stays green",
+    };
+
+    pub const wal_sim = [_][]const u8{
+        "wal sim",
+    };
+
+    pub const wal_vopr = [_][]const u8{
+        "wal group commit uses injected virtual clock",
+        "wal can reopen on modeled storage device",
+        "wal modeled storage survives crash before close after acknowledged append",
+        "wal modeled replay runner uses virtual storage and time",
+        "wal modeled crash runner preserves acknowledged public append",
+        "wal modeled VOPR campaign stays green",
+        "wal modeled replay fixtures stay green",
+        "wal modeled crash fixtures stay green",
+        "wal modeled commit backend completion uses scheduled virtual time",
+        "wal modeled storage commit delay uses injected virtual clock",
+    };
+
+    pub const wal_replay = [_][]const u8{
+        "wal replay fixtures stay green",
+    };
+
+    pub const wal_soak = [_][]const u8{
+        "wal sim soak stays green",
+    };
+
+    pub const persistent_sim = [_][]const u8{
+        "persistent sim workloads stay green",
+    };
+
+    pub const persistent_replay = [_][]const u8{
+        "persistent replay fixtures stay green",
+    };
+
+    pub const persistent_vopr = [_][]const u8{
+        "persistent modeled replay fixtures stay green",
+        "persistent modeled sim workload stays green",
+        "persistent modeled full-text compaction publish faults stay green",
+    };
+
+    pub const persistent_soak = [_][]const u8{
+        "persistent sim soak stays green",
+    };
+
+    pub const index_manager_resource = [_][]const u8{
+        "text merge resource manager accounts pending bytes and active buffers",
+    };
+
+    pub const index_manager_sim = [_][]const u8{
+        "index manager sim workloads stay green",
+    };
+
+    pub const index_manager_replay = [_][]const u8{
+        "index manager replay fixtures stay green",
+    };
+
+    pub const index_manager_vopr = [_][]const u8{
+        "index manager modeled replay fixtures stay green",
+        "index manager modeled crash fixtures stay green",
+    };
+};
+
 pub const GraphMetricTestFilters = struct {
     pub const lifecycle = [_][]const u8{
         "graph degree planned build publishes scores matching local runner",
@@ -1798,6 +2003,26 @@ pub const GraphMetricTestFilters = struct {
     };
 };
 
+pub const GraphMetricCommandTestFilters = struct {
+    pub const operations = [_][]const u8{
+        "graph metric maintenance command parses service target config",
+        "graph metric maintenance service request stays owner and budget scoped",
+        "graph metric maintenance service runner aggregates remote ticks",
+        "graph metric maintenance service boundary preserves worker pool owner request",
+        "graph metric maintenance supervisor parses config and defaults workers",
+        "graph metric maintenance supervisor parses service target config",
+        "graph metric maintenance supervisor builds coordinator and worker pool argv",
+        "graph metric maintenance supervisor builds service child argv without local writer guard",
+        "graph metric maintenance launched child argv stays owner and budget scoped",
+        "graph metric maintenance supervisor restart policy is bounded",
+        "graph metric maintenance supervisor parses child runtime telemetry",
+        "graph metric maintenance command exits after configured idle streak",
+        "graph metric maintenance command summary exposes ownership telemetry",
+    };
+};
+
+// DB focused targets are registered from these private inventories so build.zig
+// depends on aggregate handles instead of growing a field per regression.
 const db_root_module_steps = [_]DBTestStep{
     .{
         .name = "lib-db-enrichment-test",
@@ -2012,6 +2237,38 @@ fn addTestArtifact(
         .root_module = root_module,
         .filters = selectTestFilters(b, default_filters),
     });
+}
+
+pub fn addModuleTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    step_name: []const u8,
+    description: []const u8,
+    options: ModuleTestOptions,
+) ModuleTestRun {
+    const filters: []const []const u8 = if (options.filters) |default_filters|
+        if (options.select_filters) selectTestFilters(b, default_filters) else default_filters
+    else
+        &.{};
+    const tests = if (options.simple_runner) b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    }) else b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+    });
+    const run = b.addRunArtifact(tests);
+    const step = b.step(step_name, description);
+    step.dependOn(&run.step);
+    return .{
+        .tests = tests,
+        .run = run,
+        .step = step,
+    };
 }
 
 fn addSimpleAPITestRun(

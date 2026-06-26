@@ -33,6 +33,7 @@ const runtime_status = @import("../runtime_status.zig");
 const table_catalog = @import("../table_catalog.zig");
 const tables_api = @import("../tables.zig");
 const table_write_bulk_ingest = @import("bulk_ingest.zig");
+const table_write_index_config = @import("index_config.zig");
 const table_write_managed_db = @import("managed_db.zig");
 
 const max_cached_write_tables = 64;
@@ -41,6 +42,7 @@ const auto_bulk_ingest_max_window_ops = table_write_bulk_ingest.max_window_ops;
 const auto_bulk_ingest_max_idle_ns = table_write_bulk_ingest.max_idle_ns;
 const auto_bulk_ingest_finish_options = table_write_bulk_ingest.finish_options;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
+const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
 const loadTableIdentityNamespaceForGroup = table_write_managed_db.loadTableIdentityNamespaceForGroup;
 const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions;
@@ -130,6 +132,181 @@ pub fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionSt
     dst.section_index_bytes +|= src.section_index_bytes;
     dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
     dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
+}
+
+fn dbHbcCacheKindStatsFromIndex(cache_stats: hbc_mod.HbcCacheKindStats) db_mod.types.HbcCacheKindStats {
+    return .{
+        .used_bytes = cache_stats.used_bytes,
+        .peak_bytes = cache_stats.peak_bytes,
+        .insertions = cache_stats.insertions,
+        .admission_skips = cache_stats.admission_skips,
+        .evictions = cache_stats.evictions,
+    };
+}
+
+fn dbHbcCacheStatsFromIndex(cache_stats: hbc_mod.HbcCacheStats) db_mod.types.HbcCacheStats {
+    return .{
+        .total_bytes = cache_stats.total_bytes,
+        .accounted_bytes = cache_stats.accounted_bytes,
+        .node = dbHbcCacheKindStatsFromIndex(cache_stats.node),
+        .quantized = dbHbcCacheKindStatsFromIndex(cache_stats.quantized),
+        .vector = dbHbcCacheKindStatsFromIndex(cache_stats.vector),
+        .metadata = dbHbcCacheKindStatsFromIndex(cache_stats.metadata),
+    };
+}
+
+fn dbHbcPostingStatsFromIndex(backlog: hbc_mod.PostingBacklogStats, profile: hbc_mod.WriteProfile) db_mod.types.HbcPostingStats {
+    return .{
+        .scanned_nodes = backlog.scanned_nodes,
+        .scanned_postings = backlog.scanned_postings,
+        .dirty_postings = backlog.dirty_postings,
+        .centroid_dirty_postings = backlog.centroid_dirty_postings,
+        .payload_dirty_postings = backlog.payload_dirty_postings,
+        .max_centroid_version_lag = backlog.max_centroid_version_lag,
+        .max_payload_version_lag = backlog.max_payload_version_lag,
+        .max_mutation_version = backlog.max_mutation_version,
+        .skipped_missing = backlog.skipped_missing,
+        .maintenance_scanned_nodes = profile.posting_maintenance_scanned_nodes,
+        .maintenance_scanned_postings = profile.posting_maintenance_scanned_postings,
+        .maintenance_dirty_postings = profile.posting_maintenance_dirty_postings,
+        .maintenance_repaired_postings = profile.posting_maintenance_repaired_postings,
+        .maintenance_centroid_refreshed = profile.posting_maintenance_centroid_refreshed,
+        .maintenance_payload_refreshed = profile.posting_maintenance_payload_refreshed,
+        .maintenance_ancestor_refresh_roots = profile.posting_maintenance_ancestor_refresh_roots,
+        .maintenance_split_postings = profile.posting_maintenance_split_postings,
+        .maintenance_merged_postings = profile.posting_maintenance_merged_postings,
+        .maintenance_boundary_reassigned_vectors = profile.posting_maintenance_boundary_reassigned_vectors,
+        .lazy_centroid_deferrals = profile.posting_lazy_centroid_deferrals,
+        .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
+        .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
+    };
+}
+
+pub fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod.DB) void {
+    if (!db.core.tryLockApplyShared()) return;
+    defer db.core.unlockApplyShared();
+
+    for (stats.indexes) |*item| {
+        if (item.kind != .dense_vector) continue;
+        if (db.core.denseIndex(item.name)) |entry| {
+            item.hbc_cache = dbHbcCacheStatsFromIndex(entry.index.hbcCacheStats());
+        }
+    }
+}
+
+pub fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRuntimeStatus, db: *db_mod.DB) void {
+    const target_sequence = db.core.nextDerivedSequence();
+    const async_stats = db.snapshotAsyncIndexingStats();
+    status.stats.async_indexing = async_stats;
+    for (status.stats.indexes) |*item| {
+        if (target_sequence > item.replay_target_sequence) {
+            item.replay_target_sequence = target_sequence;
+            item.catch_up_target_sequence = target_sequence;
+        }
+        if (item.catch_up_target_sequence < item.replay_target_sequence) {
+            item.catch_up_target_sequence = item.replay_target_sequence;
+        }
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        item.catch_up_applied_sequence = item.replay_applied_sequence;
+        item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
+        item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
+    }
+}
+
+pub fn startupCatchUpStatsForPhase(
+    phase: db_mod.types.StartupCatchUpPhase,
+    db: ?*db_mod.DB,
+) db_mod.types.StartupCatchUpStats {
+    var stats: db_mod.types.StartupCatchUpStats = if (db) |managed_db|
+        managed_db.snapshotAsyncIndexingStats().startup
+    else
+        .{};
+    stats.active = phase != .idle;
+    stats.phase = phase;
+    if (db) |managed_db| {
+        const maintenance = managed_db.snapshotLsmMaintenanceStats();
+        stats.wal_retention_known = true;
+        stats.wal_retained_segments = maintenance.wal_retained_segments;
+        stats.wal_retained_bytes = maintenance.wal_retained_bytes;
+    }
+    return stats;
+}
+
+pub fn startupCatchUpStatsForPath(
+    path: []const u8,
+    phase: db_mod.types.StartupCatchUpPhase,
+    configured_indexes: ?*const StartupConfiguredIndexes,
+) !db_mod.types.StartupCatchUpStats {
+    var stats: db_mod.types.StartupCatchUpStats = .{
+        .active = phase != .idle,
+        .phase = phase,
+        .wal_retention_known = phase != .idle,
+    };
+    if (phase == .idle) return stats;
+
+    var native = try lsm_backend.storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+
+    const main_retention = try lsm_backend.wal.snapshotRetention(native.storage(), std.heap.page_allocator, path);
+    const replay_retention = try lsm_backend.wal.snapshotReplayRetention(native.storage(), std.heap.page_allocator, path);
+    stats.wal_retained_segments = main_retention.segments + replay_retention.segments;
+    stats.wal_retained_bytes = main_retention.bytes + replay_retention.bytes;
+    if (configured_indexes) |summary| {
+        summary.populateConfiguredCounts(&stats);
+        try summary.accumulateRetention(native.storage(), std.heap.page_allocator, path, &stats);
+    }
+    return stats;
+}
+
+pub fn applyStartupCatchUpAsyncOverlay(
+    status: *runtime_status.LocalTableRuntimeStatus,
+    async_stats: db_mod.types.AsyncIndexingStats,
+    startup: db_mod.types.StartupCatchUpStats,
+) void {
+    status.stats.async_indexing = async_stats;
+    var merged_startup = status.stats.async_indexing.startup;
+    db_mod.types.accumulateStartupCatchUpStats(&merged_startup, startup);
+    status.stats.async_indexing.startup = merged_startup;
+}
+
+pub fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    configured_indexes: *const StartupConfiguredIndexes,
+    startup: db_mod.types.StartupCatchUpStats,
+) !runtime_status.LocalTableRuntimeStatus {
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, configured_indexes.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (indexes[0..initialized]) |index| freeSyntheticStartupIndexStatsItem(alloc, index);
+        alloc.free(indexes);
+    }
+
+    for (configured_indexes.items) |item| {
+        var stats = db_mod.types.DBIndexStats{
+            .name = try alloc.dupe(u8, item.name),
+            .kind = item.kind,
+        };
+        errdefer freeSyntheticStartupIndexStatsItem(alloc, stats);
+        try item.populateStats(alloc, &stats);
+        indexes[initialized] = stats;
+        initialized += 1;
+    }
+
+    return .{
+        .group_id = group_id,
+        .stats = .{
+            .index_count = @intCast(indexes.len),
+            .indexes = indexes,
+            .async_indexing = .{ .startup = startup },
+        },
+    };
+}
+
+fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {
+    alloc.free(item.name);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

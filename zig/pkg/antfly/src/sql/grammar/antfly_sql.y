@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 9673
+%expect 9768
 
 %start statement
 
@@ -71,6 +71,9 @@ transaction_statement:
   | BEGIN begin_transaction_tail_opt
   | COMMIT transaction_boundary_tail_opt
   | ROLLBACK transaction_boundary_tail_opt
+  | ROLLBACK TO savepoint_keyword_opt identifier_name
+  | SAVEPOINT identifier_name
+  | RELEASE savepoint_keyword_opt identifier_name
   ;
 
 transaction_boundary_tail_opt:
@@ -111,6 +114,11 @@ transaction_isolation_level:
   | REPEATABLE READ
   | READ COMMITTED
   | READ UNCOMMITTED
+  ;
+
+savepoint_keyword_opt:
+    /* empty */
+  | SAVEPOINT
   ;
 
 prepared_statement:

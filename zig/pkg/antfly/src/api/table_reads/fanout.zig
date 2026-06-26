@@ -269,6 +269,382 @@ pub fn planQueryFanout(
     };
 }
 
+pub const TextStatsFanoutSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    fields: []const distributed_stats_mod.TextFieldStats = &.{},
+    err: ?anyerror = null,
+
+    fn init() TextStatsFanoutSlot {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
+    }
+
+    fn deinit(self: *TextStatsFanoutSlot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const SearchFanoutSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    result: ?db_mod.types.SearchResult = null,
+    err: ?anyerror = null,
+
+    fn init() SearchFanoutSlot {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
+    }
+
+    fn deinit(self: *SearchFanoutSlot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const PreflightFanoutSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    summary: ?db_mod.RuntimePreflightSummary = null,
+    err: ?anyerror = null,
+
+    fn init() PreflightFanoutSlot {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
+    }
+
+    fn deinit(self: *PreflightFanoutSlot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn initTextStatsFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]TextStatsFanoutSlot {
+    const slots = try alloc.alloc(TextStatsFanoutSlot, count);
+    errdefer alloc.free(slots);
+    for (slots) |*slot| slot.* = .init();
+    return slots;
+}
+
+pub fn deinitTextStatsFanoutSlots(alloc: std.mem.Allocator, slots: []TextStatsFanoutSlot) void {
+    for (slots) |*slot| slot.deinit();
+    alloc.free(slots);
+}
+
+pub fn initSearchFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]SearchFanoutSlot {
+    const slots = try alloc.alloc(SearchFanoutSlot, count);
+    errdefer alloc.free(slots);
+    for (slots) |*slot| slot.* = .init();
+    return slots;
+}
+
+pub fn deinitSearchFanoutSlots(alloc: std.mem.Allocator, slots: []SearchFanoutSlot) void {
+    for (slots) |*slot| slot.deinit();
+    alloc.free(slots);
+}
+
+pub fn initPreflightFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]PreflightFanoutSlot {
+    const slots = try alloc.alloc(PreflightFanoutSlot, count);
+    errdefer alloc.free(slots);
+    for (slots) |*slot| slot.* = .init();
+    return slots;
+}
+
+pub fn deinitPreflightFanoutSlots(alloc: std.mem.Allocator, slots: []PreflightFanoutSlot) void {
+    for (slots) |*slot| slot.deinit();
+    alloc.free(slots);
+}
+
+pub fn cloneRuntimePreflightSummary(
+    alloc: std.mem.Allocator,
+    summary: db_mod.RuntimePreflightSummary,
+) !db_mod.RuntimePreflightSummary {
+    var cloned: db_mod.RuntimePreflightSummary = .{};
+    errdefer cloned.deinit(alloc);
+    try mergeRuntimePreflightSummaryNoFree(alloc, &cloned, summary);
+    return cloned;
+}
+
+pub fn mergeRuntimePreflightSummary(
+    alloc: std.mem.Allocator,
+    target: *db_mod.RuntimePreflightSummary,
+    extra: db_mod.RuntimePreflightSummary,
+) !void {
+    defer {
+        var owned = extra;
+        owned.deinit(alloc);
+    }
+
+    try mergeRuntimePreflightSummaryNoFree(alloc, target, extra);
+}
+
+pub fn mergeRuntimePreflightSummaryNoFree(
+    alloc: std.mem.Allocator,
+    target: *db_mod.RuntimePreflightSummary,
+    extra: db_mod.RuntimePreflightSummary,
+) !void {
+    try mergeRuntimePreflightStrings(alloc, &target.result_refs, extra.result_refs);
+    try mergeRuntimePreflightStrings(alloc, &target.graph_query_order, extra.graph_query_order);
+    try mergeRuntimePreflightTextEstimates(alloc, &target.text_indexes, extra.text_indexes);
+    try mergeRuntimePreflightEmbeddingEstimates(alloc, &target.embedding_indexes, extra.embedding_indexes);
+    try mergeRuntimePreflightGraphEstimates(alloc, &target.graph_indexes, extra.graph_indexes);
+    try mergeRuntimePreflightTextQueryStats(alloc, &target.text_query_stats, extra.text_query_stats);
+    target.doc_id_value_count = @max(target.doc_id_value_count, extra.doc_id_value_count);
+    target.filter_id_count = @max(target.filter_id_count, extra.filter_id_count);
+    target.exclude_id_count = @max(target.exclude_id_count, extra.exclude_id_count);
+    target.numeric_range_clause_count = @max(target.numeric_range_clause_count, extra.numeric_range_clause_count);
+    target.term_range_clause_count = @max(target.term_range_clause_count, extra.term_range_clause_count);
+    target.ip_range_clause_count = @max(target.ip_range_clause_count, extra.ip_range_clause_count);
+    target.bool_field_clause_count = @max(target.bool_field_clause_count, extra.bool_field_clause_count);
+    target.geo_filter_clause_count = @max(target.geo_filter_clause_count, extra.geo_filter_clause_count);
+    target.positive_id_result_upper_bound = if (target.positive_id_result_upper_bound) |existing|
+        if (extra.positive_id_result_upper_bound) |incoming|
+            @min(existing, incoming)
+        else
+            existing
+    else
+        extra.positive_id_result_upper_bound;
+    const target_pre_merge_lower_bound = if (target.structured_filter_doc_count_lower_bound) |value|
+        value
+    else if (target.structured_filter_count_exact)
+        target.structured_filter_doc_count_estimate
+    else
+        target.structured_filter_doc_count_estimate;
+    const extra_pre_merge_lower_bound = if (extra.structured_filter_doc_count_lower_bound) |value|
+        value
+    else if (extra.structured_filter_count_exact)
+        extra.structured_filter_doc_count_estimate
+    else
+        extra.structured_filter_doc_count_estimate;
+    if (target.structured_filter_count_exact and extra.structured_filter_count_exact) {
+        if (target.structured_filter_doc_count_estimate) |existing| {
+            if (extra.structured_filter_doc_count_estimate) |incoming| {
+                target.structured_filter_doc_count_estimate = existing + incoming;
+                target.structured_filter_count_exact = true;
+            } else {
+                target.structured_filter_doc_count_estimate = null;
+                target.structured_filter_count_exact = false;
+            }
+        } else if (extra.structured_filter_doc_count_estimate) |incoming| {
+            target.structured_filter_doc_count_estimate = incoming;
+            target.structured_filter_count_exact = true;
+        } else {
+            target.structured_filter_doc_count_estimate = null;
+            target.structured_filter_count_exact = false;
+        }
+    } else {
+        target.structured_filter_doc_count_estimate = null;
+        target.structured_filter_count_exact = false;
+    }
+    target.structured_filter_doc_count_sample_estimate = if (target.structured_filter_doc_count_sample_estimate) |existing|
+        if (extra.structured_filter_doc_count_sample_estimate) |incoming|
+            existing + incoming
+        else
+            existing
+    else
+        extra.structured_filter_doc_count_sample_estimate;
+    target.structured_filter_count_sample_size += extra.structured_filter_count_sample_size;
+    if (target.structured_filter_count_exact) {
+        target.structured_filter_doc_count_sample_estimate = null;
+        target.structured_filter_count_sample_size = 0;
+    }
+    if (target.structured_filter_count_exact) {
+        target.structured_filter_doc_count_lower_bound = null;
+    } else {
+        target.structured_filter_doc_count_lower_bound = if (target_pre_merge_lower_bound != null or extra_pre_merge_lower_bound != null)
+            (target_pre_merge_lower_bound orelse 0) + (extra_pre_merge_lower_bound orelse 0)
+        else
+            null;
+    }
+    target.structured_filter_count_budget_limit = if (target.structured_filter_count_budget_limit) |existing|
+        if (extra.structured_filter_count_budget_limit) |incoming|
+            @max(existing, incoming)
+        else
+            existing
+    else
+        extra.structured_filter_count_budget_limit;
+    target.shard_result_window = @max(target.shard_result_window, extra.shard_result_window);
+    target.shard_result_window_total += extra.shard_result_window_total;
+    target.stored_projection_doc_upper_bound_total += extra.stored_projection_doc_upper_bound_total;
+    target.rerank_doc_upper_bound = @max(target.rerank_doc_upper_bound, extra.rerank_doc_upper_bound);
+    target.aggregation_may_scan_full_results = target.aggregation_may_scan_full_results or extra.aggregation_may_scan_full_results;
+    target.shard_count += extra.shard_count;
+    target.remote_shard_count += extra.remote_shard_count;
+    target.dense_query_count += extra.dense_query_count;
+    target.vector_worker_candidate_count += extra.vector_worker_candidate_count;
+    target.vector_worker_fallback_count += extra.vector_worker_fallback_count;
+    target.vector_worker_filter_constraint_count += extra.vector_worker_filter_constraint_count;
+    target.vector_worker_requires_algebraic_filter_resolution = target.vector_worker_requires_algebraic_filter_resolution or
+        extra.vector_worker_requires_algebraic_filter_resolution;
+    target.dense_effective_k_total += extra.dense_effective_k_total;
+    target.dense_search_width_total += extra.dense_search_width_total;
+    target.dense_search_width_max = @max(target.dense_search_width_max, extra.dense_search_width_max);
+    target.dense_epsilon_max = @max(target.dense_epsilon_max, extra.dense_epsilon_max);
+    db_mod.deriveRuntimePreflightEstimates(target);
+}
+
+fn mergeRuntimePreflightTextQueryStats(
+    alloc: std.mem.Allocator,
+    target: *[]const distributed_stats_mod.TextFieldStats,
+    extra: []const distributed_stats_mod.TextFieldStats,
+) !void {
+    const merged = try mergeDistributedTextStats(alloc, &[_][]const distributed_stats_mod.TextFieldStats{
+        target.*,
+        extra,
+    });
+    distributed_stats_mod.deinitTextFieldStats(alloc, target.*);
+    target.* = merged;
+}
+
+fn mergeRuntimePreflightStrings(
+    alloc: std.mem.Allocator,
+    target: *[]const []const u8,
+    extra: []const []const u8,
+) !void {
+    var items = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (items.items) |item| alloc.free(item);
+        items.deinit(alloc);
+    }
+    for (target.*) |item| try appendUniqueRuntimePreflightString(alloc, &items, item);
+    for (extra) |item| try appendUniqueRuntimePreflightString(alloc, &items, item);
+    freeRuntimePreflightStringSlice(alloc, target.*);
+    target.* = if (items.items.len == 0) &.{} else try items.toOwnedSlice(alloc);
+}
+
+fn appendUniqueRuntimePreflightString(
+    alloc: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try items.append(alloc, try alloc.dupe(u8, value));
+}
+
+fn freeRuntimePreflightStringSlice(alloc: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| alloc.free(@constCast(item));
+    if (items.len > 0) alloc.free(@constCast(items));
+}
+
+fn mergeRuntimePreflightTextEstimates(
+    alloc: std.mem.Allocator,
+    target: *[]const db_mod.TextIndexEstimate,
+    extra: []const db_mod.TextIndexEstimate,
+) !void {
+    var items = std.ArrayListUnmanaged(db_mod.TextIndexEstimate).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    for (target.*) |item| try items.append(alloc, .{
+        .name = try alloc.dupe(u8, item.name),
+        .doc_count = item.doc_count,
+        .chunk_backed = item.chunk_backed,
+        .group_chunk_parents = item.group_chunk_parents,
+    });
+    for (extra) |item| {
+        for (items.items) |*existing| {
+            if (!std.mem.eql(u8, existing.name, item.name)) continue;
+            existing.doc_count += item.doc_count;
+            existing.chunk_backed = existing.chunk_backed or item.chunk_backed;
+            existing.group_chunk_parents = existing.group_chunk_parents or item.group_chunk_parents;
+            break;
+        } else {
+            try items.append(alloc, .{
+                .name = try alloc.dupe(u8, item.name),
+                .doc_count = item.doc_count,
+                .chunk_backed = item.chunk_backed,
+                .group_chunk_parents = item.group_chunk_parents,
+            });
+        }
+    }
+
+    for (target.*) |*item| item.deinit(alloc);
+    if (target.*.len > 0) alloc.free(@constCast(target.*));
+    target.* = if (items.items.len == 0) &.{} else try items.toOwnedSlice(alloc);
+}
+
+fn mergeRuntimePreflightEmbeddingEstimates(
+    alloc: std.mem.Allocator,
+    target: *[]const db_mod.EmbeddingIndexEstimate,
+    extra: []const db_mod.EmbeddingIndexEstimate,
+) !void {
+    var items = std.ArrayListUnmanaged(db_mod.EmbeddingIndexEstimate).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    for (target.*) |item| try items.append(alloc, .{
+        .name = try alloc.dupe(u8, item.name),
+        .sparse = item.sparse,
+        .doc_count = item.doc_count,
+        .dims = item.dims,
+        .chunk_backed = item.chunk_backed,
+    });
+    for (extra) |item| {
+        for (items.items) |*existing| {
+            if (!std.mem.eql(u8, existing.name, item.name) or existing.sparse != item.sparse) continue;
+            existing.doc_count += item.doc_count;
+            existing.chunk_backed = existing.chunk_backed or item.chunk_backed;
+            if (existing.dims == 0) existing.dims = item.dims;
+            break;
+        } else {
+            try items.append(alloc, .{
+                .name = try alloc.dupe(u8, item.name),
+                .sparse = item.sparse,
+                .doc_count = item.doc_count,
+                .dims = item.dims,
+                .chunk_backed = item.chunk_backed,
+            });
+        }
+    }
+
+    for (target.*) |*item| item.deinit(alloc);
+    if (target.*.len > 0) alloc.free(@constCast(target.*));
+    target.* = if (items.items.len == 0) &.{} else try items.toOwnedSlice(alloc);
+}
+
+fn mergeRuntimePreflightGraphEstimates(
+    alloc: std.mem.Allocator,
+    target: *[]const db_mod.GraphIndexEstimate,
+    extra: []const db_mod.GraphIndexEstimate,
+) !void {
+    var items = std.ArrayListUnmanaged(db_mod.GraphIndexEstimate).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    for (target.*) |item| try items.append(alloc, .{
+        .name = try alloc.dupe(u8, item.name),
+        .edge_count = item.edge_count,
+        .node_count = item.node_count,
+    });
+    for (extra) |item| {
+        for (items.items) |*existing| {
+            if (!std.mem.eql(u8, existing.name, item.name)) continue;
+            existing.edge_count += item.edge_count;
+            existing.node_count += item.node_count;
+            break;
+        } else {
+            try items.append(alloc, .{
+                .name = try alloc.dupe(u8, item.name),
+                .edge_count = item.edge_count,
+                .node_count = item.node_count,
+            });
+        }
+    }
+
+    for (target.*) |*item| item.deinit(alloc);
+    if (target.*.len > 0) alloc.free(@constCast(target.*));
+    target.* = if (items.items.len == 0) &.{} else try items.toOwnedSlice(alloc);
+}
+
 pub fn mergeDistributedTextStats(
     alloc: std.mem.Allocator,
     groups: []const []const distributed_stats_mod.TextFieldStats,

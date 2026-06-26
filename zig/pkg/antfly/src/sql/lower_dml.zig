@@ -13200,9 +13200,15 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
     const body_json = try insertBodyJsonAlloc(alloc, columns, rows, conflicts.items, returning);
     defer alloc.free(body_json);
     var batch = if (conflicts.items.len != 0)
-        try relational_rows.parseRowsBatchRequestWithResolver(alloc, table_name, body_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector)
+        relational_rows.parseRowsBatchRequestWithResolver(alloc, table_name, body_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector) catch |err| {
+            std.log.err("generated insert values rows batch parse failed table={s} err={} body={s}", .{ table_name, err, body_json });
+            return err;
+        }
     else
-        try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
+        relational_rows.parseRowsBatchRequest(alloc, body_json, schema) catch |err| {
+            std.log.err("generated insert values rows batch parse failed table={s} err={} body={s}", .{ table_name, err, body_json });
+            return err;
+        };
     errdefer batch.deinit(alloc);
     batch.req.sync_level = options.sync_level;
 

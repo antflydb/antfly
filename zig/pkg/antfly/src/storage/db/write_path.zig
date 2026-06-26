@@ -45,7 +45,6 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const internal_keys = @import("../internal_keys.zig");
-const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const transform_mod = @import("transform.zig");
@@ -4713,7 +4712,7 @@ test "db write path replay buildDerivedBatch stores thin document and embedding 
     extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:dense:doc:a");
     extracted.sparse_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:sparse:doc:a");
 
-    var derived_batch = try buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
+    var derived_batch = try db_internal.buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
     defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
 
     try std.testing.expectEqual(@as(usize, 1), derived_batch.documents.len);
@@ -5886,239 +5885,6 @@ fn computeAssetRequestDerived(
     }
 }
 
-pub fn buildDerivedBatch(
-    alloc: Allocator,
-    req: types.BatchRequest,
-    extracted: []const mapper.ExtractedWrite,
-    deleted_artifact_keys: []const []u8,
-    changed_artifact_keys: []const []u8,
-) !derived_types.DerivedBatch {
-    var documents = try alloc.alloc(derived_types.DerivedDocument, req.writes.len);
-    var initialized: usize = 0;
-    errdefer {
-        var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized] };
-        derived_types.deinitDerivedBatch(alloc, &tmp);
-    }
-
-    for (req.writes, 0..) |write, i| {
-        var targets = std.ArrayListUnmanaged(derived_types.DerivedTargetRef).empty;
-        defer targets.deinit(alloc);
-
-        if (extracted[i].cleaned_value != null) {
-            try targets.append(alloc, .{
-                .kind = .full_text,
-                .index_name = try alloc.dupe(u8, "*"),
-            });
-        }
-        for (extracted[i].dense_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .dense_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
-        }
-        for (extracted[i].sparse_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .sparse_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
-        }
-        for (extracted[i].mentioned_graph_indexes) |index_name| {
-            try targets.append(alloc, .{
-                .kind = .graph,
-                .index_name = try alloc.dupe(u8, index_name),
-            });
-        }
-        for (req.graph_writes) |graph_write| {
-            if (std.mem.eql(u8, graph_write.source, write.key)) {
-                try targets.append(alloc, .{
-                    .kind = .graph,
-                    .index_name = try alloc.dupe(u8, graph_write.index_name),
-                });
-            }
-        }
-
-        documents[i] = .{
-            .key = try alloc.dupe(u8, write.key),
-            .action = if (extracted[i].cleaned_value == null) .preserve_base_document else .upsert,
-            .cleaned_value = null,
-            .targets = try targets.toOwnedSlice(alloc),
-        };
-        initialized += 1;
-    }
-
-    var deleted_keys = try alloc.alloc([]const u8, req.deletes.len + deleted_artifact_keys.len);
-    var deleted_initialized: usize = 0;
-    errdefer {
-        for (deleted_keys[0..deleted_initialized]) |key| alloc.free(key);
-        alloc.free(deleted_keys);
-    }
-    for (req.deletes, 0..) |key, i| {
-        deleted_keys[i] = try alloc.dupe(u8, key);
-        deleted_initialized += 1;
-    }
-    for (deleted_artifact_keys) |key| {
-        deleted_keys[deleted_initialized] = try alloc.dupe(u8, key);
-        deleted_initialized += 1;
-    }
-
-    var overwritten_doc_keys_list = std.ArrayListUnmanaged([]const u8).empty;
-    defer overwritten_doc_keys_list.deinit(alloc);
-    for (req.writes, 0..) |write, i| {
-        if (extracted[i].cleaned_value != null) {
-            try overwritten_doc_keys_list.append(alloc, try alloc.dupe(u8, write.key));
-        }
-    }
-
-    var changed_artifact_keys_list = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (changed_artifact_keys_list.items) |key| alloc.free(@constCast(key));
-        changed_artifact_keys_list.deinit(alloc);
-    }
-    for (changed_artifact_keys) |key| {
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
-    }
-    for (deleted_artifact_keys) |key| {
-        if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
-    }
-
-    var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
-    errdefer {
-        for (graph_doc_clears.items) |clear| {
-            alloc.free(clear.key);
-            for (clear.index_names) |index_name| alloc.free(index_name);
-            if (clear.index_names.len > 0) alloc.free(clear.index_names);
-        }
-        graph_doc_clears.deinit(alloc);
-    }
-    for (req.writes, 0..) |write, i| {
-        if (extracted[i].mentioned_graph_indexes.len == 0) continue;
-        var index_names = try alloc.alloc([]const u8, extracted[i].mentioned_graph_indexes.len);
-        for (extracted[i].mentioned_graph_indexes, 0..) |index_name, j| {
-            index_names[j] = try alloc.dupe(u8, index_name);
-        }
-        try graph_doc_clears.append(alloc, .{
-            .key = try alloc.dupe(u8, write.key),
-            .index_names = index_names,
-        });
-    }
-
-    var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer {
-        for (graph_writes.items) |write| {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-        }
-        graph_writes.deinit(alloc);
-    }
-    for (extracted) |item| {
-        for (item.graph_writes) |write| {
-            try graph_writes.append(alloc, .{
-                .index_name = try alloc.dupe(u8, write.index_name),
-                .source = try alloc.dupe(u8, write.source),
-                .target = try alloc.dupe(u8, write.target),
-                .edge_type = try alloc.dupe(u8, write.edge_type),
-                .weight = write.weight,
-                .created_at = write.created_at,
-                .updated_at = write.updated_at,
-                .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-            });
-        }
-    }
-    for (req.graph_writes) |write| {
-        try graph_writes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, write.index_name),
-            .source = try alloc.dupe(u8, write.source),
-            .target = try alloc.dupe(u8, write.target),
-            .edge_type = try alloc.dupe(u8, write.edge_type),
-            .weight = write.weight,
-            .created_at = write.created_at,
-            .updated_at = write.updated_at,
-            .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-        });
-    }
-
-    var graph_deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
-    errdefer {
-        for (graph_deletes.items) |delete| {
-            alloc.free(@constCast(delete.index_name));
-            alloc.free(@constCast(delete.source));
-            alloc.free(@constCast(delete.target));
-            alloc.free(@constCast(delete.edge_type));
-        }
-        graph_deletes.deinit(alloc);
-    }
-    for (req.graph_deletes) |delete| {
-        try graph_deletes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, delete.index_name),
-            .source = try alloc.dupe(u8, delete.source),
-            .target = try alloc.dupe(u8, delete.target),
-            .edge_type = try alloc.dupe(u8, delete.edge_type),
-        });
-    }
-
-    var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
-    errdefer {
-        for (dense_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
-        }
-        dense_embeddings.deinit(alloc);
-    }
-    for (extracted) |item| {
-        for (item.dense_embeddings) |embedding| {
-            try dense_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .vector = if (embedding.artifact_key != null) &.{} else try alloc.dupe(f32, embedding.vector),
-            });
-        }
-    }
-
-    var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
-    errdefer {
-        for (sparse_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
-        }
-        sparse_embeddings.deinit(alloc);
-    }
-    for (extracted) |item| {
-        for (item.sparse_embeddings) |embedding| {
-            try sparse_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .indices = try alloc.dupe(u32, embedding.indices),
-                .values = try alloc.dupe(f32, embedding.values),
-            });
-        }
-    }
-
-    return .{
-        .sequence = 0,
-        .documents = documents,
-        .deleted_keys = deleted_keys,
-        .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
-        .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-        .generated_enrichment_refs = &.{},
-        .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        .graph_deletes = try graph_deletes.toOwnedSlice(alloc),
-    };
-}
-
 fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);
     alloc.free(keys);
@@ -6709,7 +6475,7 @@ pub fn Impl(comptime DB: type) type {
                 .deletes = keys,
                 .sync_level = sync_level,
             };
-            var derived_batch = try buildDerivedBatch(ctx.alloc, req, &.{}, deleted_artifact_keys.items, &.{});
+            var derived_batch = try db_internal.buildDerivedBatch(ctx.alloc, req, &.{}, deleted_artifact_keys.items, &.{});
             defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
             const sequence = ctx.store.reserveNextReplaySequence(1);
             derived_batch.sequence = sequence;
@@ -8096,7 +7862,7 @@ pub fn Impl(comptime DB: type) type {
                     // document key.
                     const relational_columns = DB.WritePathCallbacks.relational_columns_for_store(self);
                     const store_value = if (relational_columns) |columns|
-                        try relational_rows.relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values)
+                        try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values)
                     else
                         try strippedStoredDocumentValueAlloc(
                             self.alloc,
@@ -8149,7 +7915,7 @@ pub fn Impl(comptime DB: type) type {
             }
             for (effective_req.relational_identity_rewrites) |rewrite| {
                 const relational_columns = DB.WritePathCallbacks.relational_columns_for_store(self) orelse return error.UnsupportedOperation;
-                const store_value = try relational_rows.relationalStoreRowValueAlloc(self.alloc, rewrite.value, relational_columns, &owned_store_values);
+                const store_value = try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, rewrite.value, relational_columns, &owned_store_values);
                 relational_participant.prepareIdentityRewrite("", rewrite.old_key, rewrite.new_key, store_value, null) catch |err| {
                     if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_parent_delete_reject(self);
                     return err;
@@ -8448,7 +8214,7 @@ pub fn Impl(comptime DB: type) type {
                     include_generated_enrichment_hint,
                 )
             else blk: {
-                materialized_derived_batch = try buildDerivedBatch(self.alloc, effective_req, extracted[0..extracted_initialized], deleted_artifact_keys, changed_graph_artifact_keys.items);
+                materialized_derived_batch = try db_internal.buildDerivedBatch(self.alloc, effective_req, extracted[0..extracted_initialized], deleted_artifact_keys, changed_graph_artifact_keys.items);
                 for (materialized_derived_batch.?.overwritten_doc_keys) |key| self.alloc.free(@constCast(key));
                 if (materialized_derived_batch.?.overwritten_doc_keys.len > 0) self.alloc.free(materialized_derived_batch.?.overwritten_doc_keys);
                 materialized_derived_batch.?.overwritten_doc_keys = try db_internal.buildOverwrittenDocKeys(self.alloc, effective_req.writes, overwritten_flags);

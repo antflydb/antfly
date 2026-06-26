@@ -18,6 +18,7 @@ const backups_api = @import("../backups.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const distributed_txn = @import("../distributed_txn.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
+const platform_time = @import("../../platform/time.zig");
 const backend_types = @import("../../storage/backend_types.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
@@ -46,6 +47,53 @@ const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryI
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 
+pub const backend_current_root_generation: u64 = 0;
+
+var txn_id_nonce: std.atomic.Value(u64) = .init(0);
+
+pub fn normalizeRelationalConstraintError(err: anyerror) anyerror {
+    return switch (err) {
+        error.ForeignKeyViolation, error.UniqueConstraintViolation => error.InvalidBatchRequest,
+        else => err,
+    };
+}
+
+pub fn nextTxnTimestamp() u64 {
+    // Transaction timestamps are stored in shard metadata and later compared
+    // against transaction recovery cutoffs, so they must stay on realtime.
+    return platform_time.realtimeNs();
+}
+
+pub fn nextTxnId() db_mod.types.TxnId {
+    const nonce = txn_id_nonce.fetchAdd(1, .monotonic);
+    var txn_id: db_mod.types.TxnId = undefined;
+    std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(), .big);
+    std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
+    return txn_id;
+}
+
+pub fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
+    if (table.predicates.len > 0) {
+        return .{
+            .table_name = table.table_name,
+            .key = table.predicates[0].key,
+            .message = "version conflict",
+            .phase = .prepare,
+        };
+    }
+    const message = switch (err) {
+        error.IntentConflict => "intent conflict",
+        else => "transaction conflict",
+    };
+    if (table.writes.len > 0) {
+        return .{ .table_name = table.table_name, .key = table.writes[0].key, .message = message, .phase = .prepare };
+    }
+    if (table.deletes.len > 0) {
+        return .{ .table_name = table.table_name, .key = table.deletes[0], .message = message, .phase = .prepare };
+    }
+    return .{ .table_name = table.table_name, .key = "", .message = message, .phase = .prepare };
+}
+
 pub const GroupBatch = struct {
     group_id: u64,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
@@ -59,6 +107,48 @@ pub const GroupBatch = struct {
         self.relational_identity_rewrites.deinit(alloc);
         self.transforms.deinit(alloc);
         self.* = undefined;
+    }
+};
+
+pub const RaftBatcher = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        batch_group: *const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!void,
+        batch_group_local: *const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!void,
+    };
+
+    pub fn batchGroup(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+    ) !void {
+        return try self.vtable.batch_group(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn batchGroupLocal(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+    ) !void {
+        return try self.vtable.batch_group_local(self.ptr, alloc, group_id, table_name, req);
     }
 };
 

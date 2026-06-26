@@ -30,7 +30,198 @@ const query_contract = @import("../query_contract.zig");
 const table_read_core = @import("core.zig");
 
 const LookupResponse = table_read_core.LookupResponse;
+const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
 const ScanResponse = table_read_core.ScanResponse;
+const algebraic_ir = db_mod.algebraic.ir;
+const algebraic_law = db_mod.algebraic.law;
+const algebraic_planner = db_mod.algebraic.planner;
+
+const TextStatsRequestMode = enum {
+    query_request,
+    explicit_fields,
+    background_fields,
+};
+
+pub const OwnedTextStatsFieldRequest = struct {
+    index_name: ?[]const u8 = null,
+    field: []const u8,
+    terms: [][]const u8 = &.{},
+
+    pub fn deinit(self: *OwnedTextStatsFieldRequest, alloc: std.mem.Allocator) void {
+        if (self.index_name) |index_name| alloc.free(index_name);
+        alloc.free(self.field);
+        for (self.terms) |term| alloc.free(term);
+        if (self.terms.len > 0) alloc.free(self.terms);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedBackgroundTextStatsFieldRequest = struct {
+    aggregation_name: []const u8,
+    index_name: ?[]const u8 = null,
+    field: []const u8,
+    terms: [][]const u8 = &.{},
+    background_query: db_mod.aggregations.BackgroundQuery,
+
+    pub fn deinit(self: *OwnedBackgroundTextStatsFieldRequest, alloc: std.mem.Allocator) void {
+        alloc.free(self.aggregation_name);
+        if (self.index_name) |index_name| alloc.free(index_name);
+        alloc.free(self.field);
+        for (self.terms) |term| alloc.free(term);
+        if (self.terms.len > 0) alloc.free(self.terms);
+        switch (self.background_query) {
+            .match_all => {},
+            .match => |query| {
+                alloc.free(query.field);
+                alloc.free(query.text);
+            },
+            .term => |query| {
+                alloc.free(query.field);
+                alloc.free(query.term);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+const TextStatsFieldRequestInput = struct {
+    index_name: ?[]const u8 = null,
+    field: []const u8,
+    terms: []const []const u8,
+};
+
+const BackgroundTextStatsFieldRequestInput = struct {
+    aggregation_name: []const u8,
+    index_name: ?[]const u8 = null,
+    field: []const u8,
+    terms: []const []const u8,
+    background_query: std.json.Value,
+};
+
+const TextStatsRequestInput = struct {
+    _identity_read_generation: ?u64 = null,
+    _resolved_doc_filter: ?std.json.Value = null,
+    query_request: ?std.json.Value = null,
+    fields: ?[]const TextStatsFieldRequestInput = null,
+    background_fields: ?[]const BackgroundTextStatsFieldRequestInput = null,
+};
+
+const ParsedExplicitTextStatsRequest = struct {
+    identity_read_generation: ?u64 = null,
+    resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
+    items: []OwnedTextStatsFieldRequest = &.{},
+
+    fn deinit(self: *ParsedExplicitTextStatsRequest, alloc: std.mem.Allocator) void {
+        if (self.resolved_doc_filter) |*filter| filter.deinit(alloc);
+        for (self.items) |*item| item.deinit(alloc);
+        if (self.items.len > 0) alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const ParsedBackgroundTextStatsRequest = struct {
+    identity_read_generation: ?u64 = null,
+    resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
+    items: []OwnedBackgroundTextStatsFieldRequest = &.{},
+
+    fn deinit(self: *ParsedBackgroundTextStatsRequest, alloc: std.mem.Allocator) void {
+        if (self.resolved_doc_filter) |*filter| filter.deinit(alloc);
+        for (self.items) |*item| item.deinit(alloc);
+        if (self.items.len > 0) alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const TextStatsTermDocFreqInput = struct {
+    term: []const u8,
+    doc_freq: u32,
+};
+
+const TextStatsFieldResponseInput = struct {
+    field: []const u8,
+    global_doc_count: u32,
+    global_total_field_len: u64,
+    term_doc_freqs: []const TextStatsTermDocFreqInput,
+};
+
+const TextStatsResponseInput = struct {
+    fields: []const TextStatsFieldResponseInput,
+};
+
+const BackgroundTextStatsFieldResponseInput = struct {
+    aggregation_name: []const u8,
+    field: []const u8,
+    background_doc_count: u32,
+    term_doc_freqs: []const TextStatsTermDocFreqInput,
+};
+
+const BackgroundTextStatsResponseInput = struct {
+    background_fields: []const BackgroundTextStatsFieldResponseInput,
+};
+
+pub const ParsedTextStatsRequest = union(TextStatsRequestMode) {
+    query_request: query_api.OwnedQueryRequest,
+    explicit_fields: ParsedExplicitTextStatsRequest,
+    background_fields: ParsedBackgroundTextStatsRequest,
+
+    pub fn deinit(self: *ParsedTextStatsRequest, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .query_request => |*request| request.deinit(alloc),
+            .explicit_fields => |*request| request.deinit(alloc),
+            .background_fields => |*request| request.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+const AlgebraicPartialsRequestInput = struct {
+    index_name: ?[]const u8 = null,
+    _identity_read_generation: ?u64 = null,
+    tensor_access_paths: ?[]const AlgebraicTensorAccessPathInput = null,
+    tensor_exprs: ?[]const AlgebraicTensorExprInput = null,
+    tensor_program: ?AlgebraicTensorProgramInput = null,
+    cardinality: ?std.json.Value = null,
+    terms_cardinality: ?std.json.Value = null,
+    range_cardinality: ?std.json.Value = null,
+    histogram_cardinality: ?std.json.Value = null,
+};
+
+const AlgebraicTensorAccessPathInput = query_contract.AlgebraicTensorAccessPathEnvelopeInput;
+const AlgebraicTensorExprInput = query_contract.AlgebraicTensorExprEnvelopeInput;
+const AlgebraicTensorProgramInput = query_contract.AlgebraicTensorProgramEnvelopeInput;
+
+const AlgebraicPartialResponseInput = struct {
+    canonical_axis: []const u8,
+    metric: []const u8 = "",
+    law: []const u8,
+    value: []const u8,
+};
+
+const AlgebraicPartialsResponseInput = struct {
+    partials: []const AlgebraicPartialResponseInput,
+};
+
+pub const ParsedAlgebraicPartialsRequest = struct {
+    index_name: ?[]u8 = null,
+    identity_read_generation: ?u64 = null,
+    tensor_access_paths: []OwnedAlgebraicTensorAccessPath = &.{},
+    tensor_exprs: []OwnedAlgebraicTensorExpr = &.{},
+    tensor_program: ?OwnedAlgebraicTensorProgram = null,
+
+    pub fn deinit(self: *ParsedAlgebraicPartialsRequest, alloc: std.mem.Allocator) void {
+        if (self.index_name) |value| alloc.free(value);
+        for (self.tensor_access_paths) |*item| item.deinit(alloc);
+        if (self.tensor_access_paths.len > 0) alloc.free(self.tensor_access_paths);
+        for (self.tensor_exprs) |*item| item.deinit(alloc);
+        if (self.tensor_exprs.len > 0) alloc.free(self.tensor_exprs);
+        if (self.tensor_program) |*program| program.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedAlgebraicTensorAccessPath = query_contract.OwnedAlgebraicTensorAccessPathEnvelope;
+pub const OwnedAlgebraicTensorExpr = query_contract.OwnedAlgebraicTensorExprEnvelope;
+pub const OwnedAlgebraicTensorProgram = query_contract.OwnedAlgebraicTensorProgramEnvelope;
 
 pub fn searchRequestHasResolvedDocFilter(req: db_mod.types.SearchRequest) bool {
     if (comptime @hasField(db_mod.types.SearchRequest, "resolved_doc_filter")) {
@@ -133,6 +324,411 @@ pub fn preflightRemote(
     return summary;
 }
 
+pub fn encodeQueryTextStatsRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
+    const encoded_query = try encodeQueryRequest(alloc, req);
+    defer alloc.free(encoded_query);
+    return try std.fmt.allocPrint(alloc, "{{\"query_request\":{s}}}", .{encoded_query});
+}
+
+pub fn encodeExplicitTextStatsRequest(
+    alloc: std.mem.Allocator,
+    items: []const OwnedTextStatsFieldRequest,
+    identity_read_generation: ?u64,
+) ![]u8 {
+    return try encodeExplicitTextStatsRequestForSearchRequest(alloc, items, .{ .identity_read_generation = identity_read_generation });
+}
+
+pub fn encodeExplicitTextStatsRequestForSearchRequest(
+    alloc: std.mem.Allocator,
+    items: []const OwnedTextStatsFieldRequest,
+    req: db_mod.types.SearchRequest,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var top_first = true;
+    if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
+    try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
+    try appendJsonFieldName(alloc, &out, &top_first, "fields");
+    try out.append(alloc, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        if (item.index_name) |index_name| {
+            try appendJsonFieldString(alloc, &out, &first, "index_name", index_name);
+        }
+        try appendJsonFieldString(alloc, &out, &first, "field", item.field);
+        try appendJsonFieldName(alloc, &out, &first, "terms");
+        try out.append(alloc, '[');
+        for (item.terms, 0..) |term, term_idx| {
+            if (term_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, &out, term);
+        }
+        try out.appendSlice(alloc, "]}");
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodeBackgroundTextStatsRequest(
+    alloc: std.mem.Allocator,
+    items: []const OwnedBackgroundTextStatsFieldRequest,
+    identity_read_generation: ?u64,
+) ![]u8 {
+    return try encodeBackgroundTextStatsRequestForSearchRequest(alloc, items, .{ .identity_read_generation = identity_read_generation });
+}
+
+pub fn encodeBackgroundTextStatsRequestForSearchRequest(
+    alloc: std.mem.Allocator,
+    items: []const OwnedBackgroundTextStatsFieldRequest,
+    req: db_mod.types.SearchRequest,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var top_first = true;
+    if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
+    try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
+    try appendJsonFieldName(alloc, &out, &top_first, "background_fields");
+    try out.append(alloc, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        try appendJsonFieldString(alloc, &out, &first, "aggregation_name", item.aggregation_name);
+        if (item.index_name) |index_name| {
+            try appendJsonFieldString(alloc, &out, &first, "index_name", index_name);
+        }
+        try appendJsonFieldString(alloc, &out, &first, "field", item.field);
+        try appendJsonFieldName(alloc, &out, &first, "terms");
+        try out.append(alloc, '[');
+        for (item.terms, 0..) |term, term_idx| {
+            if (term_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, &out, term);
+        }
+        try out.append(alloc, ']');
+        try appendJsonFieldName(alloc, &out, &first, "background_query");
+        try appendBackgroundQueryJson(alloc, &out, item.background_query);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseTextStatsRequest(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+) !ParsedTextStatsRequest {
+    var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
+    defer parsed.deinit();
+    if (parsed.value.query_request) |query_value| {
+        if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
+        const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
+        defer alloc.free(encoded_query);
+        return .{ .query_request = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query) };
+    }
+    if (parsed.value.fields) |fields_value| {
+        var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
+            try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, filter_value)
+        else
+            null;
+        errdefer if (resolved_doc_filter) |*filter| filter.deinit(alloc);
+        const identity_read_generation = try identityGenerationFromTextStatsResolvedFilter(parsed.value._identity_read_generation, if (resolved_doc_filter) |*filter| filter else null);
+        const items = try alloc.alloc(OwnedTextStatsFieldRequest, fields_value.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit(alloc);
+            if (items.len > 0) alloc.free(items);
+        }
+        for (fields_value, 0..) |field_value, i| {
+            const terms = try alloc.alloc([]const u8, field_value.terms.len);
+            var initialized_terms: usize = 0;
+            errdefer {
+                for (terms[0..initialized_terms]) |term| alloc.free(term);
+                if (terms.len > 0) alloc.free(terms);
+            }
+            for (field_value.terms, 0..) |term_value, term_idx| {
+                terms[term_idx] = try alloc.dupe(u8, term_value);
+                initialized_terms += 1;
+            }
+            items[i] = .{
+                .index_name = if (field_value.index_name) |index_name_value| try alloc.dupe(u8, index_name_value) else null,
+                .field = try alloc.dupe(u8, field_value.field),
+                .terms = terms,
+            };
+            initialized += 1;
+        }
+        return .{ .explicit_fields = .{
+            .identity_read_generation = identity_read_generation,
+            .resolved_doc_filter = resolved_doc_filter,
+            .items = items,
+        } };
+    }
+    if (parsed.value.background_fields) |fields_value| {
+        var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
+            try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, filter_value)
+        else
+            null;
+        errdefer if (resolved_doc_filter) |*filter| filter.deinit(alloc);
+        const identity_read_generation = try identityGenerationFromTextStatsResolvedFilter(parsed.value._identity_read_generation, if (resolved_doc_filter) |*filter| filter else null);
+        const items = try alloc.alloc(OwnedBackgroundTextStatsFieldRequest, fields_value.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit(alloc);
+            if (items.len > 0) alloc.free(items);
+        }
+        for (fields_value, 0..) |field_value, i| {
+            const terms = try alloc.alloc([]const u8, field_value.terms.len);
+            var initialized_terms: usize = 0;
+            errdefer {
+                for (terms[0..initialized_terms]) |term| alloc.free(term);
+                if (terms.len > 0) alloc.free(terms);
+            }
+            for (field_value.terms, 0..) |term_value, term_idx| {
+                terms[term_idx] = try alloc.dupe(u8, term_value);
+                initialized_terms += 1;
+            }
+            items[i] = .{
+                .aggregation_name = try alloc.dupe(u8, field_value.aggregation_name),
+                .index_name = if (field_value.index_name) |index_name_value| try alloc.dupe(u8, index_name_value) else null,
+                .field = try alloc.dupe(u8, field_value.field),
+                .terms = terms,
+                .background_query = try parseBackgroundQueryRequestAlloc(alloc, field_value.background_query),
+            };
+            initialized += 1;
+        }
+        return .{ .background_fields = .{
+            .identity_read_generation = identity_read_generation,
+            .resolved_doc_filter = resolved_doc_filter,
+            .items = items,
+        } };
+    }
+    return error.InvalidQueryRequest;
+}
+
+fn identityGenerationFromTextStatsResolvedFilter(
+    explicit_generation: ?u64,
+    resolved_doc_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
+) !?u64 {
+    const filter = resolved_doc_filter orelse return explicit_generation;
+    if (explicit_generation) |generation| {
+        if (generation != filter.context.identity_read_generation) return error.InvalidQueryRequest;
+        return generation;
+    }
+    return filter.context.identity_read_generation;
+}
+
+pub fn encodeTextStatsResponse(alloc: std.mem.Allocator, stats: []const distributed_stats_mod.TextFieldStats) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"fields\":[");
+    for (stats, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        try appendJsonFieldString(alloc, &out, &first, "field", item.field);
+        try appendJsonFieldU32(alloc, &out, &first, "global_doc_count", item.global_doc_count);
+        try appendJsonFieldU64(alloc, &out, &first, "global_total_field_len", item.global_total_field_len);
+        try appendJsonFieldName(alloc, &out, &first, "term_doc_freqs");
+        try out.append(alloc, '[');
+        for (item.term_doc_freqs, 0..) |term, term_idx| {
+            if (term_idx > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            var term_first = true;
+            try appendJsonFieldString(alloc, &out, &term_first, "term", term.term);
+            try appendJsonFieldU32(alloc, &out, &term_first, "doc_freq", term.doc_freq);
+            try out.append(alloc, '}');
+        }
+        try out.appendSlice(alloc, "]}");
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseTextStatsResponse(alloc: std.mem.Allocator, body: []const u8) ![]const distributed_stats_mod.TextFieldStats {
+    var parsed = try std.json.parseFromSlice(TextStatsResponseInput, alloc, body, .{});
+    defer parsed.deinit();
+    const fields_value = parsed.value.fields;
+    const stats = try alloc.alloc(distributed_stats_mod.TextFieldStats, fields_value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (stats[0..initialized]) |*item| item.deinit(alloc);
+        if (stats.len > 0) alloc.free(stats);
+    }
+    for (fields_value, 0..) |entry, i| {
+        const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, entry.term_doc_freqs.len);
+        var initialized_terms: usize = 0;
+        errdefer {
+            for (term_doc_freqs[0..initialized_terms]) |*item| item.deinit(alloc);
+            if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
+        }
+        for (entry.term_doc_freqs, 0..) |term_entry, term_idx| {
+            term_doc_freqs[term_idx] = .{
+                .term = try alloc.dupe(u8, term_entry.term),
+                .doc_freq = term_entry.doc_freq,
+            };
+            initialized_terms += 1;
+        }
+        stats[i] = .{
+            .field = try alloc.dupe(u8, entry.field),
+            .global_doc_count = entry.global_doc_count,
+            .global_total_field_len = entry.global_total_field_len,
+            .term_doc_freqs = term_doc_freqs,
+        };
+        initialized += 1;
+    }
+    return stats;
+}
+
+pub fn encodeBackgroundTextStatsResponse(
+    alloc: std.mem.Allocator,
+    stats: []const db_mod.aggregations.DistributedBackgroundTextStats,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"background_fields\":[");
+    for (stats, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        try appendJsonFieldString(alloc, &out, &first, "aggregation_name", item.aggregation_name);
+        try appendJsonFieldString(alloc, &out, &first, "field", item.field);
+        try appendJsonFieldU32(alloc, &out, &first, "background_doc_count", item.background_doc_count);
+        try appendJsonFieldName(alloc, &out, &first, "term_doc_freqs");
+        try out.append(alloc, '[');
+        for (item.term_doc_freqs, 0..) |term, term_idx| {
+            if (term_idx > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            var term_first = true;
+            try appendJsonFieldString(alloc, &out, &term_first, "term", term.term);
+            try appendJsonFieldU32(alloc, &out, &term_first, "doc_freq", term.doc_freq);
+            try out.append(alloc, '}');
+        }
+        try out.appendSlice(alloc, "]}");
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseBackgroundTextStatsResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
+    var parsed = try std.json.parseFromSlice(BackgroundTextStatsResponseInput, alloc, body, .{});
+    defer parsed.deinit();
+    const fields_value = parsed.value.background_fields;
+    const stats = try alloc.alloc(db_mod.aggregations.DistributedBackgroundTextStats, fields_value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (stats[0..initialized]) |*item| item.deinit(alloc);
+        if (stats.len > 0) alloc.free(stats);
+    }
+    for (fields_value, 0..) |entry, i| {
+        const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, entry.term_doc_freqs.len);
+        var initialized_terms: usize = 0;
+        errdefer {
+            for (term_doc_freqs[0..initialized_terms]) |*item| item.deinit(alloc);
+            if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
+        }
+        for (entry.term_doc_freqs, 0..) |term_entry, term_idx| {
+            term_doc_freqs[term_idx] = .{
+                .term = try alloc.dupe(u8, term_entry.term),
+                .doc_freq = term_entry.doc_freq,
+            };
+            initialized_terms += 1;
+        }
+        stats[i] = .{
+            .aggregation_name = try alloc.dupe(u8, entry.aggregation_name),
+            .field = try alloc.dupe(u8, entry.field),
+            .background_doc_count = entry.background_doc_count,
+            .term_doc_freqs = term_doc_freqs,
+        };
+        initialized += 1;
+    }
+    return stats;
+}
+
+pub fn parseTextStatsHttpResponse(
+    alloc: std.mem.Allocator,
+    request_body: []const u8,
+    response_body: []const u8,
+) !ParsedTextStatsHttpResponse {
+    var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, request_body, .{});
+    defer parsed.deinit();
+
+    if (parsed.value.background_fields != null) {
+        return .{
+            .background_fields = .{
+                .background_fields = try parseBackgroundTextStatsResponse(alloc, response_body),
+            },
+        };
+    }
+
+    return .{
+        .fields = .{
+            .fields = try parseTextStatsResponse(alloc, response_body),
+        },
+    };
+}
+
+fn appendBackgroundQueryJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    query: db_mod.aggregations.BackgroundQuery,
+) !void {
+    switch (query) {
+        .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
+        .match => |match| {
+            try out.appendSlice(alloc, "{\"match\":{");
+            try appendJsonString(alloc, out, match.field);
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, match.text);
+            try out.appendSlice(alloc, "}}");
+        },
+        .term => |term| {
+            try out.appendSlice(alloc, "{\"term\":{");
+            try appendJsonString(alloc, out, term.field);
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, term.term);
+            try out.appendSlice(alloc, "}}");
+        },
+    }
+}
+
+fn parseBackgroundQueryRequestAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !db_mod.aggregations.BackgroundQuery {
+    if (value == .object) {
+        if (value.object.get("match_all") != null) return .{ .match_all = {} };
+        if (value.object.get("match")) |match| {
+            if (match == .object and match.object.count() == 1) {
+                var it = match.object.iterator();
+                const entry = it.next() orelse return error.InvalidQueryRequest;
+                if (entry.value_ptr.* != .string) return error.InvalidQueryRequest;
+                return .{ .match = .{
+                    .field = try alloc.dupe(u8, entry.key_ptr.*),
+                    .text = try alloc.dupe(u8, entry.value_ptr.string),
+                } };
+            }
+        }
+        if (value.object.get("term")) |term| {
+            if (term == .object and term.object.count() == 1) {
+                var it = term.object.iterator();
+                const entry = it.next() orelse return error.InvalidQueryRequest;
+                if (entry.value_ptr.* != .string) return error.InvalidQueryRequest;
+                return .{ .term = .{
+                    .field = try alloc.dupe(u8, entry.key_ptr.*),
+                    .term = try alloc.dupe(u8, entry.value_ptr.string),
+                } };
+            }
+        }
+    }
+    return error.InvalidQueryRequest;
+}
+
 pub fn textStatsRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -159,6 +755,590 @@ pub fn algebraicPartialsRemote(
     var result = try client.fetchGroupAlgebraicPartials(base_uri, group_id, table_name, body);
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn encodeAlgebraicPartialsRequest(
+    alloc: std.mem.Allocator,
+    index_name: ?[]const u8,
+    access_paths: []const algebraic_ir.PhysicalAccessPath,
+    tensor_exprs: []const algebraic_ir.TensorExpr,
+) ![]u8 {
+    return try encodeAlgebraicPartialsRequestWithProgram(alloc, index_name, access_paths, tensor_exprs, null);
+}
+
+pub fn encodeAlgebraicPartialsRequestWithProgram(
+    alloc: std.mem.Allocator,
+    index_name: ?[]const u8,
+    access_paths: []const algebraic_ir.PhysicalAccessPath,
+    tensor_exprs: []const algebraic_ir.TensorExpr,
+    tensor_program: ?algebraic_ir.TensorProgram,
+) ![]u8 {
+    return try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, index_name, null, access_paths, tensor_exprs, tensor_program);
+}
+
+pub fn encodeAlgebraicPartialsRequestWithProgramAtGeneration(
+    alloc: std.mem.Allocator,
+    index_name: ?[]const u8,
+    identity_read_generation: ?u64,
+    access_paths: []const algebraic_ir.PhysicalAccessPath,
+    tensor_exprs: []const algebraic_ir.TensorExpr,
+    tensor_program: ?algebraic_ir.TensorProgram,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    if (index_name) |name| try appendJsonFieldString(alloc, &out, &first, "index_name", name);
+    if (identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
+    if (access_paths.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "tensor_access_paths");
+        try out.append(alloc, '[');
+        for (access_paths, 0..) |path, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const encoded = try query_contract.encodeAlgebraicTensorAccessPathEnvelopeAlloc(alloc, path);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+        try out.append(alloc, ']');
+    }
+    if (tensor_exprs.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "tensor_exprs");
+        try out.append(alloc, '[');
+        for (tensor_exprs, 0..) |expr, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const encoded = try query_contract.encodeAlgebraicTensorExprEnvelopeAlloc(alloc, expr);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+        try out.append(alloc, ']');
+    }
+    if (tensor_program) |program| {
+        try appendJsonFieldName(alloc, &out, &first, "tensor_program");
+        const encoded = try query_contract.encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodeAlgebraicExpressionPartialsRequest(
+    alloc: std.mem.Allocator,
+    index_name: ?[]const u8,
+    access_paths: []const algebraic_ir.PhysicalAccessPath,
+    tensor_exprs: []const algebraic_ir.TensorExpr,
+) ![]u8 {
+    return try encodeAlgebraicPartialsRequest(alloc, index_name, access_paths, tensor_exprs);
+}
+
+pub fn parseAlgebraicPartialsRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !ParsedAlgebraicPartialsRequest {
+    var parsed = try std.json.parseFromSlice(AlgebraicPartialsRequestInput, alloc, body, .{});
+    defer parsed.deinit();
+    const exprs_value = parsed.value.tensor_exprs orelse &.{};
+    const has_program = parsed.value.tensor_program != null;
+    const has_legacy_request = parsed.value.cardinality != null or
+        parsed.value.terms_cardinality != null or
+        parsed.value.range_cardinality != null or
+        parsed.value.histogram_cardinality != null;
+    if (has_legacy_request) return error.InvalidQueryRequest;
+    if (exprs_value.len == 0 and !has_program) return error.InvalidQueryRequest;
+    if (has_program and exprs_value.len > 0) return error.InvalidQueryRequest;
+    const paths_value = parsed.value.tensor_access_paths orelse return error.InvalidQueryRequest;
+    const expected_proof_count = if (exprs_value.len > 0) exprs_value.len else paths_value.len;
+    if (paths_value.len != expected_proof_count) return error.InvalidQueryRequest;
+    const tensor_access_paths = blk: {
+        const paths = try alloc.alloc(OwnedAlgebraicTensorAccessPath, paths_value.len);
+        var paths_initialized: usize = 0;
+        errdefer {
+            for (paths[0..paths_initialized]) |*item| item.deinit(alloc);
+            if (paths.len > 0) alloc.free(paths);
+        }
+        for (paths_value, 0..) |path_value, i| {
+            paths[i] = try parseAlgebraicTensorAccessPathAlloc(alloc, path_value);
+            paths_initialized += 1;
+        }
+        break :blk paths;
+    };
+    errdefer {
+        for (tensor_access_paths) |*item| item.deinit(alloc);
+        if (tensor_access_paths.len > 0) alloc.free(tensor_access_paths);
+    }
+    const tensor_exprs = blk: {
+        const exprs = try alloc.alloc(OwnedAlgebraicTensorExpr, exprs_value.len);
+        var exprs_initialized: usize = 0;
+        errdefer {
+            for (exprs[0..exprs_initialized]) |*item| item.deinit(alloc);
+            if (exprs.len > 0) alloc.free(exprs);
+        }
+        for (exprs_value, 0..) |expr_value, i| {
+            exprs[i] = try query_contract.parseAlgebraicTensorExprEnvelopeInputAlloc(alloc, expr_value);
+            exprs_initialized += 1;
+        }
+        break :blk exprs;
+    };
+    errdefer {
+        for (tensor_exprs) |*item| item.deinit(alloc);
+        if (tensor_exprs.len > 0) alloc.free(tensor_exprs);
+    }
+    var tensor_program: ?OwnedAlgebraicTensorProgram = null;
+    errdefer if (tensor_program) |*program| program.deinit(alloc);
+    if (parsed.value.tensor_program) |program_value| {
+        tensor_program = try query_contract.parseAlgebraicTensorProgramEnvelopeInputAlloc(alloc, program_value);
+        try validateAlgebraicProgramPartialsProof(alloc, tensor_access_paths, &tensor_program.?);
+    }
+    return .{
+        .index_name = if (parsed.value.index_name) |name| try alloc.dupe(u8, name) else null,
+        .identity_read_generation = parsed.value._identity_read_generation,
+        .tensor_access_paths = tensor_access_paths,
+        .tensor_exprs = tensor_exprs,
+        .tensor_program = tensor_program,
+    };
+}
+
+fn parseAlgebraicTensorAccessPathAlloc(
+    alloc: std.mem.Allocator,
+    input: AlgebraicTensorAccessPathInput,
+) !OwnedAlgebraicTensorAccessPath {
+    return try query_contract.parseAlgebraicTensorAccessPathEnvelopeInputAlloc(alloc, input);
+}
+
+pub fn encodeAlgebraicPartialsResponse(
+    alloc: std.mem.Allocator,
+    partials: []const db_mod.algebraic.distributed.Partial,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"partials\":[");
+    for (partials, 0..) |partial, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        try appendJsonFieldString(alloc, &out, &first, "canonical_axis", partial.canonical_axis);
+        try appendJsonFieldString(alloc, &out, &first, "metric", partial.metric);
+        try appendJsonFieldString(alloc, &out, &first, "law", @tagName(partial.law_id));
+        try appendJsonFieldString(alloc, &out, &first, "value", partial.value);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseAlgebraicPartialsResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) ![]db_mod.algebraic.distributed.Partial {
+    var parsed = try std.json.parseFromSlice(AlgebraicPartialsResponseInput, alloc, body, .{});
+    defer parsed.deinit();
+    const partials = try alloc.alloc(db_mod.algebraic.distributed.Partial, parsed.value.partials.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (partials[0..initialized]) |partial| {
+            alloc.free(@constCast(partial.canonical_axis));
+            if (partial.metric.len > 0) alloc.free(@constCast(partial.metric));
+            alloc.free(@constCast(partial.value));
+        }
+        if (partials.len > 0) alloc.free(partials);
+    }
+    for (parsed.value.partials, 0..) |partial, i| {
+        const law_id = std.meta.stringToEnum(db_mod.algebraic.law.Id, partial.law) orelse return error.InvalidQueryRequest;
+        partials[i] = .{
+            .canonical_axis = try alloc.dupe(u8, partial.canonical_axis),
+            .metric = try alloc.dupe(u8, partial.metric),
+            .law_id = law_id,
+            .value = try alloc.dupe(u8, partial.value),
+        };
+        initialized += 1;
+    }
+    return partials;
+}
+
+pub fn parsedAlgebraicTensorExpressionsAlloc(
+    alloc: std.mem.Allocator,
+    items: []const OwnedAlgebraicTensorExpr,
+) ![]algebraic_ir.TensorExpr {
+    const exprs = try alloc.alloc(algebraic_ir.TensorExpr, items.len);
+    errdefer if (exprs.len > 0) alloc.free(exprs);
+    for (items, 0..) |*item, i| exprs[i] = item.asExpr();
+    return exprs;
+}
+
+pub fn validateAlgebraicPartialsAccessPaths(
+    alloc: std.mem.Allocator,
+    access_paths: anytype,
+    tensor_exprs: anytype,
+) !void {
+    if (access_paths.len == 0 or access_paths.len != tensor_exprs.len) return error.InvalidQueryRequest;
+    for (access_paths, tensor_exprs) |access_path, tensor_expr| {
+        const expr = algebraicTensorExprValue(tensor_expr);
+        var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, expr)) orelse return error.InvalidQueryRequest;
+        defer plan.deinit(alloc);
+        if (!algebraicTensorAccessPathMatches(plan.access_path, access_path)) return error.InvalidQueryRequest;
+    }
+}
+
+pub fn validateAlgebraicProgramPartialsAccessPaths(
+    alloc: std.mem.Allocator,
+    access_paths: []OwnedAlgebraicTensorAccessPath,
+    program: *const OwnedAlgebraicTensorProgram,
+) !void {
+    try validateAlgebraicProgramPartialsProof(alloc, access_paths, program);
+    const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, null, access_paths, program);
+    defer if (exprs.len > 0) alloc.free(exprs);
+}
+
+pub fn validateAlgebraicProgramPartialsProof(
+    alloc: std.mem.Allocator,
+    access_paths: []OwnedAlgebraicTensorAccessPath,
+    program: *const OwnedAlgebraicTensorProgram,
+) !void {
+    const path_values = try algebraicTensorAccessPathValuesAlloc(alloc, access_paths);
+    defer if (path_values.len > 0) alloc.free(path_values);
+    var view = try program.asProgramAlloc(alloc);
+    defer view.deinit(alloc);
+    const proof = try algebraic_ir.tensorProgramProof(alloc, path_values, view.program);
+    if (!proof.safe()) return error.InvalidQueryRequest;
+}
+
+pub fn algebraicTensorProgramOutputExpressionsForIndexAlloc(
+    alloc: std.mem.Allocator,
+    index: ?*const db_mod.algebraic.index.Index,
+    access_paths: []OwnedAlgebraicTensorAccessPath,
+    program: *const OwnedAlgebraicTensorProgram,
+) ![]algebraic_ir.TensorExpr {
+    const path_values = try algebraicTensorAccessPathValuesAlloc(alloc, access_paths);
+    defer if (path_values.len > 0) alloc.free(path_values);
+    var view = try program.asProgramAlloc(alloc);
+    defer view.deinit(alloc);
+    const proof = try algebraic_ir.tensorProgramProof(alloc, path_values, view.program);
+    if (!proof.safe()) return error.InvalidQueryRequest;
+    const single_output = [_]algebraic_ir.TensorProgramRef{view.program.output};
+    const refs = if (view.program.outputs.len > 0) view.program.outputs else single_output[0..];
+    const exprs = try alloc.alloc(algebraic_ir.TensorExpr, refs.len);
+    errdefer if (exprs.len > 0) alloc.free(exprs);
+    for (refs, 0..) |ref, i| {
+        const step_idx = switch (ref) {
+            .step => |idx| idx,
+            .input => return error.InvalidQueryRequest,
+        };
+        if (step_idx >= view.program.steps.len) return error.InvalidQueryRequest;
+        const expr = view.program.steps[step_idx].expr;
+        exprs[i] = try algebraicTensorProgramOutputExpressionForStep(alloc, index, path_values, expr);
+    }
+    return exprs;
+}
+
+fn algebraicTensorProgramOutputExpressionForStep(
+    alloc: std.mem.Allocator,
+    index: ?*const db_mod.algebraic.index.Index,
+    path_values: []const algebraic_ir.PhysicalAccessPath,
+    expr: algebraic_ir.TensorExpr,
+) !algebraic_ir.TensorExpr {
+    if (expr.layout == .materialized_expr) {
+        var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, expr)) orelse return error.InvalidQueryRequest;
+        defer plan.deinit(alloc);
+        if (!algebraicTensorAccessPathListHas(path_values, plan.access_path)) return error.InvalidQueryRequest;
+        return expr;
+    }
+    if (expr.layout == .materialized_tensor) {
+        const concrete_index = index orelse return error.InvalidQueryRequest;
+        const materialization = expr.semantic_id orelse expr.owner orelse return error.InvalidQueryRequest;
+        const mat = findAlgebraicMaterialization(concrete_index, materialization) orelse return error.InvalidQueryRequest;
+        const access_path = algebraic_planner.materializationAccessPath(mat) orelse return error.InvalidQueryRequest;
+        if (!algebraicTensorAccessPathListHas(path_values, access_path)) return error.InvalidQueryRequest;
+        const output_expr = algebraic_planner.materializationTensorExpression(mat) orelse return error.InvalidQueryRequest;
+        if (expr.law_id != null and output_expr.law_id != expr.law_id) return error.InvalidQueryRequest;
+        return output_expr;
+    }
+    return error.InvalidQueryRequest;
+}
+
+fn algebraicTensorAccessPathListHas(paths: []const algebraic_ir.PhysicalAccessPath, expected: algebraic_ir.PhysicalAccessPath) bool {
+    for (paths) |path| {
+        if (algebraicTensorAccessPathMatches(expected, path)) return true;
+    }
+    return false;
+}
+
+pub fn algebraicTensorAccessPathValuesAlloc(
+    alloc: std.mem.Allocator,
+    access_paths: []OwnedAlgebraicTensorAccessPath,
+) ![]algebraic_ir.PhysicalAccessPath {
+    const out = try alloc.alloc(algebraic_ir.PhysicalAccessPath, access_paths.len);
+    errdefer if (out.len > 0) alloc.free(out);
+    for (access_paths, 0..) |path, i| out[i] = path.asAccessPath();
+    return out;
+}
+
+fn findAlgebraicMaterialization(
+    index: *const db_mod.algebraic.index.Index,
+    name: []const u8,
+) ?db_mod.algebraic.index.MaterializationConfig {
+    for (index.config().materializations) |mat| {
+        if (std.mem.eql(u8, mat.name, name)) return mat;
+    }
+    return null;
+}
+
+fn algebraicTensorAccessPathMatches(
+    expected: algebraic_ir.PhysicalAccessPath,
+    actual: anytype,
+) bool {
+    const actual_path = algebraicTensorAccessPathValue(actual);
+    return std.mem.eql(u8, expected.owner, actual_path.owner) and
+        expected.layout == actual_path.layout and
+        optionalDictionaryEqual(expected.dictionary, actual_path.dictionary) and
+        tensorFragmentSlicesEqual(expected.fragments, actual_path.fragments) and
+        tensorDimensionSlicesEqual(expected.output_dims, actual_path.output_dims) and
+        lawIdSlicesEqual(expected.law_ids, actual_path.law_ids);
+}
+
+fn algebraicTensorAccessPathValue(actual: anytype) algebraic_ir.PhysicalAccessPath {
+    if (@TypeOf(actual) == algebraic_ir.PhysicalAccessPath) return actual;
+    return actual.asAccessPath();
+}
+
+fn optionalDictionaryEqual(
+    left: ?db_mod.algebraic.lexical.DictionaryIdentity,
+    right: ?db_mod.algebraic.lexical.DictionaryIdentity,
+) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return left.?.eql(right.?);
+}
+
+fn algebraicTensorExprValue(actual: anytype) algebraic_ir.TensorExpr {
+    if (@TypeOf(actual) == algebraic_ir.TensorExpr) return actual;
+    return actual.asExpr();
+}
+
+fn algebraicTensorExprMatches(expected: algebraic_ir.TensorExpr, actual: algebraic_ir.TensorExpr) bool {
+    return expected.fragment == actual.fragment and
+        tensorDimensionSlicesEqual(expected.input_dims, actual.input_dims) and
+        tensorDimensionSlicesEqual(expected.output_dims, actual.output_dims) and
+        optionalStringEqual(expected.semantic_id, actual.semantic_id) and
+        optionalStringEqual(expected.owner, actual.owner) and
+        expected.layout == actual.layout and
+        expected.law_id == actual.law_id;
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn tensorFragmentSlicesEqual(left: []const algebraic_ir.TensorFragment, right: []const algebraic_ir.TensorFragment) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| {
+        if (l != r) return false;
+    }
+    return true;
+}
+
+fn tensorDimensionSlicesEqual(left: []const algebraic_ir.Dimension, right: []const algebraic_ir.Dimension) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| {
+        if (l != r) return false;
+    }
+    return true;
+}
+
+fn lawIdSlicesEqual(left: []const algebraic_law.Id, right: []const algebraic_law.Id) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| {
+        if (l != r) return false;
+    }
+    return true;
+}
+
+test "algebraic partial request preserves planner-owned materialization tensor programs" {
+    const alloc = std.testing.allocator;
+
+    var index = try db_mod.algebraic.index.Index.open(alloc, "alg",
+        \\{"version":1,"table":"docs","schema_version":1,
+        \\ "group_fields":[{"name":"customer","path":"customer","type":"keyword"}],
+        \\ "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
+        \\ "materializations":[{"name":"sum_by_customer","op":"sum","group_by":["customer"],"measure":"amount"}]}
+    );
+    defer index.close();
+
+    const materializations = [_][]const u8{"sum_by_customer"};
+    var program_plan = (try algebraic_planner.planMaterializationPartialsTensorProgramAlloc(alloc, &index, &materializations)) orelse return error.TestUnexpectedResult;
+    defer program_plan.deinit(alloc);
+
+    const encoded = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, "alg", 91, program_plan.access_paths, &.{}, program_plan.asProgram());
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"_identity_read_generation\":91") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_access_paths\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_program\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_exprs\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"materialized_tensor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"law_ids\":[\"sum\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"law_id\":\"sum\"") != null);
+
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 91), parsed.identity_read_generation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tensor_access_paths.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.tensor_exprs.len);
+    try std.testing.expect(parsed.tensor_program != null);
+    try validateAlgebraicProgramPartialsProof(alloc, parsed.tensor_access_paths, &parsed.tensor_program.?);
+
+    parsed.tensor_access_paths[0].law_ids[0] = .count;
+    try std.testing.expectError(error.InvalidQueryRequest, validateAlgebraicProgramPartialsProof(alloc, parsed.tensor_access_paths, &parsed.tensor_program.?));
+    parsed.tensor_access_paths[0].law_ids[0] = .sum;
+    try std.testing.expectError(error.UnknownField, parseAlgebraicPartialsRequest(alloc, "{\"index_name\":\"alg\",\"materializations\":[\"sum_by_customer\"]}"));
+}
+
+test "algebraic partial request rejects legacy cardinality bodies" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicPartialsRequest(
+        alloc,
+        "{\"index_name\":\"alg\",\"cardinality\":{\"aggregation_name\":\"x\",\"field\":\"y\"}}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicPartialsRequest(
+        alloc,
+        "{\"index_name\":\"alg\",\"terms_cardinality\":{\"aggregation_name\":\"x\",\"bucket_field\":\"y\",\"children\":[]}}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicPartialsRequest(
+        alloc,
+        "{\"index_name\":\"alg\",\"range_cardinality\":{\"aggregation_name\":\"x\",\"field\":\"amount\",\"kind\":\"numeric\",\"ranges\":[],\"children\":[]}}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicPartialsRequest(
+        alloc,
+        "{\"index_name\":\"alg\",\"histogram_cardinality\":{\"aggregation_name\":\"x\",\"field\":\"amount\",\"kind\":\"numeric\",\"interval\":10,\"children\":[]}}",
+    ));
+}
+
+test "algebraic partial request accepts expression cache proofs without named materializations" {
+    const alloc = std.testing.allocator;
+
+    const expr = algebraic_ir.TensorExpr{
+        .fragment = .reduce,
+        .input_dims = &.{ .doc, .scalar },
+        .output_dims = &.{.bucket},
+        .semantic_id = "expr_sum_by_customer",
+        .layout = .materialized_expr,
+        .law_id = .sum,
+    };
+    var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, expr)).?;
+    defer plan.deinit(alloc);
+
+    const encoded = try encodeAlgebraicExpressionPartialsRequest(alloc, "alg", &.{plan.access_path}, &.{expr});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_access_paths\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_exprs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"materialized_expr\"") != null);
+
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tensor_access_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tensor_exprs.len);
+    try validateAlgebraicPartialsAccessPaths(alloc, parsed.tensor_access_paths, parsed.tensor_exprs);
+
+    parsed.tensor_access_paths[0].owner[0] = if (parsed.tensor_access_paths[0].owner[0] == 'x') 'y' else 'x';
+    try std.testing.expectError(error.InvalidQueryRequest, validateAlgebraicPartialsAccessPaths(alloc, parsed.tensor_access_paths, parsed.tensor_exprs));
+}
+
+test "algebraic partial request accepts tensor program expression outputs" {
+    const alloc = std.testing.allocator;
+
+    const count_expr = algebraic_ir.TensorExpr{
+        .fragment = .reduce,
+        .input_dims = &.{.doc},
+        .output_dims = &.{.bucket},
+        .semantic_id = "expr_count_by_customer",
+        .layout = .materialized_expr,
+        .law_id = .count,
+    };
+    const sum_expr = algebraic_ir.TensorExpr{
+        .fragment = .reduce,
+        .input_dims = &.{ .doc, .scalar },
+        .output_dims = &.{.bucket},
+        .semantic_id = "expr_sum_by_customer",
+        .layout = .materialized_expr,
+        .law_id = .sum,
+    };
+    var count_plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, count_expr)).?;
+    defer count_plan.deinit(alloc);
+    var sum_plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, sum_expr)).?;
+    defer sum_plan.deinit(alloc);
+    const access_paths = [_]algebraic_ir.PhysicalAccessPath{ count_plan.access_path, sum_plan.access_path };
+    const steps = [_]algebraic_ir.TensorProgramStep{ .{ .expr = count_expr }, .{ .expr = sum_expr } };
+    const outputs = [_]algebraic_ir.TensorProgramRef{ .{ .step = 0 }, .{ .step = 1 } };
+    const program = algebraic_ir.TensorProgram{
+        .steps = &steps,
+        .output = .{ .step = 0 },
+        .outputs = &outputs,
+    };
+    try std.testing.expect((try algebraic_ir.tensorProgramProof(alloc, &access_paths, program)).safe());
+
+    const encoded = try encodeAlgebraicPartialsRequestWithProgram(alloc, "alg", &access_paths, &.{}, program);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_program\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"outputs\"") != null);
+    const mixed_encoded = try encodeAlgebraicPartialsRequestWithProgram(alloc, "alg", &access_paths, &.{count_expr}, program);
+    defer alloc.free(mixed_encoded);
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicPartialsRequest(alloc, mixed_encoded));
+
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), parsed.tensor_access_paths.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.tensor_exprs.len);
+    try std.testing.expect(parsed.tensor_program != null);
+    try validateAlgebraicProgramPartialsAccessPaths(alloc, parsed.tensor_access_paths, &parsed.tensor_program.?);
+    const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, null, parsed.tensor_access_paths, &parsed.tensor_program.?);
+    defer alloc.free(exprs);
+    try std.testing.expectEqual(@as(usize, 2), exprs.len);
+    try std.testing.expectEqual(algebraic_ir.TensorFragment.reduce, exprs[0].fragment);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.count, exprs[0].law_id.?);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.sum, exprs[1].law_id.?);
+
+    parsed.tensor_access_paths[1].law_ids[0] = .max;
+    try std.testing.expectError(error.InvalidQueryRequest, validateAlgebraicProgramPartialsAccessPaths(alloc, parsed.tensor_access_paths, &parsed.tensor_program.?));
+}
+
+test "algebraic partial request derives expression outputs from materialized tensor program" {
+    const alloc = std.testing.allocator;
+
+    var index = try db_mod.algebraic.index.Index.open(alloc, "alg",
+        \\{"version":1,"table":"docs","schema_version":1,
+        \\ "group_fields":[{"name":"customer","path":"customer","type":"keyword"}],
+        \\ "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
+        \\ "materializations":[
+        \\   {"name":"customers","op":"count","group_by":["customer"]},
+        \\   {"name":"amount_by_customer","op":"sum","group_by":["customer"],"measure":"amount"}
+        \\ ]}
+    );
+    defer index.close();
+
+    var program_plan = (try algebraic_planner.planBucketQueryMultiOutputTensorProgramAlloc(alloc, &index, .{
+        .kind = .terms,
+        .aggregation_name = "customers",
+        .bucket_field = "customer",
+        .child_metrics = &.{.{ .name = "amount_by_customer", .op = .sum, .field = "amount" }},
+    })).?;
+    defer program_plan.deinit(alloc);
+    const encoded = try encodeAlgebraicPartialsRequestWithProgram(alloc, "alg", program_plan.access_paths, &.{}, program_plan.asProgram());
+    defer alloc.free(encoded);
+
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, &index, parsed.tensor_access_paths, &parsed.tensor_program.?);
+    defer alloc.free(exprs);
+    try std.testing.expectEqual(@as(usize, 2), exprs.len);
+    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.materialized_expr, exprs[0].layout.?);
+    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.materialized_expr, exprs[1].layout.?);
+    try std.testing.expectEqualStrings("customers", exprs[0].semantic_id.?);
+    try std.testing.expectEqualStrings("amount_by_customer", exprs[1].semantic_id.?);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.count, exprs[0].law_id.?);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.sum, exprs[1].law_id.?);
 }
 
 const DocumentAlgebraicAggregateResponseWire = struct {

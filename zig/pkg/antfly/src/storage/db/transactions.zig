@@ -24,7 +24,6 @@ const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
 const relational_integrity = @import("relational_integrity.zig");
-const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
@@ -32,7 +31,7 @@ const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
-const row_claim_intent_key_prefix = relational_rows.row_claim_intent_key_prefix;
+const row_claim_intent_key_prefix = relational_store_mod.row_claim_intent_key_prefix;
 
 const TestHelpers = if (builtin.is_test) struct {
     const support = @import("test_support.zig");
@@ -92,7 +91,7 @@ pub fn Impl(comptime DB: type) type {
                         if (isMetadataKey(intent.key) or internal_keys.isInternalPhysicalTableDataKey(intent.key))
                             raw
                         else
-                            try relational_rows.relationalStoreRowValueAlloc(self.alloc, raw, relational_columns, &owned_relational_values)
+                            try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, raw, relational_columns, &owned_relational_values)
                     else
                         null;
                     try relational_intents.append(self.alloc, .{
@@ -448,7 +447,7 @@ pub fn Impl(comptime DB: type) type {
             try self.validateUniqueConstraintMutations(unique_writes, unique_deletes);
         }
 
-        const findUniqueConstraintMutation = relational_integrity.findUniqueConstraintMutation;
+        const findUniqueConstraintMutation = relational_store_mod.findUniqueConstraintMutation;
 
         fn appendUniqueConstraintMutationIntents(
             self: *DB,
@@ -761,7 +760,7 @@ pub fn Impl(comptime DB: type) type {
                         skip_new_key_owned = false;
 
                         const relational_columns = relationalColumnsForStore(self) orelse return error.UnsupportedOperation;
-                        const row_value = try relational_rows.relationalStoreRowValueAlloc(self.alloc, rewrite.value, relational_columns, &relational_extra_owned_values);
+                        const row_value = try relational_store_mod.relationalStoreRowValueAlloc(self.alloc, rewrite.value, relational_columns, &relational_extra_owned_values);
                         relational_participant_prepared = true;
                         relational_participant.prepareIdentityRewrite(
                             relational_table_name,
@@ -1064,18 +1063,18 @@ fn isUserRowMutationKey(key: []const u8) bool {
     return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
 }
 
-const rowClaimIntentKeyAlloc = relational_rows.rowClaimIntentKeyAlloc;
-const rowClaimIntentValueAlloc = relational_rows.rowClaimIntentValueAlloc;
-const relationalIdentityRewriteIntentKeyAlloc = relational_rows.relationalIdentityRewriteIntentKeyAlloc;
-const encodeRelationalIdentityRewriteIntentValueAlloc = relational_rows.encodeRelationalIdentityRewriteIntentValueAlloc;
-const collectTransactionRelationalIdentityRewritesAlloc = relational_rows.collectTransactionRelationalIdentityRewritesAlloc;
-const freeRelationalIdentityRewrites = relational_rows.freeRelationalIdentityRewrites;
-const isRelationalIdentityRewriteEndpoint = relational_rows.isRelationalIdentityRewriteEndpoint;
+const rowClaimIntentKeyAlloc = relational_store_mod.rowClaimIntentKeyAlloc;
+const rowClaimIntentValueAlloc = relational_store_mod.rowClaimIntentValueAlloc;
+const relationalIdentityRewriteIntentKeyAlloc = relational_store_mod.relationalIdentityRewriteIntentKeyAlloc;
+const encodeRelationalIdentityRewriteIntentValueAlloc = relational_store_mod.encodeRelationalIdentityRewriteIntentValueAlloc;
+const collectTransactionRelationalIdentityRewritesAlloc = relational_store_mod.collectTransactionRelationalIdentityRewritesAlloc;
+const freeRelationalIdentityRewrites = relational_store_mod.freeRelationalIdentityRewrites;
+const isRelationalIdentityRewriteEndpoint = relational_store_mod.isRelationalIdentityRewriteEndpoint;
 const isForeignKeyActionScheduleMetadataKey = relational_integrity.isForeignKeyActionScheduleMetadataKey;
-const collectTransactionExternalizedForeignKeyParentChecksAlloc = relational_integrity.collectTransactionExternalizedForeignKeyParentChecksAlloc;
-const collectTransactionForeignKeyConstraintTimingOverridesAlloc = relational_integrity.collectTransactionForeignKeyConstraintTimingOverridesAlloc;
-const freeExternalizedForeignKeyParentChecks = relational_integrity.freeExternalizedForeignKeyParentChecks;
-const freeRelationalForeignKeyConstraintTimingOverrides = relational_integrity.freeRelationalForeignKeyConstraintTimingOverrides;
+const collectTransactionExternalizedForeignKeyParentChecksAlloc = relational_store_mod.collectTransactionExternalizedForeignKeyParentChecksAlloc;
+const collectTransactionForeignKeyConstraintTimingOverridesAlloc = relational_store_mod.collectTransactionForeignKeyConstraintTimingOverridesAlloc;
+const freeExternalizedForeignKeyParentChecks = relational_store_mod.freeExternalizedForeignKeyParentChecks;
+const freeRelationalForeignKeyConstraintTimingOverrides = relational_store_mod.freeRelationalForeignKeyConstraintTimingOverrides;
 
 pub fn reclaimExpiredRowClaimIntentsForRows(
     self: anytype,
@@ -1114,7 +1113,7 @@ pub fn appendRowClaimPredicatesForMutationKeys(
     writes: anytype,
     deletes: []const []const u8,
 ) !void {
-    return try relational_rows.appendRowClaimPredicatesForMutationKeys(alloc, predicates, owned_keys, writes, deletes, isUserRowMutationKey);
+    return try relational_store_mod.appendRowClaimPredicatesForMutationKeys(alloc, predicates, owned_keys, writes, deletes, isUserRowMutationKey);
 }
 
 pub fn appendRowClaimPredicatesForIdentityRewrites(
@@ -1123,7 +1122,7 @@ pub fn appendRowClaimPredicatesForIdentityRewrites(
     owned_keys: *std.ArrayListUnmanaged([]u8),
     rewrites: []const types.RelationalIdentityRewrite,
 ) !void {
-    return try relational_rows.appendRowClaimPredicatesForIdentityRewrites(alloc, predicates, owned_keys, rewrites, isUserRowMutationKey);
+    return try relational_store_mod.appendRowClaimPredicatesForIdentityRewrites(alloc, predicates, owned_keys, rewrites, isUserRowMutationKey);
 }
 
 pub fn validateRelationalIdentityRewriteRequest(
@@ -1131,7 +1130,7 @@ pub fn validateRelationalIdentityRewriteRequest(
     writes: []const types.TransactionWrite,
     deletes: []const []const u8,
 ) !void {
-    return try relational_rows.validateRelationalIdentityRewriteRequest(rewrites, writes, deletes, isUserRowMutationKey);
+    return try relational_store_mod.validateRelationalIdentityRewriteRequest(rewrites, writes, deletes, isUserRowMutationKey);
 }
 
 pub fn appendSystemVersionedHistoryForBatch(

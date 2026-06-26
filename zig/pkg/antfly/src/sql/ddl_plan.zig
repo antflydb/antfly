@@ -3092,12 +3092,26 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     };
 }
 
-pub fn transactionControlPlanFromGeneratedAst(
+pub fn transactionControlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
 ) !LoweredDdlPlan {
     try validateGeneratedTransactionAstSpans(tokens, ast);
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (ast.name_tokens) |name_tokens| {
+        if (name_tokens.end != end) return error.UnsupportedSqlShape;
+        var pos: usize = 0;
+        var plan: LoweredDdlPlan = switch (ast.kind) {
+            .savepoint => .{ .savepoint_transaction = .{ .savepoint = try parseSavepointTransactionPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            .release_savepoint => .{ .savepoint_transaction = .{ .release = try parseReleaseSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            .rollback_to_savepoint => .{ .savepoint_transaction = .{ .rollback_to = try parseRollbackToSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            else => return error.UnsupportedSqlShape,
+        };
+        errdefer plan.deinit(alloc);
+        if (pos != end - 1) return error.UnsupportedSqlShape;
+        return plan;
+    }
     if (ast.mode_tokens) |mode_tokens| {
         if (mode_tokens.start != 1 or mode_tokens.end != end) return error.UnsupportedSqlShape;
         var pos: usize = 0;
@@ -3105,7 +3119,12 @@ pub fn transactionControlPlanFromGeneratedAst(
             .set_transaction => .set_transaction,
             .start_transaction => .start_transaction,
             .begin => .begin,
-            .commit, .rollback => return error.UnsupportedSqlShape,
+            .commit,
+            .rollback,
+            .savepoint,
+            .release_savepoint,
+            .rollback_to_savepoint,
+            => return error.UnsupportedSqlShape,
         };
         const mode = try parseTransactionModePlanTail(tokens[mode_tokens.start..mode_tokens.end], &pos, starter);
         if (pos != mode_tokens.end - mode_tokens.start) return error.UnsupportedSqlShape;
@@ -3115,10 +3134,11 @@ pub fn transactionControlPlanFromGeneratedAst(
 }
 
 pub fn transactionBoundaryPlanFromGeneratedAst(
+    alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
 ) !LoweredDdlPlan {
-    const plan = try transactionControlPlanFromGeneratedAst(tokens, ast);
+    const plan = try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, ast);
     switch (plan) {
         .adapter_noop => return plan,
         else => return error.UnsupportedSqlShape,
@@ -3139,12 +3159,24 @@ fn validateGeneratedTransactionAstSpans(
         .begin => if (!tokens[0].matchesKeywordTag(.begin)) return error.UnsupportedSqlShape,
         .commit => if (!tokens[0].matchesKeywordTag(.commit)) return error.UnsupportedSqlShape,
         .rollback => if (!tokens[0].matchesKeywordTag(.rollback)) return error.UnsupportedSqlShape,
+        .savepoint => if (!tokens[0].matchesKeywordTag(.savepoint)) return error.UnsupportedSqlShape,
+        .release_savepoint => if (!tokens[0].matchesKeywordTag(.release)) return error.UnsupportedSqlShape,
+        .rollback_to_savepoint => if (!tokens[0].matchesKeywordTag(.rollback)) return error.UnsupportedSqlShape,
     }
     if (ast.boundary_tail_tokens != null and ast.mode_tokens != null) return error.UnsupportedSqlShape;
+    if (ast.name_tokens != null and (ast.boundary_tail_tokens != null or ast.mode_tokens != null)) return error.UnsupportedSqlShape;
+    if (ast.name_tokens) |name| {
+        try validateGeneratedSavepointNameRange(tokens, end, ast.kind, name);
+        return;
+    }
     if (ast.boundary_tail_tokens) |tail| {
         if (tail.start != 1 or tail.end != 2 or tail.end > end) return error.UnsupportedSqlShape;
         switch (ast.kind) {
-            .set_transaction => return error.UnsupportedSqlShape,
+            .set_transaction,
+            .savepoint,
+            .release_savepoint,
+            .rollback_to_savepoint,
+            => return error.UnsupportedSqlShape,
             .start_transaction => if (!tokens[tail.start].matchesKeyword("transaction")) return error.UnsupportedSqlShape,
             .begin, .commit, .rollback => {
                 if (!tokens[tail.start].matchesKeyword("work") and !tokens[tail.start].matchesKeyword("transaction")) {
@@ -3157,6 +3189,25 @@ fn validateGeneratedTransactionAstSpans(
     } else if (ast.mode_tokens == null and end > 1) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedSavepointNameRange(
+    tokens: []const grammar.Token,
+    end: usize,
+    kind: generated_parser.GeneratedSqlTransactionKind,
+    name: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const expected_start: usize = switch (kind) {
+        .savepoint => 1,
+        .release_savepoint => if (end > 1 and tokens[1].matchesKeywordTag(.savepoint)) @as(usize, 2) else 1,
+        .rollback_to_savepoint => blk: {
+            if (end <= 1 or !tokens[1].matchesKeywordTag(.to)) return error.UnsupportedSqlShape;
+            break :blk if (end > 2 and tokens[2].matchesKeywordTag(.savepoint)) @as(usize, 3) else 2;
+        },
+        else => return error.UnsupportedSqlShape,
+    };
+    if (name.start != expected_start or name.end != expected_start + 1 or name.end != end) return error.UnsupportedSqlShape;
+    if (tokens[name.start].kind != .identifier) return error.UnsupportedSqlShape;
 }
 
 pub fn sessionDdlPlanFromGeneratedAstAlloc(
@@ -10950,7 +11001,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             switch (generated_ast) {
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
-                .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAst(tokens, transaction_ast),
+                .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
                 .ddl, .extension_index => |ddl_ast| {
                     if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
                         return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
@@ -15233,7 +15284,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     malformed_span_ast.statement_span.start += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(malformed_span.items(), malformed_span_ast),
+        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_span.items(), malformed_span_ast),
     );
 
     var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT;");
@@ -15246,7 +15297,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     malformed_command_ast.command_span.end += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(malformed_command.items(), malformed_command_ast),
+        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_command.items(), malformed_command_ast),
     );
 
     var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK;");
@@ -15259,7 +15310,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     mismatched_kind_ast.kind = .commit;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(mismatched_kind.items(), mismatched_kind_ast),
+        transactionBoundaryPlanFromGeneratedAst(alloc, mismatched_kind.items(), mismatched_kind_ast),
     );
 
     var missing_tail = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT WORK;");
@@ -15272,7 +15323,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     missing_tail_ast.boundary_tail_tokens = null;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(missing_tail.items(), missing_tail_ast),
+        transactionBoundaryPlanFromGeneratedAst(alloc, missing_tail.items(), missing_tail_ast),
     );
 
     var malformed_tail = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK TRANSACTION;");
@@ -15285,7 +15336,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     malformed_tail_ast.boundary_tail_tokens = .{ .start = 0, .end = 1 };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(malformed_tail.items(), malformed_tail_ast),
+        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_tail.items(), malformed_tail_ast),
     );
 }
 
@@ -15356,7 +15407,7 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
     missing_mode_ast.mode_tokens = null;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAst(missing_mode.items(), missing_mode_ast),
+        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_mode.items(), missing_mode_ast),
     );
 
     var malformed_mode = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN READ ONLY;");
@@ -15369,7 +15420,77 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
     malformed_mode_ast.mode_tokens = .{ .start = 2, .end = 3 };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAst(malformed_mode.items(), malformed_mode_ast),
+        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_mode.items(), malformed_mode_ast),
+    );
+}
+
+test "sql adapter generated savepoint transaction AST lowers to savepoint plans" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        tag: std.meta.Tag(SavepointTransactionPlan),
+    }{
+        .{ .sql = "SAVEPOINT before_retry;", .tag = .savepoint },
+        .{ .sql = "RELEASE SAVEPOINT before_retry;", .tag = .release },
+        .{ .sql = "RELEASE before_retry;", .tag = .release },
+        .{ .sql = "ROLLBACK TO SAVEPOINT before_retry;", .tag = .rollback_to },
+        .{ .sql = "ROLLBACK TO before_retry;", .tag = .rollback_to },
+    };
+
+    for (cases) |case| {
+        var generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
+        defer generated.deinit(alloc);
+        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer legacy.deinit(alloc);
+        switch (generated) {
+            .savepoint_transaction => |generated_savepoint| switch (legacy) {
+                .savepoint_transaction => |legacy_savepoint| {
+                    try std.testing.expectEqual(case.tag, std.meta.activeTag(generated_savepoint));
+                    try std.testing.expectEqual(std.meta.activeTag(legacy_savepoint), std.meta.activeTag(generated_savepoint));
+                    const generated_name = switch (generated_savepoint) {
+                        .savepoint => |savepoint| savepoint.savepoint_name,
+                        .release => |release| release.savepoint_name,
+                        .rollback_to => |rollback| rollback.savepoint_name,
+                    };
+                    const legacy_name = switch (legacy_savepoint) {
+                        .savepoint => |savepoint| savepoint.savepoint_name,
+                        .release => |release| release.savepoint_name,
+                        .rollback_to => |rollback| rollback.savepoint_name,
+                    };
+                    try std.testing.expectEqualStrings(legacy_name, generated_name);
+                    try std.testing.expectEqualStrings("before_retry", generated_name);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var missing_name = try tokenized.ParsedSql.initAlloc(alloc, "SAVEPOINT before_retry;");
+    defer missing_name.deinit(alloc);
+    const missing_name_raw = missing_name.generated_statement orelse return error.TestUnexpectedResult;
+    var missing_name_ast = switch (missing_name_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    missing_name_ast.name_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_name.items(), missing_name_ast),
+    );
+
+    var malformed_name = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK TO SAVEPOINT before_retry;");
+    defer malformed_name.deinit(alloc);
+    const malformed_name_raw = malformed_name.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_name_ast = switch (malformed_name_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_name_ast.name_tokens = .{ .start = 2, .end = 3 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_name.items(), malformed_name_ast),
     );
 }
 
@@ -16681,7 +16802,7 @@ fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: [
         .transaction => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    return try transactionBoundaryPlanFromGeneratedAst(parsed.items(), transaction_ast);
+    return try transactionBoundaryPlanFromGeneratedAst(alloc, parsed.items(), transaction_ast);
 }
 
 fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
@@ -16692,7 +16813,7 @@ fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []
         .transaction => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    return try transactionControlPlanFromGeneratedAst(parsed.items(), transaction_ast);
+    return try transactionControlPlanFromGeneratedAstAlloc(alloc, parsed.items(), transaction_ast);
 }
 
 fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
@@ -17627,7 +17748,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
-test "sql adapter generated cursor and savepoint unsupported AST lowers to catalog plans" {
+test "sql adapter generated cursor unsupported and savepoint transaction AST lowers to catalog plans" {
     const alloc = std.testing.allocator;
 
     var declare_sql = try tokenized.ParsedSql.initAlloc(
@@ -17741,7 +17862,7 @@ test "sql adapter generated cursor and savepoint unsupported AST lowers to catal
     if (malformed_subject.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
+                .transaction => |*transaction| transaction.name_tokens = .{ .start = 0, .end = malformed_subject.items().len },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;

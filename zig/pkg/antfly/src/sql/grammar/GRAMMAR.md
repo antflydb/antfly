@@ -62,7 +62,11 @@ for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
 Transaction boundary commands now dispatch through generated AST-to-plan
 lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
 adapter-noop boundaries, including retained statement/command source-span and
-command-kind validation.
+command-kind validation. Transaction mode and savepoint controls are also
+lowered from generated transaction ASTs: `SET TRANSACTION`,
+`START TRANSACTION`, `BEGIN ...` mode tails, `SAVEPOINT`, `RELEASE [SAVEPOINT]`,
+and `ROLLBACK TO [SAVEPOINT]` retain validated mode/name token ranges before
+lowering to the typed transaction-control or savepoint plans.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for

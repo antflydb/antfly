@@ -26,6 +26,8 @@ const table_write_core = @import("core.zig");
 
 const TableReadSource = table_read_core.TableReadSource;
 const TableWriteSource = table_write_core.TableWriteSource;
+const normalizeRelationalConstraintError = table_write_core.normalizeRelationalConstraintError;
+const nextTxnTimestamp = table_write_core.nextTxnTimestamp;
 
 pub fn mutateRowsJoinedFromSourceRowsOnDb(
     alloc: std.mem.Allocator,
@@ -51,6 +53,63 @@ pub fn mutateRowsJoinedFromSourceRowsOnDb(
     defer plan.deinit(alloc);
 
     return try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
+}
+
+pub fn mutateRowsFromSourceAutocommitOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsMutationSourceRequest,
+) !db_mod.types.RelationalRowsMutationSourceResult {
+    const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
+    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+
+    const begin_timestamp = nextTxnTimestamp();
+    const commit_version = begin_timestamp + 1;
+    _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
+    var result = db.mutateRelationalRowsFromSource(alloc, schema, req) catch |err| {
+        db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
+        return normalizeRelationalConstraintError(err);
+    };
+    errdefer result.deinit(alloc);
+    db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
+        return normalizeRelationalConstraintError(err);
+    };
+    return result;
+}
+
+fn joinedMutationSourceTargetClaim(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) ?db_mod.types.RowClaimRequest {
+    return switch (req.target_side) {
+        .left => req.join.left.row_claim,
+        .right => req.join.right.row_claim,
+    };
+}
+
+pub fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    source_rows: []const []const u8,
+) !db_mod.types.RelationalRowsMutationSourceResult {
+    const claim = joinedMutationSourceTargetClaim(req) orelse return error.InvalidQueryRequest;
+    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+
+    const begin_timestamp = nextTxnTimestamp();
+    const commit_version = begin_timestamp + 1;
+    _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
+    var result = mutateRowsJoinedFromSourceRowsOnDb(alloc, db, target_schema, source_schema, req, source_rows) catch |err| {
+        db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
+        return normalizeRelationalConstraintError(err);
+    };
+    errdefer result.deinit(alloc);
+    db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
+        return normalizeRelationalConstraintError(err);
+    };
+    return result;
 }
 
 pub fn mergeRowsFromSourceRowsOnDb(

@@ -368,6 +368,19 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
         return start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction");
     }
     if (tokenMatchesKeyword(first, .begin)) return true;
+    if (tokenMatchesKeyword(first, .savepoint)) return end == start + 2;
+    if (tokenMatchesText(first, "release")) {
+        if (end == start + 2) return tokens[start + 1].kind == .identifier;
+        return end == start + 3 and
+            tokenMatchesKeyword(tokens[start + 1], .savepoint) and
+            tokens[start + 2].kind == .identifier;
+    }
+    if (tokenMatchesKeyword(first, .rollback) and start + 1 < end and tokenMatchesKeyword(tokens[start + 1], .to)) {
+        if (end == start + 3) return tokens[start + 2].kind == .identifier;
+        return end == start + 4 and
+            tokenMatchesKeyword(tokens[start + 2], .savepoint) and
+            tokens[start + 3].kind == .identifier;
+    }
     if (!tokenMatchesKeyword(first, .commit) and !tokenMatchesKeyword(first, .rollback)) return false;
     if (end == start + 1) return true;
     return end == start + 2 and
@@ -2918,11 +2931,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .reindex_not_planned_by_generated_parser,
         },
         .{
-            .sql = "RELEASE SAVEPOINT usage_batch",
-            .kind = .release,
-            .reason = .release_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "REASSIGN OWNED BY old_role TO new_role",
             .kind = .reassign_owned,
             .reason = .reassign_owned_not_planned_by_generated_parser,
@@ -2931,11 +2939,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
             .kind = .revoke,
             .reason = .revoke_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "SAVEPOINT usage_batch",
-            .kind = .savepoint,
-            .reason = .savepoint_not_planned_by_generated_parser,
         },
         .{
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
@@ -3050,7 +3053,7 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (transaction.statement) {
-        .ddl => {},
+        .transaction => {},
         else => return error.TestUnexpectedResult,
     }
 
@@ -3061,6 +3064,32 @@ test "sql adapter parsed sql owns typed statement variants" {
         .transaction => |generated_transaction| {
             try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.set_transaction, generated_transaction.kind);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 4 }, generated_transaction.mode_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var savepoint = try ParsedSql.initAlloc(alloc, "SAVEPOINT before_retry");
+    defer savepoint.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.transaction, savepoint.generatedStatementKind().?);
+    switch (savepoint.generated_statement.?.ast.?) {
+        .transaction => |generated_transaction| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.savepoint, generated_transaction.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_transaction.name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (savepoint.statement) {
+        .transaction => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rollback_to_savepoint = try ParsedSql.initAlloc(alloc, "ROLLBACK TO before_retry");
+    defer rollback_to_savepoint.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.transaction, rollback_to_savepoint.generatedStatementKind().?);
+    switch (rollback_to_savepoint.generated_statement.?.ast.?) {
+        .transaction => |generated_transaction| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.rollback_to_savepoint, generated_transaction.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, generated_transaction.name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

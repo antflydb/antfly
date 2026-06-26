@@ -90,6 +90,10 @@ pub fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
     try db.core.index_manager.syncAll(false);
 }
 
+pub fn isTransientReplayVisibilityError(err: anyerror) bool {
+    return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
+}
+
 pub fn loadTableIndexesJson(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,

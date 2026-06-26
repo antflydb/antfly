@@ -17,7 +17,6 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -26,8 +25,10 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const split_restore = @import("split_restore.zig");
 const db_internal = @import("internal.zig");
+const artifact_replay = @import("artifact_replay.zig");
 const lifecycle_mod = @import("lifecycle.zig");
 const ha_replication = @import("ha_replication.zig");
+const ha_types = @import("ha_types.zig");
 const write_path = @import("write_path.zig");
 const db_transactions = @import("transactions.zig");
 const schema_runtime = @import("schema_runtime.zig");
@@ -40,26 +41,17 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
-const backfill_state_mod = @import("backfill_state.zig");
 const types = @import("types.zig");
 const aggregations_mod = @import("aggregations.zig");
-const artifact_ids = @import("artifact_ids.zig");
-const apply_state = @import("derived/apply_state.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_async = @import("derived_async.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
-const hbc_mod = @import("../hbc_adapter.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
-const asset_producer_mod = @import("enrichment/asset_producer.zig");
-const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
-const enrichment_types = @import("enrichment/enrichment_types.zig");
-const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
-const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
 const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
@@ -77,15 +69,12 @@ const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_store_mod = @import("relational_store.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const db_query_graph = @import("query/graph_exec.zig");
-const db_query_projection = @import("query/projection.zig");
 const db_query_search = @import("query/search_exec.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
-const platform_clock = @import("../../platform/clock.zig");
-const getenv = db_internal.getenv;
 
 pub const OpenOptions = lifecycle_mod.OpenOptions;
 pub const OpenMode = lifecycle_mod.OpenOptions.OpenMode;
@@ -95,14 +84,14 @@ pub const ForeignKeyDeletePlan = relational_store_mod.ForeignKeyDeletePlan;
 pub const UniqueConstraintIntegrityReport = relational_store_mod.UniqueConstraintIntegrityReport;
 pub const local_schema_json_key = schema_runtime.local_schema_json_key;
 pub const local_lite_sql_table_record_json_key = schema_runtime.local_lite_sql_table_record_json_key;
-pub const HAAsyncEffectMirror = ha_replication.AsyncEffectMirror;
-pub const HAAsyncBatchMirror = ha_replication.AsyncBatchMirror;
-pub const HAAsyncMetadataMirror = ha_replication.AsyncMetadataMirror;
-pub const HASyncWaitFn = ha_replication.SyncWaitFn;
-pub const HAProgressPollFn = ha_replication.ProgressPollFn;
-pub const HAPrimaryProgressSyncWait = ha_replication.PrimaryProgressSyncWait;
-pub const HASessionSyncWait = ha_replication.SessionSyncWait;
-pub const HAWriteGate = ha_replication.WriteGate;
+pub const HAAsyncEffectMirror = ha_types.AsyncEffectMirror;
+pub const HAAsyncBatchMirror = ha_types.AsyncBatchMirror;
+pub const HAAsyncMetadataMirror = ha_types.AsyncMetadataMirror;
+pub const HASyncWaitFn = ha_types.SyncWaitFn;
+pub const HAProgressPollFn = ha_types.ProgressPollFn;
+pub const HAPrimaryProgressSyncWait = ha_types.PrimaryProgressSyncWait;
+pub const HASessionSyncWait = ha_types.SessionSyncWait;
+pub const HAWriteGate = ha_types.WriteGate;
 
 pub const ReplayProgress = db_internal.ReplayProgress;
 pub const ReplayProgressHook = db_internal.ReplayProgressHook;
@@ -125,23 +114,10 @@ const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 
 const AsyncContext = db_internal.AsyncContext(DB);
 
-fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
-    const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-    if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
-}
-
-fn lockApply(db: *DB) void {
-    db.core.lockApply();
-}
-
 const denseCatchUpFinishOptions = derived_async.denseCatchUpFinishOptions;
-const denseCatchUpStartupCacheNodes = derived_async.denseCatchUpStartupCacheNodes;
-const denseCatchUpStartupCacheVectors = derived_async.denseCatchUpStartupCacheVectors;
 const EnrichmentAppendContext = db_internal.EnrichmentAppendContext(DB);
 
 const BatchExecutionContext = db_internal.BatchExecutionContext(DB);
-
-const ReplayApplyContext = db_internal.ReplayApplyContext(DB);
 
 const TtlCleanupContext = db_internal.TtlCleanupContext(DB);
 
@@ -154,11 +130,7 @@ pub const OpenProfile = lifecycle_mod.OpenProfile;
 
 const logBatchProfile = write_path.logBatchProfile;
 
-const threadedIo = db_internal.threadedIo;
 const monotonicTimeNs = platform.time.monotonicNs;
-const sleepNs = db_internal.sleepNs;
-const sleepPollInterval = db_internal.sleepPollInterval;
-const yieldToBackground = db_internal.yieldToBackground;
 
 pub const RestoreState = split_restore.RestoreState;
 pub const RestoreIdentity = split_restore.RestoreIdentity;
@@ -226,36 +198,36 @@ pub const DB = struct {
     const search_runtime_impl = search_runtime.Impl(@This());
     const derived_async_impl = derived_async.Impl(@This());
     pub const LifecycleCallbacks = struct {
-        pub const apply_derived_batch_to_index_async = lifecycleApplyDerivedBatchToIndexAsync;
-        pub const persist_applied_sequence_async = lifecyclePersistAppliedSequenceAsync;
-        pub const truncate_replay_sequence_async = lifecycleTruncateReplaySequenceAsync;
-        pub const begin_derived_catch_up_session_async = lifecycleBeginDerivedCatchUpSessionAsync;
-        pub const finish_derived_catch_up_session_async = lifecycleFinishDerivedCatchUpSessionAsync;
-        pub const can_advance_derived_to_target_async = derivedAsyncCanAdvanceDerivedToTargetAsync;
-        pub const append_derived_batch_from_enrichment = lifecycleAppendDerivedBatchFromEnrichment;
-        pub const notify_derived_executor_sequence = lifecycleNotifyDerivedExecutorSequence;
-        pub const delete_expired_documents_from_candidates = lifecycleDeleteExpiredDocumentsFromCandidates;
-        pub const notify_async_context_visibility_hook = notifyAsyncContextVisibilityHook;
-        pub const clear_bulk_ingest_seen_doc_keys_locked = lifecycleClearBulkIngestSeenDocKeysLocked;
-        pub const deinit_bulk_ingest_coalescer = lifecycleDeinitBulkIngestCoalescer;
-        pub const replay_pending_derived_batches = lifecycleReplayPendingDerivedBatches;
-        pub const start_async_workers = lifecycleStartAsyncWorkers;
-        pub const flush_applied_sequences_for_idle = lifecycleFlushAppliedSequencesForIdle;
-        pub const wait_for_sync_level = lifecycleWaitForSyncLevel;
-        pub const dense_index_rebuild_state_path_alloc = lifecycleDenseIndexRebuildStatePathAlloc;
-        pub const set_dense_catch_up_progress = lifecycleSetDenseCatchUpProgress;
+        pub const apply_derived_batch_to_index_async = derived_async_impl.applyDerivedBatchToIndexAsync;
+        pub const persist_applied_sequence_async = derived_async_impl.persistAppliedSequenceAsync;
+        pub const truncate_replay_sequence_async = derived_async_impl.truncateReplaySequenceAsync;
+        pub const begin_derived_catch_up_session_async = derived_async_impl.beginDerivedCatchUpSessionAsync;
+        pub const finish_derived_catch_up_session_async = derived_async_impl.finishDerivedCatchUpSessionAsync;
+        pub const can_advance_derived_to_target_async = derived_async_impl.canAdvanceDerivedToTargetAsync;
+        pub const append_derived_batch_from_enrichment = derived_async_impl.appendDerivedBatchFromEnrichment;
+        pub const notify_derived_executor_sequence = derived_async_impl.notifyDerivedExecutorSequence;
+        pub const delete_expired_documents_from_candidates = write_path_impl.deleteExpiredDocumentsFromCandidates;
+        pub const notify_async_context_visibility_hook = internal_impl.notifyAsyncContextVisibilityHook;
+        pub const clear_bulk_ingest_seen_doc_keys_locked = write_path_impl.clearBulkIngestSeenDocKeysLocked;
+        pub const deinit_bulk_ingest_coalescer = write_path_impl.deinitBulkIngestCoalescer;
+        pub const replay_pending_derived_batches = derived_async_impl.replayPendingDerivedBatches;
+        pub const start_async_workers = lifecycle_impl.startAsyncWorkers;
+        pub const flush_applied_sequences_for_idle = derived_async_impl.flushAppliedSequencesForIdle;
+        pub const wait_for_sync_level = derived_async_impl.waitForSyncLevel;
+        pub const dense_index_rebuild_state_path_alloc = derived_async_impl.denseIndexRebuildStatePathAlloc;
+        pub const set_dense_catch_up_progress = derived_async_impl.setDenseCatchUpProgress;
         pub const probe_derived_replay_target_sequence = lifecycle_mod.probeDerivedReplayTargetSequence;
-        pub const lock_apply = lockApply;
-        pub const populate_algebraic_index_stats = lifecyclePopulateAlgebraicIndexStats;
-        pub const open_mode_requires_read_only_backends = lifecycle_mod.openModeRequiresReadOnlyBackends;
+        pub const lock_apply = internal_impl.lockApply;
+        pub const populate_algebraic_index_stats = lifecycle_impl.populateAlgebraicIndexStats;
+        pub const open_mode_requires_read_only_backends = db_config.openModeRequiresReadOnlyBackends;
     };
     pub const DerivedAsyncCallbacks = struct {
         pub const dense_catch_up_finish_options = denseCatchUpFinishOptions;
-        pub const apply_derived_batch_to_index_context = derivedAsyncApplyDerivedBatchToIndexContext;
-        pub const apply_derived_batch_to_index_context_profiled = derivedAsyncApplyDerivedBatchToIndexContextProfiled;
-        pub const save_index_status_snapshots = lifecycle_mod.saveIndexStatusSnapshots;
+        pub const apply_derived_batch_to_index_context = derived_async_impl.applyDerivedBatchToIndexContext;
+        pub const apply_derived_batch_to_index_context_profiled = derived_async_impl.applyDerivedBatchToIndexContextProfiled;
+        pub const save_index_status_snapshots = db_internal.saveIndexStatusSnapshots;
         pub const async_index_profile_enabled = db_internal.asyncIndexProfileEnabled;
-        pub const replay_pending_derived_batches_context = derivedAsyncReplayPendingDerivedBatchesContext;
+        pub const replay_pending_derived_batches_context = derived_async_impl.replayPendingDerivedBatchesContext;
         pub const open_profile_enabled = lifecycle_mod.openProfileEnabled;
         pub const log_replay_catch_up_profile = derived_async.logReplayCatchUpProfile;
         pub const log_derived_worker_profile = derived_async.logDerivedWorkerProfile;
@@ -263,441 +235,76 @@ pub const DB = struct {
     pub const WritePathCallbacks = struct {
         pub const Profile = BatchProfile;
         pub const Options = BatchExecutionOptions;
-        pub const batch_internal = writePathBatchInternal;
-        pub const open_mode_requires_read_only_backends = lifecycle_mod.openModeRequiresReadOnlyBackends;
-        pub const enforce_ha_write_gate = writePathEnforceHAWriteGate;
-        pub const preflight_ha_batch_sync_commit = writePathPreflightHABatchSyncCommit;
+        pub const batch_internal = write_path_impl.batchInternal;
+        pub const open_mode_requires_read_only_backends = db_config.openModeRequiresReadOnlyBackends;
+        pub const enforce_ha_write_gate = ha_replication_impl.enforceDBWriteGate;
+        pub const preflight_ha_batch_sync_commit = ha_replication_impl.preflightDBBatchSyncCommit;
         pub const bench_metrics_enabled = db_internal.benchMetricsEnabled;
         pub const log_batch_profile = logBatchProfile;
         pub const monotonic_time_ns = monotonicTimeNs;
         pub const record_profile_ns = write_path.recordProfileNs;
-        pub const lock_apply = lockApply;
+        pub const lock_apply = internal_impl.lockApply;
         pub const append_row_claim_predicates_for_mutation_keys = db_transactions.appendRowClaimPredicatesForMutationKeys;
         pub const append_row_claim_predicates_for_identity_rewrites = db_transactions.appendRowClaimPredicatesForIdentityRewrites;
         pub const reclaim_expired_row_claim_intents_for_mutation_keys = db_transactions.reclaimExpiredRowClaimIntentsForMutationKeys;
         pub const reclaim_expired_row_claim_intents_for_identity_rewrites = db_transactions.reclaimExpiredRowClaimIntentsForIdentityRewrites;
-        pub const relational_column_index_policy_for_store = writePathRelationalColumnIndexPolicyForStore;
+        pub const relational_column_index_policy_for_store = schema_runtime_impl.relationalColumnIndexPolicyForStore;
         pub const relational_columns_for_store = relationalColumnsForStore;
-        pub const record_foreign_key_child_write_reject = writePathRecordForeignKeyChildWriteReject;
-        pub const record_foreign_key_parent_delete_reject = writePathRecordForeignKeyParentDeleteReject;
+        pub const record_foreign_key_child_write_reject = relational_integrity_impl.recordForeignKeyChildWriteReject;
+        pub const record_foreign_key_parent_delete_reject = relational_integrity_impl.recordForeignKeyParentDeleteReject;
         pub const is_metadata_key = db_internal.isMetadataKey;
         pub const augment_extracted_write_with_graph_field_edges = write_path.augmentExtractedWriteWithGraphFieldEdges;
         pub const should_write_timestamp = db_internal.shouldWriteTimestamp;
-        pub const resolve_write_timestamp_ns = writePathResolveWriteTimestampNs;
+        pub const resolve_write_timestamp_ns = internal_impl.resolveWriteTimestampNs;
         pub const make_timestamp_key = db_internal.makeTimestampKey;
         pub const encode_timestamp_value = db_internal.encodeTimestampValue;
         pub const append_system_versioned_history_for_batch = db_transactions.appendSystemVersionedHistoryForBatch;
-        pub const split_shadow_requires_materialized_derived_batch = writePathSplitShadowRequiresMaterializedDerivedBatch;
+        pub const split_shadow_requires_materialized_derived_batch = split_restore_impl.splitShadowRequiresMaterializedDerivedBatch;
         pub const encode_thin_replay_record_payload = write_path.encodeThinReplayRecordPayload;
-        pub const append_precomputed_graph_source_artifacts = writePathAppendPrecomputedGraphSourceArtifacts;
-        pub const graph_writes_from_artifact_value_alloc = derived_async.graphWritesFromArtifactValueAlloc;
-        pub const free_graph_writes = derived_async.freeGraphWrites;
-        pub const resolution_mention_state_keys_for_graph_source_alloc = derived_async.resolutionMentionStateKeysForGraphSourceAlloc;
+        pub const append_precomputed_graph_source_artifacts = write_path_impl.appendPrecomputedGraphSourceArtifacts;
+        pub const graph_writes_from_artifact_value_alloc = artifact_replay.graphWritesFromArtifactValueAlloc;
+        pub const free_graph_writes = artifact_replay.freeGraphWrites;
+        pub const resolution_mention_state_keys_for_graph_source_alloc = artifact_replay.resolutionMentionStateKeysForGraphSourceAlloc;
         pub const attach_inline_upsert_document_values = derived_async.attachInlineUpsertDocumentValues;
-        pub const apply_derived_batch_to_shadow_if_needed = writePathApplyDerivedBatchToShadowIfNeeded;
-        pub const collect_managed_sync_targets = writePathCollectManagedSyncTargets;
-        pub const encode_change_record_payload = writePathEncodeChangeRecordPayload;
-        pub const encode_change_record_payload_context = writePathEncodeChangeRecordPayloadContext;
-        pub const mirror_ha_batch_mutation_commit = writePathMirrorHABatchMutationCommit;
-        pub const mirror_ha_replay_payload_commit = writePathMirrorHAReplayPayloadCommit;
-        pub const mirror_ha_replay_payload_best_effort = writePathMirrorHAReplayPayloadBestEffort;
-        pub const should_append_split_delta = writePathShouldAppendSplitDelta;
+        pub const apply_derived_batch_to_shadow_if_needed = derived_async_impl.applyDerivedBatchToShadowIfNeeded;
+        pub const collect_managed_sync_targets = derived_async_impl.collectManagedSyncTargets;
+        pub const encode_change_record_payload = derived_async_impl.encodeChangeRecordPayloadForDB;
+        pub const encode_change_record_payload_context = derived_async_impl.encodeChangeRecordPayload;
+        pub const mirror_ha_batch_mutation_commit = ha_replication_impl.mirrorDBBatchMutationCommit;
+        pub const mirror_ha_replay_payload_commit = ha_replication_impl.mirrorDBReplayPayloadCommit;
+        pub const mirror_ha_replay_payload_best_effort = ha_replication_impl.mirrorDBReplayPayloadBestEffort;
+        pub const should_append_split_delta = split_restore_impl.shouldAppendSplitDelta;
         pub const current_time_ns = db_internal.currentTimeNs;
-        pub const mark_precomputed_enrichment_applied_for_sync = writePathMarkPrecomputedEnrichmentAppliedForSync;
-        pub const mark_precomputed_enrichment_applied_for_sync_context = writePathMarkPrecomputedEnrichmentAppliedForSyncContext;
-        pub const apply_derived_backlog_pressure = writePathApplyDerivedBacklogPressure;
-        pub const apply_derived_backlog_pressure_context = writePathApplyDerivedBacklogPressureContext;
+        pub const mark_precomputed_enrichment_applied_for_sync = lifecycle_impl.markPrecomputedEnrichmentAppliedForSync;
+        pub const mark_precomputed_enrichment_applied_for_sync_context = derived_async_impl.markPrecomputedEnrichmentAppliedForSyncContext;
+        pub const apply_derived_backlog_pressure = derived_async_impl.applyDerivedBacklogPressure;
+        pub const apply_derived_backlog_pressure_context = derived_async_impl.applyDerivedBacklogPressureContext;
         pub const notify_executor_for_sync_level_with_dense_bulk_deferral = db_internal.notifyExecutorForSyncLevelWithDenseBulkDeferral;
-        pub const wait_for_sync_level = writePathWaitForSyncLevel;
-        pub const wait_for_sync_level_context = writePathWaitForSyncLevelContext;
-        pub const sync_level_requires_derived_visibility = writePathSyncLevelRequiresDerivedVisibility;
-        pub const apply_derived_batch = writePathApplyDerivedBatch;
-        pub const apply_derived_batch_targets = writePathApplyDerivedBatchTargets;
-        pub const apply_derived_batch_context = writePathApplyDerivedBatchContext;
-        pub const apply_derived_batch_targets_context = writePathApplyDerivedBatchTargetsContext;
-        pub const apply_derived_batch_profiled = writePathApplyDerivedBatchProfiled;
-        pub const apply_derived_batch_targets_profiled = writePathApplyDerivedBatchTargetsProfiled;
-        pub const notify_resolver_replay_runtimes = writePathNotifyResolverReplayRuntimes;
-        pub const notify_resolver_replay_runtimes_for_catalog = writePathNotifyResolverReplayRuntimesForCatalog;
+        pub const wait_for_sync_level = derived_async_impl.waitForSyncLevel;
+        pub const wait_for_sync_level_context = derived_async_impl.waitForSyncLevelContext;
+        pub const sync_level_requires_derived_visibility = derived_async_impl.syncLevelRequiresDerivedVisibility;
+        pub const apply_derived_batch = derived_async_impl.applyDerivedBatch;
+        pub const apply_derived_batch_targets = derived_async_impl.applyDerivedBatchTargets;
+        pub const apply_derived_batch_context = derived_async_impl.applyDerivedBatchContext;
+        pub const apply_derived_batch_targets_context = derived_async_impl.applyDerivedBatchTargetsContext;
+        pub const apply_derived_batch_profiled = derived_async_impl.applyDerivedBatchProfiled;
+        pub const apply_derived_batch_targets_profiled = derived_async_impl.applyDerivedBatchTargetsProfiled;
+        pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
+        pub const notify_resolver_replay_runtimes_for_catalog = derived_async_impl.notifyResolverReplayRuntimesForCatalog;
     };
     pub const SchemaRuntimeCallbacks = struct {
-        pub const hydrate_algebraic_observation_status_for_index_best_effort = schemaRuntimeHydrateAlgebraicObservationStatusForIndexBestEffort;
+        pub const hydrate_algebraic_observation_status_for_index_best_effort = lifecycle_impl.hydrateAlgebraicObservationStatusForIndexBestEffort;
         pub const replay_generated_enrichments_from_stored_docs = replayGeneratedEnrichmentsFromStoredDocs;
-        pub const append_generated_enrichments = schemaRuntimeAppendGeneratedEnrichments;
+        pub const append_generated_enrichments = write_path_impl.appendGeneratedEnrichments;
         pub const append_derived_batch_record = derivedAsyncAppendDerivedBatchRecord;
-        pub const save_index_status_snapshot = schemaRuntimeSaveIndexStatusSnapshot;
-        pub const notify_resolver_replay_runtimes = schemaRuntimeNotifyResolverReplayRuntimes;
-        pub const mirror_ha_schema_metadata_commit = schemaRuntimeMirrorHASchemaMetadataCommit;
+        pub const save_index_status_snapshot = schema_runtime_impl.saveIndexStatusSnapshot;
+        pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
+        pub const mirror_ha_schema_metadata_commit = ha_replication_impl.mirrorDBSchemaMetadataCommit;
     };
     pub const HAReplicationCallbacks = struct {
-        pub const batch_replicated_apply_with_marker = haReplicationBatchReplicatedApplyWithMarker;
+        pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
         pub const apply_ha_derived_effect_record = applyHADerivedEffectRecord;
     };
-
-    fn lifecycleApplyDerivedBatchToIndexAsync(
-        ctx_ptr: *anyopaque,
-        derived_batch: derived_types.DerivedBatch,
-        index_ref: index_manager_mod.ManagedIndexRef,
-    ) !bool {
-        return try derived_async_impl.applyDerivedBatchToIndexAsync(ctx_ptr, derived_batch, index_ref);
-    }
-
-    fn lifecyclePersistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
-        return try derived_async_impl.persistAppliedSequenceAsync(ctx_ptr, index_name, sequence, force);
-    }
-
-    fn lifecycleTruncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
-        return try derived_async_impl.truncateReplaySequenceAsync(ctx_ptr, sequence);
-    }
-
-    fn lifecycleBeginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
-        return try derived_async_impl.beginDerivedCatchUpSessionAsync(ctx_ptr, index_ref);
-    }
-
-    fn lifecycleFinishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
-        return try derived_async_impl.finishDerivedCatchUpSessionAsync(ctx_ptr, index_ref, success);
-    }
-
-    fn lifecycleAppendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, derived_batch: derived_types.DerivedBatch) !u64 {
-        return try derived_async_impl.appendDerivedBatchFromEnrichment(ctx_ptr, derived_batch);
-    }
-
-    fn lifecycleNotifyDerivedExecutorSequence(ctx_ptr: *anyopaque, sequence: u64) void {
-        derived_async_impl.notifyDerivedExecutorSequence(ctx_ptr, sequence);
-    }
-
-    fn lifecycleDeleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
-        return try write_path_impl.deleteExpiredDocumentsFromCandidates(ctx_ptr, candidates);
-    }
-
-    fn lifecycleClearBulkIngestSeenDocKeysLocked(self: *DB) void {
-        write_path_impl.clearBulkIngestSeenDocKeysLocked(self);
-    }
-
-    fn lifecycleDeinitBulkIngestCoalescer(self: *DB) void {
-        write_path_impl.deinitBulkIngestCoalescer(self);
-    }
-
-    fn lifecycleReplayPendingDerivedBatches(
-        self: *DB,
-        progress_ctx: ?*anyopaque,
-        progress_hook: ?ReplayProgressHook,
-    ) !void {
-        return try derived_async_impl.replayPendingDerivedBatches(self, progress_ctx, progress_hook);
-    }
-
-    fn lifecycleStartAsyncWorkers(self: *DB) !void {
-        return try lifecycle_impl.startAsyncWorkers(self);
-    }
-
-    fn lifecycleFlushAppliedSequencesForIdle(self: *DB) !void {
-        return try derived_async_impl.flushAppliedSequencesForIdle(self);
-    }
-
-    fn lifecycleWaitForSyncLevel(
-        self: *DB,
-        sync_level: types.SyncLevel,
-        sequence: u64,
-        sync_targets: ManagedSyncTargets,
-    ) !void {
-        return try derived_async_impl.waitForSyncLevel(self, sync_level, sequence, sync_targets);
-    }
-
-    fn lifecycleDenseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
-        return try derived_async_impl.denseIndexRebuildStatePathAlloc(self, alloc, index_name);
-    }
-
-    fn lifecycleSetDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
-        derived_async_impl.setDenseCatchUpProgress(ctx, progress);
-    }
-
-    fn lifecyclePopulateAlgebraicIndexStats(
-        self: *DB,
-        alloc: Allocator,
-        index_name: []const u8,
-        item: *types.DBIndexStats,
-        include_adaptive_scans: bool,
-    ) !void {
-        return try lifecycle_impl.populateAlgebraicIndexStats(self, alloc, index_name, item, include_adaptive_scans);
-    }
-
-    fn derivedAsyncApplyDerivedBatchToIndexContext(
-        ctx: *const AsyncContext,
-        derived_batch: derived_types.DerivedBatch,
-        index_ref: index_manager_mod.ManagedIndexRef,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchToIndexContext(ctx, derived_batch, index_ref);
-    }
-
-    fn derivedAsyncApplyDerivedBatchToIndexContextProfiled(
-        ctx: *const AsyncContext,
-        derived_batch: derived_types.DerivedBatch,
-        index_ref: index_manager_mod.ManagedIndexRef,
-        profile: ?*BatchProfile,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchToIndexContextProfiled(ctx, derived_batch, index_ref, profile);
-    }
-
-    fn derivedAsyncReplayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
-        return try derived_async_impl.replayPendingDerivedBatchesContext(ctx);
-    }
-
-    fn schemaRuntimeHydrateAlgebraicObservationStatusForIndexBestEffort(self: *DB, index_name: []const u8) void {
-        lifecycle_impl.hydrateAlgebraicObservationStatusForIndexBestEffort(self, index_name);
-    }
-
-    fn schemaRuntimeAppendGeneratedEnrichments(
-        self: *DB,
-        derived_batch_out: *derived_types.DerivedBatch,
-        req: types.BatchRequest,
-        extracted: []const mapper.ExtractedWrite,
-    ) !void {
-        return try write_path_impl.appendGeneratedEnrichments(self, derived_batch_out, req, extracted);
-    }
-
-    fn schemaRuntimeNotifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
-        lifecycle_impl.notifyResolverReplayRuntimes(self, sequence);
-    }
-
-    fn schemaRuntimeSaveIndexStatusSnapshot(self: *DB, index_name: []const u8, sequence: u64) !void {
-        return try lifecycle_mod.saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-            .index_name = index_name,
-            .sequence = sequence,
-        }});
-    }
-
-    fn schemaRuntimeMirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        return try ha_replication_impl.mirrorDBSchemaMetadataCommit(self, table_schema);
-    }
-
-    fn writePathBatchInternal(
-        self: *DB,
-        req: types.BatchRequest,
-        profile: ?*BatchProfile,
-        opts: BatchExecutionOptions,
-    ) anyerror!void {
-        return try write_path_impl.batchInternal(self, req, profile, opts);
-    }
-
-    fn writePathResolveWriteTimestampNs(self: *DB, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
-        return try internal_impl.resolveWriteTimestampNs(self, fallback_timestamp_ns, value_json);
-    }
-
-    fn writePathEnforceHAWriteGate(self: *DB) !void {
-        return try ha_replication_impl.enforceDBWriteGate(self);
-    }
-
-    fn writePathPreflightHABatchSyncCommit(self: *DB) !void {
-        return try ha_replication_impl.preflightDBBatchSyncCommit(self);
-    }
-
-    fn writePathMirrorHABatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
-        return try ha_replication_impl.mirrorDBBatchMutationCommit(self, request);
-    }
-
-    fn writePathMirrorHAReplayPayloadCommit(self: *DB, payload: []const u8) !void {
-        return try ha_replication_impl.mirrorDBReplayPayloadCommit(self, payload);
-    }
-
-    fn writePathMirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
-        ha_replication_impl.mirrorDBReplayPayloadBestEffort(self, payload);
-    }
-
-    fn writePathApplyDerivedBatchToShadowIfNeeded(self: *DB, derived_batch: derived_types.DerivedBatch) !void {
-        return try derived_async_impl.applyDerivedBatchToShadowIfNeeded(self, derived_batch);
-    }
-
-    fn writePathCollectManagedSyncTargets(
-        alloc: Allocator,
-        index_manager: *index_manager_mod.IndexManager,
-        derived_batch: derived_types.DerivedBatch,
-    ) !ManagedSyncTargets {
-        return try derived_async_impl.collectManagedSyncTargets(alloc, index_manager, derived_batch);
-    }
-
-    fn writePathEncodeChangeRecordPayload(
-        self: *DB,
-        derived_batch: derived_types.DerivedBatch,
-        sequence: u64,
-    ) ![]u8 {
-        return try derived_async_impl.encodeChangeRecordPayloadForDB(self, derived_batch, sequence);
-    }
-
-    fn writePathEncodeChangeRecordPayloadContext(
-        ctx: *const BatchExecutionContext,
-        derived_batch: derived_types.DerivedBatch,
-        sequence: u64,
-    ) ![]u8 {
-        return try derived_async_impl.encodeChangeRecordPayload(ctx, derived_batch, sequence);
-    }
-
-    fn writePathShouldAppendSplitDelta(self: *DB) bool {
-        return split_restore_impl.shouldAppendSplitDelta(self);
-    }
-
-    fn writePathMarkPrecomputedEnrichmentAppliedForSync(
-        self: *DB,
-        sync_level: types.SyncLevel,
-        sequence: u64,
-    ) !void {
-        return try lifecycle_impl.markPrecomputedEnrichmentAppliedForSync(self, sync_level, sequence);
-    }
-
-    fn writePathMarkPrecomputedEnrichmentAppliedForSyncContext(
-        ctx: *const BatchExecutionContext,
-        sync_level: types.SyncLevel,
-        sequence: u64,
-    ) !void {
-        return try derived_async_impl.markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
-    }
-
-    fn writePathApplyDerivedBacklogPressure(
-        self: *DB,
-        sequence: u64,
-        sync_level: types.SyncLevel,
-        sync_targets: ManagedSyncTargets,
-    ) !void {
-        return try derived_async_impl.applyDerivedBacklogPressure(self, sequence, sync_level, sync_targets);
-    }
-
-    fn writePathApplyDerivedBacklogPressureContext(
-        ctx: *const BatchExecutionContext,
-        sequence: u64,
-        sync_level: types.SyncLevel,
-        sync_targets: ManagedSyncTargets,
-    ) !void {
-        return try derived_async_impl.applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
-    }
-
-    fn writePathWaitForSyncLevel(
-        self: *DB,
-        sync_level: types.SyncLevel,
-        sequence: u64,
-        sync_targets: ManagedSyncTargets,
-    ) !void {
-        return try derived_async_impl.waitForSyncLevel(self, sync_level, sequence, sync_targets);
-    }
-
-    fn writePathWaitForSyncLevelContext(
-        ctx: *const BatchExecutionContext,
-        sync_level: types.SyncLevel,
-        sequence: u64,
-        sync_targets: ManagedSyncTargets,
-    ) !void {
-        return try derived_async_impl.waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
-    }
-
-    fn writePathSyncLevelRequiresDerivedVisibility(sync_level: types.SyncLevel) bool {
-        return derived_async_impl.syncLevelRequiresDerivedVisibility(sync_level);
-    }
-
-    fn writePathApplyDerivedBatch(self: *DB, derived_batch: derived_types.DerivedBatch) !void {
-        return try derived_async_impl.applyDerivedBatch(self, derived_batch);
-    }
-
-    fn writePathApplyDerivedBatchTargets(
-        self: *DB,
-        derived_batch: derived_types.DerivedBatch,
-        index_names: []const []const u8,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchTargets(self, derived_batch, index_names);
-    }
-
-    fn writePathApplyDerivedBatchContext(
-        ctx: *const BatchExecutionContext,
-        derived_batch: derived_types.DerivedBatch,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchContext(ctx, derived_batch);
-    }
-
-    fn writePathApplyDerivedBatchTargetsContext(
-        ctx: *const BatchExecutionContext,
-        derived_batch: derived_types.DerivedBatch,
-        index_names: []const []const u8,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchTargetsContext(ctx, derived_batch, index_names);
-    }
-
-    fn writePathApplyDerivedBatchProfiled(
-        self: *DB,
-        derived_batch: derived_types.DerivedBatch,
-        profile: ?*BatchProfile,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchProfiled(self, derived_batch, profile);
-    }
-
-    fn writePathApplyDerivedBatchTargetsProfiled(
-        self: *DB,
-        derived_batch: derived_types.DerivedBatch,
-        index_names: []const []const u8,
-        profile: ?*BatchProfile,
-    ) !void {
-        return try derived_async_impl.applyDerivedBatchTargetsProfiled(self, derived_batch, index_names, profile);
-    }
-
-    fn writePathNotifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
-        lifecycle_impl.notifyResolverReplayRuntimes(self, sequence);
-    }
-
-    fn writePathNotifyResolverReplayRuntimesForCatalog(
-        index_manager: *const index_manager_mod.IndexManager,
-        resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime,
-        promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime,
-        sequence: u64,
-    ) void {
-        derived_async_impl.notifyResolverReplayRuntimesForCatalog(
-            index_manager,
-            resolution_runtime,
-            promotion_runtime,
-            sequence,
-        );
-    }
-
-    fn writePathRelationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-        return schema_runtime_impl.relationalColumnIndexPolicyForStore(self);
-    }
-
-    fn writePathRecordForeignKeyChildWriteReject(self: *DB) void {
-        relational_integrity_impl.recordForeignKeyChildWriteReject(self);
-    }
-
-    fn writePathRecordForeignKeyParentDeleteReject(self: *DB) void {
-        relational_integrity_impl.recordForeignKeyParentDeleteReject(self);
-    }
-
-    fn writePathSplitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
-        return split_restore_impl.splitShadowRequiresMaterializedDerivedBatch(self);
-    }
-
-    fn writePathAppendPrecomputedGraphSourceArtifacts(
-        self: *DB,
-        artifact_writes: []const types.BatchWrite,
-        artifact_delete_keys: []const []const u8,
-        owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
-        delete_keys: *std.ArrayListUnmanaged([]const u8),
-        owned_delete_keys: *std.ArrayListUnmanaged([]u8),
-        changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        return try write_path_impl.appendPrecomputedGraphSourceArtifacts(
-            self,
-            artifact_writes,
-            artifact_delete_keys,
-            owned_graph_artifact_writes,
-            store_writes,
-            delete_keys,
-            owned_delete_keys,
-            changed_artifact_keys,
-        );
-    }
-
-    fn haReplicationBatchReplicatedApplyWithMarker(
-        self: *DB,
-        req: types.BatchRequest,
-        applied_lsn_marker: ?u64,
-    ) anyerror!void {
-        return try write_path_impl.batchReplicatedApplyWithMarker(self, req, applied_lsn_marker);
-    }
 
     pub fn batchContext(self: *DB) BatchExecutionContext {
         return internal_impl.batchContext(self);
@@ -727,43 +334,38 @@ pub const DB = struct {
         lifecycle_impl.setQueryVisibilityHook(self, hook);
     }
 
-    fn enforceDurableMutationGate(self: *DB) !void {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
-    }
-
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runTransactionRecoveryOnce(self, config);
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.beginBulkIngestSessionAfterGate(self);
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.finishBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.beginDenseAutoBulkIngestSessionAfterGate(self);
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try write_path_impl.finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
         try write_path_impl.beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
     }
@@ -773,17 +375,17 @@ pub const DB = struct {
         options: backend_types.BulkIngestFinishOptions,
         notify_executor: bool,
     ) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, notify_executor);
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
     }
 
     pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
         try write_path_impl.beginDenseAutoBulkIngestSessionAfterGate(self);
     }
@@ -865,17 +467,17 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runLsmMaintenanceStep(self);
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runPrimaryLsmMaintenanceStep(self);
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runLsmMaintenanceStepBestEffort(self);
     }
 
@@ -884,27 +486,27 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceUntilIdle(self: *DB) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runLsmMaintenanceUntilIdle(self);
     }
 
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.retryQuarantinedIndexLoads(self, force);
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runDueLsmObsoleteReclaimUntilIdle(self, max_steps);
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.batchAfterGate(self, req);
     }
 
     pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *BatchProfile) anyerror!void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.batchProfiledAfterGate(self, req, profile);
     }
 
@@ -913,7 +515,7 @@ pub const DB = struct {
         req: types.BatchRequest,
         dispatcher: DocumentArtifactChildRangeDispatcher,
     ) anyerror!void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.batchWithDocumentArtifactChildRangeDispatcherAfterGate(self, req, dispatcher);
     }
 
@@ -932,12 +534,12 @@ pub const DB = struct {
         dispatcher: DocumentArtifactChildRangeDispatcher,
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.drainDocumentArtifactChildRangeOutboxAfterGate(self, dispatcher, limit);
     }
 
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.batchWithoutRangeValidationAfterGate(self, req);
     }
 
@@ -963,7 +565,7 @@ pub const DB = struct {
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.applyDocumentArtifactChildRangeBatchAfterGate(self, child_batch);
     }
 
@@ -1043,7 +645,7 @@ pub const DB = struct {
     }
 
     pub fn ensureGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64, now_ms: u64) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.ensureGroupCreatedAtMillis(self, alloc, group_id, now_ms);
     }
 
@@ -1075,7 +677,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.updateDocumentArtifactChildRangePlacementAfterGate(self, alloc, doc_key, artifact_name, update);
     }
 
@@ -1085,7 +687,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.reprocessDocumentArtifactAfterGate(self, alloc, doc_key, artifact_name);
     }
 
@@ -1095,7 +697,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.reprocessDocumentArtifactRangeAfterGate(self, alloc, artifact_name, req);
     }
 
@@ -1112,7 +714,7 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.updateRangeAfterGate(self, byte_range);
     }
 
@@ -1129,12 +731,12 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.setSplitState(self, state);
     }
 
     pub fn clearSplitState(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.clearSplitState(self);
     }
 
@@ -1147,12 +749,12 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.setSplitDeltaFinalSeq(self, seq);
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.clearSplitDeltaFinalSeq(self);
     }
 
@@ -1161,17 +763,17 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaEntries(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.clearSplitDeltaEntries(self);
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.createShadowIndexManager(self, split_key, original_range_end);
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.closeShadowIndexManager(self);
     }
 
@@ -1187,27 +789,27 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.split(self, curr_range, split_key, dest_dir1, dest_dir2, prepare_only);
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try split_restore_impl.finalizeSplit(self, new_range);
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try split_restore_impl.snapshot(self, id);
     }
 
     pub fn sync(self: *DB, full: bool) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try lifecycle_impl.sync(self, full);
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try lifecycle_impl.syncIndexes(self, force);
     }
 
@@ -1261,12 +863,12 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try split_restore_impl.repairRestoreRuntimeStateStepIfNeeded(self, alloc);
     }
 
     pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try split_restore_impl.repairRestoreRuntimeStateIfNeeded(self, alloc);
     }
 
@@ -1275,7 +877,7 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.setSchemaAfterGate(self, table_schema);
     }
@@ -1293,7 +895,7 @@ pub const DB = struct {
         options: ApplyTableSchemaOptions,
     ) !void {
         if (schema_json.len == 0) return;
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.applyTableSchemaJsonAfterGate(self, alloc, schema_json, options);
     }
@@ -1301,17 +903,13 @@ pub const DB = struct {
     pub const SchemaRewriteJobExecutionResult = schema_runtime.SchemaRewriteJobExecutionResult;
     pub const SchemaRewriteJobDrainOptions = schema_runtime.SchemaRewriteJobDrainOptions;
 
-    fn enforceSchemaRewriteMutationGate(self: *DB) !void {
-        try self.enforceDurableMutationGate();
-    }
-
     pub fn drainSchemaRewriteJobsForIdle(
         self: *DB,
         alloc: Allocator,
         service: anytype,
         options: SchemaRewriteJobDrainOptions,
     ) !usize {
-        try self.enforceSchemaRewriteMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.drainSchemaRewriteJobsForIdle(self, alloc, service, options);
     }
 
@@ -1320,7 +918,7 @@ pub const DB = struct {
         alloc: Allocator,
         job: metadata_table_manager.SchemaRewriteJobRecord,
     ) !SchemaRewriteJobExecutionResult {
-        try self.enforceSchemaRewriteMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.executeClaimedSchemaRewriteJob(self, alloc, job);
     }
 
@@ -1338,12 +936,8 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !relational_store_mod.SecondaryIndexRebuildReport {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.rebuildRelationalSecondaryIndexInRange(self, index_name, index_generation, lower_doc_key, upper_doc_key);
-    }
-
-    fn enforceRelationalIntegrityMutationGate(self: *DB) !void {
-        try self.enforceDurableMutationGate();
     }
 
     pub fn validateForeignKeyRefsInRange(
@@ -1368,7 +962,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.repairForeignKeyRefsInRange(self, lower_doc_key, upper_doc_key);
     }
 
@@ -1378,7 +972,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.repairForeignKeyRefsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
@@ -1420,7 +1014,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !UniqueConstraintIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.repairUniqueConstraintRowsInRange(self, lower_doc_key, upper_doc_key);
     }
 
@@ -1448,7 +1042,7 @@ pub const DB = struct {
         parent_table: []const u8,
         parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.repairForeignKeyRefOwnerForParent(self, constraint_name, parent_table, parent_key);
     }
 
@@ -1479,7 +1073,7 @@ pub const DB = struct {
         start_parent_key: []const u8,
         end_parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.repairForeignKeyRefOwnerRange(self, constraint_name, parent_table, start_parent_key, end_parent_key);
     }
 
@@ -1600,13 +1194,13 @@ pub const DB = struct {
     /// normal apply work just like `applyTableSchemaJson`.
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try schema_runtime_impl.reloadAlgebraicSchemaConfigsAfterGate(self, schema_json);
     }
 
     pub fn schemaRuntimeStageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try schema_runtime_impl.stageAlgebraicSchemaConfigsPending(self, schema_json);
     }
 
@@ -1620,7 +1214,7 @@ pub const DB = struct {
 
     pub fn applyLiteSqlTableRecord(self: *DB, alloc: Allocator, table: metadata_table_manager.TableRecord) !void {
         if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.applyLiteSqlTableRecordAfterGate(self, alloc, table);
     }
@@ -1629,27 +1223,23 @@ pub const DB = struct {
         return try schema_runtime_impl.getLiteSqlTableRecordAlloc(self, alloc);
     }
 
-    fn enforceTransactionMutationGate(self: *DB) !void {
-        try self.enforceDurableMutationGate();
-    }
-
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.beginTransaction(self, timestamp_ns);
     }
 
     pub fn beginTransactionWithId(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !transactions_mod.TxnId {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.beginTransactionWithId(self, txn_id, timestamp_ns);
     }
 
     pub fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.beginTransactionWithParticipants(self, timestamp_ns, participants);
     }
 
     pub fn beginTransactionWithIdAndParticipants(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.beginTransactionWithIdAndParticipants(self, txn_id, timestamp_ns, participants);
     }
 
@@ -1659,12 +1249,12 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.writeIntents(self, txn_id, intents, predicates);
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.writeTransaction(self, txn_id, req);
     }
 
@@ -1674,22 +1264,22 @@ pub const DB = struct {
         row_keys: []const []const u8,
         claim: types.RowClaimRequest,
     ) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.claimRowsForTransaction(self, txn_id, row_keys, claim);
     }
 
     pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.commitTransaction(self, txn_id, timestamp_ns);
     }
 
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.resolveTransactionIntents(self, txn_id, status, commit_version);
     }
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.abortTransaction(self, txn_id, timestamp_ns);
     }
 
@@ -1702,7 +1292,7 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.markTransactionParticipantResolved(self, txn_id, participant);
     }
 
@@ -1715,7 +1305,7 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
-        try self.enforceTransactionMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.recoverTransactions(self, cutoff_timestamp, resolution_timestamp);
     }
 
@@ -1807,22 +1397,22 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.addIndex(self, cfg);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.addEnrichment(self, cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.upsertEnrichment(self, cfg);
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.addResolver(self, cfg);
     }
 
@@ -1837,27 +1427,27 @@ pub const DB = struct {
         cfg: index_manager_mod.ResolverConfig,
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.upsertResolverWithResultOptions(self, cfg, options);
     }
 
     pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.upsertResolverWithResult(self, cfg);
     }
 
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.upsertResolver(self, cfg);
     }
 
     pub fn drainResolverBackfill(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.drainResolverBackfill(self);
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.removeResolver(self, name);
     }
 
@@ -1880,7 +1470,7 @@ pub const DB = struct {
         table: []const u8,
         key: []const u8,
     ) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.recordReviewDecisionAfterGate(self, doc_key, source_artifact, resolution_artifact, local_id, decision, table, key);
     }
 
@@ -1897,7 +1487,7 @@ pub const DB = struct {
         old_key: []const u8,
         new_key: []const u8,
     ) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.rewriteEntityEdges(self, alloc, index_name, old_key, new_key);
     }
 
@@ -1918,12 +1508,12 @@ pub const DB = struct {
     }
 
     pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.evaluateAlgebraicAdaptiveCandidates(self);
     }
 
     pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.runAlgebraicAdaptiveWork(self);
     }
 
@@ -1948,22 +1538,22 @@ pub const DB = struct {
     }
 
     pub fn compactTextIndexes(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.compactTextIndexes(self);
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.drainScheduledTextMerges(self);
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.forceCompactTextIndexes(self);
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.bestEffortForceCompactTextIndexes(self);
     }
 
@@ -1998,12 +1588,12 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.deleteIndex(self, name);
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.deleteEnrichment(self, kind, name);
     }
 
@@ -2012,27 +1602,27 @@ pub const DB = struct {
     }
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runDerivedUntil(self, sequence);
     }
 
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runDerivedUntilTargets(self, sequence, index_names);
     }
 
     pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runEnrichmentUntil(self, sequence);
     }
 
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runMaintenanceUntil(self, sequence, sync_targets);
     }
 
     pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runMaintenanceUntilTargets(self, sequence, index_names);
     }
 
@@ -2041,7 +1631,7 @@ pub const DB = struct {
     }
 
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try derived_async_impl.replayPendingDerivedBatches(self, null, null);
     }
 
@@ -2050,7 +1640,7 @@ pub const DB = struct {
         progress_ctx: *anyopaque,
         progress_hook: ReplayProgressHook,
     ) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         try derived_async_impl.replayPendingDerivedBatches(self, progress_ctx, progress_hook);
     }
 
@@ -2064,7 +1654,7 @@ pub const DB = struct {
     }
 
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.appendDerivedBatchRecord(self, derived_batch);
     }
 
@@ -2109,16 +1699,12 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runUntilIdle(self);
     }
 
-    fn enforceGraphMetricMutationGate(self: *DB) !void {
-        try self.enforceDurableMutationGate();
-    }
-
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricMaintenanceForIdle(self);
     }
 
@@ -2126,37 +1712,37 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedMaintenanceForIdle(self, options);
     }
 
     pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricServiceMaintenanceJsonAlloc(self, alloc, body);
     }
 
     pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.refreshGraphMetric(self, alloc, index_name, metric_name);
     }
 
     pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.rebuildGraphMetric(self, alloc, index_name, metric_name);
     }
 
     pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.deleteGraphMetricMaterialization(self, alloc, index_name, metric_name);
     }
 
     pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.pauseGraphMetricMaintenance(self, alloc, index_name, metric_name);
     }
 
     pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.resumeGraphMetricMaintenance(self, alloc, index_name, metric_name);
     }
 
@@ -2167,7 +1753,7 @@ pub const DB = struct {
         metric_name: []const u8,
         target_generation: u64,
     ) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.ensureGraphMetricPlannedBuild(self, alloc, index_name, metric_name, target_generation);
     }
 
@@ -2177,7 +1763,7 @@ pub const DB = struct {
         metric_name: []const u8,
         worker_id: []const u8,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStep(self, index_name, metric_name, worker_id);
     }
 
@@ -2188,7 +1774,7 @@ pub const DB = struct {
         worker_id: []const u8,
         now_ms: u64,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStepAt(self, index_name, metric_name, worker_id, now_ms);
     }
 
@@ -2197,7 +1783,7 @@ pub const DB = struct {
         index_name: []const u8,
         metric_name: []const u8,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStep(self, index_name, metric_name);
     }
 
@@ -2207,7 +1793,7 @@ pub const DB = struct {
         metric_name: []const u8,
         now_ms: u64,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStepAt(self, index_name, metric_name, now_ms);
     }
 
@@ -2218,7 +1804,7 @@ pub const DB = struct {
         metric_name: []const u8,
         err: anyerror,
     ) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.failGraphMetricPlannedBuild(self, alloc, index_name, metric_name, err);
     }
 
@@ -2230,7 +1816,7 @@ pub const DB = struct {
         target_generation: u64,
         options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
     ) !types.GraphMetricStatus {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedDrain(self, alloc, index_name, metric_name, target_generation, options);
     }
 
@@ -2238,7 +1824,7 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorSweep(self, options);
     }
 
@@ -2246,44 +1832,44 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        try self.enforceGraphMetricMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedWorkerSweep(self, options);
     }
 
     pub const DenseArtifactRebuildTarget = derived_async.DenseArtifactRebuildTarget;
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildDenseIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildSparseIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try split_restore_impl.rebuildGraphIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.runDensePostingMaintenanceForIdle(self);
     }
 
     pub fn runDensePostingMaintenanceForIdleBestEffort(self: *DB) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.runDensePostingMaintenanceForIdleBestEffort(self);
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifacts(self, alloc);
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self: *DB, alloc: Allocator) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self, alloc);
     }
 
@@ -2297,7 +1883,7 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(self, alloc, progress_ctx, progress_hook);
     }
 
@@ -2314,7 +1900,7 @@ pub const DB = struct {
         rebuild_chunk_size: usize,
         rebuild_progress_interval: usize,
     ) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
             self,
             alloc,
@@ -2350,7 +1936,7 @@ pub const DB = struct {
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
     }
 
@@ -2375,7 +1961,7 @@ pub const DB = struct {
     }
 
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.reassignIdentityNamespaceForInternalTransition(self, namespace);
     }
 
@@ -2725,7 +2311,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         lease_ms: u64,
     ) !ForeignKeyIntegrityClaimRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
@@ -2742,7 +2328,7 @@ pub const DB = struct {
         lease_ms: u64,
         now_ns: u64,
     ) !ForeignKeyIntegrityClaimRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
@@ -2759,7 +2345,7 @@ pub const DB = struct {
         max_work_units: usize,
         status: []const u8,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecord(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status);
     }
 
@@ -2777,7 +2363,7 @@ pub const DB = struct {
         status: []const u8,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecordAt(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status, now_ns);
     }
 
@@ -2788,7 +2374,7 @@ pub const DB = struct {
         valid: bool,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecord(self, job_id, status, valid, report);
     }
 
@@ -2802,7 +2388,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnostics(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2814,7 +2400,7 @@ pub const DB = struct {
         report: relational_store_mod.ForeignKeyIntegrityReport,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordAt(self, job_id, status, valid, report, now_ns);
     }
 
@@ -2829,7 +2415,7 @@ pub const DB = struct {
         violations_truncated: ?bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
@@ -2840,7 +2426,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnostics(self, job_id, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2852,7 +2438,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReport(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2864,7 +2450,7 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsAt(self, job_id, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
@@ -2877,157 +2463,157 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
     pub fn scheduleForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn requeueForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKey(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKey(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn markForeignKeyActionScheduleSeeded(self: *DB, schedule_id: []const u8, scheduled_groups: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.markForeignKeyActionScheduleSeeded(self, schedule_id, scheduled_groups);
     }
 
     pub fn markForeignKeyActionScheduleSeededAt(self: *DB, schedule_id: []const u8, scheduled_groups: u64, now_ns: u64) !ForeignKeyActionScheduleRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.markForeignKeyActionScheduleSeededAt(self, schedule_id, scheduled_groups, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
     pub fn claimForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn finishClaimedForeignKeyActionJobPage(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.finishClaimedForeignKeyActionJobPage(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error);
     }
 
     pub fn finishClaimedForeignKeyActionJobPageAt(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8, now_ns: u64) !ForeignKeyActionJobRecord {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.finishClaimedForeignKeyActionJobPageAt(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error, now_ns);
     }
 
     pub fn claimAndRunForeignKeyIntegrityWorkUnit(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
     pub fn claimAndRunForeignKeyIntegrityWorkUnitAt(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64, now_ns: u64) !ForeignKeyIntegrityReport {
-        try self.enforceRelationalIntegrityMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
@@ -3104,7 +2690,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_rows_impl.mutateRelationalRowsFromSource(self, alloc, runtime_schema, req);
     }
 
@@ -3178,7 +2764,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_rows_impl.stagePlannedRelationalRowsMutationSourceAlloc(self, alloc, runtime_schema, req, matched, candidates);
     }
 
@@ -3188,7 +2774,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_rows_impl.mutateRelationalRowsJoinedSourceAlloc(self, alloc, runtime_schema, req);
     }
 
@@ -3321,7 +2907,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_rows_impl.stagePlannedRelationalRowsJoinedMutationSourceAlloc(self, alloc, runtime_schema, req, matched, candidates);
     }
 
@@ -3334,7 +2920,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
-        try self.enforceDurableMutationGate();
+        try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_rows_impl.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(self, alloc, target_schema, source_schema, req, matched, candidates);
     }
 
@@ -3652,6 +3238,16 @@ pub const DB = struct {
         return try relational_rows_impl.relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(alloc, predicates, required);
     }
 
+    pub fn relationalRowsExpressionPredicatesImply(
+        self: *DB,
+        alloc: Allocator,
+        implications: relational_store_mod.PredicateImplications,
+        required: []const types.RelationalRowsExpressionCondition,
+    ) !bool {
+        _ = self;
+        return try relational_rows_impl.relationalRowsExpressionPredicatesImply(alloc, implications, required);
+    }
+
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
         return try search_runtime_impl.search(self, alloc, req);
     }
@@ -3904,7 +3500,7 @@ pub const DB = struct {
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
         query: search_mod.SearchQuery,
-        implications: relational_rows.PredicateImplications,
+        implications: relational_store_mod.PredicateImplications,
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, query, implications, generation);
@@ -3916,7 +3512,7 @@ pub const DB = struct {
         current: *?doc_set.ResolvedDocSet,
         child: *const doc_set.ResolvedDocSet,
         generation: ?u64,
-        mode: relational_rows.FilterCombineMode,
+        mode: relational_store_mod.FilterCombineMode,
     ) !void {
         try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, current, child, generation, mode);
     }
@@ -3929,7 +3525,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         column: schema_mod.RelationalColumn,
-        implications: relational_rows.PredicateImplications,
+        implications: relational_store_mod.PredicateImplications,
     ) !bool {
         return try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications);
     }

@@ -44,6 +44,9 @@ pub const GeneratedSqlTransactionKind = enum {
     begin,
     commit,
     rollback,
+    savepoint,
+    release_savepoint,
+    rollback_to_savepoint,
 };
 
 pub const GeneratedSqlPreparedKind = enum {
@@ -974,6 +977,7 @@ pub const GeneratedSqlTransactionAst = struct {
     command_span: token_mod.SourceSpan,
     boundary_tail_tokens: ?GeneratedSqlTokenRange = null,
     mode_tokens: ?GeneratedSqlTokenRange = null,
+    name_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlPreparedAst = struct {
@@ -1807,6 +1811,11 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ROLLBACK", .kind = .transaction },
     .{ .sql = "ROLLBACK WORK", .kind = .transaction },
     .{ .sql = "ROLLBACK TRANSACTION", .kind = .transaction },
+    .{ .sql = "SAVEPOINT before_retry", .kind = .transaction },
+    .{ .sql = "RELEASE SAVEPOINT before_retry", .kind = .transaction },
+    .{ .sql = "RELEASE before_retry", .kind = .transaction },
+    .{ .sql = "ROLLBACK TO SAVEPOINT before_retry", .kind = .transaction },
+    .{ .sql = "ROLLBACK TO before_retry", .kind = .transaction },
     .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
     .{ .sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1", .kind = .prepared },
     .{ .sql = "EXECUTE read_stmt()", .kind = .prepared },
@@ -2097,10 +2106,8 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
-    .{ .sql = "RELEASE SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "REASSIGN OWNED BY old_role TO new_role", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
-    .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
@@ -2124,15 +2131,61 @@ pub fn parseTokensAllocWithAstMode(
     tokens: []const token_mod.Token,
     ast_mode: GeneratedSqlAstMode,
 ) !GeneratedSqlParseResult {
+    const statement = classifyStatement(tokens);
+    if (generatedSavepointTransactionBypassesLrParse(tokens, statement)) {
+        return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
+    }
     const token_ids = try tokenIdsAlloc(alloc, tokens);
     defer alloc.free(token_ids);
     try generated.parse(alloc, token_ids);
-    const statement = classifyStatement(tokens);
+    return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
+}
+
+fn buildGeneratedParseResult(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    statement: GeneratedSqlStatement,
+    ast_mode: GeneratedSqlAstMode,
+) !GeneratedSqlParseResult {
     return .{
         .kind = std.meta.activeTag(statement),
         .statement = statement,
         .ast = if (ast_mode == .skip_read and statement == .read) null else try buildGeneratedAst(alloc, tokens, statement),
     };
+}
+
+fn generatedSavepointTransactionBypassesLrParse(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) bool {
+    const kind = switch (statement) {
+        .transaction => |transaction| transaction,
+        else => return false,
+    };
+    const end = generatedTokenEnd(tokens);
+    return switch (kind) {
+        .savepoint => end == 2 and tokens[0].matchesKeywordTag(.savepoint) and tokens[1].kind == .identifier,
+        .release_savepoint => (end == 2 and
+            tokens[0].matchesKeywordTag(.release) and
+            tokens[1].kind == .identifier) or
+            (end == 3 and
+                tokens[0].matchesKeywordTag(.release) and
+                tokens[1].matchesKeywordTag(.savepoint) and
+                tokens[2].kind == .identifier),
+        .rollback_to_savepoint => (end == 3 and
+            tokens[0].matchesKeywordTag(.rollback) and
+            tokens[1].matchesKeywordTag(.to) and
+            tokens[2].kind == .identifier) or
+            (end == 4 and
+                tokens[0].matchesKeywordTag(.rollback) and
+                tokens[1].matchesKeywordTag(.to) and
+                tokens[2].matchesKeywordTag(.savepoint) and
+                tokens[3].kind == .identifier),
+        else => false,
+    };
+}
+
+fn generatedTokenEnd(tokens: []const token_mod.Token) usize {
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    return end;
 }
 
 pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
@@ -2284,9 +2337,14 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
     if (tok.matchesKeyword("isolation")) return generated.symbolId("ISOLATION") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("level")) return generated.symbolId("LEVEL") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("read")) return generated.symbolId("READ") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeywordTag(.release)) return generated.symbolId("RELEASE") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("repeatable")) return generated.symbolId("REPEATABLE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeywordTag(.as)) return generated.symbolId("AS") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeywordTag(.savepoint)) return generated.symbolId("SAVEPOINT") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("serializable")) return generated.symbolId("SERIALIZABLE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("session")) return generated.symbolId("SESSION") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("start")) return generated.symbolId("START") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeywordTag(.to)) return generated.symbolId("TO") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("transaction")) return generated.symbolId("TRANSACTION") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("uncommitted")) return generated.symbolId("UNCOMMITTED") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("work")) return generated.symbolId("WORK") orelse error.UnsupportedSqlShape;
@@ -2299,7 +2357,10 @@ fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: us
     const first = tokens[0];
     if (first.matchesKeyword("start")) return true;
     if (first.matchesKeywordTag(.begin)) return true;
-    if (first.matchesKeywordTag(.commit) or first.matchesKeywordTag(.rollback)) return index <= 1;
+    if (first.matchesKeywordTag(.savepoint)) return true;
+    if (first.matchesKeywordTag(.release)) return true;
+    if (first.matchesKeywordTag(.commit)) return index <= 1;
+    if (first.matchesKeywordTag(.rollback)) return index <= 3;
     if (!first.matchesKeywordTag(.set)) return false;
     if (tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return true;
     return tokens.len > 4 and
@@ -2379,7 +2440,12 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeyword("start")) return .{ .transaction = .start_transaction };
     if (first.matchesKeywordTag(.begin)) return .{ .transaction = .begin };
     if (first.matchesKeywordTag(.commit)) return .{ .transaction = .commit };
-    if (first.matchesKeywordTag(.rollback)) return .{ .transaction = .rollback };
+    if (first.matchesKeywordTag(.rollback)) {
+        if (tokens.len > 1 and tokens[1].matchesKeywordTag(.to)) return .{ .transaction = .rollback_to_savepoint };
+        return .{ .transaction = .rollback };
+    }
+    if (first.matchesKeywordTag(.savepoint)) return .{ .transaction = .savepoint };
+    if (first.matchesKeywordTag(.release)) return .{ .transaction = .release_savepoint };
     if (first.matchesKeywordTag(.prepare)) return .{ .prepared = .prepare };
     if (first.matchesKeywordTag(.execute)) return .{ .prepared = .execute };
     if (first.matchesKeywordTag(.deallocate)) return .{ .prepared = .deallocate };
@@ -2596,9 +2662,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.reassign) and tokens.len > 1 and tokens[1].matchesKeywordTag(.owned)) return .{ .unsupported = .reassign_owned };
     if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
-    if (first.matchesKeywordTag(.release)) return .{ .unsupported = .release };
     if (first.matchesKeywordTag(.revoke)) return .{ .unsupported = .revoke };
-    if (first.matchesKeywordTag(.savepoint)) return .{ .unsupported = .savepoint };
     if (first.matchesKeywordTag(.security)) return .{ .unsupported = .security_label };
     if (first.matchesKeywordTag(.unlisten)) return .{ .unsupported = .unlisten };
     if (first.matchesKeywordTag(.vacuum)) return .{ .unsupported = .vacuum };
@@ -3030,8 +3094,23 @@ fn buildTransactionAst(
         .commit, .rollback => {
             if (end > 1) ast.boundary_tail_tokens = .{ .start = 1, .end = end };
         },
+        .savepoint => {
+            if (end > 1) ast.name_tokens = .{ .start = 1, .end = end };
+        },
+        .release_savepoint => {
+            ast.name_tokens = generatedSavepointNameRange(tokens, end, 1);
+        },
+        .rollback_to_savepoint => {
+            ast.name_tokens = generatedSavepointNameRange(tokens, end, 2);
+        },
     }
     return ast;
+}
+
+fn generatedSavepointNameRange(tokens: []const token_mod.Token, end: usize, start: usize) ?GeneratedSqlTokenRange {
+    if (start >= end or end > tokens.len) return null;
+    const name_start = if (tokens[start].matchesKeywordTag(.savepoint)) start + 1 else start;
+    return if (name_start < end) .{ .start = name_start, .end = end } else null;
 }
 
 fn generatedBeginHasModeTail(tokens: []const token_mod.Token, end: usize) bool {
@@ -7133,10 +7212,10 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_transform }, (try parseSqlAlloc(alloc, "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .release }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .release_savepoint }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reassign_owned }, (try parseSqlAlloc(alloc, "REASSIGN OWNED BY old_role TO new_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .security_label }, (try parseSqlAlloc(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .unlisten }, (try parseSqlAlloc(alloc, "UNLISTEN *")).statement);
 }
@@ -7201,6 +7280,34 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("START", spanText(transaction_mode_sql, transaction.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, transaction.mode_tokens.?);
             try std.testing.expect(transaction.boundary_tail_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const release_savepoint_sql = "RELEASE SAVEPOINT before_retry;";
+    const release_savepoint_result = try parseSqlAlloc(alloc, release_savepoint_sql);
+    switch (release_savepoint_result.ast.?) {
+        .transaction => |transaction| {
+            try std.testing.expectEqual(GeneratedSqlTransactionKind.release_savepoint, transaction.kind);
+            try std.testing.expectEqualStrings("RELEASE SAVEPOINT before_retry", spanText(release_savepoint_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("RELEASE", spanText(release_savepoint_sql, transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, transaction.name_tokens.?);
+            try std.testing.expect(transaction.boundary_tail_tokens == null);
+            try std.testing.expect(transaction.mode_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const rollback_to_savepoint_sql = "ROLLBACK TO before_retry;";
+    const rollback_to_savepoint_result = try parseSqlAlloc(alloc, rollback_to_savepoint_sql);
+    switch (rollback_to_savepoint_result.ast.?) {
+        .transaction => |transaction| {
+            try std.testing.expectEqual(GeneratedSqlTransactionKind.rollback_to_savepoint, transaction.kind);
+            try std.testing.expectEqualStrings("ROLLBACK TO before_retry", spanText(rollback_to_savepoint_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("ROLLBACK", spanText(rollback_to_savepoint_sql, transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, transaction.name_tokens.?);
+            try std.testing.expect(transaction.boundary_tail_tokens == null);
+            try std.testing.expect(transaction.mode_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

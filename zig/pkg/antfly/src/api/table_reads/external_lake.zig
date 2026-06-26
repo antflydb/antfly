@@ -1955,3 +1955,997 @@ test "pinned external lake rows scanner forwards sidecar freshness policy" {
         ),
     );
 }
+
+test "object storage pinned external lake source routes row plans through scanner" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:expected" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var inventory = external_source_api.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:stale"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source_api.types.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 128,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var lake_source = PinnedExternalObjectStorageLakeRowsSource.init(inventory, client);
+    var source = lake_source.source();
+    const projection = [_][]const u8{"amount"};
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        source.rowsQueryPlan(alloc, "events", schema, .{
+            .query = .{
+                .select = projection[0..],
+                .select_all = false,
+            },
+        }, .read_index),
+    );
+
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+    };
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        source.rowsAggregatePlan(alloc, "events", schema, .{
+            .aggregate = .{
+                .aggregations = aggregations[0..],
+            },
+        }, .read_index),
+    );
+}
+
+test "owned object storage lake source discovers and pins parquet prefix inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const current_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+    var put_b = try client.putObject("bucket", "events/_SUCCESS", "ok", .{});
+    defer put_b.deinit(alloc);
+
+    var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+        alloc,
+        current_schema,
+        client,
+        "bucket",
+        "events",
+        .{},
+    );
+    defer owned_source.deinit();
+    try std.testing.expectEqualStrings("events", owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", owned_source.inventory.source_uri);
+    try std.testing.expect(std.mem.startsWith(u8, owned_source.inventory.snapshot_id, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 1), owned_source.inventory.files.len);
+    try std.testing.expectEqualStrings("part-a.parquet", owned_source.inventory.files[0].file_id);
+    try std.testing.expectEqualStrings("s3://bucket/events/part-a.parquet", owned_source.inventory.files[0].object_uri);
+    const pinned_state = owned_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.parquet, pinned_state.format);
+    try std.testing.expectEqualStrings("s3://bucket/events", pinned_state.source_uri);
+    try std.testing.expectEqualStrings(owned_source.inventory.snapshot_id, pinned_state.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v1", pinned_state.schema_fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), pinned_state.file_count);
+    try std.testing.expectEqual(@as(usize, 0), pinned_state.row_group_count);
+    try std.testing.expectEqual(@as(u64, 0), pinned_state.row_count);
+    try std.testing.expectEqual(@as(u64, "not-a-real-parquet-file".len), pinned_state.byte_len);
+    _ = owned_source.source();
+
+    const stale_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:stale" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+            alloc,
+            stale_schema,
+            client,
+            "bucket",
+            "events",
+            .{},
+        ),
+    );
+}
+
+test "opened object storage lake source owns store and pins parquet prefix inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+    var put_b = try client.putObject("bucket", "events/part-b.parquet", "not-a-real-parquet-file", .{});
+    defer put_b.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    try std.testing.expectEqualStrings("bucket", opened_source.opened_store.bucket);
+    try std.testing.expectEqualStrings("events", opened_source.opened_store.prefix);
+    try std.testing.expectEqualStrings("events", opened_source.owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", opened_source.owned_source.inventory.source_uri);
+    try std.testing.expect(std.mem.startsWith(u8, opened_source.owned_source.inventory.snapshot_id, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
+    const pinned_state = opened_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.parquet, pinned_state.format);
+    try std.testing.expectEqualStrings("s3://bucket/events", pinned_state.source_uri);
+    try std.testing.expectEqualStrings(opened_source.owned_source.inventory.snapshot_id, pinned_state.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v1", pinned_state.schema_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), pinned_state.file_count);
+    try std.testing.expectEqual(@as(usize, 0), pinned_state.row_group_count);
+    try std.testing.expectEqual(@as(u64, 0), pinned_state.row_count);
+    try std.testing.expectEqual(@as(u64, "not-a-real-parquet-file".len * 2), pinned_state.byte_len);
+    _ = opened_source.source();
+}
+
+test "opened object storage lake source can own serving object range cache" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const persistent_cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lake-range-cache", .{tmp.sub_path});
+    defer alloc.free(persistent_cache_root);
+
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    const sidecars = [_]sidecar_manifest_api.DeclaredArtifact{.{
+        .name = "events.amount.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_parquet,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "sha256:expected",
+            .schema_fingerprint = "schema-v1",
+            .column_bindings = &[_][]const u8{"amount"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = artifact_ref_api.ArtifactKind.vector_segment,
+            .name = "events.amount.vector",
+            .artifact_id = "artifact:vector:expected",
+            .byte_len = 1,
+            .checksum = "sha256:artifact",
+        },
+    }};
+    const desired = [_]serverless_query.LakeSidecarDesired{.{ .kind = source_binding_api.SidecarKind.vector }};
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{
+            .serving_cache_max_bytes = 1024,
+            .persistent_cache_root_dir = persistent_cache_root,
+            .sidecar_context = .{
+                .sidecars = sidecars[0..],
+                .desired_sidecars = desired[0..],
+            },
+        },
+    );
+    defer opened_source.deinit();
+
+    const owned_cache = opened_source.owned_source.owned_cache orelse return error.TestExpectedEqual;
+    const owned_persistent_cache = opened_source.owned_source.owned_persistent_cache orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(owned_cache, opened_source.owned_source.pinned_source.scanner.cache.?);
+    try std.testing.expectEqual(owned_persistent_cache, owned_cache.persistent.?);
+    try std.testing.expectEqualStrings(persistent_cache_root, owned_persistent_cache.root_dir);
+    try std.testing.expectEqual(@as(?usize, 1024), owned_cache.policy.max_total_bytes);
+    try std.testing.expect(owned_cache.policy.isProtected(.metadata));
+    try std.testing.expect(owned_cache.policy.isProtected(.serving_sidecar));
+    try std.testing.expectEqual(@as(?usize, 128), owned_cache.policy.laneLimit(.broad_scan_scratch));
+    const sidecar_context = opened_source.sidecarContext();
+    try std.testing.expectEqual(@as(usize, 1), sidecar_context.sidecars.len);
+    try std.testing.expectEqual(@as(usize, 1), sidecar_context.desired_sidecars.len);
+    try std.testing.expectEqualStrings("events.amount.vector", sidecar_context.sidecars[0].name);
+
+    var external_cache = serverless_query.initLakeParquetServingObjectRangeCache(2048);
+    defer external_cache.deinit(alloc);
+    const invalid_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            alloc,
+            schema,
+            invalid_store,
+            .{
+                .cache = &external_cache,
+                .serving_cache_max_bytes = 1024,
+            },
+        ),
+    );
+    const invalid_persistent_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            alloc,
+            schema,
+            invalid_persistent_store,
+            .{
+                .cache = &external_cache,
+                .persistent_cache_root_dir = persistent_cache_root,
+            },
+        ),
+    );
+}
+
+test "opened object storage lake source resolves iceberg table root inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "iceberg-schema:7",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var version_hint = try client.putObject("bucket", "events/metadata/version-hint.text", "1\n", .{});
+    defer version_hint.deinit(alloc);
+    var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", icebergRoutingMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var manifest_list = try buildIcebergRoutingManifestListFixture(alloc);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest = try buildIcebergRoutingDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+    const data_a = try alloc.alloc(u8, 4096);
+    defer alloc.free(data_a);
+    @memset(data_a, 0);
+    var data_a_put = try client.putObject("bucket", "events/data/a.parquet", data_a, .{});
+    defer data_a_put.deinit(alloc);
+    const data_b = try alloc.alloc(u8, 2048);
+    defer alloc.free(data_b);
+    @memset(data_b, 0);
+    var data_b_put = try client.putObject("bucket", "events/data/b.parquet", data_b, .{});
+    defer data_b_put.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    try std.testing.expectEqual(external_source_api.Format.iceberg, opened_source.owned_source.inventory.format);
+    try std.testing.expectEqualStrings("events", opened_source.owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", opened_source.owned_source.inventory.source_uri);
+    try std.testing.expectEqualStrings("12", opened_source.owned_source.inventory.snapshot_id);
+    try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
+    try std.testing.expectEqualStrings("s3://bucket/events/data/a.parquet", opened_source.owned_source.inventory.files[0].object_uri);
+    try std.testing.expect(opened_source.owned_source.inventory.files[0].etag.len != 0);
+    try std.testing.expect(opened_source.owned_source.inventory.files[0].version_id.len == 0);
+    try std.testing.expectEqual(@as(?i64, 42), opened_source.owned_source.inventory.files[0].data_sequence_number);
+    const pinned_state = opened_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.iceberg, pinned_state.format);
+    try std.testing.expectEqual(@as(usize, 2), pinned_state.file_count);
+    try std.testing.expectEqual(@as(u64, 6144), pinned_state.byte_len);
+}
+
+test "opened object storage iceberg source applies position delete files" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "iceberg-schema:7",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var version_hint = try client.putObject("bucket", "events/metadata/version-hint.text", "1\n", .{});
+    defer version_hint.deinit(alloc);
+    var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", icebergRoutingMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+
+    const data_file_path = "s3://bucket/events/data/a.parquet";
+    const data_object = try serverless_query.buildLakeParquetTestSingleColumnPlainI64ObjectAlloc(
+        alloc,
+        "amount",
+        &[_]i64{ 10, 20, 30 },
+    );
+    defer alloc.free(data_object);
+    var data_put = try client.putObject("bucket", "events/data/a.parquet", data_object, .{});
+    defer data_put.deinit(alloc);
+
+    const delete_file_path = "s3://bucket/events/deletes/pos-a.parquet";
+    const pos_columns = [_]serverless_query.LakeParquetTestPlainI64Column{.{
+        .column_id = "pos",
+        .values = &[_]i64{1},
+    }};
+    const file_path_columns = [_]serverless_query.LakeParquetTestPlainByteArrayColumn{.{
+        .column_id = "file_path",
+        .values = &[_][]const u8{data_file_path},
+    }};
+    const delete_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(
+        alloc,
+        &pos_columns,
+        &file_path_columns,
+    );
+    defer alloc.free(delete_object);
+    var delete_put = try client.putObject("bucket", "events/deletes/pos-a.parquet", delete_object, .{});
+    defer delete_put.deinit(alloc);
+
+    var data_manifest = try buildIcebergRoutingOneDataManifestFixture(alloc, data_file_path, 3, data_object.len);
+    defer data_manifest.deinit(alloc);
+    var delete_manifest = try buildIcebergRoutingDeleteManifestFixture(alloc, delete_file_path, 1, delete_object.len);
+    defer delete_manifest.deinit(alloc);
+    var manifest_list = try buildIcebergRoutingDataAndDeleteManifestListFixture(
+        alloc,
+        data_manifest.items.len,
+        delete_manifest.items.len,
+    );
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+    var delete_manifest_put = try client.putObject("bucket", "events/metadata/d-a.avro", delete_manifest.items, .{});
+    defer delete_manifest_put.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    const projection = [_][]const u8{"amount"};
+    var result = try opened_source.owned_source.pinned_source.scanner.scanAlloc(alloc, schema, .{
+        .projected_columns = &projection,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 10), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
+test "external lake routing source resolves object store for external row plans" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const external_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+    const local_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+
+    const FakeBase = struct {
+        rows_query_count: u32 = 0,
+        document_algebraic_aggregate_count: u32 = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .document_algebraic_aggregate = documentAlgebraicAggregate,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?LookupResponse {
+            return error.UnexpectedBaseLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?ScanResponse {
+            return error.UnexpectedBaseScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedBaseQuery;
+        }
+
+        fn rowsQueryPlan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: storage_schema.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rows_query_count += 1;
+            return error.BaseRowsQueryReached;
+        }
+
+        fn documentAlgebraicAggregate(
+            ptr: *anyopaque,
+            aggregate_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.AlgebraicAggregateResponse {
+            _ = consistency;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.document_algebraic_aggregate_count += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("amount_alg", req.index_name);
+            try std.testing.expectEqualStrings("avg_by_status", req.materialization_name);
+            var rows = try aggregate_alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, 1);
+            errdefer aggregate_alloc.free(rows);
+            rows[0] = .{
+                .value_json = try aggregate_alloc.dupe(u8, "11"),
+                .raw_value = try db_mod.algebraic.algebra.encodeAvgAlloc(aggregate_alloc, .{ .sum = 11, .count = 1 }),
+            };
+            return .{ .rows = rows, .total_groups = 1 };
+        }
+    };
+
+    const FakeResolver = struct {
+        memory: *object_storage_api.MemoryObjectStorage,
+        open_count: u32 = 0,
+
+        fn resolver(self: *@This()) ExternalLakeObjectStoreResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .open_parquet_prefix = openParquetPrefix,
+                },
+            };
+        }
+
+        fn openParquetPrefix(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            binding: external_binding_api.Binding,
+            _: ExternalObjectStorageLakeRowsSourceOptions,
+        ) !object_store_support.OpenedObjectStore {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.open_count += 1;
+            try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
+            try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
+            return try object_store_support.OpenedObjectStore.initWithClient(
+                inner_alloc,
+                self.memory.client(),
+                "bucket",
+                "events",
+            );
+        }
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put.deinit(alloc);
+
+    var base = FakeBase{};
+    var resolver = FakeResolver{ .memory = &memory };
+    var routed = ExternalLakeRoutingTableReadSource.init(base.source(), resolver.resolver(), .{});
+    var source = routed.source();
+    const projection = [_][]const u8{"amount"};
+    const plan = db_mod.types.RelationalRowsQueryPlan{
+        .query = .{
+            .select = projection[0..],
+            .select_all = false,
+        },
+    };
+
+    try std.testing.expectError(error.InvalidParquetRowGroupBatch, source.rowsQueryPlan(alloc, "events", external_schema, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base.rows_query_count);
+
+    try std.testing.expectError(error.BaseRowsQueryReached, source.rowsQueryPlan(alloc, "events", local_schema, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 1), base.rows_query_count);
+
+    var aggregate = (try source.documentAlgebraicAggregate(alloc, "docs", .{
+        .index_name = "amount_alg",
+        .materialization_name = "avg_by_status",
+        .aggregate_op = .avg,
+        .group_by = null,
+        .limit = null,
+    }, .read_index)).?;
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), base.document_algebraic_aggregate_count);
+    try std.testing.expectEqual(@as(u32, 1), aggregate.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
+    try std.testing.expect(aggregate.rows[0].group_json == null);
+    try std.testing.expectEqualStrings("11", aggregate.rows[0].value_json);
+}
+
+fn icebergRoutingMetadataJson() []const u8 {
+    return
+    \\{
+    \\  "format-version": 2,
+    \\  "table-uuid": "uuid-events",
+    \\  "location": "s3://bucket/events",
+    \\  "current-schema-id": 7,
+    \\  "current-snapshot-id": 12,
+    \\  "snapshots": [
+    \\    {
+    \\      "snapshot-id": 12,
+    \\      "sequence-number": 42,
+    \\      "timestamp-ms": 1700000000000,
+    \\      "manifest-list": "s3://bucket/events/metadata/snap-12.avro"
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
+fn buildIcebergRoutingManifestListFixture(alloc: std.mem.Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingManifestListSchema(), "0123456789abcdef");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingManifestListRecord(alloc, &block, "s3://bucket/events/metadata/m-a.avro", 512, 0, .{});
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "0123456789abcdef");
+    return out;
+}
+
+fn buildIcebergRoutingDataAndDeleteManifestListFixture(
+    alloc: std.mem.Allocator,
+    data_manifest_len: usize,
+    delete_manifest_len: usize,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingManifestListSchema(), "0123456789abcdef");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingManifestListRecord(alloc, &block, "s3://bucket/events/metadata/m-a.avro", data_manifest_len, 0, .{
+        .added_files = 1,
+        .added_rows = 3,
+    });
+    try appendIcebergRoutingManifestListRecord(alloc, &block, "s3://bucket/events/metadata/d-a.avro", delete_manifest_len, 1, .{
+        .added_files = 1,
+        .added_rows = 1,
+    });
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 2, "0123456789abcdef");
+    return out;
+}
+
+const IcebergRoutingManifestSummary = struct {
+    added_files: i64 = 0,
+    existing_files: i64 = 0,
+    deleted_files: i64 = 0,
+    added_rows: i64 = 0,
+    existing_rows: i64 = 0,
+    deleted_rows: i64 = 0,
+};
+
+fn appendIcebergRoutingManifestListRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    manifest_path: []const u8,
+    manifest_len: usize,
+    content: i64,
+    summary: IcebergRoutingManifestSummary,
+) !void {
+    try appendIcebergRoutingString(alloc, out, manifest_path);
+    try appendIcebergRoutingLong(alloc, out, @intCast(manifest_len));
+    try appendIcebergRoutingLong(alloc, out, 0);
+    try appendIcebergRoutingLong(alloc, out, content);
+    try appendIcebergRoutingLong(alloc, out, 42);
+    try appendIcebergRoutingLong(alloc, out, summary.added_files);
+    try appendIcebergRoutingLong(alloc, out, summary.existing_files);
+    try appendIcebergRoutingLong(alloc, out, summary.deleted_files);
+    try appendIcebergRoutingLong(alloc, out, summary.added_rows);
+    try appendIcebergRoutingLong(alloc, out, summary.existing_rows);
+    try appendIcebergRoutingLong(alloc, out, summary.deleted_rows);
+}
+
+fn buildIcebergRoutingDataManifestFixture(alloc: std.mem.Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingDataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingDataManifestRecord(alloc, &block, 1, "s3://bucket/events/data/a.parquet", 3, 4096);
+    try appendIcebergRoutingDataManifestRecord(alloc, &block, 0, "s3://bucket/events/data/b.parquet", 2, 2048);
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 2, "fedcba9876543210");
+    return out;
+}
+
+fn buildIcebergRoutingOneDataManifestFixture(
+    alloc: std.mem.Allocator,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: usize,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingDataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingDataManifestRecordWithContent(alloc, &block, 1, 0, file_path, record_count, @intCast(file_size_in_bytes));
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
+fn buildIcebergRoutingDeleteManifestFixture(
+    alloc: std.mem.Allocator,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: usize,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingDataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingDataManifestRecordWithContent(alloc, &block, 1, 1, file_path, record_count, @intCast(file_size_in_bytes));
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
+fn icebergRoutingManifestListSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_file","fields":[
+    \\{"name":"manifest_path","type":"string"},
+    \\{"name":"manifest_length","type":"long"},
+    \\{"name":"partition_spec_id","type":"int"},
+    \\{"name":"content","type":"int"},
+    \\{"name":"sequence_number","type":"long"},
+    \\{"name":"added_files_count","type":"int"},
+    \\{"name":"existing_files_count","type":"int"},
+    \\{"name":"deleted_files_count","type":"int"},
+    \\{"name":"added_rows_count","type":"long"},
+    \\{"name":"existing_rows_count","type":"long"},
+    \\{"name":"deleted_rows_count","type":"long"}]}
+    ;
+}
+
+fn icebergRoutingDataManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"}]}}]}
+    ;
+}
+
+fn appendIcebergRoutingDataManifestRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: i64,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+) !void {
+    return try appendIcebergRoutingDataManifestRecordWithContent(
+        alloc,
+        out,
+        status,
+        0,
+        file_path,
+        record_count,
+        file_size_in_bytes,
+    );
+}
+
+fn appendIcebergRoutingDataManifestRecordWithContent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: i64,
+    content: i64,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+) !void {
+    try appendIcebergRoutingLong(alloc, out, status);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 12);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 42);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 43);
+    try appendIcebergRoutingLong(alloc, out, content);
+    try appendIcebergRoutingString(alloc, out, file_path);
+    try appendIcebergRoutingString(alloc, out, "PARQUET");
+    try appendIcebergRoutingLong(alloc, out, record_count);
+    try appendIcebergRoutingLong(alloc, out, file_size_in_bytes);
+}
+
+fn appendIcebergRoutingAvroHeader(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    schema: []const u8,
+    sync: []const u8,
+) !void {
+    try out.appendSlice(alloc, "Obj\x01");
+    try appendIcebergRoutingLong(alloc, out, 2);
+    try appendIcebergRoutingString(alloc, out, "avro.schema");
+    try appendIcebergRoutingBytes(alloc, out, schema);
+    try appendIcebergRoutingString(alloc, out, "avro.codec");
+    try appendIcebergRoutingBytes(alloc, out, "null");
+    try appendIcebergRoutingLong(alloc, out, 0);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendIcebergRoutingAvroBlock(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    block: []const u8,
+    count: i64,
+    sync: []const u8,
+) !void {
+    try appendIcebergRoutingLong(alloc, out, count);
+    try appendIcebergRoutingLong(alloc, out, @intCast(block.len));
+    try out.appendSlice(alloc, block);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendIcebergRoutingBytes(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    try appendIcebergRoutingLong(alloc, out, @intCast(bytes.len));
+    try out.appendSlice(alloc, bytes);
+}
+
+fn appendIcebergRoutingString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    try appendIcebergRoutingBytes(alloc, out, text);
+}
+
+fn appendIcebergRoutingLong(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: i64) !void {
+    var remaining = encodeIcebergRoutingZigzag(value);
+    while (remaining >= 0x80) {
+        try out.append(alloc, @as(u8, @intCast(remaining & 0x7f)) | 0x80);
+        remaining >>= 7;
+    }
+    try out.append(alloc, @intCast(remaining));
+}
+
+fn encodeIcebergRoutingZigzag(value: i64) u64 {
+    if (value >= 0) return @as(u64, @intCast(value)) << 1;
+    const magnitude: u64 = @intCast(-(value + 1));
+    return (magnitude << 1) | 1;
+}
+
+test "configured external lake resolver opens credentialed filesystem connection" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allowed_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/allowed/events", .{tmp.sub_path});
+    defer alloc.free(allowed_path);
+    const denied_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/denied/events", .{tmp.sub_path});
+    defer alloc.free(denied_path);
+
+    const cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "prod-lake-read": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {{
+        \\        "protocol": "filesystem",
+        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{tmp.sub_path});
+    defer alloc.free(cfg_json);
+    var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
+    defer cfg.deinit();
+
+    var resolver = ConfiguredExternalLakeObjectStoreResolver{};
+    resolver.configure(&cfg, null);
+    const source = resolver.resolver();
+
+    const allowed_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{allowed_path});
+    defer alloc.free(allowed_uri);
+    var opened = try source.openParquetPrefixAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = allowed_uri,
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{});
+    defer opened.deinit();
+    try std.testing.expectEqualStrings("external-lake", opened.bucket);
+
+    const denied_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{denied_path});
+    defer alloc.free(denied_uri);
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, source.openParquetPrefixAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = denied_uri,
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{}));
+
+    const no_lake_read_cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "prod-lake-read": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_write"],
+        \\      "external_io": {{
+        \\        "protocol": "filesystem",
+        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{tmp.sub_path});
+    defer alloc.free(no_lake_read_cfg_json);
+    var no_lake_read_cfg = try common_config.Config.parseFromSlice(alloc, no_lake_read_cfg_json);
+    defer no_lake_read_cfg.deinit();
+    resolver.configure(&no_lake_read_cfg, null);
+    try std.testing.expectError(error.UnsupportedExternalLakeCredentialRef, source.openParquetPrefixAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = allowed_uri,
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{}));
+}

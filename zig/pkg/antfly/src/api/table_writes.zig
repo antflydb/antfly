@@ -107,9 +107,15 @@ pub const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorke
 pub const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 pub const SchemaRewriteGroupRequest = table_write_schema_jobs.SchemaRewriteGroupRequest;
 pub const TableWriteSource = table_write_core.TableWriteSource;
+pub const RaftBatcher = table_write_core.RaftBatcher;
 pub const freeForeignKeyRefChildrenPage = table_write_core.freeForeignKeyRefChildrenPage;
 
 const GroupBatch = table_write_core.GroupBatch;
+const backend_current_root_generation = table_write_core.backend_current_root_generation;
+const normalizeRelationalConstraintError = table_write_core.normalizeRelationalConstraintError;
+const nextTxnTimestamp = table_write_core.nextTxnTimestamp;
+const nextTxnId = table_write_core.nextTxnId;
+const boundConflict = table_write_core.boundConflict;
 const cloneOptionalString = table_write_integrity.cloneOptionalString;
 const foreignKeyActionJobStatusFromDbRecord = table_write_integrity.foreignKeyActionJobStatusFromDbRecord;
 const cloneForeignKeyActionJobStatus = table_write_integrity.cloneForeignKeyActionJobStatus;
@@ -184,6 +190,18 @@ const foreignKeyIntegritySchemaControllerResultsContainJobId = table_write_integ
 const finalizeForeignKeyIntegritySchemaControllerMaintenanceResult = table_write_integrity.finalizeForeignKeyIntegritySchemaControllerMaintenanceResult;
 const resultForeignKeyConstraintName = table_write_integrity.resultForeignKeyConstraintName;
 const shouldPromoteForeignKeyAfterSchemaControllerResult = table_write_integrity.shouldPromoteForeignKeyAfterSchemaControllerResult;
+const runUniqueConstraintIntegritySchemaControllerMaintenanceForTable = table_write_integrity.runUniqueConstraintIntegritySchemaControllerMaintenanceForTable;
+const promoteLocalUniqueConstraintAfterSchemaControllerResult = table_write_integrity.promoteLocalUniqueConstraintAfterSchemaControllerResult;
+const foreignKeyIntegritySchemaControllerPassWithSchemaJson = table_write_integrity.foreignKeyIntegritySchemaControllerPassWithSchemaJson;
+const runForeignKeyIntegritySchemaControllerMaintenanceForTable = table_write_integrity.runForeignKeyIntegritySchemaControllerMaintenanceForTable;
+const runForeignKeyIntegrityJobControllerMaintenanceForTable = table_write_integrity.runForeignKeyIntegrityJobControllerMaintenanceForTable;
+const runForeignKeyActionScheduleControllerMaintenanceForTable = table_write_integrity.runForeignKeyActionScheduleControllerMaintenanceForTable;
+const runForeignKeyActionJobControllerMaintenanceForTable = table_write_integrity.runForeignKeyActionJobControllerMaintenanceForTable;
+const foreignKeyActionCanRunGroupDbLocal = table_write_integrity.foreignKeyActionCanRunGroupDbLocal;
+const foreignKeyActionOwnerParentTableNameAlloc = table_write_integrity.foreignKeyActionOwnerParentTableNameAlloc;
+const promoteLocalForeignKeyAfterSchemaControllerResult = table_write_integrity.promoteLocalForeignKeyAfterSchemaControllerResult;
+const runCatalogForeignKeyIntegritySchemaControllerMaintenancePass = table_write_integrity.runCatalogForeignKeyIntegritySchemaControllerMaintenancePass;
+const runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass = table_write_integrity.runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass;
 const planForeignKeyIntegrityWorkUnits = table_write_integrity.planForeignKeyIntegrityWorkUnits;
 const planForeignKeyIntegrityWorkerWorkUnits = table_write_integrity.planForeignKeyIntegrityWorkerWorkUnits;
 const appendForeignKeyIntegrityOwnerRangeWorkUnits = table_write_integrity.appendForeignKeyIntegrityOwnerRangeWorkUnits;
@@ -216,7 +234,6 @@ const runSchemaRewriteWorkerPassForCatalog = table_write_schema_jobs.runSchemaRe
 const nativeCatalogTableNameAlloc = table_catalog.nativeTableNameForCatalogTargetAlloc;
 const nativeCatalogTableNameForCreateAlloc = table_catalog.nativeTableNameForCatalogCreateTargetAlloc;
 
-var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 const max_cached_write_tables = 64;
 const auto_bulk_ingest_min_batch_ops = table_write_bulk_ingest.min_batch_ops;
 const auto_bulk_ingest_max_window_ops = table_write_bulk_ingest.max_window_ops;
@@ -252,7 +269,9 @@ pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc = table_write_rela
 pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc;
 pub const mergeRowsFromRecursiveCtePlanAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanAlloc;
 pub const mergeRowsFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanWithSessionAlloc;
+const mutateRowsFromSourceAutocommitOnDb = table_write_relational_mutation.mutateRowsFromSourceAutocommitOnDb;
 const mutateRowsJoinedFromSourceRowsOnDb = table_write_relational_mutation.mutateRowsJoinedFromSourceRowsOnDb;
+const mutateRowsJoinedFromSourceRowsAutocommitOnDb = table_write_relational_mutation.mutateRowsJoinedFromSourceRowsAutocommitOnDb;
 const mergeRowsFromSourceRowsOnDb = table_write_relational_mutation.mergeRowsFromSourceRowsOnDb;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const ManagedDbOpenOptions = table_write_managed_db.ManagedDbOpenOptions;
@@ -260,6 +279,7 @@ const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDb
 const loadLocalTableSchemaJson = table_write_managed_db.loadLocalTableSchemaJson;
 const applyLocalTableSchemaJson = table_write_managed_db.applyLocalTableSchemaJson;
 const drainManagedDbBeforeClose = table_write_managed_db.drainManagedDbBeforeClose;
+const isTransientReplayVisibilityError = table_write_managed_db.isTransientReplayVisibilityError;
 const loadTableIndexesJson = table_write_managed_db.loadTableIndexesJson;
 const loadTableManagedMetadata = table_write_managed_db.loadTableManagedMetadata;
 const loadTableIdentityNamespaceForGroup = table_write_managed_db.loadTableIdentityNamespaceForGroup;
@@ -275,152 +295,20 @@ const validateTableWritesAgainstCatalogSchema = table_write_managed_db.validateT
 const validateTableBatchAgainstCatalogSchema = table_write_managed_db.validateTableBatchAgainstCatalogSchema;
 const validateTableBatchAgainstSchemaJson = table_write_managed_db.validateTableBatchAgainstSchemaJson;
 const validateTransactionAgainstCatalogSchema = table_write_managed_db.validateTransactionAgainstCatalogSchema;
-fn openManagedDbForStatusWithCache(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    group_id: u64,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime);
-}
-
-pub fn openManagedDbForStatusWithIndexesJsonAndCache(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForStatusWithIndexesJsonAndCache(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime);
-}
-
-fn openManagedDbWithIndexesJsonAndCache(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheMode(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntime(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntime(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    identity_namespace: ?doc_identity.Namespace,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, identity_namespace);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, antfly_provider, secret_store, remote_content);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
-    identity_namespace: ?doc_identity.Namespace,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, antfly_provider, secret_store, remote_content, identity_namespace);
-}
-
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    mode: ManagedDbOpenMode,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
-    identity_namespace: ?doc_identity.Namespace,
-    options: ManagedDbOpenOptions,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, antfly_provider, secret_store, remote_content, identity_namespace, options);
-}
-
-fn isTransientReplayVisibilityError(err: anyerror) bool {
-    return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
-}
-
-fn normalizeRelationalConstraintError(err: anyerror) anyerror {
-    return switch (err) {
-        error.ForeignKeyViolation, error.UniqueConstraintViolation => error.InvalidBatchRequest,
-        else => err,
-    };
-}
+const openManagedDbForStatusWithCache = table_write_managed_db.openManagedDbForStatusWithCache;
+pub const openManagedDbForStatusWithIndexesJsonAndCache = table_write_managed_db.openManagedDbForStatusWithIndexesJsonAndCache;
+const openManagedDbWithIndexesJsonAndCache = table_write_managed_db.openManagedDbWithIndexesJsonAndCache;
+const openManagedDbWithIndexesJsonAndCacheMode = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheMode;
+const openManagedDbWithIndexesJsonAndCacheModeWithRuntime = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntime;
+const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity;
+const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly;
+const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity;
+const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions;
+const openManagedDbForTableWithCacheAndRuntime = table_write_managed_db.openManagedDbForTableWithCacheAndRuntime;
+const openManagedDbForTableGroupWithCacheAndRuntime = table_write_managed_db.openManagedDbForTableGroupWithCacheAndRuntime;
+const openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate = table_write_managed_db.openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate;
+const openManagedDbForTableWithIndexesJsonAndCache = table_write_managed_db.openManagedDbForTableWithIndexesJsonAndCache;
+const openManagedDbForTableWithIndexesJsonAndCacheAndRuntime = table_write_managed_db.openManagedDbForTableWithIndexesJsonAndCacheAndRuntime;
 
 fn mergeDocumentArtifactTableReprocessResult(
     alloc: std.mem.Allocator,
@@ -586,669 +474,6 @@ fn jsonValueContainsText(value: std.json.Value, needle: []const u8) bool {
 const TestEmbeddingRequest = struct {
     model: std.json.Value,
     input: std.json.Value,
-};
-
-fn runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    schema_json: []const u8,
-    options: UniqueConstraintIntegritySchemaControllerOptions,
-    summary: *UniqueConstraintIntegritySchemaControllerResult,
-    results: *std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult),
-) !void {
-    const selected = (try table_write_integrity.selectedUniqueConstraintIntegrityControllerConstraintAlloc(alloc, schema_json)) orelse return;
-    defer alloc.free(selected);
-    summary.tables_with_pending_constraints += 1;
-    if (summary.tables_executed >= options.max_tables) {
-        summary.complete = false;
-        return;
-    }
-
-    var result = (try source.uniqueConstraintIntegrity(
-        alloc,
-        table_name,
-        options.action,
-        "",
-        "",
-    )) orelse return;
-    errdefer result.deinit(alloc);
-
-    if (options.action == .repair and result.complete) {
-        var validation = (try source.uniqueConstraintIntegrity(
-            alloc,
-            table_name,
-            .validate,
-            "",
-            "",
-        )) orelse return;
-        defer validation.deinit(alloc);
-        result.valid = validation.valid;
-        result.complete = result.complete and validation.complete;
-    }
-
-    summary.tables_executed += 1;
-    summary.complete = summary.complete and result.complete;
-    summary.valid = summary.valid and result.valid;
-    if (result.complete and result.valid) summary.terminal_valid_results += 1;
-    if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
-    try appendUniqueConstraintIntegritySchemaControllerTableResult(alloc, results, table_name, selected, true, result);
-}
-
-fn promoteLocalUniqueConstraintAfterSchemaControllerResult(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    constraint_name: []const u8,
-    result: UniqueConstraintIntegrityResult,
-) !void {
-    if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(result)) return;
-    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
-    defer alloc.free(schema_json);
-    const enforced_schema_json = try tables_api.schemaWithUniqueConstraintValidationStateAlloc(
-        alloc,
-        schema_json,
-        constraint_name,
-        .enforced,
-    );
-    defer alloc.free(enforced_schema_json);
-    try applyLocalTableSchemaJson(alloc, db, enforced_schema_json);
-}
-
-fn foreignKeyIntegritySchemaControllerPassWithSchemaJson(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    schema_json: []const u8,
-    action: ForeignKeyIntegrityAction,
-    worker_id: []const u8,
-    lease_ms: u64,
-    max_work_units: usize,
-    constraint_name: ?[]const u8,
-    lower_doc_key: []const u8,
-    upper_doc_key: []const u8,
-    violation_limit: usize,
-) !?ForeignKeyIntegrityResult {
-    if (worker_id.len == 0 or lease_ms == 0) return error.InvalidForeignKeyIntegrityRequest;
-    if (!foreignKeyIntegrityWorkerActionSupported(action)) return error.InvalidForeignKeyIntegrityRequest;
-
-    const selected_constraint = try table_write_integrity.selectedForeignKeyIntegrityControllerConstraintAlloc(alloc, schema_json, constraint_name);
-    defer if (selected_constraint) |value| alloc.free(value);
-    if (selected_constraint == null) {
-        return try emptyForeignKeyIntegrityControllerResult(alloc, action, violation_limit);
-    }
-
-    const job_id = try stableForeignKeyIntegrityJobIdAlloc(alloc, table_name, action, selected_constraint, lower_doc_key, upper_doc_key);
-    defer alloc.free(job_id);
-    return try source.foreignKeyIntegrityWorkerPass(
-        alloc,
-        table_name,
-        action,
-        job_id,
-        worker_id,
-        lease_ms,
-        max_work_units,
-        selected_constraint,
-        lower_doc_key,
-        upper_doc_key,
-        violation_limit,
-    );
-}
-
-fn runForeignKeyIntegritySchemaControllerMaintenanceForTable(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    schema_json: []const u8,
-    options: ForeignKeyIntegritySchemaControllerOptions,
-    summary: *ForeignKeyIntegritySchemaControllerResult,
-    results: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
-) !void {
-    const selected = (try table_write_integrity.selectedForeignKeyIntegrityControllerConstraintAlloc(alloc, schema_json, null)) orelse return;
-    defer alloc.free(selected);
-    summary.tables_with_pending_constraints += 1;
-    if (summary.tables_executed >= options.max_tables) {
-        summary.complete = false;
-        return;
-    }
-
-    var result = (try source.foreignKeyIntegritySchemaControllerPass(
-        alloc,
-        table_name,
-        options.action,
-        options.worker_id,
-        options.lease_ms,
-        options.max_work_units_per_table,
-        null,
-        "",
-        "",
-        options.violation_limit,
-    )) orelse return;
-    errdefer result.deinit(alloc);
-
-    summary.tables_executed += 1;
-    summary.claim_attempts += result.work_claims.len;
-    summary.complete = summary.complete and result.complete;
-    summary.valid = summary.valid and result.valid;
-    if (result.complete and result.valid) summary.terminal_valid_results += 1;
-    if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
-    try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, true, result);
-}
-
-fn runForeignKeyIntegrityJobControllerMaintenanceForTable(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    options: ForeignKeyIntegritySchemaControllerOptions,
-    summary: *ForeignKeyIntegritySchemaControllerResult,
-    results: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
-) !void {
-    var progress = (try source.foreignKeyIntegrity(
-        alloc,
-        table_name,
-        .progress,
-        null,
-        "",
-        "",
-        0,
-    )) orelse return;
-    defer progress.deinit(alloc);
-
-    summary.jobs_scanned += progress.jobs.len;
-    for (progress.jobs) |job| {
-        if (job.completed) continue;
-        if (!std.mem.eql(u8, job.table_name, table_name)) continue;
-        if (foreignKeyIntegritySchemaControllerResultsContainJobId(results.items, job.job_id)) continue;
-        const action = foreignKeyIntegrityActionFromJobStatus(job) orelse continue;
-        if (!foreignKeyIntegrityWorkerActionSupported(action)) continue;
-        if (summary.jobs_executed >= options.max_jobs) {
-            summary.complete = false;
-            break;
-        }
-
-        var result = (try source.foreignKeyIntegrityWorkerPass(
-            alloc,
-            table_name,
-            action,
-            job.job_id,
-            options.worker_id,
-            options.lease_ms,
-            options.max_work_units_per_table,
-            job.constraint_name,
-            job.lower_doc_key,
-            job.upper_doc_key,
-            options.violation_limit,
-        )) orelse {
-            summary.complete = false;
-            continue;
-        };
-        errdefer result.deinit(alloc);
-
-        summary.jobs_executed += 1;
-        summary.claim_attempts += result.work_claims.len;
-        summary.complete = summary.complete and result.complete;
-        summary.valid = summary.valid and result.valid;
-        if (result.complete and result.valid) summary.terminal_valid_results += 1;
-        if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
-        try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, false, result);
-    }
-}
-
-fn foreignKeyActionJobSchemaControllerResultsContainJobId(
-    jobs: []const ForeignKeyActionJobStatus,
-    job_id: []const u8,
-) bool {
-    for (jobs) |job| {
-        if (std.mem.eql(u8, job.job_id, job_id)) return true;
-    }
-    return false;
-}
-
-fn foreignKeyActionCanRunGroupDbLocal(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    group_id: u64,
-    child_table_name: []const u8,
-    constraint_name: []const u8,
-    parent_table_name: []const u8,
-    parent_key: []const u8,
-) !bool {
-    const child_groups = try table_catalog.resolveGroupsForSpan(alloc, catalog, child_table_name, "", "");
-    defer if (child_groups.len > 0) alloc.free(child_groups);
-    if (child_groups.len != 1 or child_groups[0] != group_id) return false;
-
-    const owner_parent_table_name = try foreignKeyActionOwnerParentTableNameAlloc(
-        alloc,
-        catalog,
-        child_table_name,
-        constraint_name,
-        parent_table_name,
-    );
-    defer alloc.free(owner_parent_table_name);
-
-    var owner_resolution = try table_catalog.resolveForeignKeyRefOwnerGroups(
-        alloc,
-        catalog,
-        child_table_name,
-        constraint_name,
-        owner_parent_table_name,
-        parent_key,
-    );
-    defer owner_resolution.deinit(alloc);
-    if (!owner_resolution.configured) return true;
-    return owner_resolution.groups.len == 1 and owner_resolution.groups[0] == group_id;
-}
-
-fn foreignKeyActionOwnerParentTableNameAlloc(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    child_table_name: []const u8,
-    constraint_name: []const u8,
-    parent_table_name: []const u8,
-) ![]u8 {
-    const schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, child_table_name)) orelse return try alloc.dupe(u8, parent_table_name);
-    defer alloc.free(schema_json);
-    if (schema_json.len == 0) return try alloc.dupe(u8, parent_table_name);
-
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-    if (runtime_schema.storage_mode != .relational) return try alloc.dupe(u8, parent_table_name);
-
-    for (runtime_schema.foreign_keys) |foreign_key| {
-        if (!std.mem.eql(u8, foreign_key.name, constraint_name)) continue;
-        const catalog_parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, runtime_schema.default_type))
-            child_table_name
-        else
-            foreign_key.parent_table;
-        if (!std.mem.eql(u8, parent_table_name, foreign_key.parent_table) and
-            !std.mem.eql(u8, parent_table_name, catalog_parent_table_name))
-        {
-            return error.UnsupportedOperation;
-        }
-        return try alloc.dupe(u8, catalog_parent_table_name);
-    }
-    return try alloc.dupe(u8, parent_table_name);
-}
-
-fn runForeignKeyActionScheduleControllerMaintenanceForTable(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    options: ForeignKeyIntegritySchemaControllerOptions,
-    summary: *ForeignKeyIntegritySchemaControllerResult,
-    action_schedules: *std.ArrayListUnmanaged(ForeignKeyActionScheduleStatus),
-) !void {
-    var progress = (try source.foreignKeyActionScheduleProgress(alloc, table_name)) orelse return;
-    defer progress.deinit(alloc);
-
-    summary.action_schedules_scanned += progress.schedules.len;
-    for (progress.schedules) |schedule| {
-        if (schedule.completed) continue;
-        if (std.mem.eql(u8, schedule.status, "invalid")) {
-            var cloned = try cloneForeignKeyActionScheduleStatus(alloc, schedule);
-            errdefer cloned.deinit(alloc);
-            try action_schedules.append(alloc, cloned);
-            summary.action_schedules_invalid += 1;
-            summary.complete = false;
-            summary.valid = false;
-            continue;
-        }
-        if (summary.action_schedules_executed >= options.max_action_jobs) {
-            summary.complete = false;
-            break;
-        }
-
-        const page_limit = @min(schedule.page_limit, options.action_job_page_limit);
-        var result = if (try source.foreignKeyActionJobGroupLocalSchedule(
-            alloc,
-            schedule.group_id,
-            table_name,
-            schedule.action_job_id,
-            schedule.action,
-            options.worker_id,
-            schedule.constraint_name,
-            schedule.parent_table,
-            schedule.parent_key,
-            schedule.updated_parent_key,
-            page_limit,
-            schedule.cascade_depth,
-            schedule.cascade_max_depth,
-        )) |status| blk: {
-            const groups = try alloc.alloc(ForeignKeyActionJobStatus, 1);
-            groups[0] = status;
-            break :blk ForeignKeyActionJobResult{
-                .complete = status.completed,
-                .groups = groups,
-            };
-        } else (try source.foreignKeyActionJobSchedule(
-            alloc,
-            table_name,
-            schedule.action_job_id,
-            schedule.action,
-            options.worker_id,
-            schedule.constraint_name,
-            schedule.parent_table,
-            schedule.parent_key,
-            schedule.updated_parent_key,
-            page_limit,
-            schedule.cascade_depth,
-            schedule.cascade_max_depth,
-        )) orelse {
-            summary.complete = false;
-            continue;
-        };
-        defer result.deinit(alloc);
-
-        if (result.groups.len == 0) {
-            summary.complete = false;
-            if (try source.foreignKeyActionScheduleGroupLocalMarkSeeded(
-                alloc,
-                schedule.group_id,
-                table_name,
-                schedule.schedule_id,
-                0,
-            )) |status_value| {
-                var status = status_value;
-                defer status.deinit(alloc);
-                var cloned = try cloneForeignKeyActionScheduleStatus(alloc, status);
-                errdefer cloned.deinit(alloc);
-                try action_schedules.append(alloc, cloned);
-                if (std.mem.eql(u8, status.status, "invalid")) {
-                    summary.action_schedules_invalid += 1;
-                    summary.valid = false;
-                }
-            } else if (try source.foreignKeyActionScheduleMarkSeeded(
-                alloc,
-                table_name,
-                schedule.schedule_id,
-                0,
-            )) |status_value| {
-                var status = status_value;
-                defer status.deinit(alloc);
-                var cloned = try cloneForeignKeyActionScheduleStatus(alloc, status);
-                errdefer cloned.deinit(alloc);
-                try action_schedules.append(alloc, cloned);
-                if (std.mem.eql(u8, status.status, "invalid")) {
-                    summary.action_schedules_invalid += 1;
-                    summary.valid = false;
-                }
-            }
-            continue;
-        }
-
-        var marked = if (try source.foreignKeyActionScheduleGroupLocalMarkSeeded(
-            alloc,
-            schedule.group_id,
-            table_name,
-            schedule.schedule_id,
-            @intCast(result.groups.len),
-        )) |status| status else (try source.foreignKeyActionScheduleMarkSeeded(
-            alloc,
-            table_name,
-            schedule.schedule_id,
-            @intCast(result.groups.len),
-        )) orelse {
-            summary.complete = false;
-            continue;
-        };
-        defer marked.deinit(alloc);
-        summary.action_schedules_executed += 1;
-        summary.claim_attempts += result.groups.len;
-        summary.complete = summary.complete and result.complete;
-        summary.complete = summary.complete and marked.completed;
-        if (std.mem.eql(u8, marked.status, "invalid")) {
-            summary.action_schedules_invalid += 1;
-            summary.valid = false;
-        }
-        var cloned = try cloneForeignKeyActionScheduleStatus(alloc, marked);
-        errdefer cloned.deinit(alloc);
-        try action_schedules.append(alloc, cloned);
-    }
-}
-
-fn runForeignKeyActionJobControllerMaintenanceForTable(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    table_name: []const u8,
-    options: ForeignKeyIntegritySchemaControllerOptions,
-    summary: *ForeignKeyIntegritySchemaControllerResult,
-    action_jobs: *std.ArrayListUnmanaged(ForeignKeyActionJobStatus),
-) !void {
-    var progress = (try source.foreignKeyActionJobProgress(alloc, table_name)) orelse return;
-    defer progress.deinit(alloc);
-
-    summary.action_jobs_scanned += progress.jobs.len;
-    for (progress.jobs) |job| {
-        if (job.completed) continue;
-        if (foreignKeyActionJobSchemaControllerResultsContainJobId(action_jobs.items, job.job_id)) continue;
-        if (std.mem.eql(u8, job.status, "invalid")) {
-            var cloned = try cloneForeignKeyActionJobStatus(alloc, job);
-            errdefer cloned.deinit(alloc);
-            try action_jobs.append(alloc, cloned);
-            summary.action_jobs_invalid += 1;
-            summary.complete = false;
-            summary.valid = false;
-            continue;
-        }
-        if (summary.action_jobs_executed >= options.max_action_jobs) {
-            summary.complete = false;
-            break;
-        }
-
-        var result = (source.foreignKeyActionJobPage(
-            alloc,
-            table_name,
-            job.job_id,
-            job.action,
-            options.worker_id,
-            job.constraint_name,
-            job.parent_table,
-            job.parent_key,
-            job.updated_parent_key,
-            @min(job.page_limit, options.action_job_page_limit),
-            options.lease_ms,
-        ) catch |err| switch (err) {
-            error.ForeignKeyIntegrityClaimBusy => {
-                summary.complete = false;
-                continue;
-            },
-            else => {
-                var refreshed = (try source.foreignKeyActionJobProgress(alloc, table_name)) orelse return err;
-                defer refreshed.deinit(alloc);
-                const appended = try appendForeignKeyActionJobStatusFromProgressByJobId(alloc, action_jobs, refreshed, job.job_id);
-                if (appended == 0) return err;
-                const invalid = countInvalidForeignKeyActionJobStatusesByJobId(refreshed.jobs, job.job_id);
-                summary.action_jobs_invalid += invalid;
-                if (invalid > 0) summary.valid = false;
-                summary.action_jobs_executed += 1;
-                summary.claim_attempts += appended;
-                summary.complete = false;
-                continue;
-            },
-        }) orelse {
-            summary.complete = false;
-            continue;
-        };
-        defer result.deinit(alloc);
-
-        summary.action_jobs_executed += 1;
-        summary.claim_attempts += result.groups.len;
-        summary.complete = summary.complete and result.complete;
-        const invalid = countInvalidForeignKeyActionJobStatuses(result.groups);
-        summary.action_jobs_invalid += invalid;
-        if (invalid > 0) summary.valid = false;
-        try appendForeignKeyActionJobStatuses(alloc, action_jobs, result.groups);
-    }
-}
-
-fn promoteLocalForeignKeyAfterSchemaControllerResult(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    result: ForeignKeyIntegrityResult,
-) !void {
-    if (!shouldPromoteForeignKeyAfterSchemaControllerResult(result)) return;
-    const constraint_name = resultForeignKeyConstraintName(result) orelse return;
-    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
-    defer alloc.free(schema_json);
-    const enforced_schema_json = try tables_api.schemaWithForeignKeyValidationStateAlloc(
-        alloc,
-        schema_json,
-        constraint_name,
-        .enforced,
-    );
-    defer alloc.free(enforced_schema_json);
-    try applyLocalTableSchemaJson(alloc, db, enforced_schema_json);
-}
-
-fn runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    options: ForeignKeyIntegritySchemaControllerOptions,
-) !ForeignKeyIntegritySchemaControllerResult {
-    try validateForeignKeyIntegritySchemaControllerOptions(options);
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-
-    var summary = ForeignKeyIntegritySchemaControllerResult{};
-    var results = std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult).empty;
-    var action_schedules = std.ArrayListUnmanaged(ForeignKeyActionScheduleStatus).empty;
-    var action_jobs = std.ArrayListUnmanaged(ForeignKeyActionJobStatus).empty;
-    errdefer {
-        for (results.items) |*result| result.deinit(alloc);
-        results.deinit(alloc);
-        for (action_schedules.items) |*schedule| schedule.deinit(alloc);
-        action_schedules.deinit(alloc);
-        for (action_jobs.items) |*job| job.deinit(alloc);
-        action_jobs.deinit(alloc);
-    }
-
-    for (snapshot.tables) |table| {
-        if (table.schema_json.len == 0) continue;
-        summary.tables_scanned += 1;
-        if (!(try table_write_integrity.tableSchemaHasForeignKeysAlloc(alloc, table.schema_json))) continue;
-        try runForeignKeyIntegritySchemaControllerMaintenanceForTable(
-            alloc,
-            source,
-            table.name,
-            table.schema_json,
-            options,
-            &summary,
-            &results,
-        );
-        try runForeignKeyIntegrityJobControllerMaintenanceForTable(
-            alloc,
-            source,
-            table.name,
-            options,
-            &summary,
-            &results,
-        );
-        try runForeignKeyActionScheduleControllerMaintenanceForTable(
-            alloc,
-            source,
-            table.name,
-            options,
-            &summary,
-            &action_schedules,
-        );
-        try runForeignKeyActionJobControllerMaintenanceForTable(
-            alloc,
-            source,
-            table.name,
-            options,
-            &summary,
-            &action_jobs,
-        );
-        if (summary.tables_executed >= options.max_tables and summary.jobs_executed >= options.max_jobs and summary.action_schedules_executed >= options.max_action_jobs and summary.action_jobs_executed >= options.max_action_jobs) break;
-    }
-
-    return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
-}
-
-fn runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(
-    alloc: std.mem.Allocator,
-    source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    options: UniqueConstraintIntegritySchemaControllerOptions,
-) !UniqueConstraintIntegritySchemaControllerResult {
-    try validateUniqueConstraintIntegritySchemaControllerOptions(options);
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-
-    var summary = UniqueConstraintIntegritySchemaControllerResult{};
-    var results = std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult).empty;
-    errdefer {
-        for (results.items) |*result| result.deinit(alloc);
-        results.deinit(alloc);
-    }
-
-    for (snapshot.tables) |table| {
-        if (table.schema_json.len == 0) continue;
-        summary.tables_scanned += 1;
-        if (!(try table_write_integrity.tableSchemaHasUniqueConstraintsAlloc(alloc, table.schema_json))) continue;
-        const first_result_index = results.items.len;
-        try runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
-            alloc,
-            source,
-            table.name,
-            table.schema_json,
-            options,
-            &summary,
-            &results,
-        );
-        for (results.items[first_result_index..]) |entry| {
-            if (!entry.schema_adoption) continue;
-            if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(entry.result)) continue;
-            _ = try table_catalog.promoteUniqueConstraintEnforced(alloc, catalog, entry.table_name, entry.constraint_name);
-        }
-        if (summary.tables_executed >= options.max_tables) break;
-    }
-
-    return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
-}
-
-pub const RaftBatcher = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        batch_group: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.BatchRequest,
-        ) anyerror!void,
-        batch_group_local: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.BatchRequest,
-        ) anyerror!void,
-    };
-
-    pub fn batchGroup(
-        self: RaftBatcher,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: db_mod.types.BatchRequest,
-    ) !void {
-        return try self.vtable.batch_group(self.ptr, alloc, group_id, table_name, req);
-    }
-
-    pub fn batchGroupLocal(
-        self: RaftBatcher,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: db_mod.types.BatchRequest,
-    ) !void {
-        return try self.vtable.batch_group_local(self.ptr, alloc, group_id, table_name, req);
-    }
 };
 
 pub const BoundTableWriteSource = struct {
@@ -2814,7 +2039,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn visibleRootGeneration(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
@@ -9115,7 +8340,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn visibleRootGeneration(self: *const HostedProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
@@ -12194,6 +11419,14 @@ const parseIndexKind = table_write_index_config.parseIndexKind;
 const isReservedTableIndexMetadataEntry = table_write_index_config.isReservedTableIndexMetadataEntry;
 const parseIndexConfig = table_write_index_config.parseIndexConfig;
 const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
+const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
+const parseStartupConfiguredIndexes = table_write_index_config.parseStartupConfiguredIndexes;
+const overlayDenseHbcCacheStatsFromDb = table_write_cache.overlayDenseHbcCacheStatsFromDb;
+const overlayRuntimeStatusReplayTargetFromDb = table_write_cache.overlayRuntimeStatusReplayTargetFromDb;
+const startupCatchUpStatsForPhase = table_write_cache.startupCatchUpStatsForPhase;
+const startupCatchUpStatsForPath = table_write_cache.startupCatchUpStatsForPath;
+const applyStartupCatchUpAsyncOverlay = table_write_cache.applyStartupCatchUpAsyncOverlay;
+const syntheticStartupRuntimeStatusFromConfiguredIndexes = table_write_cache.syntheticStartupRuntimeStatusFromConfiguredIndexes;
 pub const validateIndexConfig = table_write_index_config.validateIndexConfig;
 pub const validateIndexConfigWithOptions = table_write_index_config.validateIndexConfigWithOptions;
 pub const normalizeManagedEmbeddingIndexDimensionJsonWithOptions = table_write_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions;
@@ -12203,99 +11436,6 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
-}
-
-fn mutateRowsFromSourceAutocommitOnDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    schema: storage_schema.TableSchema,
-    req: db_mod.types.RelationalRowsMutationSourceRequest,
-) !db_mod.types.RelationalRowsMutationSourceResult {
-    const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
-    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
-
-    const begin_timestamp = nextTxnTimestamp();
-    const commit_version = begin_timestamp + 1;
-    _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
-    var result = db.mutateRelationalRowsFromSource(alloc, schema, req) catch |err| {
-        db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
-        return normalizeRelationalConstraintError(err);
-    };
-    errdefer result.deinit(alloc);
-    db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
-        return normalizeRelationalConstraintError(err);
-    };
-    return result;
-}
-
-fn joinedMutationSourceTargetClaim(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) ?db_mod.types.RowClaimRequest {
-    return switch (req.target_side) {
-        .left => req.join.left.row_claim,
-        .right => req.join.right.row_claim,
-    };
-}
-
-fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    target_schema: storage_schema.TableSchema,
-    source_schema: storage_schema.TableSchema,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    source_rows: []const []const u8,
-) !db_mod.types.RelationalRowsMutationSourceResult {
-    const claim = joinedMutationSourceTargetClaim(req) orelse return error.InvalidQueryRequest;
-    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
-
-    const begin_timestamp = nextTxnTimestamp();
-    const commit_version = begin_timestamp + 1;
-    _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
-    var result = mutateRowsJoinedFromSourceRowsOnDb(alloc, db, target_schema, source_schema, req, source_rows) catch |err| {
-        db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
-        return normalizeRelationalConstraintError(err);
-    };
-    errdefer result.deinit(alloc);
-    db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
-        return normalizeRelationalConstraintError(err);
-    };
-    return result;
-}
-
-fn nextTxnTimestamp() u64 {
-    // Transaction timestamps are stored in shard metadata and later compared
-    // against transaction recovery cutoffs, so they must stay on realtime.
-    return platform_time.realtimeNs();
-}
-
-fn nextTxnId() db_mod.types.TxnId {
-    const nonce = txn_id_nonce.fetchAdd(1, .monotonic);
-    var txn_id: db_mod.types.TxnId = undefined;
-    std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(), .big);
-    std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
-    return txn_id;
-}
-
-fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
-    if (table.predicates.len > 0) {
-        return .{
-            .table_name = table.table_name,
-            .key = table.predicates[0].key,
-            .message = "version conflict",
-            .phase = .prepare,
-        };
-    }
-    const message = switch (err) {
-        error.IntentConflict => "intent conflict",
-        else => "transaction conflict",
-    };
-    if (table.writes.len > 0) {
-        return .{ .table_name = table.table_name, .key = table.writes[0].key, .message = message, .phase = .prepare };
-    }
-    if (table.deletes.len > 0) {
-        return .{ .table_name = table.table_name, .key = table.deletes[0], .message = message, .phase = .prepare };
-    }
-    return .{ .table_name = table.table_name, .key = "", .message = message, .phase = .prepare };
 }
 
 fn openManagedDbForTable(
@@ -12314,7 +11454,7 @@ fn openManagedDbForTableWithRuntime(
     table_name: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
+    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, backend_current_root_generation, null, backend_runtime);
 }
 
 fn openManagedDbForTableGroupWithRuntime(
@@ -12338,7 +11478,7 @@ fn openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
     ha_write_gate: ?db_mod.HAWriteGate,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
 }
 
 fn openManagedDbForTableWithCache(
@@ -12354,83 +11494,12 @@ fn openManagedDbForTableWithCache(
     return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, null);
 }
 
-fn openManagedDbForTableWithCacheAndRuntime(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime);
-}
-
-fn openManagedDbForTableGroupWithCacheAndRuntime(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    group_id: u64,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime);
-}
-
-fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    group_id: u64,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    ha_write_gate: ?db_mod.HAWriteGate,
-    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime, ha_write_gate, ha_async_mirror);
-}
-
 fn openManagedDbForTableWithIndexesJson(
     alloc: std.mem.Allocator,
     path: []const u8,
     indexes_json: ?[]const u8,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, null);
-}
-
-fn openManagedDbForTableWithIndexesJsonAndCache(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: ?[]const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForTableWithIndexesJsonAndCache(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager);
-}
-
-fn openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: ?[]const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !db_mod.DB {
-    return try table_write_managed_db.openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime);
+    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, backend_current_root_generation, null, null);
 }
 
 fn reconcileLocalTableIndexes(
@@ -12753,7 +11822,7 @@ fn snapshotLocalTableRuntimeStatusesUncached(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
+        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, backend_current_root_generation, null, backend_runtime);
         errdefer db.close();
         items[initialized] = .{
             .group_id = group_id,
@@ -12771,7 +11840,7 @@ fn openManagedDbWithIndexesJson(
     path: []const u8,
     indexes_json: []const u8,
 ) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null);
+    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, backend_current_root_generation, null);
 }
 
 fn publishRuntimeStatusSnapshot(
@@ -12962,361 +12031,6 @@ fn cachedStartupCatchUpStats(
     return .{};
 }
 
-fn dbHbcCacheKindStatsFromIndex(cache_stats: hbc_mod.HbcCacheKindStats) db_mod.types.HbcCacheKindStats {
-    return .{
-        .used_bytes = cache_stats.used_bytes,
-        .peak_bytes = cache_stats.peak_bytes,
-        .insertions = cache_stats.insertions,
-        .admission_skips = cache_stats.admission_skips,
-        .evictions = cache_stats.evictions,
-    };
-}
-
-fn dbHbcCacheStatsFromIndex(cache_stats: hbc_mod.HbcCacheStats) db_mod.types.HbcCacheStats {
-    return .{
-        .total_bytes = cache_stats.total_bytes,
-        .accounted_bytes = cache_stats.accounted_bytes,
-        .node = dbHbcCacheKindStatsFromIndex(cache_stats.node),
-        .quantized = dbHbcCacheKindStatsFromIndex(cache_stats.quantized),
-        .vector = dbHbcCacheKindStatsFromIndex(cache_stats.vector),
-        .metadata = dbHbcCacheKindStatsFromIndex(cache_stats.metadata),
-    };
-}
-
-fn dbHbcPostingStatsFromIndex(backlog: hbc_mod.PostingBacklogStats, profile: hbc_mod.WriteProfile) db_mod.types.HbcPostingStats {
-    return .{
-        .scanned_nodes = backlog.scanned_nodes,
-        .scanned_postings = backlog.scanned_postings,
-        .dirty_postings = backlog.dirty_postings,
-        .centroid_dirty_postings = backlog.centroid_dirty_postings,
-        .payload_dirty_postings = backlog.payload_dirty_postings,
-        .max_centroid_version_lag = backlog.max_centroid_version_lag,
-        .max_payload_version_lag = backlog.max_payload_version_lag,
-        .max_mutation_version = backlog.max_mutation_version,
-        .skipped_missing = backlog.skipped_missing,
-        .maintenance_scanned_nodes = profile.posting_maintenance_scanned_nodes,
-        .maintenance_scanned_postings = profile.posting_maintenance_scanned_postings,
-        .maintenance_dirty_postings = profile.posting_maintenance_dirty_postings,
-        .maintenance_repaired_postings = profile.posting_maintenance_repaired_postings,
-        .maintenance_centroid_refreshed = profile.posting_maintenance_centroid_refreshed,
-        .maintenance_payload_refreshed = profile.posting_maintenance_payload_refreshed,
-        .maintenance_ancestor_refresh_roots = profile.posting_maintenance_ancestor_refresh_roots,
-        .maintenance_split_postings = profile.posting_maintenance_split_postings,
-        .maintenance_merged_postings = profile.posting_maintenance_merged_postings,
-        .maintenance_boundary_reassigned_vectors = profile.posting_maintenance_boundary_reassigned_vectors,
-        .lazy_centroid_deferrals = profile.posting_lazy_centroid_deferrals,
-        .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
-        .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
-    };
-}
-
-fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod.DB) void {
-    if (!db.core.tryLockApplyShared()) return;
-    defer db.core.unlockApplyShared();
-
-    for (stats.indexes) |*item| {
-        if (item.kind != .dense_vector) continue;
-        if (db.core.denseIndex(item.name)) |entry| {
-            item.hbc_cache = dbHbcCacheStatsFromIndex(entry.index.hbcCacheStats());
-        }
-    }
-}
-
-fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRuntimeStatus, db: *db_mod.DB) void {
-    const target_sequence = db.core.nextDerivedSequence();
-    const async_stats = db.snapshotAsyncIndexingStats();
-    status.stats.async_indexing = async_stats;
-    for (status.stats.indexes) |*item| {
-        if (target_sequence > item.replay_target_sequence) {
-            item.replay_target_sequence = target_sequence;
-            item.catch_up_target_sequence = target_sequence;
-        }
-        if (item.catch_up_target_sequence < item.replay_target_sequence) {
-            item.catch_up_target_sequence = item.replay_target_sequence;
-        }
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
-        item.catch_up_applied_sequence = item.replay_applied_sequence;
-        item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
-        item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
-    }
-}
-
-fn startupCatchUpStatsForPhase(
-    phase: db_mod.types.StartupCatchUpPhase,
-    db: ?*db_mod.DB,
-) db_mod.types.StartupCatchUpStats {
-    var stats: db_mod.types.StartupCatchUpStats = if (db) |managed_db|
-        managed_db.snapshotAsyncIndexingStats().startup
-    else
-        .{};
-    stats.active = phase != .idle;
-    stats.phase = phase;
-    if (db) |managed_db| {
-        const maintenance = managed_db.snapshotLsmMaintenanceStats();
-        stats.wal_retention_known = true;
-        stats.wal_retained_segments = maintenance.wal_retained_segments;
-        stats.wal_retained_bytes = maintenance.wal_retained_bytes;
-    }
-    return stats;
-}
-
-const StartupConfiguredIndex = struct {
-    name: []u8 = &.{},
-    kind: db_mod.types.IndexKind = .dense_vector,
-    algebraic_schema_version: u32 = 0,
-    algebraic_capability_fingerprint: ?[]u8 = null,
-    algebraic_capability_lifecycle_status: ?[]u8 = null,
-    algebraic_capability_change_added_fields: u32 = 0,
-    algebraic_capability_change_removed_fields: u32 = 0,
-    algebraic_capability_change_changed_type_fields: u32 = 0,
-    algebraic_skipped_dynamic_fields: u32 = 0,
-    algebraic_skipped_complex_fields: u32 = 0,
-    algebraic_skipped_unbounded_fields: u32 = 0,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.name.len > 0) alloc.free(self.name);
-        if (self.algebraic_capability_fingerprint) |value| alloc.free(value);
-        if (self.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-        self.* = undefined;
-    }
-
-    fn populateStats(self: *const @This(), alloc: std.mem.Allocator, stats: *db_mod.types.DBIndexStats) !void {
-        if (self.kind != .algebraic) return;
-        stats.algebraic_schema_version = self.algebraic_schema_version;
-        stats.algebraic_capability_change_added_fields = self.algebraic_capability_change_added_fields;
-        stats.algebraic_capability_change_removed_fields = self.algebraic_capability_change_removed_fields;
-        stats.algebraic_capability_change_changed_type_fields = self.algebraic_capability_change_changed_type_fields;
-        stats.algebraic_skipped_dynamic_fields = self.algebraic_skipped_dynamic_fields;
-        stats.algebraic_skipped_complex_fields = self.algebraic_skipped_complex_fields;
-        stats.algebraic_skipped_unbounded_fields = self.algebraic_skipped_unbounded_fields;
-        if (self.algebraic_capability_fingerprint) |value| {
-            stats.algebraic_capability_fingerprint = try alloc.dupe(u8, value);
-        }
-        if (self.algebraic_capability_lifecycle_status) |value| {
-            stats.algebraic_capability_lifecycle_status = try alloc.dupe(u8, value);
-        }
-    }
-};
-
-const StartupConfiguredIndexes = struct {
-    items: []StartupConfiguredIndex,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.items) |*item| item.deinit(alloc);
-        alloc.free(self.items);
-        self.* = undefined;
-    }
-
-    fn populateConfiguredCounts(self: *const @This(), stats: *db_mod.types.StartupCatchUpStats) void {
-        for (self.items) |item| incrementStartupConfiguredIndexCounts(stats, item.kind);
-    }
-
-    fn accumulateRetention(
-        self: *const @This(),
-        storage: lsm_backend.Storage,
-        alloc: std.mem.Allocator,
-        table_path: []const u8,
-        stats: *db_mod.types.StartupCatchUpStats,
-    ) !void {
-        for (self.items) |item| {
-            const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ table_path, item.name });
-            defer alloc.free(index_path);
-            const main_retention = try lsm_backend.wal.snapshotRetention(storage, alloc, index_path);
-            const replay_retention = try lsm_backend.wal.snapshotReplayRetention(storage, alloc, index_path);
-            stats.wal_retained_segments += main_retention.segments + replay_retention.segments;
-            stats.wal_retained_bytes += main_retention.bytes + replay_retention.bytes;
-        }
-    }
-};
-
-fn parseStartupConfiguredIndexes(
-    alloc: std.mem.Allocator,
-    indexes_json: []const u8,
-) !StartupConfiguredIndexes {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
-    const array_form = object.get("indexes");
-    const index_count = try startupConfiguredStorageIndexCount(parsed.value);
-    const items = try alloc.alloc(StartupConfiguredIndex, index_count);
-    errdefer {
-        for (items[0..index_count]) |*item| item.deinit(alloc);
-        alloc.free(items);
-    }
-    @memset(items, .{});
-    var initialized: usize = 0;
-
-    if (array_form) |value| {
-        const array_items = switch (value) {
-            .array => value.array.items,
-            else => return error.InvalidCreateTableRequest,
-        };
-        for (array_items) |item| {
-            if (item != .object) return error.InvalidCreateTableRequest;
-            const name_value = item.object.get("name") orelse return error.InvalidCreateTableRequest;
-            if (name_value != .string) return error.InvalidCreateTableRequest;
-            const kind = try parseIndexKind(item);
-            var configured = StartupConfiguredIndex{
-                .name = try alloc.dupe(u8, name_value.string),
-                .kind = kind,
-            };
-            errdefer configured.deinit(alloc);
-            try populateStartupAlgebraicCapability(alloc, &configured, item);
-            items[initialized] = configured;
-            initialized += 1;
-        }
-        return .{ .items = items };
-    }
-
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (isReservedTableIndexMetadataEntry(entry.key_ptr.*)) continue;
-        const kind = try parseIndexKind(entry.value_ptr.*);
-        var configured = StartupConfiguredIndex{
-            .name = try alloc.dupe(u8, entry.key_ptr.*),
-            .kind = kind,
-        };
-        errdefer configured.deinit(alloc);
-        try populateStartupAlgebraicCapability(alloc, &configured, entry.value_ptr.*);
-        items[initialized] = configured;
-        initialized += 1;
-    }
-    return .{ .items = items };
-}
-
-fn startupConfiguredStorageIndexCount(root: std.json.Value) !usize {
-    const object = switch (root) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
-    if (object.get("indexes")) |array_value| {
-        const array_items = switch (array_value) {
-            .array => array_value.array.items,
-            else => return error.InvalidCreateTableRequest,
-        };
-        var count: usize = 0;
-        for (array_items) |item| {
-            if (item != .object) return error.InvalidCreateTableRequest;
-            count += 1;
-        }
-        return count;
-    }
-
-    var count: usize = 0;
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (isReservedTableIndexMetadataEntry(entry.key_ptr.*)) continue;
-        count += 1;
-    }
-    return count;
-}
-
-fn startupAlgebraicField(value: std.json.Value, field: []const u8) ?std.json.Value {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return null,
-    };
-    if (object.get(field)) |direct| return direct;
-    const config = object.get("config") orelse return null;
-    const config_object = switch (config) {
-        .object => |config_object| config_object,
-        else => return null,
-    };
-    return config_object.get(field);
-}
-
-fn startupAlgebraicString(value: std.json.Value, field: []const u8) ?[]const u8 {
-    const field_value = startupAlgebraicField(value, field) orelse return null;
-    return switch (field_value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn startupAlgebraicU32(value: std.json.Value, field: []const u8) ?u32 {
-    const field_value = startupAlgebraicField(value, field) orelse return null;
-    return switch (field_value) {
-        .integer => |integer| if (integer >= 0 and integer <= std.math.maxInt(u32)) @intCast(integer) else null,
-        else => null,
-    };
-}
-
-fn populateStartupAlgebraicCapability(
-    alloc: std.mem.Allocator,
-    item: *StartupConfiguredIndex,
-    value: std.json.Value,
-) !void {
-    if (item.kind != .algebraic) return;
-    item.algebraic_schema_version = startupAlgebraicU32(value, "schema_version") orelse 0;
-    item.algebraic_capability_change_added_fields = startupAlgebraicU32(value, "capability_change_added_fields") orelse 0;
-    item.algebraic_capability_change_removed_fields = startupAlgebraicU32(value, "capability_change_removed_fields") orelse 0;
-    item.algebraic_capability_change_changed_type_fields = startupAlgebraicU32(value, "capability_change_changed_type_fields") orelse 0;
-    item.algebraic_skipped_dynamic_fields = startupAlgebraicU32(value, "skipped_dynamic_fields") orelse 0;
-    item.algebraic_skipped_complex_fields = startupAlgebraicU32(value, "skipped_complex_fields") orelse 0;
-    item.algebraic_skipped_unbounded_fields = startupAlgebraicU32(value, "skipped_unbounded_fields") orelse 0;
-    if (startupAlgebraicString(value, "capability_fingerprint")) |fingerprint| {
-        if (fingerprint.len > 0) item.algebraic_capability_fingerprint = try alloc.dupe(u8, fingerprint);
-    }
-    if (startupAlgebraicString(value, "capability_lifecycle_status")) |status| {
-        if (status.len > 0) item.algebraic_capability_lifecycle_status = try alloc.dupe(u8, status);
-    }
-}
-
-fn startupCatchUpStatsForPath(
-    path: []const u8,
-    phase: db_mod.types.StartupCatchUpPhase,
-    configured_indexes: ?*const StartupConfiguredIndexes,
-) !db_mod.types.StartupCatchUpStats {
-    var stats: db_mod.types.StartupCatchUpStats = .{
-        .active = phase != .idle,
-        .phase = phase,
-        .wal_retention_known = phase != .idle,
-    };
-    if (phase == .idle) return stats;
-
-    var native = try lsm_backend.storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
-    defer native.deinit();
-
-    const main_retention = try lsm_backend.wal.snapshotRetention(native.storage(), std.heap.page_allocator, path);
-    const replay_retention = try lsm_backend.wal.snapshotReplayRetention(native.storage(), std.heap.page_allocator, path);
-    stats.wal_retained_segments = main_retention.segments + replay_retention.segments;
-    stats.wal_retained_bytes = main_retention.bytes + replay_retention.bytes;
-    if (configured_indexes) |summary| {
-        summary.populateConfiguredCounts(&stats);
-        try summary.accumulateRetention(native.storage(), std.heap.page_allocator, path, &stats);
-    }
-    return stats;
-}
-
-fn applyStartupCatchUpAsyncOverlay(
-    status: *runtime_status.LocalTableRuntimeStatus,
-    async_stats: db_mod.types.AsyncIndexingStats,
-    startup: db_mod.types.StartupCatchUpStats,
-) void {
-    status.stats.async_indexing = async_stats;
-    var merged_startup = status.stats.async_indexing.startup;
-    db_mod.types.accumulateStartupCatchUpStats(&merged_startup, startup);
-    status.stats.async_indexing.startup = merged_startup;
-}
-
-fn incrementStartupConfiguredIndexCounts(
-    stats: *db_mod.types.StartupCatchUpStats,
-    kind: db_mod.types.IndexKind,
-) void {
-    stats.configured_indexes += 1;
-    switch (kind) {
-        .dense_vector => stats.configured_dense_indexes += 1,
-        .sparse_vector => stats.configured_sparse_indexes += 1,
-        .full_text => stats.configured_full_text_indexes += 1,
-        .graph => stats.configured_graph_indexes += 1,
-        .algebraic => {},
-    }
-}
-
 fn publishStartupCatchUpRuntimeStatusSnapshot(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -13398,46 +12112,6 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
         status.stats.async_indexing.startup = merged_startup;
     }
     try snapshot_cache.upsertGroupStatus(table_name, status);
-}
-
-fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
-    alloc: std.mem.Allocator,
-    group_id: u64,
-    configured_indexes: *const StartupConfiguredIndexes,
-    startup: db_mod.types.StartupCatchUpStats,
-) !runtime_status.LocalTableRuntimeStatus {
-    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, configured_indexes.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (indexes[0..initialized]) |index| freeSyntheticStartupIndexStatsItem(alloc, index);
-        alloc.free(indexes);
-    }
-
-    for (configured_indexes.items) |item| {
-        var stats = db_mod.types.DBIndexStats{
-            .name = try alloc.dupe(u8, item.name),
-            .kind = item.kind,
-        };
-        errdefer freeSyntheticStartupIndexStatsItem(alloc, stats);
-        try item.populateStats(alloc, &stats);
-        indexes[initialized] = stats;
-        initialized += 1;
-    }
-
-    return .{
-        .group_id = group_id,
-        .stats = .{
-            .index_count = @intCast(indexes.len),
-            .indexes = indexes,
-            .async_indexing = .{ .startup = startup },
-        },
-    };
-}
-
-fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {
-    alloc.free(item.name);
-    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
 }
 
 fn catchUpManagedDb(
@@ -24151,7 +22825,7 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
 
     {
-        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
+        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, backend_current_root_generation, null, .default);
         defer db.close();
     }
 

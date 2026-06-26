@@ -23,9 +23,12 @@ const storage_schema = @import("../../storage/schema.zig");
 const distributed_txn = @import("../distributed_txn.zig");
 const table_catalog = @import("../table_catalog.zig");
 const tables_api = @import("../tables.zig");
+const table_write_core = @import("core.zig");
 const integrity_types = @import("integrity_types.zig");
+const table_write_managed_db = @import("managed_db.zig");
 
 const ForeignKeyActionJobProgressResult = integrity_types.ForeignKeyActionJobProgressResult;
+const ForeignKeyActionJobResult = integrity_types.ForeignKeyActionJobResult;
 const ForeignKeyActionJobStatus = integrity_types.ForeignKeyActionJobStatus;
 const ForeignKeyActionScheduleProgressResult = integrity_types.ForeignKeyActionScheduleProgressResult;
 const ForeignKeyActionScheduleStatus = integrity_types.ForeignKeyActionScheduleStatus;
@@ -52,6 +55,630 @@ const UniqueConstraintIntegritySchemaControllerResult = integrity_types.UniqueCo
 const UniqueConstraintIntegritySchemaControllerTableResult = integrity_types.UniqueConstraintIntegritySchemaControllerTableResult;
 const UniqueConstraintOwnerRange = integrity_types.UniqueConstraintOwnerRange;
 const UniqueConstraintOwnerTopology = integrity_types.UniqueConstraintOwnerTopology;
+const TableWriteSource = table_write_core.TableWriteSource;
+const applyLocalTableSchemaJson = table_write_managed_db.applyLocalTableSchemaJson;
+const loadLocalTableSchemaJson = table_write_managed_db.loadLocalTableSchemaJson;
+
+pub fn runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    schema_json: []const u8,
+    options: UniqueConstraintIntegritySchemaControllerOptions,
+    summary: *UniqueConstraintIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult),
+) !void {
+    const selected = (try selectedUniqueConstraintIntegrityControllerConstraintAlloc(alloc, schema_json)) orelse return;
+    defer alloc.free(selected);
+    summary.tables_with_pending_constraints += 1;
+    if (summary.tables_executed >= options.max_tables) {
+        summary.complete = false;
+        return;
+    }
+
+    var result = (try source.uniqueConstraintIntegrity(
+        alloc,
+        table_name,
+        options.action,
+        "",
+        "",
+    )) orelse return;
+    errdefer result.deinit(alloc);
+
+    if (options.action == .repair and result.complete) {
+        var validation = (try source.uniqueConstraintIntegrity(
+            alloc,
+            table_name,
+            .validate,
+            "",
+            "",
+        )) orelse return;
+        defer validation.deinit(alloc);
+        result.valid = validation.valid;
+        result.complete = result.complete and validation.complete;
+    }
+
+    summary.tables_executed += 1;
+    summary.complete = summary.complete and result.complete;
+    summary.valid = summary.valid and result.valid;
+    if (result.complete and result.valid) summary.terminal_valid_results += 1;
+    if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
+    try appendUniqueConstraintIntegritySchemaControllerTableResult(alloc, results, table_name, selected, true, result);
+}
+
+pub fn promoteLocalUniqueConstraintAfterSchemaControllerResult(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    constraint_name: []const u8,
+    result: UniqueConstraintIntegrityResult,
+) !void {
+    if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(result)) return;
+    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
+    defer alloc.free(schema_json);
+    const enforced_schema_json = try tables_api.schemaWithUniqueConstraintValidationStateAlloc(
+        alloc,
+        schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer alloc.free(enforced_schema_json);
+    try applyLocalTableSchemaJson(alloc, db, enforced_schema_json);
+}
+
+pub fn foreignKeyIntegritySchemaControllerPassWithSchemaJson(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    schema_json: []const u8,
+    action: ForeignKeyIntegrityAction,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+    constraint_name: ?[]const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    violation_limit: usize,
+) !?ForeignKeyIntegrityResult {
+    if (worker_id.len == 0 or lease_ms == 0) return error.InvalidForeignKeyIntegrityRequest;
+    if (!foreignKeyIntegrityWorkerActionSupported(action)) return error.InvalidForeignKeyIntegrityRequest;
+
+    const selected_constraint = try selectedForeignKeyIntegrityControllerConstraintAlloc(alloc, schema_json, constraint_name);
+    defer if (selected_constraint) |value| alloc.free(value);
+    if (selected_constraint == null) {
+        return try emptyForeignKeyIntegrityControllerResult(alloc, action, violation_limit);
+    }
+
+    const job_id = try stableForeignKeyIntegrityJobIdAlloc(alloc, table_name, action, selected_constraint, lower_doc_key, upper_doc_key);
+    defer alloc.free(job_id);
+    return try source.foreignKeyIntegrityWorkerPass(
+        alloc,
+        table_name,
+        action,
+        job_id,
+        worker_id,
+        lease_ms,
+        max_work_units,
+        selected_constraint,
+        lower_doc_key,
+        upper_doc_key,
+        violation_limit,
+    );
+}
+
+pub fn runForeignKeyIntegritySchemaControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    schema_json: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+    summary: *ForeignKeyIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
+) !void {
+    const selected = (try selectedForeignKeyIntegrityControllerConstraintAlloc(alloc, schema_json, null)) orelse return;
+    defer alloc.free(selected);
+    summary.tables_with_pending_constraints += 1;
+    if (summary.tables_executed >= options.max_tables) {
+        summary.complete = false;
+        return;
+    }
+
+    var result = (try source.foreignKeyIntegritySchemaControllerPass(
+        alloc,
+        table_name,
+        options.action,
+        options.worker_id,
+        options.lease_ms,
+        options.max_work_units_per_table,
+        null,
+        "",
+        "",
+        options.violation_limit,
+    )) orelse return;
+    errdefer result.deinit(alloc);
+
+    summary.tables_executed += 1;
+    summary.claim_attempts += result.work_claims.len;
+    summary.complete = summary.complete and result.complete;
+    summary.valid = summary.valid and result.valid;
+    if (result.complete and result.valid) summary.terminal_valid_results += 1;
+    if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
+    try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, true, result);
+}
+
+pub fn runForeignKeyIntegrityJobControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+    summary: *ForeignKeyIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
+) !void {
+    var progress = (try source.foreignKeyIntegrity(
+        alloc,
+        table_name,
+        .progress,
+        null,
+        "",
+        "",
+        0,
+    )) orelse return;
+    defer progress.deinit(alloc);
+
+    summary.jobs_scanned += progress.jobs.len;
+    for (progress.jobs) |job| {
+        if (job.completed) continue;
+        if (!std.mem.eql(u8, job.table_name, table_name)) continue;
+        if (foreignKeyIntegritySchemaControllerResultsContainJobId(results.items, job.job_id)) continue;
+        const action = foreignKeyIntegrityActionFromJobStatus(job) orelse continue;
+        if (!foreignKeyIntegrityWorkerActionSupported(action)) continue;
+        if (summary.jobs_executed >= options.max_jobs) {
+            summary.complete = false;
+            break;
+        }
+
+        var result = (try source.foreignKeyIntegrityWorkerPass(
+            alloc,
+            table_name,
+            action,
+            job.job_id,
+            options.worker_id,
+            options.lease_ms,
+            options.max_work_units_per_table,
+            job.constraint_name,
+            job.lower_doc_key,
+            job.upper_doc_key,
+            options.violation_limit,
+        )) orelse {
+            summary.complete = false;
+            continue;
+        };
+        errdefer result.deinit(alloc);
+
+        summary.jobs_executed += 1;
+        summary.claim_attempts += result.work_claims.len;
+        summary.complete = summary.complete and result.complete;
+        summary.valid = summary.valid and result.valid;
+        if (result.complete and result.valid) summary.terminal_valid_results += 1;
+        if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
+        try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, false, result);
+    }
+}
+
+fn foreignKeyActionJobSchemaControllerResultsContainJobId(
+    jobs: []const ForeignKeyActionJobStatus,
+    job_id: []const u8,
+) bool {
+    for (jobs) |job| {
+        if (std.mem.eql(u8, job.job_id, job_id)) return true;
+    }
+    return false;
+}
+
+pub fn foreignKeyActionCanRunGroupDbLocal(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    group_id: u64,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    parent_table_name: []const u8,
+    parent_key: []const u8,
+) !bool {
+    const child_groups = try table_catalog.resolveGroupsForSpan(alloc, catalog, child_table_name, "", "");
+    defer if (child_groups.len > 0) alloc.free(child_groups);
+    if (child_groups.len != 1 or child_groups[0] != group_id) return false;
+
+    const owner_parent_table_name = try foreignKeyActionOwnerParentTableNameAlloc(
+        alloc,
+        catalog,
+        child_table_name,
+        constraint_name,
+        parent_table_name,
+    );
+    defer alloc.free(owner_parent_table_name);
+
+    var owner_resolution = try table_catalog.resolveForeignKeyRefOwnerGroups(
+        alloc,
+        catalog,
+        child_table_name,
+        constraint_name,
+        owner_parent_table_name,
+        parent_key,
+    );
+    defer owner_resolution.deinit(alloc);
+    if (!owner_resolution.configured) return true;
+    return owner_resolution.groups.len == 1 and owner_resolution.groups[0] == group_id;
+}
+
+pub fn foreignKeyActionOwnerParentTableNameAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    parent_table_name: []const u8,
+) ![]u8 {
+    const schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, child_table_name)) orelse return try alloc.dupe(u8, parent_table_name);
+    defer alloc.free(schema_json);
+    if (schema_json.len == 0) return try alloc.dupe(u8, parent_table_name);
+
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    if (runtime_schema.storage_mode != .relational) return try alloc.dupe(u8, parent_table_name);
+
+    for (runtime_schema.foreign_keys) |foreign_key| {
+        if (!std.mem.eql(u8, foreign_key.name, constraint_name)) continue;
+        const catalog_parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, runtime_schema.default_type))
+            child_table_name
+        else
+            foreign_key.parent_table;
+        if (!std.mem.eql(u8, parent_table_name, foreign_key.parent_table) and
+            !std.mem.eql(u8, parent_table_name, catalog_parent_table_name))
+        {
+            return error.UnsupportedOperation;
+        }
+        return try alloc.dupe(u8, catalog_parent_table_name);
+    }
+    return try alloc.dupe(u8, parent_table_name);
+}
+
+pub fn runForeignKeyActionScheduleControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+    summary: *ForeignKeyIntegritySchemaControllerResult,
+    action_schedules: *std.ArrayListUnmanaged(ForeignKeyActionScheduleStatus),
+) !void {
+    var progress = (try source.foreignKeyActionScheduleProgress(alloc, table_name)) orelse return;
+    defer progress.deinit(alloc);
+
+    summary.action_schedules_scanned += progress.schedules.len;
+    for (progress.schedules) |schedule| {
+        if (schedule.completed) continue;
+        if (std.mem.eql(u8, schedule.status, "invalid")) {
+            var cloned = try cloneForeignKeyActionScheduleStatus(alloc, schedule);
+            errdefer cloned.deinit(alloc);
+            try action_schedules.append(alloc, cloned);
+            summary.action_schedules_invalid += 1;
+            summary.complete = false;
+            summary.valid = false;
+            continue;
+        }
+        if (summary.action_schedules_executed >= options.max_action_jobs) {
+            summary.complete = false;
+            break;
+        }
+
+        const page_limit = @min(schedule.page_limit, options.action_job_page_limit);
+        var result = if (try source.foreignKeyActionJobGroupLocalSchedule(
+            alloc,
+            schedule.group_id,
+            table_name,
+            schedule.action_job_id,
+            schedule.action,
+            options.worker_id,
+            schedule.constraint_name,
+            schedule.parent_table,
+            schedule.parent_key,
+            schedule.updated_parent_key,
+            page_limit,
+            schedule.cascade_depth,
+            schedule.cascade_max_depth,
+        )) |status| blk: {
+            const groups = try alloc.alloc(ForeignKeyActionJobStatus, 1);
+            groups[0] = status;
+            break :blk ForeignKeyActionJobResult{
+                .complete = status.completed,
+                .groups = groups,
+            };
+        } else (try source.foreignKeyActionJobSchedule(
+            alloc,
+            table_name,
+            schedule.action_job_id,
+            schedule.action,
+            options.worker_id,
+            schedule.constraint_name,
+            schedule.parent_table,
+            schedule.parent_key,
+            schedule.updated_parent_key,
+            page_limit,
+            schedule.cascade_depth,
+            schedule.cascade_max_depth,
+        )) orelse {
+            summary.complete = false;
+            continue;
+        };
+        defer result.deinit(alloc);
+
+        if (result.groups.len == 0) {
+            summary.complete = false;
+            if (try source.foreignKeyActionScheduleGroupLocalMarkSeeded(
+                alloc,
+                schedule.group_id,
+                table_name,
+                schedule.schedule_id,
+                0,
+            )) |status_value| {
+                var status = status_value;
+                defer status.deinit(alloc);
+                var cloned = try cloneForeignKeyActionScheduleStatus(alloc, status);
+                errdefer cloned.deinit(alloc);
+                try action_schedules.append(alloc, cloned);
+                if (std.mem.eql(u8, status.status, "invalid")) {
+                    summary.action_schedules_invalid += 1;
+                    summary.valid = false;
+                }
+            } else if (try source.foreignKeyActionScheduleMarkSeeded(
+                alloc,
+                table_name,
+                schedule.schedule_id,
+                0,
+            )) |status_value| {
+                var status = status_value;
+                defer status.deinit(alloc);
+                var cloned = try cloneForeignKeyActionScheduleStatus(alloc, status);
+                errdefer cloned.deinit(alloc);
+                try action_schedules.append(alloc, cloned);
+                if (std.mem.eql(u8, status.status, "invalid")) {
+                    summary.action_schedules_invalid += 1;
+                    summary.valid = false;
+                }
+            }
+            continue;
+        }
+
+        var marked = if (try source.foreignKeyActionScheduleGroupLocalMarkSeeded(
+            alloc,
+            schedule.group_id,
+            table_name,
+            schedule.schedule_id,
+            @intCast(result.groups.len),
+        )) |status| status else (try source.foreignKeyActionScheduleMarkSeeded(
+            alloc,
+            table_name,
+            schedule.schedule_id,
+            @intCast(result.groups.len),
+        )) orelse {
+            summary.complete = false;
+            continue;
+        };
+        defer marked.deinit(alloc);
+        summary.action_schedules_executed += 1;
+        summary.claim_attempts += result.groups.len;
+        summary.complete = summary.complete and result.complete;
+        summary.complete = summary.complete and marked.completed;
+        if (std.mem.eql(u8, marked.status, "invalid")) {
+            summary.action_schedules_invalid += 1;
+            summary.valid = false;
+        }
+        var cloned = try cloneForeignKeyActionScheduleStatus(alloc, marked);
+        errdefer cloned.deinit(alloc);
+        try action_schedules.append(alloc, cloned);
+    }
+}
+
+pub fn runForeignKeyActionJobControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+    summary: *ForeignKeyIntegritySchemaControllerResult,
+    action_jobs: *std.ArrayListUnmanaged(ForeignKeyActionJobStatus),
+) !void {
+    var progress = (try source.foreignKeyActionJobProgress(alloc, table_name)) orelse return;
+    defer progress.deinit(alloc);
+
+    summary.action_jobs_scanned += progress.jobs.len;
+    for (progress.jobs) |job| {
+        if (job.completed) continue;
+        if (foreignKeyActionJobSchemaControllerResultsContainJobId(action_jobs.items, job.job_id)) continue;
+        if (std.mem.eql(u8, job.status, "invalid")) {
+            var cloned = try cloneForeignKeyActionJobStatus(alloc, job);
+            errdefer cloned.deinit(alloc);
+            try action_jobs.append(alloc, cloned);
+            summary.action_jobs_invalid += 1;
+            summary.complete = false;
+            summary.valid = false;
+            continue;
+        }
+        if (summary.action_jobs_executed >= options.max_action_jobs) {
+            summary.complete = false;
+            break;
+        }
+
+        var result = (source.foreignKeyActionJobPage(
+            alloc,
+            table_name,
+            job.job_id,
+            job.action,
+            options.worker_id,
+            job.constraint_name,
+            job.parent_table,
+            job.parent_key,
+            job.updated_parent_key,
+            @min(job.page_limit, options.action_job_page_limit),
+            options.lease_ms,
+        ) catch |err| switch (err) {
+            error.ForeignKeyIntegrityClaimBusy => {
+                summary.complete = false;
+                continue;
+            },
+            else => {
+                var refreshed = (try source.foreignKeyActionJobProgress(alloc, table_name)) orelse return err;
+                defer refreshed.deinit(alloc);
+                const appended = try appendForeignKeyActionJobStatusFromProgressByJobId(alloc, action_jobs, refreshed, job.job_id);
+                if (appended == 0) return err;
+                const invalid = countInvalidForeignKeyActionJobStatusesByJobId(refreshed.jobs, job.job_id);
+                summary.action_jobs_invalid += invalid;
+                if (invalid > 0) summary.valid = false;
+                summary.action_jobs_executed += 1;
+                summary.claim_attempts += appended;
+                summary.complete = false;
+                continue;
+            },
+        }) orelse {
+            summary.complete = false;
+            continue;
+        };
+        defer result.deinit(alloc);
+
+        summary.action_jobs_executed += 1;
+        summary.claim_attempts += result.groups.len;
+        summary.complete = summary.complete and result.complete;
+        const invalid = countInvalidForeignKeyActionJobStatuses(result.groups);
+        summary.action_jobs_invalid += invalid;
+        if (invalid > 0) summary.valid = false;
+        try appendForeignKeyActionJobStatuses(alloc, action_jobs, result.groups);
+    }
+}
+
+pub fn promoteLocalForeignKeyAfterSchemaControllerResult(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    result: ForeignKeyIntegrityResult,
+) !void {
+    if (!shouldPromoteForeignKeyAfterSchemaControllerResult(result)) return;
+    const constraint_name = resultForeignKeyConstraintName(result) orelse return;
+    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
+    defer alloc.free(schema_json);
+    const enforced_schema_json = try tables_api.schemaWithForeignKeyValidationStateAlloc(
+        alloc,
+        schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer alloc.free(enforced_schema_json);
+    try applyLocalTableSchemaJson(alloc, db, enforced_schema_json);
+}
+
+pub fn runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+) !ForeignKeyIntegritySchemaControllerResult {
+    try validateForeignKeyIntegritySchemaControllerOptions(options);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    var summary = ForeignKeyIntegritySchemaControllerResult{};
+    var results = std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult).empty;
+    var action_schedules = std.ArrayListUnmanaged(ForeignKeyActionScheduleStatus).empty;
+    var action_jobs = std.ArrayListUnmanaged(ForeignKeyActionJobStatus).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+        for (action_schedules.items) |*schedule| schedule.deinit(alloc);
+        action_schedules.deinit(alloc);
+        for (action_jobs.items) |*job| job.deinit(alloc);
+        action_jobs.deinit(alloc);
+    }
+
+    for (snapshot.tables) |table| {
+        if (table.schema_json.len == 0) continue;
+        summary.tables_scanned += 1;
+        if (!(try tableSchemaHasForeignKeysAlloc(alloc, table.schema_json))) continue;
+        try runForeignKeyIntegritySchemaControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            table.schema_json,
+            options,
+            &summary,
+            &results,
+        );
+        try runForeignKeyIntegrityJobControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            options,
+            &summary,
+            &results,
+        );
+        try runForeignKeyActionScheduleControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            options,
+            &summary,
+            &action_schedules,
+        );
+        try runForeignKeyActionJobControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            options,
+            &summary,
+            &action_jobs,
+        );
+        if (summary.tables_executed >= options.max_tables and summary.jobs_executed >= options.max_jobs and summary.action_schedules_executed >= options.max_action_jobs and summary.action_jobs_executed >= options.max_action_jobs) break;
+    }
+
+    return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
+}
+
+pub fn runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    options: UniqueConstraintIntegritySchemaControllerOptions,
+) !UniqueConstraintIntegritySchemaControllerResult {
+    try validateUniqueConstraintIntegritySchemaControllerOptions(options);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    var summary = UniqueConstraintIntegritySchemaControllerResult{};
+    var results = std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+    }
+
+    for (snapshot.tables) |table| {
+        if (table.schema_json.len == 0) continue;
+        summary.tables_scanned += 1;
+        if (!(try tableSchemaHasUniqueConstraintsAlloc(alloc, table.schema_json))) continue;
+        const first_result_index = results.items.len;
+        try runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            table.schema_json,
+            options,
+            &summary,
+            &results,
+        );
+        for (results.items[first_result_index..]) |entry| {
+            if (!entry.schema_adoption) continue;
+            if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(entry.result)) continue;
+            _ = try table_catalog.promoteUniqueConstraintEnforced(alloc, catalog, entry.table_name, entry.constraint_name);
+        }
+        if (summary.tables_executed >= options.max_tables) break;
+    }
+
+    return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
+}
 
 pub fn cloneOptionalString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |text| try alloc.dupe(u8, text) else null;

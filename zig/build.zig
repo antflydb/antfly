@@ -51,6 +51,7 @@ const snowball_languages = [_][]const u8{
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
 const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
 const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
+const max_build_zig_bytes = 2 * 1024 * 1024;
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -75,6 +76,39 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     const io = b.graph.io;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
+}
+
+fn readBuildSourceAlloc(b: *std.Build) []const u8 {
+    return b.build_root.handle.readFileAlloc(b.graph.io, "build.zig", b.allocator, .limited(max_build_zig_bytes)) catch |err| {
+        std.debug.panic("failed to read build.zig for test filter guardrail: {}", .{err});
+    };
+}
+
+fn lineNumberForOffset(source: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    for (source[0..@min(offset, source.len)]) |byte| {
+        if (byte == '\n') line += 1;
+    }
+    return line;
+}
+
+fn assertBuildZigDoesNotInlineTestFilters(b: *std.Build) void {
+    const source = readBuildSourceAlloc(b);
+    const needle = ".filters = &." ++ "{";
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
+        const list_start = start + needle.len;
+        const list_end = std.mem.indexOfScalarPos(u8, source, list_start, '}') orelse
+            std.debug.panic("unterminated inline test filter list in build.zig at line {}", .{lineNumberForOffset(source, start)});
+        const string_count = std.mem.count(u8, source[list_start..list_end], "\"") / 2;
+        if (string_count > 0) {
+            std.debug.panic(
+                "build.zig has inline test filters at line {}; move exact test-title lists to pkg/antfly/build/tests.zig",
+                .{lineNumberForOffset(source, start)},
+            );
+        }
+        search_index = list_end + 1;
+    }
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
@@ -158,35 +192,6 @@ fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) voi
     for (dependencies) |dependency| {
         step.dependOn(dependency);
     }
-}
-
-const FilteredTestStepOptions = struct {
-    simple_runner: bool = false,
-};
-
-fn addFilteredTestStep(
-    b: *std.Build,
-    root_module: *std.Build.Module,
-    step_name: []const u8,
-    description: []const u8,
-    default_filters: []const []const u8,
-    options: FilteredTestStepOptions,
-) *std.Build.Step.Run {
-    const tests = if (options.simple_runner) b.addTest(.{
-        .root_module = root_module,
-        .filters = selectTestFilters(b, default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    }) else b.addTest(.{
-        .root_module = root_module,
-        .filters = selectTestFilters(b, default_filters),
-    });
-    const run = b.addRunArtifact(tests);
-    const step = b.step(step_name, description);
-    step.dependOn(&run.step);
-    return run;
 }
 
 fn addDelegatedPackageStep(
@@ -1253,6 +1258,8 @@ fn addOpenApiGeneratedCheckStep(
 }
 
 pub fn build(b: *std.Build) void {
+    assertBuildZigDoesNotInlineTestFilters(b);
+
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -2383,29 +2390,11 @@ pub fn build(b: *std.Build) void {
     const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
     lite_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
-    const capi_default_filters = [_][]const u8{
-        "capi lite opens exports imports checks and vacuums aflite",
-        "capi zero buffer helper wipes bytes before free",
-        "capi lite exposes hosted and status-only profiles",
-        "capi lite open options validate and configure ttl cleanup",
-        "capi execute graph queries honors identity read generation",
-        "capi search rejects stale identity generation before readable lease hook",
-        "capi search json returns stamped identity generation",
-        "packed dense response exposes public ids not doc ordinals",
-        "dense response identity generation footer",
-        "capi aggregate hits rejects stale identity generation before aggregation materialization",
-    };
-    const capi_tests = b.addTest(.{
-        .root_module = capi_mod,
-        .filters = selectTestFilters(b, &capi_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
+    const capi_test = antfly_tests_build.addModuleTestStep(b, capi_mod, "capi-test", "Run C API tests", .{
+        .filters = &antfly_tests_build.capi_default_filters,
+        .simple_runner = true,
     });
-    const run_capi_tests = b.addRunArtifact(capi_tests);
-    const capi_test_step = b.step("capi-test", "Run C API tests");
-    capi_test_step.dependOn(&run_capi_tests.step);
+    const run_capi_tests = capi_test.run;
 
     // Tests
     const lib_regex_tests = b.addTest(.{
@@ -2564,21 +2553,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
-    const api_artifact_reprocess_jobs_tests = b.addTest(.{
-        .root_module = api_artifact_reprocess_jobs_test_mod,
-        .filters = &.{
-            "artifact reprocess job store starts and updates a job",
-            "artifact reprocess job store recovers durable jobs and reseeds ids",
-            "artifact reprocess job cleanup removes recovered durable expired jobs",
+    const run_api_artifact_reprocess_jobs_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        api_artifact_reprocess_jobs_test_mod,
+        "lib-api-artifact-reprocess-jobs-test",
+        "Run artifact reprocess job store tests",
+        .{
+            .filters = &antfly_tests_build.ArtifactReprocessJobTestFilters.store,
+            .select_filters = false,
+            .simple_runner = true,
         },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
-    const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
-    lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
+    ).run;
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -2723,7 +2708,7 @@ pub fn build(b: *std.Build) void {
     });
     const lib_image_conformance_tests = b.addTest(.{
         .root_module = lib_image_conformance_test_mod,
-        .filters = &.{"conformance corpus"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.image_conformance),
     });
     const run_lib_image_conformance_tests = b.addRunArtifact(lib_image_conformance_tests);
     const lib_image_conformance_run_step = b.step("lib-image-conformance-run", "Run lib/image conformance suites without fetching fixtures");
@@ -2876,13 +2861,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_image_conformance_tests_after_fetch_quiet = b.addRunArtifact(lib_image_conformance_tests);
     run_lib_image_conformance_tests_after_fetch_quiet.step.dependOn(fetch_lib_image_conformance_fixtures_quiet_step);
 
-    const lib_generating_runtime_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
-    });
-    const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
-    const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
-    lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    const run_lib_generating_runtime_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-generating-runtime-test",
+        "Run generating backend adapter tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.generating_runtime },
+    ).run;
 
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
@@ -2891,33 +2876,32 @@ pub fn build(b: *std.Build) void {
     const lib_reranking_test_step = b.step("lib-reranking-test", "Run standalone lib/reranking tests");
     lib_reranking_test_step.dependOn(&run_lib_reranking_tests.step);
 
-    const lib_reranking_runtime_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"reranking runtime"},
-    });
-    const run_lib_reranking_runtime_tests = b.addRunArtifact(lib_reranking_runtime_tests);
-    const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
-    lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
+    const run_lib_reranking_runtime_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-reranking-runtime-test",
+        "Run reranking backend adapter tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.reranking_runtime },
+    ).run;
 
-    const lib_common_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"provider registry"},
-    });
-    const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
-    const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
-    lib_common_test_step.dependOn(&run_lib_common_tests.step);
+    const run_lib_common_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-common-test",
+        "Run common/provider registry tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.common },
+    ).run;
 
-    const lib_common_config_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"common config"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const run_lib_common_config_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-common-config-test",
+        "Run common/config tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.common_config,
+            .simple_runner = true,
         },
-    });
-    const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
-    const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
-    lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
+    ).run;
 
     const lib_casbin_tests = b.addTest(.{
         .root_module = casbin_mod,
@@ -2933,27 +2917,28 @@ pub fn build(b: *std.Build) void {
     const lib_usermgr_test_step = b.step("lib-usermgr-test", "Run standalone pkg/antfly/src/usermgr tests");
     lib_usermgr_test_step.dependOn(&run_lib_usermgr_tests.step);
 
-    const embedded_tests = b.addTest(.{
-        .root_module = embedded_mod,
-        .filters = &.{"embedded"},
-    });
-    const run_embedded_tests = b.addRunArtifact(embedded_tests);
-    const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
-    embedded_test_step.dependOn(&run_embedded_tests.step);
+    const embedded_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        embedded_mod,
+        "embedded-test",
+        "Run embedded API tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.embedded },
+    );
+    const run_embedded_tests = embedded_test_run.run;
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
-        .filters = &.{"pkg antfly embedded root"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_root),
     });
     const run_antfly_embedded_pkg_tests = b.addRunArtifact(antfly_embedded_pkg_tests);
     const antfly_embedded_db_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_db_pkg_mod,
-        .filters = &.{"pkg antfly embedded db"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_db),
     });
     const run_antfly_embedded_db_pkg_tests = b.addRunArtifact(antfly_embedded_db_pkg_tests);
     const antfly_embedded_api_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_api_pkg_mod,
-        .filters = &.{"pkg antfly embedded api"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_api),
     });
     const run_antfly_embedded_api_pkg_tests = b.addRunArtifact(antfly_embedded_api_pkg_tests);
     const antfly_embedded_pkg_test_step = b.step("antfly-embedded-test", "Run the standalone antfly-embedded package compile test");
@@ -2961,13 +2946,13 @@ pub fn build(b: *std.Build) void {
     antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
     antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
 
-    const antfly_client_pkg_tests = b.addTest(.{
-        .root_module = antfly_client_pkg_mod,
-        .filters = &.{"antfly client pkg compiles"},
-    });
-    const run_antfly_client_pkg_tests = b.addRunArtifact(antfly_client_pkg_tests);
-    const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
-    antfly_client_pkg_test_step.dependOn(&run_antfly_client_pkg_tests.step);
+    const run_antfly_client_pkg_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        antfly_client_pkg_mod,
+        "antfly-client-test",
+        "Run the standalone antfly-client package compile test",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.antfly_client },
+    ).run;
 
     const root_test_skip_filters = antfly_tests_build.RootTestFilters.skip;
     const unit_progress_skip_filters = antfly_tests_build.RootTestFilters.unit_progress_skip;
@@ -3011,17 +2996,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, lite_native_test_mod, true, true);
-    const lite_native_tests = b.addTest(.{
-        .root_module = lite_native_test_mod,
-        .filters = &.{"storage.lite."},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const run_lite_native_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lite_native_test_mod,
+        "lite-native-test",
+        "Run Lite native backend tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.lite_native,
+            .simple_runner = true,
         },
-    });
-    const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
-    const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
-    lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    ).run;
 
     const lite_cli_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
@@ -3037,29 +3021,28 @@ pub fn build(b: *std.Build) void {
     lite_cli_test_mod.addImport("antfly_platform", platform_mod);
     lite_cli_test_mod.addImport("handlebars", handlebars_mod);
     lite_cli_test_mod.addOptions("build_options", build_options);
-    const lite_cli_tests = b.addTest(.{
-        .root_module = lite_cli_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup" },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const run_lite_cli_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lite_cli_test_mod,
+        "lite-cli-test",
+        "Run Antfly Lite CLI tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.lite_cli,
+            .simple_runner = true,
         },
-    });
-    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
-    const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
-    lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
+    ).run;
 
-    const lib_recall_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.RecallTestFilters.hbc),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const recall_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "recall-test",
+        "Run HBC vector recall quality tests",
+        .{
+            .filters = &antfly_tests_build.RecallTestFilters.hbc,
+            .simple_runner = true,
         },
-    });
-    const run_lib_recall_tests = b.addRunArtifact(lib_recall_tests);
-    const recall_test_step = b.step("recall-test", "Run HBC vector recall quality tests");
-    recall_test_step.dependOn(&run_lib_recall_tests.step);
+    );
+    const recall_test_step = recall_test_run.step;
 
     const raft_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3089,35 +3072,38 @@ pub fn build(b: *std.Build) void {
     const lib_raft_chaos_test_step = b.step("lib-raft-chaos-test", "Run longer raft restart/HTTP simulation campaigns");
     lib_raft_chaos_test_step.dependOn(&run_lib_raft_chaos_tests.step);
 
-    const lib_lsm_backend_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"lsm backend simulation"},
-    });
-    const run_lib_lsm_backend_sim_tests = b.addRunArtifact(lib_lsm_backend_sim_tests);
-    const lib_lsm_backend_sim_test_step = b.step("lib-lsm-backend-sim-test", "Run LSM backend storage workload simulation tests");
-    lib_lsm_backend_sim_test_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    const run_lib_lsm_backend_sim_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-lsm-backend-sim-test",
+        "Run LSM backend storage workload simulation tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.lsm_backend_sim },
+    ).run;
 
-    const lib_lsm_backend_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"lsm backend compaction chaos campaign"},
-    });
-    const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
-    const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
-    lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
-    const lib_ha_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.HATestFilters.chaos),
-    });
-    const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
-    const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
-    lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
-    const lib_ha_compat_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.HATestFilters.compat),
-    });
-    const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
-    const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
-    lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
+    const lib_lsm_backend_chaos_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-lsm-backend-chaos-test",
+        "Run longer LSM backend compaction chaos campaigns",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.lsm_backend_chaos },
+    );
+    const lib_lsm_backend_chaos_tests = lib_lsm_backend_chaos_test_run.tests;
+    const lib_lsm_backend_chaos_test_step = lib_lsm_backend_chaos_test_run.step;
+    const ha_chaos_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "ha-chaos-test",
+        "Run HA hot-standby crash and partition hardening tests",
+        .{ .filters = &antfly_tests_build.HATestFilters.chaos },
+    );
+    const lib_ha_chaos_tests = ha_chaos_test_run.tests;
+    const run_lib_ha_compat_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "ha-compat-test",
+        "Run HA replication format compatibility tests",
+        .{ .filters = &antfly_tests_build.HATestFilters.compat },
+    ).run;
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
@@ -3140,21 +3126,40 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_test = antfly_tests_build.addDBRootTestStep(b, lib_test_mod);
 
-    const serverless_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"serverless"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const serverless_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "serverless-test",
+        "Run serverless and serverless transport tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.serverless,
+            .simple_runner = true,
         },
-    });
-    const run_serverless_tests = b.addRunArtifact(serverless_tests);
-    const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
-    serverless_test_step.dependOn(&run_serverless_tests.step);
+    );
+    const serverless_tests = serverless_test_run.tests;
+    const run_serverless_tests = serverless_test_run.run;
 
-    const run_lib_data_runtime_tests = addFilteredTestStep(b, data_runtime_test_mod, "lib-data-runtime-test", "Run focused data runtime tests", &antfly_tests_build.DataTestFilters.runtime, .{ .simple_runner = true });
+    const run_lib_data_runtime_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        data_runtime_test_mod,
+        "lib-data-runtime-test",
+        "Run focused data runtime tests",
+        .{
+            .filters = &antfly_tests_build.DataTestFilters.runtime,
+            .simple_runner = true,
+        },
+    ).run;
 
-    const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &antfly_tests_build.DataTestFilters.storage, .{ .simple_runner = true });
+    const run_lib_data_storage_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        data_storage_test_mod,
+        "lib-data-storage-test",
+        "Run focused data storage tests",
+        .{
+            .filters = &antfly_tests_build.DataTestFilters.storage,
+            .simple_runner = true,
+        },
+    ).run;
 
     const lib_db_module_tests = antfly_tests_build.addDBRootModuleTestSteps(b, lib_test_mod);
 
@@ -3223,6 +3228,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
+    // Keep API tests wired at stable suite granularity. Leaf implementation
+    // tests should join these roots via pkg/antfly/build/tests.zig filters,
+    // not by adding one top-level build step per regression.
     const api_docid_tests = antfly_tests_build.addAPIDocIdTestSteps(b, .{
         .root = lib_test_mod,
         .transactions_docid = api_transactions_docid_test_mod,
@@ -3463,31 +3471,7 @@ pub fn build(b: *std.Build) void {
     swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
     const lib_swarm_runtime_tests = b.addTest(.{
         .root_module = swarm_runtime_test_mod,
-        .filters = &.{
-            "swarm runtime module compiles",
-            "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
-            "swarm runtime registers internal group routes explicitly",
-            "swarm runtime registers mcp routes before antfarm catch-all",
-            "parse cli accepts config path",
-            "parse cli accepts secret store path",
-            "parse cli accepts ARD identity flags",
-            "parse cli accepts canonical host port and models dir flags",
-            "parse cli accepts HA primary runtime flags",
-            "parse cli accepts HA primary sync policy flags",
-            "parse cli accepts HA standby runtime flags",
-            "swarm HA standby replication flags require upstream and slot",
-            "swarm HA string classifier distinguishes missing padded and valid values",
-            "swarm HA runtime rejects ambiguous role flags",
-            "antfly config uses cli override before common config",
-            "swarm public api caps keep alive request reuse",
-            "swarm public api body limit matches common http listener",
-            "swarm public HTTP server uses public API request body limit",
-            "parse cli accepts inference budget overrides",
-            "inference config falls back to common config",
-            "swarm runtime resolves paths from common storage base dir",
-            "swarm local metadata drop table cascade removes child foreign keys",
-            "swarm runtime resolves extension package store env before local default",
-        },
+        .filters = &antfly_tests_build.SwarmRuntimeTestFilters.focused,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3578,7 +3562,7 @@ pub fn build(b: *std.Build) void {
 
     const storage_lmdb_replay_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
-        .filters = &.{"LMDB replay fixtures stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.lmdb_replay,
     });
     const run_storage_lmdb_replay_tests = b.addRunArtifact(storage_lmdb_replay_tests);
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
@@ -3601,7 +3585,7 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
-        .filters = &.{"LMDB sim soak stays green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.lmdb_soak,
     });
     const run_storage_lmdb_soak_tests = b.addRunArtifact(storage_lmdb_soak_tests);
     const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
@@ -3609,6 +3593,8 @@ pub fn build(b: *std.Build) void {
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
+    docstore_test_mod.addImport("antfly_vellum", vellum_mod);
+    docstore_test_mod.addImport("antfly_regex", regex_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
     });
@@ -3619,6 +3605,8 @@ pub fn build(b: *std.Build) void {
 
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
+    shard_test_mod.addImport("antfly_vellum", vellum_mod);
+    shard_test_mod.addImport("antfly_regex", regex_mod);
     const shard_unit_tests = b.addTest(.{
         .root_module = shard_test_mod,
     });
@@ -3629,6 +3617,8 @@ pub fn build(b: *std.Build) void {
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
+    wal_test_mod.addImport("antfly_vellum", vellum_mod);
+    wal_test_mod.addImport("antfly_regex", regex_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
@@ -3644,7 +3634,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_sim_tests = b.addTest(.{
         .root_module = wal_test_mod,
-        .filters = &.{"wal sim"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_sim,
     });
     const run_wal_sim_tests = b.addRunArtifact(wal_sim_tests);
     const wal_sim_test_step = b.step("wal-sim-test", "Run only the WAL simulation workload tests");
@@ -3652,18 +3642,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_vopr_tests = b.addTest(.{
         .root_module = wal_test_mod,
-        .filters = &.{
-            "wal group commit uses injected virtual clock",
-            "wal can reopen on modeled storage device",
-            "wal modeled storage survives crash before close after acknowledged append",
-            "wal modeled replay runner uses virtual storage and time",
-            "wal modeled crash runner preserves acknowledged public append",
-            "wal modeled VOPR campaign stays green",
-            "wal modeled replay fixtures stay green",
-            "wal modeled crash fixtures stay green",
-            "wal modeled commit backend completion uses scheduled virtual time",
-            "wal modeled storage commit delay uses injected virtual clock",
-        },
+        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_vopr,
     });
     const run_wal_vopr_tests = b.addRunArtifact(wal_vopr_tests);
     const wal_vopr_test_step = b.step("wal-vopr-test", "Run WAL modeled-time VOPR smoke tests");
@@ -3671,7 +3650,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_replay_tests = b.addTest(.{
         .root_module = wal_test_mod,
-        .filters = &.{"wal replay fixtures stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_replay,
     });
     const run_wal_replay_tests = b.addRunArtifact(wal_replay_tests);
     const wal_replay_step = b.step("wal-replay-fixtures", "Run only the WAL replay fixture tests");
@@ -3681,9 +3660,11 @@ pub fn build(b: *std.Build) void {
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
     const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
+    wal_soak_test_mod.addImport("antfly_vellum", vellum_mod);
+    wal_soak_test_mod.addImport("antfly_regex", regex_mod);
     const wal_soak_tests = b.addTest(.{
         .root_module = wal_soak_test_mod,
-        .filters = &.{"wal sim soak stays green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_soak,
     });
     const run_wal_soak_tests = b.addRunArtifact(wal_soak_tests);
     const wal_soak_step = b.step("wal-sim-soak", "Run only the WAL simulation soak test");
@@ -3716,7 +3697,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_sim_tests = b.addTest(.{
         .root_module = persistent_test_mod,
-        .filters = &.{"persistent sim workloads stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_sim,
     });
     const run_persistent_sim_tests = b.addRunArtifact(persistent_sim_tests);
     const persistent_sim_step = b.step("persistent-sim-test", "Run only the persistent simulation workload tests");
@@ -3724,7 +3705,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_replay_tests = b.addTest(.{
         .root_module = persistent_test_mod,
-        .filters = &.{"persistent replay fixtures stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_replay,
     });
     const run_persistent_replay_tests = b.addRunArtifact(persistent_replay_tests);
     const persistent_replay_step = b.step("persistent-replay-fixtures", "Run only the persistent replay fixture tests");
@@ -3732,11 +3713,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_vopr_tests = b.addTest(.{
         .root_module = persistent_test_mod,
-        .filters = &.{
-            "persistent modeled replay fixtures stay green",
-            "persistent modeled sim workload stays green",
-            "persistent modeled full-text compaction publish faults stay green",
-        },
+        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_vopr,
     });
     const run_persistent_vopr_tests = b.addRunArtifact(persistent_vopr_tests);
     const persistent_vopr_step = b.step("persistent-vopr-test", "Run persistent modeled-storage VOPR smoke tests");
@@ -3753,7 +3730,7 @@ pub fn build(b: *std.Build) void {
     persistent_soak_test_mod.addImport("antfly_reranking", reranking_mod);
     const persistent_soak_tests = b.addTest(.{
         .root_module = persistent_soak_test_mod,
-        .filters = &.{"persistent sim soak stays green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_soak,
     });
     const run_persistent_soak_tests = b.addRunArtifact(persistent_soak_tests);
     const persistent_soak_step = b.step("persistent-sim-soak", "Run only the persistent simulation soak test");
@@ -3774,7 +3751,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("structlog", structlog_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        .filters = selectTestFilters(b, &antfly_tests_build.no_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3787,7 +3764,7 @@ pub fn build(b: *std.Build) void {
 
     const index_manager_resource_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = &.{"text merge resource manager accounts pending bytes and active buffers"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_resource,
     });
     const run_index_manager_resource_tests = b.addRunArtifact(index_manager_resource_tests);
     const index_manager_resource_step = b.step("index-manager-resource-test", "Run index manager resource-manager accounting tests");
@@ -3795,7 +3772,7 @@ pub fn build(b: *std.Build) void {
 
     const index_manager_sim_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = &.{"index manager sim workloads stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_sim,
     });
     const run_index_manager_sim_tests = b.addRunArtifact(index_manager_sim_tests);
     const index_manager_sim_step = b.step("index-manager-sim-test", "Run only the index manager simulation workload tests");
@@ -3803,7 +3780,7 @@ pub fn build(b: *std.Build) void {
 
     const index_manager_replay_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = &.{"index manager replay fixtures stay green"},
+        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_replay,
     });
     const run_index_manager_replay_tests = b.addRunArtifact(index_manager_replay_tests);
     const index_manager_replay_step = b.step("index-manager-replay-fixtures", "Run only the index manager replay fixture tests");
@@ -3811,10 +3788,7 @@ pub fn build(b: *std.Build) void {
 
     const index_manager_vopr_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = &.{
-            "index manager modeled replay fixtures stay green",
-            "index manager modeled crash fixtures stay green",
-        },
+        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_vopr,
     });
     const run_index_manager_vopr_tests = b.addRunArtifact(index_manager_vopr_tests);
     const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
@@ -3856,6 +3830,8 @@ pub fn build(b: *std.Build) void {
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    sparse_test_mod.addImport("antfly_vellum", vellum_mod);
+    sparse_test_mod.addImport("antfly_regex", regex_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
     });
@@ -5576,21 +5552,7 @@ pub fn build(b: *std.Build) void {
 
     const graph_metric_operations_command_tests = b.addTest(.{
         .root_module = graph_metric_maintenance_test_mod,
-        .filters = &.{
-            "graph metric maintenance command parses service target config",
-            "graph metric maintenance service request stays owner and budget scoped",
-            "graph metric maintenance service runner aggregates remote ticks",
-            "graph metric maintenance service boundary preserves worker pool owner request",
-            "graph metric maintenance supervisor parses config and defaults workers",
-            "graph metric maintenance supervisor parses service target config",
-            "graph metric maintenance supervisor builds coordinator and worker pool argv",
-            "graph metric maintenance supervisor builds service child argv without local writer guard",
-            "graph metric maintenance launched child argv stays owner and budget scoped",
-            "graph metric maintenance supervisor restart policy is bounded",
-            "graph metric maintenance supervisor parses child runtime telemetry",
-            "graph metric maintenance command exits after configured idle streak",
-            "graph metric maintenance command summary exposes ownership telemetry",
-        },
+        .filters = &antfly_tests_build.GraphMetricCommandTestFilters.operations,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -5665,7 +5627,7 @@ pub fn build(b: *std.Build) void {
     lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
     const lite_core_main_tests = b.addTest(.{
         .root_module = lite_core_main_mod,
-        .filters = &.{"lite core main compiles"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_core_main),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
