@@ -571,6 +571,7 @@ test "std http listener and executor round-trip raft batch route" {
         raft_engine.runtime.BinaryCodec.codec(),
         handler.iface(),
         null,
+        null,
     );
     var listener = StdHttpListener.init(std.testing.allocator, .{}, app.executor());
     defer listener.deinit();
@@ -741,6 +742,7 @@ test "std http listener and executor round-trip snapshot routes" {
         raft_engine.runtime.BinaryCodec.codec(),
         noop.iface(),
         store.iface(),
+        null,
     );
     var listener = StdHttpListener.init(std.testing.allocator, .{}, app.executor());
     defer listener.deinit();

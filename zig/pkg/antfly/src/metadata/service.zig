@@ -57,6 +57,7 @@ pub const default_unique_schema_controller_worker_id = "metadata-unique-schema-c
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
 
 fn logMetadataRunRoundPhase(name: []const u8, start_ns: u64) void {
     const elapsed_ns = platform_time.monotonicNs() -| start_ns;
@@ -4029,15 +4030,26 @@ pub const MetadataHttpService = struct {
             .{ linearizable_metadata_read_prefix, request_id },
         );
 
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            try self.raft.requestReadableLease(self.metadata_group_id, request_ctx);
-        }
-
         const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        var next_request_ns: u64 = 0;
         while (platform_time.monotonicNs() < deadline_ns) {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= next_request_ns) {
+                self.lockRuntime();
+                {
+                    defer self.unlockRuntime();
+                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                        // A follower may not know the leader yet during elections,
+                        // restarts, or after endpoint-level load balancing. Keep
+                        // driving raft below and retry the same read context until
+                        // the barrier completes or the caller's timeout expires.
+                        error.NotLeader => {},
+                        else => return err,
+                    };
+                }
+                next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
+            }
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
@@ -11464,6 +11476,99 @@ test "metadata http service projected tables cache invalidates without prior run
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
     try std.testing.expectEqual(epoch_after_signal, svc.projected_core_snapshot_cache.projection_epoch);
+}
+
+test "metadata http service linearizable read waits for leader discovery" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted => .persisted,
+                    .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+
+    var svc = try MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2910,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2910,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+
+    try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
+    try svc.ensureLinearizableRead();
+    try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
+    try std.testing.expect(svc.metrics().read_lease_requests > 0);
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

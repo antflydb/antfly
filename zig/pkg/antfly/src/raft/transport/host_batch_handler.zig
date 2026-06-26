@@ -28,9 +28,23 @@ pub const HostBatchHandler = struct {
         };
     }
 
+    pub fn snapshotHandler(self: *HostBatchHandler) http_server.SnapshotUploadHandler {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .handle_snapshot_upload = handleSnapshotUpload,
+            },
+        };
+    }
+
     fn handlePeerBatch(ptr: *anyopaque, batch: raft_engine.runtime.transport_iface.PeerBatch) !void {
         const self: *HostBatchHandler = @ptrCast(@alignCast(ptr));
         try self.host.enqueueInboundBatch(batch);
+    }
+
+    fn handleSnapshotUpload(ptr: *anyopaque, upload: http_server.SnapshotUpload) !void {
+        const self: *HostBatchHandler = @ptrCast(@alignCast(ptr));
+        try self.host.handleSnapshotUpload(upload);
     }
 };
 
