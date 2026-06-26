@@ -240,6 +240,7 @@ fn validateGeneratedExpressionListForClause(
 
 fn validateGeneratedAggregateFunctionForSpec(
     tokens: []const Token,
+    op: db_mod.types.RelationalRowsAggregateOp,
     function_start: usize,
     argument_start: usize,
     argument_end: usize,
@@ -259,6 +260,8 @@ fn validateGeneratedAggregateFunctionForSpec(
     if (function_tokens.start != function_start or function_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (expression.function_name_tokens == null or expression.function_name_tokens.?.start != function_start) return error.UnsupportedSqlShape;
     if (expression.function_name_tokens.?.end >= function_tokens.end) return error.UnsupportedSqlShape;
+    const generated_op = aggregateOpForName(tokens[expression.function_name_tokens.?.start].text) orelse return error.UnsupportedSqlShape;
+    if (generated_op != op) return error.UnsupportedSqlShape;
 
     if (argument_start < argument_end) {
         if (expression.argument_tokens == null) return error.UnsupportedSqlShape;
@@ -10954,6 +10957,7 @@ pub fn parseAggregateSpecAlloc(
     const filter_predicate_end = if (filter_start != null) pos.* - 1 else null;
     try validateGeneratedAggregateFunctionForSpec(
         tokens,
+        op,
         function_start,
         argument_start,
         argument_end,
@@ -31061,6 +31065,19 @@ test "sql adapter lower expr lowers grouped aggregate queries" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_inputs.aggregate.aggregations[1].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_inputs.aggregate.aggregations[1].expression.?.operands[0].kind);
     try std.testing.expectEqualStrings("shifted_remainder", modulo_inputs.aggregate.order_by[0].field);
+
+    var malformed_generated_aggregate_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer",
+    );
+    defer malformed_generated_aggregate_function_name.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(&malformed_generated_aggregate_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_aggregate_function_name,
+        schema,
+        &.{},
+    ));
 
     var interleaved = try lowerAggregateForLowerExprTestAlloc(
         alloc,

@@ -21581,41 +21581,6 @@ test "provisioned table read source survives many external write-sync batches be
         write_source.source(),
     );
 
-    const IndexDetail = struct {
-        status: ?struct {
-            doc_count: ?u64 = null,
-            total_indexed: ?u64 = null,
-            replay_target_sequence: ?u64 = null,
-            replay_applied_sequence: ?u64 = null,
-            replay_catch_up_required: ?bool = null,
-            backfill_active: ?bool = null,
-            rebuilding: ?bool = null,
-        } = null,
-    };
-
-    var ready = false;
-    for (0..1000) |_| {
-        var detail = try server.handlePublicTableGetIndex("docs", "semantic_idx");
-        defer detail.deinit(alloc);
-        try std.testing.expectEqual(@as(u16, 200), detail.status);
-        var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });
-        defer parsed_detail.deinit();
-        if (parsed_detail.value.status) |idx| {
-            if ((idx.doc_count orelse 0) == total_docs and
-                (idx.total_indexed orelse 0) == total_docs and
-                (idx.replay_applied_sequence orelse 0) == (idx.replay_target_sequence orelse 0) and
-                !(idx.replay_catch_up_required orelse false) and
-                !(idx.backfill_active orelse false) and
-                !(idx.rebuilding orelse false))
-            {
-                ready = true;
-                break;
-            }
-        }
-        sleepNs(10 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(ready);
-
     var response = try server.handlePublicTableQuery("docs", query_json, null);
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);

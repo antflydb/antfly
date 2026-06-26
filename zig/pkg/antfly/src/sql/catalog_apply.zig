@@ -21,7 +21,6 @@ const ddl_plan = @import("ddl.zig");
 const fingerprint = @import("fingerprint.zig");
 const lower_expr = @import("lower_expr.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
-const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const schema_json = @import("schema_json.zig");
@@ -808,7 +807,7 @@ pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
     };
 }
 
-pub fn applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(
+pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
     alloc: std.mem.Allocator,
     current: runtime_schema.TableSchema,
     plan: ddl_plan.LoweredDdlPlan,
@@ -1129,7 +1128,7 @@ fn alterTableRowRewritePlanSourceAlloc(
     };
 }
 
-pub fn applyLoweredDdlPlanToSchemaJsonForTestAlloc(
+pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
     alloc: std.mem.Allocator,
     current_schema_json: []const u8,
     plan: ddl_plan.LoweredDdlPlan,
@@ -1964,28 +1963,13 @@ fn addRelationalPrimaryKeyAlloc(
     schema.primary_key = try ddl_plan.cloneDdlPrimaryKey(alloc, primary_key);
 }
 
-fn lowerDdlPlanForCatalogApplyTestAlloc(
+fn logicalDdlPlanForCatalogApplyTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
-) !ddl_plan.LoweredDdlPlan {
+) !binder.LogicalSqlPlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    const tokens = parsed_sql.items();
-
-    var state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens,
-    };
-    return try ddl_plan.parseDdlPlanAlloc(alloc, tokens, &state.pos, .{
-        .schema = state.schema,
-        .field_expression_qualifiers = state.field_expression_qualifiers,
-        .returning_expression_qualifiers = state.returning_expression_qualifiers,
-        .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
-        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
-        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
-        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
-        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
-    });
+    return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
 }
 
 fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected: []const ddl_plan.AppliedDdlWorkAction) !void {
@@ -2004,7 +1988,7 @@ fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected:
 test "catalog apply applies SQL session catalog plans" {
     const alloc = std.testing.allocator;
 
-    var set_tenant_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO tenant_schema, public;");
+    var set_tenant_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO tenant_schema, public;");
     defer set_tenant_search_path.deinit(alloc);
     const set_tenant_search_path_plan = switch (set_tenant_search_path) {
         .session_catalog => |plan| plan,
@@ -2015,7 +1999,7 @@ test "catalog apply applies SQL session catalog plans" {
     try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
     try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
 
-    var set_local_public_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO public;");
+    var set_local_public_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO public;");
     defer set_local_public_search_path.deinit(alloc);
     const set_local_public_search_path_plan = switch (set_local_public_search_path) {
         .session_catalog => |plan| plan,
@@ -2026,7 +2010,7 @@ test "catalog apply applies SQL session catalog plans" {
     try std.testing.expect(local_public_session.transaction_local_search_path);
     try std.testing.expectEqualStrings("public", local_public_session.session().primarySearchPathNamespace());
 
-    var set_local_tenant_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
+    var set_local_tenant_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
     defer set_local_tenant_search_path.deinit(alloc);
     const set_local_tenant_search_path_plan = switch (set_local_tenant_search_path) {
         .session_catalog => |plan| plan,
@@ -2046,7 +2030,7 @@ test "catalog apply applies SQL session catalog plans" {
     try std.testing.expectEqual(@as(usize, 1), empty_path_session.search_path.len);
     try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, empty_path_session.session().primarySearchPathNamespace());
 
-    var set_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    var set_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer set_app_setting.deinit(alloc);
     const set_app_setting_plan = switch (set_app_setting) {
         .session_catalog => |plan| plan,
@@ -2056,7 +2040,7 @@ test "catalog apply applies SQL session catalog plans" {
     defer app_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("tenant-a", app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 
-    var set_local_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL app.tenant_id = 'tenant-b';");
+    var set_local_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL app.tenant_id = 'tenant-b';");
     defer set_local_app_setting.deinit(alloc);
     const set_local_app_setting_plan = switch (set_local_app_setting) {
         .session_catalog => |plan| plan,
@@ -2071,7 +2055,7 @@ test "catalog apply applies SQL session catalog plans" {
     try std.testing.expect(local_app_setting_session.transaction_local_settings_base == null);
     try std.testing.expectEqualStrings("tenant-a", local_app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 
-    var set_sync_level = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'full_index';");
+    var set_sync_level = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'full_index';");
     defer set_sync_level.deinit(alloc);
     const set_sync_level_plan = switch (set_sync_level) {
         .session_catalog => |plan| plan,
@@ -2081,7 +2065,7 @@ test "catalog apply applies SQL session catalog plans" {
     defer sync_level_session.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, try sqlSyncLevelFromSession(sync_level_session.session()));
 
-    var set_local_sync_level = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
+    var set_local_sync_level = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
     defer set_local_sync_level.deinit(alloc);
     const set_local_sync_level_plan = switch (set_local_sync_level) {
         .session_catalog => |plan| plan,
@@ -2094,9 +2078,9 @@ test "catalog apply applies SQL session catalog plans" {
     try local_sync_level_session.clearTransactionLocalState(alloc);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, try sqlSyncLevelFromSession(local_sync_level_session.session()));
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, try sqlSyncLevelFromSession(catalog_resources.SqlCatalogSession.default()));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'eventual';"));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'eventual';"));
 
-    var set_runtime_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '1ms';");
+    var set_runtime_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '1ms';");
     defer set_runtime_setting.deinit(alloc);
     const set_runtime_setting_plan = switch (set_runtime_setting) {
         .session_catalog => |plan| plan,
@@ -2121,7 +2105,7 @@ test "catalog apply applies SQL session catalog plans" {
     try enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms - 1);
     try std.testing.expectError(error.StatementTimeout, enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms));
 
-    var disable_timeout = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '0';");
+    var disable_timeout = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '0';");
     defer disable_timeout.deinit(alloc);
     const disable_timeout_plan = switch (disable_timeout) {
         .session_catalog => |plan| plan,
@@ -2132,7 +2116,7 @@ test "catalog apply applies SQL session catalog plans" {
     try std.testing.expectEqual(@as(?u64, null), try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()));
     try std.testing.expect(!sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()), 1_000, std.math.maxInt(u64)));
 
-    var invalid_timeout = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = 'five';");
+    var invalid_timeout = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = 'five';");
     defer invalid_timeout.deinit(alloc);
     const invalid_timeout_plan = switch (invalid_timeout) {
         .session_catalog => |plan| plan,
@@ -2140,7 +2124,7 @@ test "catalog apply applies SQL session catalog plans" {
     };
     try std.testing.expectError(error.InvalidRoleSetting, applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), invalid_timeout_plan));
 
-    var reset_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "RESET app.tenant_id;");
+    var reset_app_setting = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "RESET app.tenant_id;");
     defer reset_app_setting.deinit(alloc);
     const reset_app_setting_plan = switch (reset_app_setting) {
         .session_catalog => |plan| plan,
@@ -2154,7 +2138,7 @@ test "catalog apply applies SQL session catalog plans" {
 
 test "catalog apply applies adapter noops and comment ddl to public schema json" {
     const alloc = std.testing.allocator;
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\CREATE TABLE users (
         \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -2171,10 +2155,10 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     );
     defer create.deinit(alloc);
 
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", create);
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", create);
     defer applied.deinit(alloc);
 
-    var create_public_schema = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
+    var create_public_schema = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
     defer create_public_schema.deinit(alloc);
     const create_public_schema_noop = switch (create_public_schema) {
         .adapter_noop => |plan| plan,
@@ -2184,11 +2168,11 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     const create_public_schema_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_public_schema);
     defer alloc.free(create_public_schema_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=schema_namespace", create_public_schema_fingerprint);
-    var public_schema_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, create_public_schema);
+    var public_schema_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_public_schema);
     defer public_schema_applied.deinit(alloc);
     try std.testing.expectEqualStrings(applied.schema_json, public_schema_applied.schema_json);
 
-    var create_extension = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;");
+    var create_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;");
     defer create_extension.deinit(alloc);
     const create_extension_noop = switch (create_extension) {
         .adapter_noop => |plan| plan,
@@ -2198,11 +2182,11 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     const create_extension_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_extension);
     defer alloc.free(create_extension_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_extension_fingerprint);
-    var extension_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, create_extension);
+    var extension_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension);
     defer extension_applied.deinit(alloc);
     try std.testing.expectEqualStrings(applied.schema_json, extension_applied.schema_json);
 
-    var create_public_extension = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
+    var create_public_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
     defer create_public_extension.deinit(alloc);
     const create_public_extension_noop = switch (create_public_extension) {
         .adapter_noop => |plan| plan,
@@ -2213,81 +2197,81 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     defer alloc.free(create_public_extension_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_public_extension_fingerprint);
 
-    var table_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS 'metered usage rows';");
+    var table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS 'metered usage rows';");
     defer table_comment.deinit(alloc);
     const table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, table_comment);
     defer alloc.free(table_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=true", table_comment_fingerprint);
-    var table_commented = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, table_comment);
+    var table_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_comment);
     defer table_commented.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, table_commented.schema_json, "\"comments\":{\"table\":\"metered usage rows\"") != null);
 
-    var column_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN users.email IS 'contact address';");
+    var column_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN users.email IS 'contact address';");
     defer column_comment.deinit(alloc);
     const column_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, column_comment);
     defer alloc.free(column_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=column:object=users.email:comment=true", column_comment_fingerprint);
-    var column_commented = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, table_commented.schema_json, column_comment);
+    var column_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, table_commented.schema_json, column_comment);
     defer column_commented.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, column_commented.schema_json, "\"columns\":{\"email\":\"contact address\"}") != null);
 
-    var comment_index_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_email_comment_idx ON users (email);");
+    var comment_index_create = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_email_comment_idx ON users (email);");
     defer comment_index_create.deinit(alloc);
-    var comment_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, column_commented.schema_json, comment_index_create);
+    var comment_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, column_commented.schema_json, comment_index_create);
     defer comment_indexed.deinit(alloc);
 
-    var index_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX users_email_comment_idx IS 'email lookup';");
+    var index_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX users_email_comment_idx IS 'email lookup';");
     defer index_comment.deinit(alloc);
     const index_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, index_comment);
     defer alloc.free(index_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=index:object=users_email_comment_idx:comment=true", index_comment_fingerprint);
-    var index_commented = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, comment_indexed.schema_json, index_comment);
+    var index_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, comment_indexed.schema_json, index_comment);
     defer index_commented.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, index_commented.schema_json, "\"indexes\":{\"users_email_comment_idx\":\"email lookup\"}") != null);
 
-    var constraint_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT users_updated_check ON users IS 'valid status';");
+    var constraint_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT users_updated_check ON users IS 'valid status';");
     defer constraint_comment.deinit(alloc);
     const constraint_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, constraint_comment);
     defer alloc.free(constraint_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=constraint:object=users_updated_check:table=users:comment=true", constraint_comment_fingerprint);
-    var constraint_commented = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, index_commented.schema_json, constraint_comment);
+    var constraint_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, index_commented.schema_json, constraint_comment);
     defer constraint_commented.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, constraint_commented.schema_json, "\"constraints\":{\"users_updated_check\":\"valid status\"}") != null);
 
-    var clear_table_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS NULL;");
+    var clear_table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS NULL;");
     defer clear_table_comment.deinit(alloc);
     const clear_table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, clear_table_comment);
     defer alloc.free(clear_table_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=false", clear_table_comment_fingerprint);
-    var table_comment_cleared = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, constraint_commented.schema_json, clear_table_comment);
+    var table_comment_cleared = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, constraint_commented.schema_json, clear_table_comment);
     defer table_comment_cleared.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, table_comment_cleared.schema_json, "\"table\":\"metered usage rows\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, table_comment_cleared.schema_json, "\"columns\":{\"email\":\"contact address\"}") != null);
 
-    var rename_commented_column = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN email TO contact_email;");
+    var rename_commented_column = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN email TO contact_email;");
     defer rename_commented_column.deinit(alloc);
-    var renamed_column_comment = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, table_comment_cleared.schema_json, rename_commented_column);
+    var renamed_column_comment = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, table_comment_cleared.schema_json, rename_commented_column);
     defer renamed_column_comment.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, renamed_column_comment.schema_json, "\"columns\":{\"contact_email\":\"contact address\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, renamed_column_comment.schema_json, "\"columns\":{\"email\":\"contact address\"}") == null);
 
-    var rename_commented_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_updated_check TO users_updated_at_check;");
+    var rename_commented_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_updated_check TO users_updated_at_check;");
     defer rename_commented_constraint.deinit(alloc);
-    var renamed_constraint_comment = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, renamed_column_comment.schema_json, rename_commented_constraint);
+    var renamed_constraint_comment = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, renamed_column_comment.schema_json, rename_commented_constraint);
     defer renamed_constraint_comment.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, renamed_constraint_comment.schema_json, "\"constraints\":{\"users_updated_at_check\":\"valid status\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, renamed_constraint_comment.schema_json, "\"constraints\":{\"users_updated_check\":\"valid status\"}") == null);
 
-    var drop_commented_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_comment_idx;");
+    var drop_commented_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_comment_idx;");
     defer drop_commented_index.deinit(alloc);
-    var dropped_index_comment = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, renamed_constraint_comment.schema_json, drop_commented_index);
+    var dropped_index_comment = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, renamed_constraint_comment.schema_json, drop_commented_index);
     defer dropped_index_comment.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, dropped_index_comment.schema_json, "\"users_email_comment_idx\":\"email lookup\"") == null);
 }
 
 test "catalog apply creates clones and replaces public schema json" {
     const alloc = std.testing.allocator;
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\CREATE TABLE users (
         \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -2304,7 +2288,7 @@ test "catalog apply creates clones and replaces public schema json" {
     );
     defer create.deinit(alloc);
 
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", create);
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", create);
     defer applied.deinit(alloc);
     try std.testing.expect(!applied.requires_rebuild);
     try std.testing.expect(!applied.validation_required);
@@ -2328,34 +2312,34 @@ test "catalog apply creates clones and replaces public schema json" {
     try std.testing.expectEqualStrings("users_tenant_email_key", applied_runtime.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 1), applied_runtime.checks.len);
 
-    var begin_protocol = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "BEGIN;");
+    var begin_protocol = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "BEGIN;");
     defer begin_protocol.deinit(alloc);
-    var begin_protocol_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, begin_protocol);
+    var begin_protocol_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, begin_protocol);
     defer begin_protocol_applied.deinit(alloc);
     try std.testing.expectEqualStrings(applied.schema_json, begin_protocol_applied.schema_json);
 
-    var set_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO public;");
+    var set_search_path = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO public;");
     defer set_search_path.deinit(alloc);
-    var set_search_path_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, set_search_path);
+    var set_search_path_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, set_search_path);
     defer set_search_path_applied.deinit(alloc);
     try std.testing.expectEqualStrings(applied.schema_json, set_search_path_applied.schema_json);
 
-    var duplicate_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users (id uuid PRIMARY KEY);");
+    var duplicate_create = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users (id uuid PRIMARY KEY);");
     defer duplicate_create.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, duplicate_create));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create));
 
-    var duplicate_create_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY);");
+    var duplicate_create_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY);");
     defer duplicate_create_if_not_exists.deinit(alloc);
-    var unchanged = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, duplicate_create_if_not_exists);
+    var unchanged = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create_if_not_exists);
     defer unchanged.deinit(alloc);
     try std.testing.expectEqualStrings(applied.schema_json, unchanged.schema_json);
     try std.testing.expect(!unchanged.requires_rebuild);
     try std.testing.expect(!unchanged.validation_required);
     try std.testing.expect(!unchanged.rewrite_required);
 
-    var table_clone = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    var table_clone = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
     defer table_clone.deinit(alloc);
-    var cloned = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, table_clone);
+    var cloned = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone);
     defer cloned.deinit(alloc);
     try std.testing.expect(cloned.requires_rebuild);
     try std.testing.expect(cloned.validation_required);
@@ -2375,13 +2359,13 @@ test "catalog apply creates clones and replaces public schema json" {
     const cloned_current_day = binder.relationalColumnForField(cloned_runtime, "current_day_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cloned_current_day.default_value != null);
 
-    var table_clone_without_constraints = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users_copy (LIKE users);");
+    var table_clone_without_constraints = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users_copy (LIKE users);");
     defer table_clone_without_constraints.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, table_clone_without_constraints));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone_without_constraints));
 
-    var replace = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE users (id uuid PRIMARY KEY);");
+    var replace = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE users (id uuid PRIMARY KEY);");
     defer replace.deinit(alloc);
-    var replaced = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, replace);
+    var replaced = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace);
     defer replaced.deinit(alloc);
     try std.testing.expect(replaced.requires_rebuild);
     try std.testing.expect(replaced.validation_required);
@@ -2394,9 +2378,9 @@ test "catalog apply creates clones and replaces public schema json" {
     try std.testing.expectEqual(@as(usize, 1), replaced_runtime.relational_columns.len);
     try std.testing.expectEqualStrings("id", replaced_runtime.primary_key.?.columns[0]);
 
-    var replace_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, status text);");
+    var replace_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, status text);");
     defer replace_if_not_exists.deinit(alloc);
-    var replaced_if_not_exists = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, applied.schema_json, replace_if_not_exists);
+    var replaced_if_not_exists = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_if_not_exists);
     defer replaced_if_not_exists.deinit(alloc);
     try std.testing.expect(replaced_if_not_exists.requires_rebuild);
     try std.testing.expect(replaced_if_not_exists.validation_required);
@@ -2412,20 +2396,20 @@ test "catalog apply creates clones and replaces public schema json" {
 
 test "catalog apply applies incremental ddl plans to public schema json" {
     const alloc = std.testing.allocator;
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, account_id text, email text, status text, deleted_at timestamptz, updated_at_ns bigint);",
     );
     defer create.deinit(alloc);
-    var created = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", create);
+    var created = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", create);
     defer created.deinit(alloc);
 
-    var multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_account_email_idx ON users (account_id, email);",
     );
     defer multi_column_index.deinit(alloc);
-    var multi_column_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, created.schema_json, multi_column_index);
+    var multi_column_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, multi_column_index);
     defer multi_column_indexed.deinit(alloc);
     try std.testing.expect(multi_column_indexed.requires_rebuild);
     try std.testing.expect(!multi_column_indexed.validation_required);
@@ -2441,9 +2425,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("users_account_email_idx", multi_email.index_name.?);
     try std.testing.expectEqual(multi_account.index_generation, multi_email.index_generation);
 
-    var drop_multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_account_email_idx;");
+    var drop_multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_account_email_idx;");
     defer drop_multi_column_index.deinit(alloc);
-    var multi_column_dropped = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, multi_column_indexed.schema_json, drop_multi_column_index);
+    var multi_column_dropped = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, multi_column_indexed.schema_json, drop_multi_column_index);
     defer multi_column_dropped.deinit(alloc);
     try std.testing.expect(!multi_column_dropped.requires_rebuild);
     try std.testing.expect(!multi_column_dropped.validation_required);
@@ -2456,33 +2440,33 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(dropped_multi_account.index_name == null);
     try std.testing.expect(dropped_multi_email.index_name == null);
 
-    var status_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var status_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_idx ON users (status);",
     );
     defer status_index.deinit(alloc);
-    var status_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, created.schema_json, status_index);
+    var status_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, status_index);
     defer status_indexed.deinit(alloc);
     try std.testing.expect(status_indexed.requires_rebuild);
     try std.testing.expect(!status_indexed.validation_required);
     try expectAppliedDdlWorkActions(status_indexed, &.{.rebuild});
 
-    var status_index_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var status_index_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX IF NOT EXISTS users_status_idx ON users (status);",
     );
     defer status_index_if_not_exists.deinit(alloc);
-    var status_index_noop = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, status_indexed.schema_json, status_index_if_not_exists);
+    var status_index_noop = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, status_index_if_not_exists);
     defer status_index_noop.deinit(alloc);
     try std.testing.expect(!status_index_noop.requires_rebuild);
     try std.testing.expect(!status_index_noop.validation_required);
 
-    var upper_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var upper_expression_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_upper_email_idx ON users (upper(email));",
     );
     defer upper_expression_index.deinit(alloc);
-    var upper_expression_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, status_indexed.schema_json, upper_expression_index);
+    var upper_expression_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, upper_expression_index);
     defer upper_expression_indexed.deinit(alloc);
     try std.testing.expect(upper_expression_indexed.requires_rebuild);
     try std.testing.expect(!upper_expression_indexed.validation_required);
@@ -2497,12 +2481,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(upper_expression.index_name != null);
     try std.testing.expectEqualStrings("users_upper_email_idx", upper_expression.index_name.?);
 
-    var concat_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var concat_expression_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_tenant_status_idx ON users (concat(tenant_id, ':', status));",
     );
     defer concat_expression_index.deinit(alloc);
-    var concat_expression_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, upper_expression_indexed.schema_json, concat_expression_index);
+    var concat_expression_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, upper_expression_indexed.schema_json, concat_expression_index);
     defer concat_expression_indexed.deinit(alloc);
     try std.testing.expect(concat_expression_indexed.requires_rebuild);
     try std.testing.expect(!concat_expression_indexed.validation_required);
@@ -2520,12 +2504,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(concat_expression.index_name != null);
     try std.testing.expectEqualStrings("users_tenant_status_idx", concat_expression.index_name.?);
 
-    var md5_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var md5_expression_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_md5_email_idx ON users (md5(email));",
     );
     defer md5_expression_index.deinit(alloc);
-    var md5_expression_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, concat_expression_indexed.schema_json, md5_expression_index);
+    var md5_expression_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, concat_expression_indexed.schema_json, md5_expression_index);
     defer md5_expression_indexed.deinit(alloc);
     try std.testing.expect(md5_expression_indexed.requires_rebuild);
     try std.testing.expect(!md5_expression_indexed.validation_required);
@@ -2540,12 +2524,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(md5_expression.index_name != null);
     try std.testing.expectEqualStrings("users_md5_email_idx", md5_expression.index_name.?);
 
-    var rich_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rich_expression_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
     );
     defer rich_expression_index.deinit(alloc);
-    var rich_expression_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, md5_expression_indexed.schema_json, rich_expression_index);
+    var rich_expression_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, md5_expression_indexed.schema_json, rich_expression_index);
     defer rich_expression_indexed.deinit(alloc);
     try std.testing.expect(rich_expression_indexed.requires_rebuild);
     try std.testing.expect(!rich_expression_indexed.validation_required);
@@ -2562,23 +2546,23 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(rich_expression.index_name != null);
     try std.testing.expectEqualStrings("users_status_replace_idx", rich_expression.index_name.?);
 
-    var index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
     );
     defer index.deinit(alloc);
-    var indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, status_indexed.schema_json, index);
+    var indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, index);
     defer indexed.deinit(alloc);
     try std.testing.expect(indexed.requires_rebuild);
     try std.testing.expect(indexed.validation_required);
     try expectAppliedDdlWorkActions(indexed, &.{ .rebuild, .validate });
 
-    var unique_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var unique_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
     );
     defer unique_covering_index.deinit(alloc);
-    var unique_covering_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, indexed.schema_json, unique_covering_index);
+    var unique_covering_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, unique_covering_index);
     defer unique_covering_indexed.deinit(alloc);
     try std.testing.expect(unique_covering_indexed.requires_rebuild);
     try std.testing.expect(unique_covering_indexed.validation_required);
@@ -2595,12 +2579,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("tenant_id", unique_covering.include_columns[0]);
     try std.testing.expectEqualStrings("status", unique_covering.include_columns[1]);
 
-    var expression_where_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var expression_where_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_tenant_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
     );
     defer expression_where_unique_index.deinit(alloc);
-    var expression_where_unique_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, indexed.schema_json, expression_where_unique_index);
+    var expression_where_unique_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, expression_where_unique_index);
     defer expression_where_unique_indexed.deinit(alloc);
     try std.testing.expect(expression_where_unique_indexed.requires_rebuild);
     try std.testing.expect(expression_where_unique_indexed.validation_required);
@@ -2618,7 +2602,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("status", expression_where_unique.where_expressions[0].lhs.operands[0].field);
     try std.testing.expectEqualStrings("\"active\"", expression_where_unique.where_expressions[0].rhs[0].value_json);
 
-    var temporal_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc,
+    var temporal_create = try logicalDdlPlanForCatalogApplyTestAlloc(alloc,
         \\CREATE TABLE prices (
         \\  id uuid PRIMARY KEY,
         \\  sku text NOT NULL,
@@ -2629,15 +2613,15 @@ test "catalog apply applies incremental ddl plans to public schema json" {
         \\);
     );
     defer temporal_create.deinit(alloc);
-    var temporal_created = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", temporal_create);
+    var temporal_created = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", temporal_create);
     defer temporal_created.deinit(alloc);
 
-    var temporal_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var temporal_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
     );
     defer temporal_unique_index.deinit(alloc);
-    var temporal_unique_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, temporal_created.schema_json, temporal_unique_index);
+    var temporal_unique_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, temporal_created.schema_json, temporal_unique_index);
     defer temporal_unique_indexed.deinit(alloc);
     try std.testing.expect(temporal_unique_indexed.requires_rebuild);
     try std.testing.expect(temporal_unique_indexed.validation_required);
@@ -2650,12 +2634,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("valid_time", temporal_unique_runtime.unique_constraints[0].without_overlaps_period.?);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_unique_runtime.unique_constraints[0].validation_state);
 
-    var md5_unique_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var md5_unique_expression_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_md5_email_key ON users (md5(email));",
     );
     defer md5_unique_expression_index.deinit(alloc);
-    var md5_unique_expression_indexed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, indexed.schema_json, md5_unique_expression_index);
+    var md5_unique_expression_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, md5_unique_expression_index);
     defer md5_unique_expression_indexed.deinit(alloc);
     try std.testing.expect(md5_unique_expression_indexed.requires_rebuild);
     try std.testing.expect(md5_unique_expression_indexed.validation_required);
@@ -2671,7 +2655,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, md5_unique_expression.expressions[0].op);
     try std.testing.expectEqualStrings("email", md5_unique_expression.expressions[0].field);
 
-    var alter = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var alter = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE users
         \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
@@ -2680,17 +2664,17 @@ test "catalog apply applies incremental ddl plans to public schema json" {
         ,
     );
     defer alter.deinit(alloc);
-    var altered = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, indexed.schema_json, alter);
+    var altered = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, alter);
     defer altered.deinit(alloc);
     try std.testing.expect(altered.requires_rebuild);
     try std.testing.expect(altered.validation_required);
 
-    var create_no_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create_no_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE usage_records (tenant_id text NOT NULL, id uuid NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text);",
     );
     defer create_no_pk.deinit(alloc);
-    var no_pk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", create_no_pk);
+    var no_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", create_no_pk);
     defer no_pk.deinit(alloc);
     var parsed_no_pk = try schema_api.parseValidatedTableSchema(alloc, no_pk.schema_json);
     defer parsed_no_pk.deinit(alloc);
@@ -2699,7 +2683,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(no_pk_runtime.primary_key == null);
     try std.testing.expectEqual(@as(usize, 5), no_pk_runtime.relational_columns.len);
 
-    var add_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var add_primary_key = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
@@ -2707,7 +2691,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
         ,
     );
     defer add_primary_key.deinit(alloc);
-    var primary_keyed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, no_pk.schema_json, add_primary_key);
+    var primary_keyed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, no_pk.schema_json, add_primary_key);
     defer primary_keyed.deinit(alloc);
     try std.testing.expect(primary_keyed.requires_rebuild);
     try std.testing.expect(primary_keyed.validation_required);
@@ -2724,9 +2708,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("status", primary_keyed_runtime.primary_key.?.include_columns[0]);
     try std.testing.expectEqualStrings("valid_time", primary_keyed_runtime.primary_key.?.without_overlaps_period.?);
     try std.testing.expectEqual(@as(usize, 1), primary_keyed_runtime.periods.len);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, primary_keyed.schema_json, add_primary_key));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, primary_keyed.schema_json, add_primary_key));
 
-    var add_temporal = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var add_temporal = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE users
         \\  ADD COLUMN valid_from numeric NOT NULL,
@@ -2736,7 +2720,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
         ,
     );
     defer add_temporal.deinit(alloc);
-    var temporal = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, altered.schema_json, add_temporal);
+    var temporal = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, altered.schema_json, add_temporal);
     defer temporal.deinit(alloc);
     try std.testing.expect(temporal.requires_rebuild);
     try std.testing.expect(temporal.validation_required);
@@ -2752,32 +2736,32 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("users_tenant_valid_key", temporal_runtime.unique_constraints[1].name);
     try std.testing.expectEqualStrings("valid_time", temporal_runtime.unique_constraints[1].without_overlaps_period.?);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, temporal_runtime.unique_constraints[1].validation_state);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, temporal.schema_json, add_temporal));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, temporal.schema_json, add_temporal));
 
-    var not_valid = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var not_valid = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users ADD CONSTRAINT users_status_known_check CHECK (status != 'unknown') NOT VALID;",
     );
     defer not_valid.deinit(alloc);
-    var with_unvalidated_check = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, altered.schema_json, not_valid);
+    var with_unvalidated_check = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, altered.schema_json, not_valid);
     defer with_unvalidated_check.deinit(alloc);
     try std.testing.expect(with_unvalidated_check.validation_required);
 
-    var validate = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var validate = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE ONLY users VALIDATE CONSTRAINT users_status_known_check;",
     );
     defer validate.deinit(alloc);
-    var validated = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, with_unvalidated_check.schema_json, validate);
+    var validated = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, with_unvalidated_check.schema_json, validate);
     defer validated.deinit(alloc);
     try std.testing.expect(validated.validation_required);
 
-    var validate_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var validate_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE ONLY users VALIDATE CONSTRAINT users_pkey;",
     );
     defer validate_default_pk.deinit(alloc);
-    var validated_default_pk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, validated.schema_json, validate_default_pk);
+    var validated_default_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, validate_default_pk);
     defer validated_default_pk.deinit(alloc);
     var parsed_validated_default_pk = try schema_api.parseValidatedTableSchema(alloc, validated_default_pk.schema_json);
     defer parsed_validated_default_pk.deinit(alloc);
@@ -2786,12 +2770,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(validated_default_pk_runtime.primary_key != null);
     try std.testing.expect(validated_default_pk_runtime.primary_key.?.name == null);
 
-    var rename_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rename_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users RENAME CONSTRAINT users_pkey TO users_id_pk;",
     );
     defer rename_default_pk.deinit(alloc);
-    var renamed_default_pk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, validated.schema_json, rename_default_pk);
+    var renamed_default_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, rename_default_pk);
     defer renamed_default_pk.deinit(alloc);
     var parsed_renamed_default_pk = try schema_api.parseValidatedTableSchema(alloc, renamed_default_pk.schema_json);
     defer parsed_renamed_default_pk.deinit(alloc);
@@ -2799,19 +2783,19 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, renamed_default_pk_runtime);
     try std.testing.expectEqualStrings("users_id_pk", renamed_default_pk_runtime.primary_key.?.name.?);
 
-    var rename_default_pk_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rename_default_pk_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users RENAME CONSTRAINT users_pkey TO users_tenant_lower_email_key;",
     );
     defer rename_default_pk_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, validated.schema_json, rename_default_pk_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, rename_default_pk_duplicate));
 
-    var drop_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users DROP CONSTRAINT users_pkey;",
     );
     defer drop_default_pk.deinit(alloc);
-    var without_default_pk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, validated.schema_json, drop_default_pk);
+    var without_default_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, drop_default_pk);
     defer without_default_pk.deinit(alloc);
     try std.testing.expect(without_default_pk.requires_rebuild);
     try std.testing.expect(!without_default_pk.validation_required);
@@ -2822,12 +2806,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, without_default_pk_runtime);
     try std.testing.expect(without_default_pk_runtime.primary_key == null);
 
-    var drop_named_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_named_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users DROP CONSTRAINT users_id_pk;",
     );
     defer drop_named_pk.deinit(alloc);
-    var without_named_pk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, renamed_default_pk.schema_json, drop_named_pk);
+    var without_named_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, renamed_default_pk.schema_json, drop_named_pk);
     defer without_named_pk.deinit(alloc);
     try std.testing.expect(without_named_pk.requires_rebuild);
     try std.testing.expect(!without_named_pk.validation_required);
@@ -2838,12 +2822,12 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, without_named_pk_runtime);
     try std.testing.expect(without_named_pk_runtime.primary_key == null);
 
-    var trigger = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var trigger = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TRIGGER users_updated_at BEFORE UPDATE ON users EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
     );
     defer trigger.deinit(alloc);
-    var updated = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, validated.schema_json, trigger);
+    var updated = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, trigger);
     defer updated.deinit(alloc);
     try std.testing.expect(!updated.requires_rebuild);
     try std.testing.expect(!updated.validation_required);
@@ -2872,9 +2856,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     const updated_at = binder.relationalColumnForField(runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(updated_at.on_update_value != null);
 
-    var drop_trigger = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TRIGGER users_updated_at ON users;");
+    var drop_trigger = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TRIGGER users_updated_at ON users;");
     defer drop_trigger.deinit(alloc);
-    var update_policy_dropped = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_trigger);
+    var update_policy_dropped = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_trigger);
     defer update_policy_dropped.deinit(alloc);
     try std.testing.expect(!update_policy_dropped.requires_rebuild);
     try std.testing.expect(!update_policy_dropped.validation_required);
@@ -2885,9 +2869,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     const update_policy_dropped_column = binder.relationalColumnForField(update_policy_dropped_runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(update_policy_dropped_column.on_update_value == null);
 
-    var drop_status_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_idx;");
+    var drop_status_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_idx;");
     defer drop_status_index.deinit(alloc);
-    var status_index_dropped = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_status_index);
+    var status_index_dropped = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status_index);
     defer status_index_dropped.deinit(alloc);
     try std.testing.expect(!status_index_dropped.requires_rebuild);
     try std.testing.expect(!status_index_dropped.validation_required);
@@ -2901,9 +2885,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(u64, 0), dropped_json_status.index_generation);
     try std.testing.expect(dropped_json_status.index_name == null);
 
-    var drop_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
+    var drop_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
     defer drop_unique_index.deinit(alloc);
-    var unique_index_dropped = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_unique_index);
+    var unique_index_dropped = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_unique_index);
     defer unique_index_dropped.deinit(alloc);
     var parsed_unique_index_dropped = try schema_api.parseValidatedTableSchema(alloc, unique_index_dropped.schema_json);
     defer parsed_unique_index_dropped.deinit(alloc);
@@ -2911,9 +2895,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, unique_index_dropped_runtime);
     try std.testing.expectEqual(@as(usize, 0), unique_index_dropped_runtime.unique_constraints.len);
 
-    var set_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'pending';");
+    var set_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'pending';");
     defer set_default.deinit(alloc);
-    var defaulted = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, set_default);
+    var defaulted = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_default);
     defer defaulted.deinit(alloc);
     try std.testing.expect(!defaulted.requires_rebuild);
     try std.testing.expect(!defaulted.validation_required);
@@ -2925,9 +2909,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(defaulted_status.default_value != null);
     try std.testing.expectEqualStrings("\"pending\"", defaulted_status.default_value.?.value_json);
 
-    var set_casted_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::numeric;");
+    var set_casted_numeric_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::numeric;");
     defer set_casted_numeric_default.deinit(alloc);
-    var casted_numeric_defaulted = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, set_casted_numeric_default);
+    var casted_numeric_defaulted = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_casted_numeric_default);
     defer casted_numeric_defaulted.deinit(alloc);
     var parsed_casted_numeric_defaulted = try schema_api.parseValidatedTableSchema(alloc, casted_numeric_defaulted.schema_json);
     defer parsed_casted_numeric_defaulted.deinit(alloc);
@@ -2937,13 +2921,13 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expect(casted_numeric_updated_at.default_value != null);
     try std.testing.expectEqualStrings("7", casted_numeric_updated_at.default_value.?.value_json);
 
-    var set_text_cast_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::text;");
+    var set_text_cast_numeric_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::text;");
     defer set_text_cast_numeric_default.deinit(alloc);
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, set_text_cast_numeric_default));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_text_cast_numeric_default));
 
-    var drop_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP DEFAULT;");
+    var drop_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP DEFAULT;");
     defer drop_default.deinit(alloc);
-    var undefaulted = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, defaulted.schema_json, drop_default);
+    var undefaulted = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, defaulted.schema_json, drop_default);
     defer undefaulted.deinit(alloc);
     try std.testing.expect(!undefaulted.requires_rebuild);
     try std.testing.expect(!undefaulted.validation_required);
@@ -2954,9 +2938,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     const undefaulted_status = binder.relationalColumnForField(undefaulted_runtime, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(undefaulted_status.default_value == null);
 
-    var set_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET NOT NULL;");
+    var set_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET NOT NULL;");
     defer set_not_null.deinit(alloc);
-    var required_status_schema = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, set_not_null);
+    var required_status_schema = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_not_null);
     defer required_status_schema.deinit(alloc);
     try std.testing.expect(!required_status_schema.requires_rebuild);
     try std.testing.expect(required_status_schema.validation_required);
@@ -2967,9 +2951,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     const required_json_status = binder.relationalColumnForField(required_status_runtime, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!required_json_status.nullable);
 
-    var drop_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP NOT NULL;");
+    var drop_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP NOT NULL;");
     defer drop_not_null.deinit(alloc);
-    var nullable_status_schema = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, required_status_schema.schema_json, drop_not_null);
+    var nullable_status_schema = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, required_status_schema.schema_json, drop_not_null);
     defer nullable_status_schema.deinit(alloc);
     try std.testing.expect(!nullable_status_schema.requires_rebuild);
     try std.testing.expect(!nullable_status_schema.validation_required);
@@ -2980,13 +2964,13 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     const nullable_json_status = binder.relationalColumnForField(nullable_status_runtime, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(nullable_json_status.nullable);
 
-    var drop_pk_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN id DROP NOT NULL;");
+    var drop_pk_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN id DROP NOT NULL;");
     defer drop_pk_not_null.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_pk_not_null));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_pk_not_null));
 
-    var alter_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns TYPE timestamptz USING (updated_at_ns)::timestamptz;");
+    var alter_type = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns TYPE timestamptz USING (updated_at_ns)::timestamptz;");
     defer alter_type.deinit(alloc);
-    var typed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, alter_type);
+    var typed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_type);
     defer typed.deinit(alloc);
     try std.testing.expect(typed.requires_rebuild);
     try std.testing.expect(typed.validation_required);
@@ -2999,9 +2983,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(runtime_schema.AntflyType.datetime, typed_updated_at.field_type);
     try std.testing.expect(typed_updated_at.on_update_value != null);
 
-    var alter_status_collated = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE text COLLATE \"C\";");
+    var alter_status_collated = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE text COLLATE \"C\";");
     defer alter_status_collated.deinit(alloc);
-    var collated = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, alter_status_collated);
+    var collated = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_status_collated);
     defer collated.deinit(alloc);
     try std.testing.expect(collated.requires_rebuild);
     try std.testing.expect(collated.validation_required);
@@ -3014,17 +2998,17 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, collated_status.field_type);
     try std.testing.expectEqualStrings("C", collated_status.collation.?);
 
-    var alter_collated_status_to_numeric = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE numeric;");
+    var alter_collated_status_to_numeric = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE numeric;");
     defer alter_collated_status_to_numeric.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, collated.schema_json, alter_collated_status_to_numeric));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, collated.schema_json, alter_collated_status_to_numeric));
 
-    var alter_generated_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN tenant_status_key TYPE text;");
+    var alter_generated_type = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN tenant_status_key TYPE text;");
     defer alter_generated_type.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, alter_generated_type));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_generated_type));
 
-    var rename_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO state;");
+    var rename_status = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO state;");
     defer rename_status.deinit(alloc);
-    var renamed = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_status);
+    var renamed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_status);
     defer renamed.deinit(alloc);
     try std.testing.expect(renamed.requires_rebuild);
     try std.testing.expect(renamed.validation_required);
@@ -3040,13 +3024,13 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqualStrings("state", renamed_generated.generated.?.fields[1]);
     try std.testing.expectEqualStrings("state", renamed_runtime.checks[0].field);
 
-    var rename_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO tenant_id;");
+    var rename_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO tenant_id;");
     defer rename_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_duplicate));
 
-    var rename_unique_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_tenant_lower_email_key TO users_tenant_email_ci_key;");
+    var rename_unique_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_tenant_lower_email_key TO users_tenant_email_ci_key;");
     defer rename_unique_constraint.deinit(alloc);
-    var renamed_unique = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_unique_constraint);
+    var renamed_unique = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_unique_constraint);
     defer renamed_unique.deinit(alloc);
     try std.testing.expect(!renamed_unique.requires_rebuild);
     try std.testing.expect(!renamed_unique.validation_required);
@@ -3056,9 +3040,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, renamed_unique_runtime);
     try std.testing.expectEqualStrings("users_tenant_email_ci_key", renamed_unique_runtime.unique_constraints[0].name);
 
-    var rename_fk_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_account_fkey TO users_account_fk;");
+    var rename_fk_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_account_fkey TO users_account_fk;");
     defer rename_fk_constraint.deinit(alloc);
-    var renamed_fk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_fk_constraint);
+    var renamed_fk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_fk_constraint);
     defer renamed_fk.deinit(alloc);
     var parsed_renamed_fk = try schema_api.parseValidatedTableSchema(alloc, renamed_fk.schema_json);
     defer parsed_renamed_fk.deinit(alloc);
@@ -3066,9 +3050,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, renamed_fk_runtime);
     try std.testing.expectEqualStrings("users_account_fk", renamed_fk_runtime.foreign_keys[0].name);
 
-    var rename_check_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_state_check;");
+    var rename_check_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_state_check;");
     defer rename_check_constraint.deinit(alloc);
-    var renamed_check = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_check_constraint);
+    var renamed_check = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_check_constraint);
     defer renamed_check.deinit(alloc);
     var parsed_renamed_check = try schema_api.parseValidatedTableSchema(alloc, renamed_check.schema_json);
     defer parsed_renamed_check.deinit(alloc);
@@ -3076,13 +3060,13 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, renamed_check_runtime);
     try std.testing.expectEqualStrings("users_state_check", renamed_check_runtime.checks[0].name);
 
-    var rename_constraint_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_tenant_lower_email_key;");
+    var rename_constraint_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_tenant_lower_email_key;");
     defer rename_constraint_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, rename_constraint_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_constraint_duplicate));
 
-    var drop_check = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_status_known_check;");
+    var drop_check = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_status_known_check;");
     defer drop_check.deinit(alloc);
-    var without_check = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_check);
+    var without_check = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_check);
     defer without_check.deinit(alloc);
     var parsed_without_check = try schema_api.parseValidatedTableSchema(alloc, without_check.schema_json);
     defer parsed_without_check.deinit(alloc);
@@ -3092,9 +3076,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 1), without_check_runtime.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 1), without_check_runtime.checks.len);
 
-    var drop_unique = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_tenant_lower_email_key;");
+    var drop_unique = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_tenant_lower_email_key;");
     defer drop_unique.deinit(alloc);
-    var without_unique = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_unique);
+    var without_unique = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_unique);
     defer without_unique.deinit(alloc);
     var parsed_without_unique = try schema_api.parseValidatedTableSchema(alloc, without_unique.schema_json);
     defer parsed_without_unique.deinit(alloc);
@@ -3104,9 +3088,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 1), without_unique_runtime.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 2), without_unique_runtime.checks.len);
 
-    var drop_fk = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_fkey;");
+    var drop_fk = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_fkey;");
     defer drop_fk.deinit(alloc);
-    var without_fk = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_fk);
+    var without_fk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_fk);
     defer without_fk.deinit(alloc);
     var parsed_without_fk = try schema_api.parseValidatedTableSchema(alloc, without_fk.schema_json);
     defer parsed_without_fk.deinit(alloc);
@@ -3116,9 +3100,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 0), without_fk_runtime.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 2), without_fk_runtime.checks.len);
 
-    var drop_missing_constraint_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS missing_constraint;");
+    var drop_missing_constraint_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS missing_constraint;");
     defer drop_missing_constraint_if_exists.deinit(alloc);
-    var unchanged_constraints = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_missing_constraint_if_exists);
+    var unchanged_constraints = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_constraint_if_exists);
     defer unchanged_constraints.deinit(alloc);
     var parsed_unchanged_constraints = try schema_api.parseValidatedTableSchema(alloc, unchanged_constraints.schema_json);
     defer parsed_unchanged_constraints.deinit(alloc);
@@ -3128,13 +3112,13 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 1), unchanged_constraints_runtime.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 2), unchanged_constraints_runtime.checks.len);
 
-    var drop_missing_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT missing_constraint;");
+    var drop_missing_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT missing_constraint;");
     defer drop_missing_constraint.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_missing_constraint));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_constraint));
 
-    var drop_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status;");
+    var drop_status = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status;");
     defer drop_status.deinit(alloc);
-    var dropped = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_status);
+    var dropped = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status);
     defer dropped.deinit(alloc);
     try std.testing.expect(dropped.requires_rebuild);
     try std.testing.expect(dropped.validation_required);
@@ -3150,9 +3134,9 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 1), dropped_runtime.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 0), dropped_runtime.checks.len);
 
-    var drop_missing_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN IF EXISTS missing_column;");
+    var drop_missing_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN IF EXISTS missing_column;");
     defer drop_missing_if_exists.deinit(alloc);
-    var unchanged = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_missing_if_exists);
+    var unchanged = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_if_exists);
     defer unchanged.deinit(alloc);
     var parsed_unchanged = try schema_api.parseValidatedTableSchema(alloc, unchanged.schema_json);
     defer parsed_unchanged.deinit(alloc);
@@ -3160,17 +3144,17 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     defer runtime_schema.freeSchema(alloc, unchanged_runtime);
     try std.testing.expectEqual(@as(usize, 8), unchanged_runtime.relational_columns.len);
 
-    var drop_status_restrict = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status RESTRICT;");
+    var drop_status_restrict = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status RESTRICT;");
     defer drop_status_restrict.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_status_restrict));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status_restrict));
 
-    var drop_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN id;");
+    var drop_primary_key = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN id;");
     defer drop_primary_key.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, drop_primary_key));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_primary_key));
 
-    var duplicate_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text REFERENCES accounts(id);");
+    var duplicate_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text REFERENCES accounts(id);");
     defer duplicate_if_not_exists.deinit(alloc);
-    var unchanged_existing = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, updated.schema_json, duplicate_if_not_exists);
+    var unchanged_existing = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, duplicate_if_not_exists);
     defer unchanged_existing.deinit(alloc);
     var parsed_unchanged_existing = try schema_api.parseValidatedTableSchema(alloc, unchanged_existing.schema_json);
     defer parsed_unchanged_existing.deinit(alloc);
@@ -3179,37 +3163,37 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 8), unchanged_existing_runtime.relational_columns.len);
     try std.testing.expectEqual(@as(usize, 1), unchanged_existing_runtime.foreign_keys.len);
 
-    var missing_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE IF EXISTS missing_users ADD COLUMN status text;");
+    var missing_table_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE IF EXISTS missing_users ADD COLUMN status text;");
     defer missing_table_if_exists.deinit(alloc);
-    var missing_noop = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", missing_table_if_exists);
+    var missing_noop = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", missing_table_if_exists);
     defer missing_noop.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), missing_noop.schema_json.len);
     try std.testing.expect(!missing_noop.requires_rebuild);
     try std.testing.expect(!missing_noop.validation_required);
 
-    var missing_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_users ADD COLUMN status text;");
+    var missing_table = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_users ADD COLUMN status text;");
     defer missing_table.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", missing_table));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", missing_table));
 
-    var missing_drop_index_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_users_status_idx;");
+    var missing_drop_index_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_users_status_idx;");
     defer missing_drop_index_if_exists.deinit(alloc);
-    var missing_drop_noop = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", missing_drop_index_if_exists);
+    var missing_drop_noop = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", missing_drop_index_if_exists);
     defer missing_drop_noop.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), missing_drop_noop.schema_json.len);
 
-    var drop_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE users;");
+    var drop_table = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE users;");
     defer drop_table.deinit(alloc);
-    var dropped_table = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, created.schema_json, drop_table);
+    var dropped_table = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, drop_table);
     defer dropped_table.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), dropped_table.schema_json.len);
     try std.testing.expect(!dropped_table.requires_rebuild);
     try std.testing.expect(!dropped_table.validation_required);
     try std.testing.expect(!dropped_table.rewrite_required);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", drop_table));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", drop_table));
 
-    var drop_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE IF EXISTS users;");
+    var drop_table_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE IF EXISTS users;");
     defer drop_table_if_exists.deinit(alloc);
-    var missing_drop_table_noop = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, "", drop_table_if_exists);
+    var missing_drop_table_noop = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", drop_table_if_exists);
     defer missing_drop_table_noop.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), missing_drop_table_noop.schema_json.len);
 }
@@ -3222,7 +3206,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "sql-prepared-txn" });
     defer runtime_store.deinit();
 
-    var prepare = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    var prepare = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
     defer prepare.deinit(alloc);
     const prepare_plan = switch (prepare) {
         .prepared_transaction => |plan| plan,
@@ -3244,7 +3228,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(expected_txn_id));
     try std.testing.expectError(error.PreparedTransactionAlreadyExists, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_001));
 
-    var commit = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    var commit = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
     defer commit.deinit(alloc);
     const commit_plan = switch (commit) {
         .prepared_transaction => |plan| plan,
@@ -3262,7 +3246,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed_retry.status);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(expected_txn_id));
 
-    var rollback_committed = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    var rollback_committed = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
     defer rollback_committed.deinit(alloc);
     const rollback_committed_plan = switch (rollback_committed) {
         .prepared_transaction => |plan| plan,
@@ -3270,7 +3254,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     };
     try std.testing.expectError(error.PreparedTransactionDecisionConflict, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_committed_plan, 3_000));
 
-    var rollback = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_abort';");
+    var rollback = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_abort';");
     defer rollback.deinit(alloc);
     const rollback_prepare_plan = switch (rollback) {
         .prepared_transaction => |plan| plan,
@@ -3278,7 +3262,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     };
     _ = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepare_plan, 4_000);
 
-    var rollback_prepared = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_abort';");
+    var rollback_prepared = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_abort';");
     defer rollback_prepared.deinit(alloc);
     const rollback_prepared_plan = switch (rollback_prepared) {
         .prepared_transaction => |plan| plan,
@@ -3291,7 +3275,7 @@ test "catalog apply executes prepared transaction recovery intents" {
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, aborted_retry.operation);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, aborted_retry.status);
 
-    var missing_commit = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'missing_gid';");
+    var missing_commit = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'missing_gid';");
     defer missing_commit.deinit(alloc);
     const missing_commit_plan = switch (missing_commit) {
         .prepared_transaction => |plan| plan,
@@ -3302,7 +3286,7 @@ test "catalog apply executes prepared transaction recovery intents" {
 
 test "catalog apply applies create table ddl plan to owned runtime schema" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var lowered = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\CREATE TABLE usage_records (
         \\  id uuid PRIMARY KEY,
@@ -3317,16 +3301,16 @@ test "catalog apply applies create table ddl plan to owned runtime schema" {
     );
     defer lowered.deinit(alloc);
 
-    const schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, lowered);
+    const schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, lowered);
     defer runtime_schema.freeSchema(alloc, schema);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, lowered));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, lowered));
 
-    var idempotent = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var idempotent = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE IF NOT EXISTS usage_records (id uuid PRIMARY KEY);",
     );
     defer idempotent.deinit(alloc);
-    const unchanged = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, idempotent);
+    const unchanged = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, idempotent);
     defer runtime_schema.freeSchema(alloc, unchanged);
     try std.testing.expectEqual(@as(usize, schema.relational_columns.len), unchanged.relational_columns.len);
     try std.testing.expectEqualStrings("id", unchanged.primary_key.?.columns[0]);
@@ -3334,9 +3318,9 @@ test "catalog apply applies create table ddl plan to owned runtime schema" {
     const tenant_id = binder.relationalColumnForField(schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("C", tenant_id.collation.?);
 
-    var table_clone = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL);");
+    var table_clone = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL);");
     defer table_clone.deinit(alloc);
-    const cloned = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, table_clone);
+    const cloned = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, table_clone);
     defer runtime_schema.freeSchema(alloc, cloned);
     try std.testing.expectEqual(runtime_schema.StorageMode.relational, cloned.storage_mode);
     try std.testing.expectEqual(@as(usize, schema.relational_columns.len), cloned.relational_columns.len);
@@ -3354,10 +3338,10 @@ test "catalog apply applies create table ddl plan to owned runtime schema" {
     try std.testing.expectEqual(@as(usize, 1), cloned.checks.len);
     try std.testing.expectEqualStrings("usage_records_updated_check", cloned.checks[0].name);
 
-    var table_clone_without_constraints = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE usage_records_copy (LIKE usage_records);");
+    var table_clone_without_constraints = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE usage_records_copy (LIKE usage_records);");
     defer table_clone_without_constraints.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, table_clone_without_constraints));
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, table_clone));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, table_clone_without_constraints));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, table_clone));
 
     try std.testing.expectEqual(runtime_schema.StorageMode.relational, schema.storage_mode);
     try std.testing.expect(schema.enforce_types);
@@ -3395,7 +3379,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
         .relational_columns = try ddl_plan.cloneDdlRelationalColumns(alloc, &no_pk_columns),
     };
     defer runtime_schema.freeSchema(alloc, no_pk_schema);
-    var add_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var add_primary_key = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
@@ -3403,7 +3387,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
         ,
     );
     defer add_primary_key.deinit(alloc);
-    const primary_keyed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, no_pk_schema, add_primary_key);
+    const primary_keyed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, no_pk_schema, add_primary_key);
     defer runtime_schema.freeSchema(alloc, primary_keyed);
     try std.testing.expect(primary_keyed.primary_key != null);
     try std.testing.expectEqualStrings("usage_records_pk", primary_keyed.primary_key.?.name.?);
@@ -3414,17 +3398,17 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("valid_time", primary_keyed.primary_key.?.without_overlaps_period.?);
     try std.testing.expectEqual(@as(usize, 1), primary_keyed.periods.len);
     try std.testing.expectEqualStrings("valid_time", primary_keyed.periods[0].name);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, primary_keyed, add_primary_key));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, primary_keyed, add_primary_key));
 
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL, status text);",
     );
     defer create.deinit(alloc);
-    const schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, create);
+    const schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
     defer runtime_schema.freeSchema(alloc, schema);
 
-    var alter = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var alter = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
@@ -3436,7 +3420,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     );
     defer alter.deinit(alloc);
 
-    const updated = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, alter);
+    const updated = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, alter);
     defer runtime_schema.freeSchema(alloc, updated);
 
     try std.testing.expectEqual(@as(usize, 5), updated.relational_columns.len);
@@ -3454,7 +3438,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 1), updated.checks.len);
     try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, updated.checks[0].validation_state);
 
-    var add_temporal = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var add_temporal = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD COLUMN valid_from numeric NOT NULL,
@@ -3464,7 +3448,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
         ,
     );
     defer add_temporal.deinit(alloc);
-    const temporal = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, add_temporal);
+    const temporal = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, add_temporal);
     defer runtime_schema.freeSchema(alloc, temporal);
     try std.testing.expectEqual(@as(usize, 7), temporal.relational_columns.len);
     try std.testing.expectEqual(@as(usize, 1), temporal.periods.len);
@@ -3475,193 +3459,193 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("usage_records_tenant_valid_key", temporal.unique_constraints[1].name);
     try std.testing.expectEqualStrings("valid_time", temporal.unique_constraints[1].without_overlaps_period.?);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, temporal.unique_constraints[1].validation_state);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, temporal, add_temporal));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, temporal, add_temporal));
 
-    var not_valid = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var not_valid = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_not_deleted CHECK (status != 'deleted') NOT VALID;",
     );
     defer not_valid.deinit(alloc);
-    const with_unvalidated_check = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, not_valid);
+    const with_unvalidated_check = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, not_valid);
     defer runtime_schema.freeSchema(alloc, with_unvalidated_check);
     try std.testing.expectEqual(@as(usize, 2), with_unvalidated_check.checks.len);
     try std.testing.expectEqualStrings("usage_records_status_not_deleted", with_unvalidated_check.checks[1].name);
     try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, with_unvalidated_check.checks[1].validation_state);
 
-    var validate = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var validate = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_status_not_deleted;",
     );
     defer validate.deinit(alloc);
-    const validated = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, with_unvalidated_check, validate);
+    const validated = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, with_unvalidated_check, validate);
     defer runtime_schema.freeSchema(alloc, validated);
     try std.testing.expectEqual(@as(usize, 2), validated.checks.len);
     try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.enforced, validated.checks[1].validation_state);
 
-    var validate_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var validate_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_pkey;",
     );
     defer validate_default_pk.deinit(alloc);
-    const validated_default_pk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, validate_default_pk);
+    const validated_default_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, validate_default_pk);
     defer runtime_schema.freeSchema(alloc, validated_default_pk);
     try std.testing.expect(validated_default_pk.primary_key != null);
     try std.testing.expect(validated_default_pk.primary_key.?.name == null);
 
-    var rename_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rename_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk;",
     );
     defer rename_default_pk.deinit(alloc);
-    const renamed_default_pk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_default_pk);
+    const renamed_default_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_default_pk);
     defer runtime_schema.freeSchema(alloc, renamed_default_pk);
     try std.testing.expectEqualStrings("usage_records_id_pk", renamed_default_pk.primary_key.?.name.?);
 
-    var rename_default_pk_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rename_default_pk_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_pkey TO usage_records_tenant_status_key;",
     );
     defer rename_default_pk_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_default_pk_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_default_pk_duplicate));
 
-    var drop_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_default_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records DROP CONSTRAINT usage_records_pkey;",
     );
     defer drop_default_pk.deinit(alloc);
-    const without_default_pk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_default_pk);
+    const without_default_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_default_pk);
     defer runtime_schema.freeSchema(alloc, without_default_pk);
     try std.testing.expect(without_default_pk.primary_key == null);
 
-    var drop_named_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_named_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records DROP CONSTRAINT usage_records_id_pk;",
     );
     defer drop_named_pk.deinit(alloc);
-    const without_named_pk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, renamed_default_pk, drop_named_pk);
+    const without_named_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, renamed_default_pk, drop_named_pk);
     defer runtime_schema.freeSchema(alloc, without_named_pk);
     try std.testing.expect(without_named_pk.primary_key == null);
 
-    var drop_check = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_check;");
+    var drop_check = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_check;");
     defer drop_check.deinit(alloc);
-    const without_check = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_check);
+    const without_check = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_check);
     defer runtime_schema.freeSchema(alloc, without_check);
     try std.testing.expectEqual(@as(usize, 1), without_check.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 1), without_check.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 0), without_check.checks.len);
 
-    var drop_unique = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_tenant_status_key;");
+    var drop_unique = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_tenant_status_key;");
     defer drop_unique.deinit(alloc);
-    const without_unique = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_unique);
+    const without_unique = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_unique);
     defer runtime_schema.freeSchema(alloc, without_unique);
     try std.testing.expectEqual(@as(usize, 0), without_unique.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 1), without_unique.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 1), without_unique.checks.len);
 
-    var drop_fk = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS usage_records_tenant_fkey;");
+    var drop_fk = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS usage_records_tenant_fkey;");
     defer drop_fk.deinit(alloc);
-    const without_fk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_fk);
+    const without_fk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_fk);
     defer runtime_schema.freeSchema(alloc, without_fk);
     try std.testing.expectEqual(@as(usize, 1), without_fk.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 0), without_fk.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 1), without_fk.checks.len);
 
-    var drop_missing_constraint_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS missing_constraint;");
+    var drop_missing_constraint_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS missing_constraint;");
     defer drop_missing_constraint_if_exists.deinit(alloc);
-    const unchanged_constraints = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_missing_constraint_if_exists);
+    const unchanged_constraints = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_missing_constraint_if_exists);
     defer runtime_schema.freeSchema(alloc, unchanged_constraints);
     try std.testing.expectEqual(@as(usize, 1), unchanged_constraints.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 1), unchanged_constraints.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 1), unchanged_constraints.checks.len);
 
-    var drop_missing_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT missing_constraint;");
+    var drop_missing_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT missing_constraint;");
     defer drop_missing_constraint.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_missing_constraint));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_missing_constraint));
 
-    var set_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending';");
+    var set_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending';");
     defer set_default.deinit(alloc);
-    const with_default = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, set_default);
+    const with_default = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, set_default);
     defer runtime_schema.freeSchema(alloc, with_default);
     const status_defaulted = binder.relationalColumnForField(with_default, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(status_defaulted.default_value != null);
     try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, status_defaulted.default_value.?.kind);
     try std.testing.expectEqualStrings("\"pending\"", status_defaulted.default_value.?.value_json);
 
-    var set_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 5;");
+    var set_numeric_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 5;");
     defer set_numeric_default.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, set_numeric_default));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, set_numeric_default));
 
-    var add_amount = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN amount numeric;");
+    var add_amount = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN amount numeric;");
     defer add_amount.deinit(alloc);
-    const with_amount = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, add_amount);
+    const with_amount = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, add_amount);
     defer runtime_schema.freeSchema(alloc, with_amount);
 
-    var set_casted_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::numeric;");
+    var set_casted_numeric_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::numeric;");
     defer set_casted_numeric_default.deinit(alloc);
-    const with_casted_numeric_default = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, with_amount, set_casted_numeric_default);
+    const with_casted_numeric_default = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, with_amount, set_casted_numeric_default);
     defer runtime_schema.freeSchema(alloc, with_casted_numeric_default);
     const amount_defaulted = binder.relationalColumnForField(with_casted_numeric_default, "amount", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(amount_defaulted.default_value != null);
     try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, amount_defaulted.default_value.?.kind);
     try std.testing.expectEqualStrings("7", amount_defaulted.default_value.?.value_json);
 
-    var set_text_cast_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::text;");
+    var set_text_cast_numeric_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::text;");
     defer set_text_cast_numeric_default.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, with_amount, set_text_cast_numeric_default));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, with_amount, set_text_cast_numeric_default));
 
-    var drop_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT;");
+    var drop_default = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT;");
     defer drop_default.deinit(alloc);
-    const without_default = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, with_default, drop_default);
+    const without_default = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, with_default, drop_default);
     defer runtime_schema.freeSchema(alloc, without_default);
     const status_without_default = binder.relationalColumnForField(without_default, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(status_without_default.default_value == null);
 
-    var set_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;");
+    var set_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;");
     defer set_not_null.deinit(alloc);
-    const status_required = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, set_not_null);
+    const status_required = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, set_not_null);
     defer runtime_schema.freeSchema(alloc, status_required);
     const required_status = binder.relationalColumnForField(status_required, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!required_status.nullable);
 
-    var drop_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL;");
+    var drop_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL;");
     defer drop_not_null.deinit(alloc);
-    const status_nullable = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, status_required, drop_not_null);
+    const status_nullable = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, status_required, drop_not_null);
     defer runtime_schema.freeSchema(alloc, status_nullable);
     const nullable_status = binder.relationalColumnForField(status_nullable, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(nullable_status.nullable);
 
-    var drop_pk_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN id DROP NOT NULL;");
+    var drop_pk_not_null = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN id DROP NOT NULL;");
     defer drop_pk_not_null.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_pk_not_null));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_pk_not_null));
 
-    var alter_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE varchar(64);");
+    var alter_type = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE varchar(64);");
     defer alter_type.deinit(alloc);
-    const typed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, alter_type);
+    const typed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, alter_type);
     defer runtime_schema.freeSchema(alloc, typed);
     const typed_status = binder.relationalColumnForField(typed, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, typed_status.field_type);
     try std.testing.expect(typed_status.array_item_type == null);
     try std.testing.expect(typed_status.collation == null);
 
-    var alter_type_collated = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE text COLLATE \"C\";");
+    var alter_type_collated = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE text COLLATE \"C\";");
     defer alter_type_collated.deinit(alloc);
-    const typed_collated = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, alter_type_collated);
+    const typed_collated = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, alter_type_collated);
     defer runtime_schema.freeSchema(alloc, typed_collated);
     const collated_status = binder.relationalColumnForField(typed_collated, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, collated_status.field_type);
     try std.testing.expectEqualStrings("C", collated_status.collation.?);
 
-    var alter_collated_to_numeric = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE numeric;");
+    var alter_collated_to_numeric = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE numeric;");
     defer alter_collated_to_numeric.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, typed_collated, alter_collated_to_numeric));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, typed_collated, alter_collated_to_numeric));
 
-    var alter_generated_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN tenant_status_key TYPE text;");
+    var alter_generated_type = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN tenant_status_key TYPE text;");
     defer alter_generated_type.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, alter_generated_type));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, alter_generated_type));
 
-    var rename_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME COLUMN status TO state;");
+    var rename_status = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME COLUMN status TO state;");
     defer rename_status.deinit(alloc);
-    const renamed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_status);
+    const renamed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_status);
     defer runtime_schema.freeSchema(alloc, renamed);
     try std.testing.expect(binder.relationalColumnForField(renamed, "status", null) == null);
     const state = binder.relationalColumnForField(renamed, "state", null) orelse return error.TestUnexpectedResult;
@@ -3671,35 +3655,35 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("state", renamed.unique_constraints[0].columns[1]);
     try std.testing.expectEqualStrings("state", renamed.checks[0].field);
 
-    var rename_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME COLUMN status TO tenant_id;");
+    var rename_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME COLUMN status TO tenant_id;");
     defer rename_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_duplicate));
 
-    var rename_unique_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_tenant_status_key TO usage_records_tenant_state_key;");
+    var rename_unique_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_tenant_status_key TO usage_records_tenant_state_key;");
     defer rename_unique_constraint.deinit(alloc);
-    const renamed_unique = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_unique_constraint);
+    const renamed_unique = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_unique_constraint);
     defer runtime_schema.freeSchema(alloc, renamed_unique);
     try std.testing.expectEqualStrings("usage_records_tenant_state_key", renamed_unique.unique_constraints[0].name);
 
-    var rename_fk_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_tenant_fkey TO usage_records_tenant_fk;");
+    var rename_fk_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_tenant_fkey TO usage_records_tenant_fk;");
     defer rename_fk_constraint.deinit(alloc);
-    const renamed_fk = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_fk_constraint);
+    const renamed_fk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_fk_constraint);
     defer runtime_schema.freeSchema(alloc, renamed_fk);
     try std.testing.expectEqualStrings("usage_records_tenant_fk", renamed_fk.foreign_keys[0].name);
 
-    var rename_check_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check;");
+    var rename_check_constraint = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check;");
     defer rename_check_constraint.deinit(alloc);
-    const renamed_check = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_check_constraint);
+    const renamed_check = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_check_constraint);
     defer runtime_schema.freeSchema(alloc, renamed_check);
     try std.testing.expectEqualStrings("usage_records_state_check", renamed_check.checks[0].name);
 
-    var rename_constraint_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_tenant_status_key;");
+    var rename_constraint_duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_tenant_status_key;");
     defer rename_constraint_duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, rename_constraint_duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, rename_constraint_duplicate));
 
-    var drop_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN status;");
+    var drop_status = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN status;");
     defer drop_status.deinit(alloc);
-    const dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_status);
+    const dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_status);
     defer runtime_schema.freeSchema(alloc, dropped);
     try std.testing.expectEqual(@as(usize, 2), dropped.relational_columns.len);
     try std.testing.expect(binder.relationalColumnForField(dropped, "status", null) == null);
@@ -3708,59 +3692,59 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 1), dropped.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 0), dropped.checks.len);
 
-    var drop_missing_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN IF EXISTS missing_column;");
+    var drop_missing_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN IF EXISTS missing_column;");
     defer drop_missing_if_exists.deinit(alloc);
-    const unchanged = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_missing_if_exists);
+    const unchanged = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_missing_if_exists);
     defer runtime_schema.freeSchema(alloc, unchanged);
     try std.testing.expectEqual(@as(usize, 5), unchanged.relational_columns.len);
 
-    var drop_status_restrict = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN status RESTRICT;");
+    var drop_status_restrict = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN status RESTRICT;");
     defer drop_status_restrict.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_status_restrict));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_status_restrict));
 
-    var drop_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN id;");
+    var drop_primary_key = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN id;");
     defer drop_primary_key.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_primary_key));
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_primary_key));
 
-    var duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN status text;");
+    var duplicate = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN status text;");
     defer duplicate.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, duplicate));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, duplicate));
 
-    var duplicate_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS status text REFERENCES tenants(id);");
+    var duplicate_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS status text REFERENCES tenants(id);");
     defer duplicate_if_not_exists.deinit(alloc);
-    const unchanged_existing = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, duplicate_if_not_exists);
+    const unchanged_existing = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, duplicate_if_not_exists);
     defer runtime_schema.freeSchema(alloc, unchanged_existing);
     try std.testing.expectEqual(@as(usize, 5), unchanged_existing.relational_columns.len);
     try std.testing.expectEqual(@as(usize, 1), unchanged_existing.foreign_keys.len);
 
-    var missing_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE IF EXISTS missing_usage ADD COLUMN status text;");
+    var missing_table_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE IF EXISTS missing_usage ADD COLUMN status text;");
     defer missing_table_if_exists.deinit(alloc);
-    const missing_noop = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, missing_table_if_exists);
+    const missing_noop = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, missing_table_if_exists);
     defer runtime_schema.freeSchema(alloc, missing_noop);
     try std.testing.expectEqual(runtime_schema.StorageMode.document, missing_noop.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), missing_noop.relational_columns.len);
 
-    var missing_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_usage ADD COLUMN status text;");
+    var missing_table = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_usage ADD COLUMN status text;");
     defer missing_table.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, missing_table));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, missing_table));
 }
 
 test "catalog apply applies create index ddl plan to runtime schema" {
     const alloc = std.testing.allocator;
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, amount numeric, status text, deleted_at timestamptz, metadata jsonb, tags text[]);",
     );
     defer create.deinit(alloc);
-    const schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, create);
+    const schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
     defer runtime_schema.freeSchema(alloc, schema);
 
-    var partial_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var partial_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_active_idx ON users (status DESC NULLS LAST) WHERE deleted_at IS NULL;",
     );
     defer partial_index.deinit(alloc);
-    const indexed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, partial_index);
+    const indexed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, partial_index);
     defer runtime_schema.freeSchema(alloc, indexed);
     const status = binder.relationalColumnForField(indexed, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(status.indexed);
@@ -3771,31 +3755,31 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 1), status.index_where.len);
     try std.testing.expectEqualStrings("deleted_at", status.index_where[0].field);
 
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, indexed, partial_index));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, indexed, partial_index));
 
-    var partial_index_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var partial_index_if_not_exists = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX IF NOT EXISTS users_status_active_idx ON users (status) WHERE deleted_at IS NULL;",
     );
     defer partial_index_if_not_exists.deinit(alloc);
-    const indexed_noop = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, indexed, partial_index_if_not_exists);
+    const indexed_noop = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, indexed, partial_index_if_not_exists);
     defer runtime_schema.freeSchema(alloc, indexed_noop);
     const status_noop = binder.relationalColumnForField(indexed_noop, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(status.index_generation, status_noop.index_generation);
     try std.testing.expect(status_noop.index_name != null);
     try std.testing.expectEqualStrings("users_status_active_idx", status_noop.index_name.?);
 
-    const indexed_again = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, partial_index);
+    const indexed_again = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, partial_index);
     defer runtime_schema.freeSchema(alloc, indexed_again);
     const status_again = binder.relationalColumnForField(indexed_again, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(status.index_generation, status_again.index_generation);
 
-    var covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_email_cover_idx ON users (email) INCLUDE (tenant_id, amount);",
     );
     defer covering_index.deinit(alloc);
-    const covering_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, covering_index);
+    const covering_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, covering_index);
     defer runtime_schema.freeSchema(alloc, covering_schema);
     const covered_email = binder.relationalColumnForField(covering_schema, "email", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(covered_email.indexed);
@@ -3809,21 +3793,21 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     const covered_tenant = binder.relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
 
-    var drop_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_cover_idx;");
+    var drop_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_cover_idx;");
     defer drop_covering_index.deinit(alloc);
-    const covering_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, covering_schema, drop_covering_index);
+    const covering_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, covering_schema, drop_covering_index);
     defer runtime_schema.freeSchema(alloc, covering_dropped);
     const dropped_email_cover = binder.relationalColumnForField(covering_dropped, "email", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!dropped_email_cover.indexed);
     try std.testing.expect(dropped_email_cover.index_name == null);
     try std.testing.expectEqual(@as(usize, 0), dropped_email_cover.index_include_columns.len);
 
-    var generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_lower_email_idx ON users (lower(email));",
     );
     defer generated_index.deinit(alloc);
-    const generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, indexed, generated_index);
+    const generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, indexed, generated_index);
     defer runtime_schema.freeSchema(alloc, generated_schema);
     const generated = binder.relationalColumnForField(generated_schema, "users_lower_email_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(generated.generated != null);
@@ -3834,12 +3818,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.generated.?.op);
     try std.testing.expectEqualStrings("email", generated.generated.?.field.?);
 
-    var generated_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var generated_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_lower_email_cover_idx ON users (lower(email)) INCLUDE (tenant_id, amount);",
     );
     defer generated_covering_index.deinit(alloc);
-    const generated_covering_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, generated_schema, generated_covering_index);
+    const generated_covering_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, generated_covering_index);
     defer runtime_schema.freeSchema(alloc, generated_covering_schema);
     const generated_covering = binder.relationalColumnForField(generated_covering_schema, "users_lower_email_cover_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(generated_covering.generated != null);
@@ -3848,12 +3832,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("tenant_id", generated_covering.index_include_columns[0]);
     try std.testing.expectEqualStrings("amount", generated_covering.index_include_columns[1]);
 
-    var gin_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var gin_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_metadata_gin_cover_idx ON users USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
     );
     defer gin_covering_index.deinit(alloc);
-    const gin_covering_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, gin_covering_index);
+    const gin_covering_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, gin_covering_index);
     defer runtime_schema.freeSchema(alloc, gin_covering_schema);
     const gin_covering = binder.relationalColumnForField(gin_covering_schema, "metadata", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(gin_covering.indexed);
@@ -3861,24 +3845,24 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 1), gin_covering.index_include_columns.len);
     try std.testing.expectEqualStrings("tenant_id", gin_covering.index_include_columns[0]);
 
-    var wrapped_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var wrapped_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_lower_email_wrapped_idx ON users ((lower(email)));",
     );
     defer wrapped_generated_index.deinit(alloc);
-    const wrapped_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, generated_schema, wrapped_generated_index);
+    const wrapped_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, wrapped_generated_index);
     defer runtime_schema.freeSchema(alloc, wrapped_generated_schema);
     const wrapped_generated = binder.relationalColumnForField(wrapped_generated_schema, "users_lower_email_wrapped_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(wrapped_generated.generated != null);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, wrapped_generated.generated.?.op);
     try std.testing.expectEqualStrings("email", wrapped_generated.generated.?.field.?);
 
-    var upper_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var upper_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_upper_email_idx ON users (upper(email));",
     );
     defer upper_generated_index.deinit(alloc);
-    const upper_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, generated_schema, upper_generated_index);
+    const upper_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, upper_generated_index);
     defer runtime_schema.freeSchema(alloc, upper_generated_schema);
     const upper_generated = binder.relationalColumnForField(upper_generated_schema, "users_upper_email_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(upper_generated.generated != null);
@@ -3889,12 +3873,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, upper_generated.generated.?.op);
     try std.testing.expectEqualStrings("email", upper_generated.generated.?.field.?);
 
-    var md5_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var md5_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_md5_email_idx ON users (md5(email));",
     );
     defer md5_generated_index.deinit(alloc);
-    const md5_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_generated_schema, md5_generated_index);
+    const md5_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_generated_schema, md5_generated_index);
     defer runtime_schema.freeSchema(alloc, md5_generated_schema);
     const md5_generated = binder.relationalColumnForField(md5_generated_schema, "users_md5_email_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(md5_generated.generated != null);
@@ -3905,12 +3889,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, md5_generated.generated.?.op);
     try std.testing.expectEqualStrings("email", md5_generated.generated.?.field.?);
 
-    var concat_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var concat_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_tenant_status_idx ON users (concat(tenant_id, ':', status));",
     );
     defer concat_generated_index.deinit(alloc);
-    const concat_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_generated_schema, concat_generated_index);
+    const concat_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_generated_schema, concat_generated_index);
     defer runtime_schema.freeSchema(alloc, concat_generated_schema);
     const concat_generated = binder.relationalColumnForField(concat_generated_schema, "users_tenant_status_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(concat_generated.generated != null);
@@ -3924,12 +3908,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("status", concat_generated.generated.?.fields[1]);
     try std.testing.expectEqualStrings(":", concat_generated.generated.?.separator);
 
-    var concat_ws_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var concat_ws_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_tenant_status_ws_idx ON users (concat_ws(':', tenant_id, status));",
     );
     defer concat_ws_generated_index.deinit(alloc);
-    const concat_ws_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, concat_generated_schema, concat_ws_generated_index);
+    const concat_ws_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, concat_generated_schema, concat_ws_generated_index);
     defer runtime_schema.freeSchema(alloc, concat_ws_generated_schema);
     const concat_ws_generated = binder.relationalColumnForField(concat_ws_generated_schema, "users_tenant_status_ws_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(concat_ws_generated.generated != null);
@@ -3943,12 +3927,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("status", concat_ws_generated.generated.?.fields[1]);
     try std.testing.expectEqualStrings(":", concat_ws_generated.generated.?.separator);
 
-    var rich_expression_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rich_expression_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
     );
     defer rich_expression_generated_index.deinit(alloc);
-    const rich_expression_generated_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, concat_ws_generated_schema, rich_expression_generated_index);
+    const rich_expression_generated_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, concat_ws_generated_schema, rich_expression_generated_index);
     defer runtime_schema.freeSchema(alloc, rich_expression_generated_schema);
     const rich_expression_generated = binder.relationalColumnForField(rich_expression_generated_schema, "users_status_replace_idx", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(rich_expression_generated.generated != null);
@@ -3961,24 +3945,24 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_expression.kind);
     try std.testing.expectEqual(@as(usize, 3), rich_expression.operands.len);
 
-    var unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
     );
     defer unique_index.deinit(alloc);
-    const unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, generated_schema, unique_index);
+    const unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, unique_index);
     defer runtime_schema.freeSchema(alloc, unique_schema);
     try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_tenant_lower_email_key", unique_schema.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints[0].expressions.len);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, unique_schema.unique_constraints[0].validation_state);
 
-    var unique_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var unique_covering_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
     );
     defer unique_covering_index.deinit(alloc);
-    const unique_covering_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, unique_covering_index);
+    const unique_covering_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, unique_covering_index);
     defer runtime_schema.freeSchema(alloc, unique_covering_schema);
     try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_email_cover_key", unique_covering_schema.unique_constraints[1].name);
@@ -3988,12 +3972,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("tenant_id", unique_covering_schema.unique_constraints[1].include_columns[0]);
     try std.testing.expectEqualStrings("status", unique_covering_schema.unique_constraints[1].include_columns[1]);
 
-    var upper_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var upper_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_upper_email_key ON users (upper(email));",
     );
     defer upper_unique_index.deinit(alloc);
-    const upper_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, upper_unique_index);
+    const upper_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, upper_unique_index);
     defer runtime_schema.freeSchema(alloc, upper_unique_schema);
     try std.testing.expectEqual(@as(usize, 2), upper_unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_upper_email_key", upper_unique_schema.unique_constraints[1].name);
@@ -4002,12 +3986,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("email", upper_unique_schema.unique_constraints[1].expressions[0].field);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, upper_unique_schema.unique_constraints[1].validation_state);
 
-    var md5_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var md5_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_md5_email_key ON users (md5(email));",
     );
     defer md5_unique_index.deinit(alloc);
-    const md5_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, md5_unique_index);
+    const md5_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, md5_unique_index);
     defer runtime_schema.freeSchema(alloc, md5_unique_schema);
     try std.testing.expectEqual(@as(usize, 3), md5_unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_md5_email_key", md5_unique_schema.unique_constraints[2].name);
@@ -4016,12 +4000,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("email", md5_unique_schema.unique_constraints[2].expressions[0].field);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, md5_unique_schema.unique_constraints[2].validation_state);
 
-    var rich_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var rich_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_status_replace_key ON users (replace(status, 'old', 'new'));",
     );
     defer rich_unique_index.deinit(alloc);
-    const rich_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, md5_unique_schema, rich_unique_index);
+    const rich_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, md5_unique_schema, rich_unique_index);
     defer runtime_schema.freeSchema(alloc, rich_unique_schema);
     try std.testing.expectEqual(@as(usize, 4), rich_unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_status_replace_key", rich_unique_schema.unique_constraints[3].name);
@@ -4035,7 +4019,7 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("\"new\"", rich_unique_expression.operands[2].value_json);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, rich_unique_schema.unique_constraints[3].validation_state);
 
-    var temporal_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc,
+    var temporal_create = try logicalDdlPlanForCatalogApplyTestAlloc(alloc,
         \\CREATE TABLE prices (
         \\  id uuid PRIMARY KEY,
         \\  sku text NOT NULL,
@@ -4046,15 +4030,15 @@ test "catalog apply applies create index ddl plan to runtime schema" {
         \\);
     );
     defer temporal_create.deinit(alloc);
-    const temporal_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, temporal_create);
+    const temporal_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, temporal_create);
     defer runtime_schema.freeSchema(alloc, temporal_schema);
 
-    var temporal_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var temporal_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
     );
     defer temporal_unique_index.deinit(alloc);
-    const temporal_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, temporal_schema, temporal_unique_index);
+    const temporal_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, temporal_schema, temporal_unique_index);
     defer runtime_schema.freeSchema(alloc, temporal_unique_schema);
     try std.testing.expectEqual(@as(usize, 1), temporal_unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("prices_sku_valid_time_key", temporal_unique_schema.unique_constraints[0].name);
@@ -4062,12 +4046,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("valid_time", temporal_unique_schema.unique_constraints[0].without_overlaps_period.?);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_unique_schema.unique_constraints[0].validation_state);
 
-    var wrapped_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var wrapped_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_tenant_wrapped_lower_email_key ON users (tenant_id, (lower(email))) WHERE deleted_at IS NULL;",
     );
     defer wrapped_unique_index.deinit(alloc);
-    const wrapped_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, md5_unique_schema, wrapped_unique_index);
+    const wrapped_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, md5_unique_schema, wrapped_unique_index);
     defer runtime_schema.freeSchema(alloc, wrapped_unique_schema);
     try std.testing.expectEqual(@as(usize, 4), wrapped_unique_schema.unique_constraints.len);
     try std.testing.expectEqualStrings("users_tenant_wrapped_lower_email_key", wrapped_unique_schema.unique_constraints[3].name);
@@ -4076,12 +4060,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("email", wrapped_unique_schema.unique_constraints[3].expressions[0].field);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, wrapped_unique_schema.unique_constraints[3].validation_state);
 
-    var expression_where_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var expression_where_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_tenant_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
     );
     defer expression_where_unique_index.deinit(alloc);
-    const expression_where_unique_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, wrapped_unique_schema, expression_where_unique_index);
+    const expression_where_unique_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, wrapped_unique_schema, expression_where_unique_index);
     defer runtime_schema.freeSchema(alloc, expression_where_unique_schema);
     try std.testing.expectEqual(@as(usize, 5), expression_where_unique_schema.unique_constraints.len);
     const expression_where_unique = expression_where_unique_schema.unique_constraints[4];
@@ -4094,12 +4078,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("\"active\"", expression_where_unique.where_expressions[0].rhs[0].value_json);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, expression_where_unique.validation_state);
 
-    var gin_json_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var gin_json_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_metadata_gin ON users USING gin (metadata jsonb_path_ops);",
     );
     defer gin_json_index.deinit(alloc);
-    const json_indexed_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, gin_json_index);
+    const json_indexed_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, gin_json_index);
     defer runtime_schema.freeSchema(alloc, json_indexed_schema);
     const metadata = binder.relationalColumnForField(json_indexed_schema, "metadata", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(metadata.indexed);
@@ -4108,12 +4092,12 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(metadata.index_name != null);
     try std.testing.expectEqualStrings("users_metadata_gin", metadata.index_name.?);
 
-    var gin_array_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var gin_array_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_tags_gin ON users USING gin (tags array_ops);",
     );
     defer gin_array_index.deinit(alloc);
-    const array_indexed_schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, json_indexed_schema, gin_array_index);
+    const array_indexed_schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, json_indexed_schema, gin_array_index);
     defer runtime_schema.freeSchema(alloc, array_indexed_schema);
     const tags = binder.relationalColumnForField(array_indexed_schema, "tags", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(tags.indexed);
@@ -4122,30 +4106,30 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(tags.index_name != null);
     try std.testing.expectEqualStrings("users_tags_gin", tags.index_name.?);
 
-    var invalid_gin_scalar = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var invalid_gin_scalar = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_gin ON users USING gin (status);",
     );
     defer invalid_gin_scalar.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, invalid_gin_scalar));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_scalar));
 
-    var invalid_gin_json_opclass = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var invalid_gin_json_opclass = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_metadata_bad_gin ON users USING gin (metadata array_ops);",
     );
     defer invalid_gin_json_opclass.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, invalid_gin_json_opclass));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_json_opclass));
 
-    var invalid_gin_array_opclass = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var invalid_gin_array_opclass = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_tags_bad_gin ON users USING gin (tags jsonb_path_ops);",
     );
     defer invalid_gin_array_opclass.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, invalid_gin_array_opclass));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_array_opclass));
 
-    var drop_ordinary_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_active_idx;");
+    var drop_ordinary_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_active_idx;");
     defer drop_ordinary_index.deinit(alloc);
-    const ordinary_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, upper_unique_schema, drop_ordinary_index);
+    const ordinary_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, drop_ordinary_index);
     defer runtime_schema.freeSchema(alloc, ordinary_dropped);
     const dropped_status = binder.relationalColumnForField(ordinary_dropped, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!dropped_status.indexed);
@@ -4154,52 +4138,52 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(dropped_status.index_name == null);
     try std.testing.expectEqual(@as(usize, 0), dropped_status.index_where.len);
 
-    var concurrent_status_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var concurrent_status_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE INDEX users_status_concurrent_idx ON users (status);",
     );
     defer concurrent_status_index.deinit(alloc);
-    const concurrent_indexed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, ordinary_dropped, concurrent_status_index);
+    const concurrent_indexed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, ordinary_dropped, concurrent_status_index);
     defer runtime_schema.freeSchema(alloc, concurrent_indexed);
-    var drop_concurrent_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX CONCURRENTLY users_status_concurrent_idx;");
+    var drop_concurrent_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX CONCURRENTLY users_status_concurrent_idx;");
     defer drop_concurrent_index.deinit(alloc);
-    const concurrent_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, concurrent_indexed, drop_concurrent_index);
+    const concurrent_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, concurrent_indexed, drop_concurrent_index);
     defer runtime_schema.freeSchema(alloc, concurrent_dropped);
     const concurrent_dropped_status = binder.relationalColumnForField(concurrent_dropped, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!concurrent_dropped_status.indexed);
     try std.testing.expect(concurrent_dropped_status.index_name == null);
 
-    var drop_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_lower_email_idx;");
+    var drop_generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_lower_email_idx;");
     defer drop_generated_index.deinit(alloc);
-    const generated_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, drop_generated_index);
+    const generated_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_generated_index);
     defer runtime_schema.freeSchema(alloc, generated_dropped);
     try std.testing.expect(binder.relationalColumnForField(generated_dropped, "users_lower_email_idx", null) == null);
 
-    var drop_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
+    var drop_unique_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
     defer drop_unique_index.deinit(alloc);
-    const unique_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, drop_unique_index);
+    const unique_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_unique_index);
     defer runtime_schema.freeSchema(alloc, unique_dropped);
     try std.testing.expectEqual(@as(usize, 0), unique_dropped.unique_constraints.len);
 
-    var drop_missing_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX missing_idx;");
+    var drop_missing_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX missing_idx;");
     defer drop_missing_index.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, drop_missing_index));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_missing_index));
 
-    var drop_missing_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_idx;");
+    var drop_missing_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_idx;");
     defer drop_missing_if_exists.deinit(alloc);
-    const unchanged_drop = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, unique_schema, drop_missing_if_exists);
+    const unchanged_drop = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_missing_if_exists);
     defer runtime_schema.freeSchema(alloc, unchanged_drop);
     try std.testing.expectEqual(@as(usize, unique_schema.relational_columns.len), unchanged_drop.relational_columns.len);
     try std.testing.expectEqual(@as(usize, unique_schema.unique_constraints.len), unchanged_drop.unique_constraints.len);
 
-    const empty_drop_noop = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, drop_missing_if_exists);
+    const empty_drop_noop = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, drop_missing_if_exists);
     defer runtime_schema.freeSchema(alloc, empty_drop_noop);
     try std.testing.expectEqual(runtime_schema.StorageMode.document, empty_drop_noop.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), empty_drop_noop.relational_columns.len);
 
-    var multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_tenant_status_idx ON users (tenant_id, status);");
+    var multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_tenant_status_idx ON users (tenant_id, status);");
     defer multi_column_index.deinit(alloc);
-    const multi_indexed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, multi_column_index);
+    const multi_indexed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, multi_column_index);
     defer runtime_schema.freeSchema(alloc, multi_indexed);
     const indexed_tenant = binder.relationalColumnForField(multi_indexed, "tenant_id", null) orelse return error.TestUnexpectedResult;
     const indexed_status = binder.relationalColumnForField(multi_indexed, "status", null) orelse return error.TestUnexpectedResult;
@@ -4214,9 +4198,9 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("users_tenant_status_idx", indexed_tenant.index_name.?);
     try std.testing.expectEqualStrings("users_tenant_status_idx", indexed_status.index_name.?);
 
-    var drop_multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_status_idx;");
+    var drop_multi_column_index = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_status_idx;");
     defer drop_multi_column_index.deinit(alloc);
-    const multi_dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, multi_indexed, drop_multi_column_index);
+    const multi_dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, multi_indexed, drop_multi_column_index);
     defer runtime_schema.freeSchema(alloc, multi_dropped);
     const dropped_tenant = binder.relationalColumnForField(multi_dropped, "tenant_id", null) orelse return error.TestUnexpectedResult;
     const dropped_multi_status = binder.relationalColumnForField(multi_dropped, "status", null) orelse return error.TestUnexpectedResult;
@@ -4228,104 +4212,104 @@ test "catalog apply applies create index ddl plan to runtime schema" {
 
 test "catalog apply applies updated-at trigger ddl plan to runtime schema" {
     const alloc = std.testing.allocator;
-    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint, CONSTRAINT usage_records_updated_check CHECK (updated_at_ns >= 0));",
     );
     defer create.deinit(alloc);
-    const schema = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, create);
+    const schema = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
     defer runtime_schema.freeSchema(alloc, schema);
 
-    var table_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE usage_records IS 'metered usage rows';");
+    var table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE usage_records IS 'metered usage rows';");
     defer table_comment.deinit(alloc);
-    const table_commented = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, table_comment);
+    const table_commented = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, table_comment);
     defer runtime_schema.freeSchema(alloc, table_commented);
     try std.testing.expectEqual(runtime_schema.StorageMode.relational, table_commented.storage_mode);
     try std.testing.expectEqual(schema.relational_columns.len, table_commented.relational_columns.len);
 
-    var column_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.updated_at_ns IS 'update clock';");
+    var column_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.updated_at_ns IS 'update clock';");
     defer column_comment.deinit(alloc);
-    const column_commented = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, column_comment);
+    const column_commented = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, column_comment);
     defer runtime_schema.freeSchema(alloc, column_commented);
     try std.testing.expect(binder.relationalColumnForField(column_commented, "updated_at_ns", null) != null);
 
-    var clear_column_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.updated_at_ns IS NULL;");
+    var clear_column_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.updated_at_ns IS NULL;");
     defer clear_column_comment.deinit(alloc);
-    const column_cleared = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, clear_column_comment);
+    const column_cleared = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, clear_column_comment);
     defer runtime_schema.freeSchema(alloc, column_cleared);
     try std.testing.expect(binder.relationalColumnForField(column_cleared, "updated_at_ns", null) != null);
 
-    var missing_column_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.missing IS 'missing';");
+    var missing_column_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN usage_records.missing IS 'missing';");
     defer missing_column_comment.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, missing_column_comment));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, missing_column_comment));
 
-    var index_plan = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX usage_records_updated_idx ON usage_records (updated_at_ns);");
+    var index_plan = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX usage_records_updated_idx ON usage_records (updated_at_ns);");
     defer index_plan.deinit(alloc);
-    const indexed = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, index_plan);
+    const indexed = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, index_plan);
     defer runtime_schema.freeSchema(alloc, indexed);
 
-    var index_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX usage_records_updated_idx IS 'updated-at lookup';");
+    var index_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX usage_records_updated_idx IS 'updated-at lookup';");
     defer index_comment.deinit(alloc);
-    const index_commented = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, indexed, index_comment);
+    const index_commented = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, indexed, index_comment);
     defer runtime_schema.freeSchema(alloc, index_commented);
     try std.testing.expect(binder.relationalIndexNameExists(index_commented, "usage_records_updated_idx"));
 
-    var constraint_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT usage_records_updated_check ON usage_records IS 'valid update clock';");
+    var constraint_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT usage_records_updated_check ON usage_records IS 'valid update clock';");
     defer constraint_comment.deinit(alloc);
-    const constraint_commented = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, constraint_comment);
+    const constraint_commented = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, constraint_comment);
     defer runtime_schema.freeSchema(alloc, constraint_commented);
     try std.testing.expect(binder.relationalConstraintNameExists(constraint_commented, "usage_records", "usage_records_updated_check"));
 
-    var missing_constraint_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT missing_check ON usage_records IS 'missing';");
+    var missing_constraint_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT missing_check ON usage_records IS 'missing';");
     defer missing_constraint_comment.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, missing_constraint_comment));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, missing_constraint_comment));
 
-    var trigger = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var trigger = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
     );
     defer trigger.deinit(alloc);
-    const updated = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, trigger);
+    const updated = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, trigger);
     defer runtime_schema.freeSchema(alloc, updated);
 
     const column = binder.relationalColumnForField(updated, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(column.on_update_value != null);
     try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, column.on_update_value.?.kind);
 
-    var drop_trigger = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_trigger = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "DROP TRIGGER update_timestamp ON usage_records;",
     );
     defer drop_trigger.deinit(alloc);
-    const dropped = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, updated, drop_trigger);
+    const dropped = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_trigger);
     defer runtime_schema.freeSchema(alloc, dropped);
     const dropped_column = binder.relationalColumnForField(dropped, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(dropped_column.on_update_value == null);
 
-    var drop_trigger_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(
+    var drop_trigger_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;",
     );
     defer drop_trigger_if_exists.deinit(alloc);
-    const unchanged = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, dropped, drop_trigger_if_exists);
+    const unchanged = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, dropped, drop_trigger_if_exists);
     defer runtime_schema.freeSchema(alloc, unchanged);
     const unchanged_column = binder.relationalColumnForField(unchanged, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
     try std.testing.expect(unchanged_column.on_update_value == null);
 
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, dropped, drop_trigger));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, dropped, drop_trigger));
 
-    var drop_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE usage_records;");
+    var drop_table = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE usage_records;");
     defer drop_table.deinit(alloc);
-    const dropped_table = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, schema, drop_table);
+    const dropped_table = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, schema, drop_table);
     defer runtime_schema.freeSchema(alloc, dropped_table);
     try std.testing.expectEqual(runtime_schema.StorageMode.document, dropped_table.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), dropped_table.relational_columns.len);
     try std.testing.expect(dropped_table.primary_key == null);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, drop_table));
+    try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, drop_table));
 
-    var drop_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE IF EXISTS usage_records;");
+    var drop_table_if_exists = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE IF EXISTS usage_records;");
     defer drop_table_if_exists.deinit(alloc);
-    const missing_table_noop = try applyLoweredDdlPlanToRuntimeSchemaForTestAlloc(alloc, .{}, drop_table_if_exists);
+    const missing_table_noop = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, drop_table_if_exists);
     defer runtime_schema.freeSchema(alloc, missing_table_noop);
     try std.testing.expectEqual(runtime_schema.StorageMode.document, missing_table_noop.storage_mode);
 }
@@ -4335,10 +4319,10 @@ test "catalog apply emits typed row rewrite plan for column rename" {
     const schema_v1 =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
     ;
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, schema_v1, .{ .alter_table = .{
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, schema_v1, .{ .table_ddl = .{ .alter_table = .{
         .table_name = "events",
         .operations = &.{.{ .rename_column = .{ .old_name = "status", .new_name = "state" } }},
-    } });
+    } } });
     defer applied.deinit(alloc);
 
     try std.testing.expect(applied.rewrite_required);
@@ -4358,10 +4342,10 @@ test "catalog apply emits typed row rewrite plan for column drop" {
     const schema_v1 =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"legacy_status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
     ;
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, schema_v1, .{ .alter_table = .{
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, schema_v1, .{ .table_ddl = .{ .alter_table = .{
         .table_name = "events",
         .operations = &.{.{ .drop_column = .{ .name = "legacy_status" } }},
-    } });
+    } } });
     defer applied.deinit(alloc);
 
     try std.testing.expect(applied.rewrite_required);

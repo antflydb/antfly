@@ -1099,6 +1099,8 @@ contract until storage and API row plans grow those outer-join semantics.
    closed before fallback projection parsing can accept it; fixed select-list
    function branches now also validate the retained function-name token against
    the typed branch, including accepted aliases such as `jsonb_typeof`;
+   aggregate specs now validate the retained function-name token against the
+   typed aggregate op before accepting aggregate argument/filter metadata;
    select-list,
    `GROUP BY`, and order-expression item handoffs now also require the
    retained generated expression payload to be internally valid at the lookup
