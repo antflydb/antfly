@@ -2971,105 +2971,10 @@ pub fn build(b: *std.Build) void {
     const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
     antfly_client_pkg_test_step.dependOn(&run_antfly_client_pkg_tests.step);
 
-    const root_test_skip_filters = [_][]const u8{
-        "metadata http cluster simulation",
-        "managed host simulation",
-        "managed http host simulation",
-        "managed http cluster simulation",
-        "cluster simulation",
-        "http host simulation",
-        "simulation harness module compiles",
-        "lsm backend simulation",
-        "persistent sim ",
-        "wal sim ",
-        "index manager sim ",
-        "db split sim ",
-        "HBC recall",
-    };
-    const unit_progress_skip_filters = root_test_skip_filters ++ [_][]const u8{
-        "lsm backend compaction chaos campaign",
-    };
-    const lib_unit_default_filters = [_][]const u8{
-        ".test_0",
-        "module compiles",
-        "batch parser preserves oversized value errors",
-        "batch parser accepts raw payload value under public request cap",
-        "linear merge request parser accepts raw payload value under public request cap",
-        "query parser accepts direct graph metric reads",
-        "query parser accepts graph metric rerank",
-        "query parser accepts public generated match helper shape with explicit nulls",
-        "query parser accepts public query string full text",
-        "query encoder emits graph metric results",
-        "query encoder supports count-only and profile responses",
-        "query profile reports failed graph metric status across read surfaces",
-        "query merge applies deterministic graph metric top-k across shards",
-        "query merge rejects missing or unpublished graph metric shard results",
-        "query merge rejects duplicate direct graph metric score nodes",
-        "query merge rejects non-finite direct graph metric scores",
-        "query merge rejects duplicate direct graph metric shard results",
-        "query merge rejects mismatched direct graph metric shard identity",
-        "query merge rejects inconsistent graph metric fan-in status state",
-        "query merge rejects non-finite graph metric fan-in status numbers",
-        "query merge rejects out-of-range graph metric fan-in progress",
-        "query merge rejects incompatible graph metric fan-in metadata",
-        "query merge rejects unsolicited graph score surfaces",
-        "query merge rejects unsolicited graph search metric status",
-        "query merge validates included graph search metric status list",
-        "query merge rejects malformed graph search metric payloads",
-        "query merge rejects malformed graph search traversal payloads",
-        "query merge rejects malformed graph search hit payloads",
-        "query merge preserves failed graph metric status across shard fan-in",
-        "query merge requires comparable graph search metric generations across shards",
-        "query merge allows unpublished projected graph search metric status",
-        "query merge rejects ambiguous graph search fan-in metric status",
-        "query merge preserves failed graph search metric status across shards",
-        "query merge enforces graph search order and filter metric generations across shards",
-        "lowered sql recursive cte plans execute bounded materialization",
-        "query profile reports merged graph search metric generation",
-        "query merge requires comparable graph metric rerank generations across shards",
-        "query merge rejects malformed graph metric rerank score details",
-        "query merge rejects missing or unpublished graph metric rerank shard status",
-        "query encoder emits graph metric rerank score details",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
-        "graph metric order and filter dependencies attach status without projection",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
-        "graph metric failed planned build cleans abandoned scores and job namespace",
-        "graph metric failed planned build retains bounded diagnostics",
-        "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
-        "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
-        "graph metric repeated failed hits builds bound diagnostics and cleanup abandoned namespaces",
-        "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
-        "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
-        "provisioned table write cache retires stale db when index metadata changes",
-        "primary lookup adopts seeded write cache across visible generation bump",
-        "pgwire cancel registry matches backend key data",
-        "pgwire parse infers text parameter oids outside literals and comments",
-        "pgwire text parameters decode to typed sql values without rewriting sql",
-        "pgwire binary parameters decode to typed sql values",
-        "pgwire binary result encoders use postgres wire layouts",
-        "pgwire relational column descriptions use postgres-compatible text types",
-        "pgwire sqlstate mapping preserves postgres error classes",
-        "retrieval agent treats aggregations as first-class tool capability",
-        "retrieval agent requires filter and aggregate tools for filtered aggregations",
-        "retrieval agent ignores empty map-valued tool fields for policy and strategy",
-    };
-    const lib_unit_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_unit_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-    for (root_test_skip_filters) |filter| {
-        run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
-    const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
-    root_test_step.dependOn(&run_lib_unit_tests.step);
+    const root_test_skip_filters = antfly_tests_build.RootTestFilters.skip;
+    const unit_progress_skip_filters = antfly_tests_build.RootTestFilters.unit_progress_skip;
+    const root_module_tests = antfly_tests_build.addRootTestStep(b, lib_test_mod);
+    const root_test_step = root_module_tests.step;
 
     const lake_scaffold_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
@@ -4620,7 +4525,7 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
-        &run_lib_unit_tests.step,
+        &root_module_tests.run.step,
         &run_lib_metadata_tests.step,
         &run_lib_storage_tests.step,
         &run_lsm_backend_tests.step,

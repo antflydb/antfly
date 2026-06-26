@@ -9,6 +9,11 @@ pub const postgres_reference = .{
     .branch = "master",
     .commit = "4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5",
     .commit_date = "2026-06-23",
+    .gram_y = "https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/gram.y",
+    .scan_l = "https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l",
+};
+pub const cockroach_reference = .{
+    .sql_y = "https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y",
 };
 
 pub const source_sha256_hex = "12a86e3045f9f63cfad075a25ce100bb6ca7b4dd30cd082fed627e0dd33b8d0b";

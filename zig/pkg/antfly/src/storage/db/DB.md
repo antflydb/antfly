@@ -193,15 +193,31 @@ Start with these large modules, adjusting names as the code settles:
   graph search composition, doc-set filters, algebraic doc filters, and
   hydrated-result projection callbacks.
 
+- `db/aggregations.zig`
+  Search aggregation request/result types, document-scan aggregation execution,
+  algebraic/distributed aggregation adapters, pipeline aggregation execution,
+  and aggregation-specific test coverage. This is a lower-level domain module
+  exported through `db/mod.zig` for API, C API, serverless, and bench callers;
+  it should not become a `DB.Impl` module unless it grows DB-owned orchestration
+  responsibilities.
+
 - `db/ha_replication.zig` if HA helper volume continues to grow.
   HA write-gate evaluation, mirror preflight, commit gating, best-effort mirror
   helpers, and shared HA context plumbing. Mutating modules should still make
   HA guard calls obvious at their public DB entry points.
 
 Keep existing domain modules such as `core.zig`, `types.zig`,
-`relational_store.zig`, `query/`, `catalog/`, `derived/`, `enrichment/`, and
-`maintenance/` as the lower-level building blocks. The new modules should
-organize `DB` orchestration code, not absorb everything underneath them.
+`relational_store.zig`, `aggregations.zig`, `query/`, `catalog/`, `derived/`,
+`enrichment/`, and `maintenance/` as the lower-level building blocks. The new
+modules should organize `DB` orchestration code, not absorb everything
+underneath them.
+
+Graph metric maintenance is split intentionally: `db/search_runtime.zig` owns
+the public DB entry points and keeps the DB mutation gate visible at those entry
+points, while `db/maintenance/graph_metric_runtime.zig` owns the lower-level
+runtime, scheduler, role, lease, worker, and planned-build test coverage. Do
+not move that runtime into `search_runtime.zig` just to make the file list
+shorter.
 
 ## Shared Internal State
 
@@ -282,6 +298,14 @@ Cross-subsystem workflow tests can remain in `db.zig` when they prove the whole
 `DB` composition through public behavior. Examples include restore plus
 enrichment plus dense rebuild, split plus relational rows plus index replay, and
 transaction plus foreign key action scheduling.
+
+Build target wiring should follow the same ownership rule. Keep filter buckets
+and focused DB/API test registration in `pkg/antfly/build/tests.zig`; `build.zig`
+should call coarse helpers such as `addDBRootModuleTestSteps`,
+`addDBStorageTestSteps`, `addAPIDocIdTestSteps`, and
+`addGraphMetricTestSteps` instead of accumulating a hand-maintained list of
+individual test titles. New tests should prefer stable module/category prefixes
+over one-off titles in build files.
 
 HA and Lite tests should be kept where they prove the boundary:
 

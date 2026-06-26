@@ -20,6 +20,9 @@ pub const Grammar = struct {
     postgres_branch: []const u8 = "",
     postgres_commit: []const u8 = "",
     postgres_commit_date: []const u8 = "",
+    postgres_gram_y: []const u8 = "",
+    postgres_scan_l: []const u8 = "",
+    cockroach_sql_y: []const u8 = "",
     tokens: std.ArrayListUnmanaged([]const u8) = .empty,
     rules: std.ArrayListUnmanaged(Rule) = .empty,
 };
@@ -171,7 +174,11 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
 }
 
 fn stripLineComment(line: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, line, "//")) |idx| return line[0..idx];
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, line, index, "//")) |idx| {
+        if (idx == 0 or std.ascii.isWhitespace(line[idx - 1])) return line[0..idx];
+        index = idx + 2;
+    }
     return line;
 }
 
@@ -188,6 +195,12 @@ fn parseReference(grammar: *Grammar, line: []const u8) !void {
         grammar.postgres_commit = value;
     } else if (std.mem.eql(u8, key, "postgres_commit_date")) {
         grammar.postgres_commit_date = value;
+    } else if (std.mem.eql(u8, key, "postgres_gram_y")) {
+        grammar.postgres_gram_y = value;
+    } else if (std.mem.eql(u8, key, "postgres_scan_l")) {
+        grammar.postgres_scan_l = value;
+    } else if (std.mem.eql(u8, key, "cockroach_sql_y")) {
+        grammar.cockroach_sql_y = value;
     }
 }
 
@@ -557,6 +570,11 @@ fn emitZigMetadata(
         \\    .branch = "{s}",
         \\    .commit = "{s}",
         \\    .commit_date = "{s}",
+        \\    .gram_y = "{s}",
+        \\    .scan_l = "{s}",
+        \\}};
+        \\pub const cockroach_reference = .{{
+        \\    .sql_y = "{s}",
         \\}};
         \\
         \\pub const source_sha256_hex = "{s}";
@@ -579,6 +597,9 @@ fn emitZigMetadata(
         grammar.postgres_branch,
         grammar.postgres_commit,
         grammar.postgres_commit_date,
+        grammar.postgres_gram_y,
+        grammar.postgres_scan_l,
+        grammar.cockroach_sql_y,
         &source_hash,
         grammar.start_symbol,
         grammar.tokens.items.len,
@@ -822,6 +843,7 @@ fn emitZigMetadata(
         \\    }
         \\    return null;
         \\}
+        \\
     );
     return out.toOwnedSlice(allocator);
 }
@@ -996,6 +1018,31 @@ test "parseGrammar handles tokens start productions and empty alternatives" {
     try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[1].alternatives.items[0].symbols.len);
 }
 
+test "parseGrammar preserves reference URLs while stripping real comments" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\// leading comment
+        \\%reference postgres_major 19
+        \\%reference postgres_gram_y https://github.com/postgres/postgres/blob/hash/src/backend/parser/gram.y
+        \\%reference postgres_scan_l https://github.com/postgres/postgres/blob/hash/src/backend/parser/scan.l // trailing comment
+        \\%reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
+        \\%start stmt
+        \\%token SELECT
+        \\stmt:
+        \\    SELECT // trailing comment
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqualStrings("19", grammar.postgres_major);
+    try std.testing.expectEqualStrings("https://github.com/postgres/postgres/blob/hash/src/backend/parser/gram.y", grammar.postgres_gram_y);
+    try std.testing.expectEqualStrings("https://github.com/postgres/postgres/blob/hash/src/backend/parser/scan.l", grammar.postgres_scan_l);
+    try std.testing.expectEqualStrings("https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y", grammar.cockroach_sql_y);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("SELECT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+}
+
 test "buildSlrTables builds conflict-free tables for a small grammar" {
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_impl.deinit();
@@ -1042,6 +1089,9 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     const source =
         \\%reference postgres_major 19
         \\%reference postgres_commit abc
+        \\%reference postgres_gram_y https://example.test/postgres/gram.y
+        \\%reference postgres_scan_l https://example.test/postgres/scan.l
+        \\%reference cockroach_sql_y https://example.test/cockroach/sql.y
         \\%start stmt
         \\%token SELECT IDENT
         \\stmt:
@@ -1054,6 +1104,10 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const state_count = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const actions = [_]Action") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const conflicts = [_]Conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".scan_l = \"https://example.test/postgres/scan.l\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".sql_y = \"https://example.test/cockroach/sql.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
 }
 

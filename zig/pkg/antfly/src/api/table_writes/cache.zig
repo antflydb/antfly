@@ -1855,6 +1855,110 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
+test "provisioned table write cache retires stale db when index metadata changes" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-metadata-refresh", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = "";
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            table_records[0].indexes_json = indexes_json_buf;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    Catalog.indexes_json_buf = "{\"first_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var first = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    var first_released = false;
+    defer if (!first_released) first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+
+    Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.entry.?.retired);
+    try std.testing.expect(second.entry.? != first.entry.?);
+    try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
+    try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
+
+    first.deinit(alloc);
+    first_released = true;
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+}
+
+test "managed status-only cache open skips shared bulk ingest session state" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-status-only-bulk", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const catalog = testingEmptyIndexesCatalog();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    try write_cache.beginBulkIngestLocked("docs");
+    try std.testing.expectEqual(@as(usize, 1), write_cache.active_bulk_ingest_sessions.items.len);
+    var cached_seed = try write_cache.getOrOpenLocked(path, catalog, 7001, 0, "docs");
+    defer cached_seed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(write_cache.entries.items[0].bulk_ingest_session_open);
+
+    var cached = try write_cache.getOrOpenLockedMode(path, catalog, 7001, 0, "docs", .status_only);
+    defer cached.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(write_cache.entries.items[0].bulk_ingest_session_open);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.active_bulk_ingest_sessions.items.len);
+}
+
 test "full text memory attribution aggregation includes norm bytes" {
     var dst = db_mod.TextMemoryAttributionStats{
         .inverted_header_bytes = 3,

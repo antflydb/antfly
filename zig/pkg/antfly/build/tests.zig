@@ -77,6 +77,12 @@ pub const GraphMetricTestRuns = struct {
     default_gate: *std.Build.Step.Run,
 };
 
+pub const RootTestStep = struct {
+    tests: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+    step: *std.Build.Step,
+};
+
 pub const db_root_step_name = "lib-db-test";
 pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
@@ -219,6 +225,106 @@ pub const DBTestFilters = struct {
 };
 
 pub const APITestFilters = struct {
+    pub const public_api_parity = [_][]const u8{
+        "public openapi contract module is generated and wired",
+        "admin openapi contract module is generated and wired",
+        "internal openapi contract module is generated and wired",
+        "metadata openapi module generates extractor surface for routed endpoints",
+        "usermgr openapi module generates extractor surface for routed endpoints",
+        "client openapi module resolves shared refs through owner modules",
+        "public api routes compile",
+        "mcp table tools expose catalog fields and route supported catalog lifecycle targets",
+        "internal group write routes expose unique integrity",
+        "internal group write routes expose foreign key action job requeue",
+        "batch parser accepts Go transform op spelling",
+        "public table contract exposes migration metadata",
+        "table contract accepts public field scoped full text create index",
+        "api http client round-trips public table management routes",
+        "api http server serves status",
+        "api http server returns json eval and query builder validation errors",
+        "api http server returns json not found for missing query builder table",
+        "api http server serves eval response envelope",
+        "api http server serves query builder response envelope",
+        "api http server query builder infers semantic indexes from table metadata",
+        "api http server query builder handles tree graph indexes",
+        "api http server query builder replays clarification decisions",
+        "api http server serves secrets crud when backed by a local store",
+        "api http server lists secrets status without a local secret store",
+        "api http server rejects secret writes without a local secret store",
+        "api http server serves table lookup with version header",
+        "api http server serves table scan as ndjson",
+        "api http server routes table query through read schema full text index",
+        "api http server serves table query response envelope",
+        "api http server serves retrieval agent response envelope",
+        "api http server serves table batch writes",
+        "api http server exposes relational foreign key integrity repair",
+        "api http server exposes relational unique integrity repair",
+        "auto bulk max-window session rolls without a following write",
+        "auto bulk group writes release leases so idle finish can publish",
+        "auto bulk max-window rolls publish all threshold aligned docs",
+        "provisioned table write source seeds doc identity namespace from table range",
+        "provisioned table write source cached runtime status does not fetch catalog coverage",
+        "managed startup catch-up uses provided indexes json without catalog fetch",
+        "api http server serves table batch transforms",
+        "api http server updates local table schema through bound write source",
+        "api http server serves public transaction commit route",
+        "api http server surfaces structured participant diagnostics for unavailable transaction commits",
+        "api http server surfaces structured decision conflicts for transaction commits",
+        "api http server surfaces structured torn-state conflicts when txn record is missing",
+        "api http server surfaces structured torn-state conflicts when txn record is corrupted",
+        "api http server serves transaction session cleanup route",
+        "api http server serves table metadata list and detail",
+        "api http server serves runtime schema debug on table and index detail",
+        "api http server serves table index metadata routes",
+        "api index status prefers best-effort write runtime status",
+        "api index status prefers cached read runtime status before write status",
+        "api index status does not fall through to write runtime status when read cache is empty",
+        "api index status uses propagated remote store runtime status",
+        "api index status ignores propagated runtime status from removed owner",
+        "api index status reports missing remote shard as not ready",
+        "single embeddings index encoder keeps backfill active while enrichment replay lags",
+        "api http server serves local index runtime backfill status",
+        "api http server graph metric action endpoint returns updated status",
+        "api http server serves provisioned index runtime backfill status across shards",
+        "api http server derives public SQL DDL command tags from parsed statements",
+        "optional pgwire listener rejects host without port",
+        "api http server serves database and namespace catalog routes",
+        "explicit catalog routes declare qualified namespace and table permissions",
+        "api http server serves table create and drop",
+        "api http server serves table metadata routes against real metadata service",
+        "api http server create table with replication sources returns encoded table detail",
+        "api http server exposes relational foreign key integrity repair",
+        "api http server exposes relational unique integrity repair",
+        "api http server lists cluster backups through public route",
+        "api http server backs up and restores a table through public routes",
+        "api http server prefers metadata-owned restore over inline write-source restore",
+        "public API request body limit matches Go linear merge contract",
+        "public api smoke e2e creates table inserts and queries documents",
+        "public api e2e supports graph queries",
+        "public api e2e recreates managed embeddings index after corrupt artifact",
+        "public api split e2e uses distributed global text stats for bm25 and significant_terms",
+        "public api multi-node e2e routes CRUD from a non-host node",
+    };
+
+    pub const public_api_graph_metric_e2e = [_][]const u8{
+        "public index contract exposes runtime status metadata",
+        "indexes openapi parses graph metric runtime summary",
+        "client openapi parses graph metric runtime summary",
+        "client openapi module resolves shared refs through owner modules",
+        "api http server graph metric action endpoint returns updated status",
+        "public api e2e supports graph queries",
+    };
+
+    pub const resolution_source = [_][]const u8{
+        "DistributedCandidateSource",
+        "prefixUpperBoundAlloc",
+        "DistributedEntitySink",
+    };
+
+    pub const swarm_backup_restore = [_][]const u8{
+        "public api swarm-like e2e backs up drops and restores a table",
+    };
+
     pub const auth = [_][]const u8{
         "api http server requires auth on public routes when enabled",
         "api http server dispatches HA admin and internal executors",
@@ -910,6 +1016,8 @@ pub const APITestFilters = struct {
         "hosted provisioned table write source globally plans relational mutation source across local owner ranges",
         "provisioned table write source consistent visibility hook does not block on busy apply lock",
         "provisioned table write source consistent visibility refreshes stale dense status",
+        "provisioned table write cache retires stale db when index metadata changes",
+        "managed status-only cache open skips shared bulk ingest session state",
     };
 
     pub const provisioned_query_visibility = [_][]const u8{
@@ -1101,6 +1209,96 @@ pub const APITestFilters = struct {
         "storage.db.search_runtime.test.db search runtime identity ",
         "doc filter wire rejects old required-field fixtures but tolerates additive fields",
         "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+    };
+};
+
+pub const RootTestFilters = struct {
+    pub const skip = [_][]const u8{
+        "metadata http cluster simulation",
+        "managed host simulation",
+        "managed http host simulation",
+        "managed http cluster simulation",
+        "cluster simulation",
+        "http host simulation",
+        "simulation harness module compiles",
+        "lsm backend simulation",
+        "persistent sim ",
+        "wal sim ",
+        "index manager sim ",
+        "db split sim ",
+        "HBC recall",
+    };
+
+    pub const unit_progress_skip = skip ++ [_][]const u8{
+        "lsm backend compaction chaos campaign",
+    };
+
+    pub const fast = [_][]const u8{
+        ".test_0",
+        "module compiles",
+        "batch parser preserves oversized value errors",
+        "batch parser accepts raw payload value under public request cap",
+        "linear merge request parser accepts raw payload value under public request cap",
+        "query parser accepts direct graph metric reads",
+        "query parser accepts graph metric rerank",
+        "query parser accepts public generated match helper shape with explicit nulls",
+        "query parser accepts public query string full text",
+        "query encoder emits graph metric results",
+        "query encoder supports count-only and profile responses",
+        "query profile reports failed graph metric status across read surfaces",
+        "query merge applies deterministic graph metric top-k across shards",
+        "query merge rejects missing or unpublished graph metric shard results",
+        "query merge rejects duplicate direct graph metric score nodes",
+        "query merge rejects non-finite direct graph metric scores",
+        "query merge rejects duplicate direct graph metric shard results",
+        "query merge rejects mismatched direct graph metric shard identity",
+        "query merge rejects inconsistent graph metric fan-in status state",
+        "query merge rejects non-finite graph metric fan-in status numbers",
+        "query merge rejects out-of-range graph metric fan-in progress",
+        "query merge rejects incompatible graph metric fan-in metadata",
+        "query merge rejects unsolicited graph score surfaces",
+        "query merge rejects unsolicited graph search metric status",
+        "query merge validates included graph search metric status list",
+        "query merge rejects malformed graph search metric payloads",
+        "query merge rejects malformed graph search traversal payloads",
+        "query merge rejects malformed graph search hit payloads",
+        "query merge preserves failed graph metric status across shard fan-in",
+        "query merge requires comparable graph search metric generations across shards",
+        "query merge allows unpublished projected graph search metric status",
+        "query merge rejects ambiguous graph search fan-in metric status",
+        "query merge preserves failed graph search metric status across shards",
+        "query merge enforces graph search order and filter metric generations across shards",
+        "lowered sql recursive cte plans execute bounded materialization",
+        "query profile reports merged graph search metric generation",
+        "query merge requires comparable graph metric rerank generations across shards",
+        "query merge rejects malformed graph metric rerank score details",
+        "query merge rejects missing or unpublished graph metric rerank shard status",
+        "query encoder emits graph metric rerank score details",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "graph metric order and filter dependencies attach status without projection",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
+        "graph metric failed planned build cleans abandoned scores and job namespace",
+        "graph metric failed planned build retains bounded diagnostics",
+        "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed hits builds bound diagnostics and cleanup abandoned namespaces",
+        "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned table write cache retires stale db when index metadata changes",
+        "primary lookup adopts seeded write cache across visible generation bump",
+        "pgwire cancel registry matches backend key data",
+        "pgwire parse infers text parameter oids outside literals and comments",
+        "pgwire text parameters decode to typed sql values without rewriting sql",
+        "pgwire binary parameters decode to typed sql values",
+        "pgwire binary result encoders use postgres wire layouts",
+        "pgwire relational column descriptions use postgres-compatible text types",
+        "pgwire sqlstate mapping preserves postgres error classes",
+        "retrieval agent treats aggregations as first-class tool capability",
+        "retrieval agent requires filter and aggregate tools for filtered aggregations",
+        "retrieval agent ignores empty map-valued tool fields for policy and strategy",
     };
 };
 
@@ -1482,6 +1680,31 @@ fn addFocusedTestStep(
 ) void {
     const step = b.step(name, description);
     step.dependOn(&run.step);
+}
+
+pub fn addRootTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+) RootTestStep {
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = selectTestFilters(b, &RootTestFilters.fast),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run = b.addRunArtifact(tests);
+    for (RootTestFilters.skip) |filter| {
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
+    const step = b.step("root-test", "Run fast root-module compile smoke tests");
+    step.dependOn(&run.step);
+    return .{
+        .tests = tests,
+        .run = run,
+        .step = step,
+    };
 }
 
 pub fn addGraphMetricTestSteps(

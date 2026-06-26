@@ -27,13 +27,19 @@ The reusable generator machinery lives under `zig/lib/yacc`, following the same
 library-plus-codegen shape as `zig/lib/openapi`. Antfly SQL owns only the input
 grammar, migration docs, and checked-in generated output under this directory.
 Use `zig build regen-sql-grammar` to refresh checked-in grammar metadata and
-`zig build sql-grammar-generated-check` to verify it is current.
+`zig build sql-grammar-generated-check` to verify it is current. The checked-in
+generated metadata retains the PostgreSQL version/branch/commit/date plus the
+referenced PostgreSQL `gram.y`, PostgreSQL `scan.l`, and CockroachDB `sql.y`
+URLs from the grammar seed, keeping compatibility provenance visible without
+vendoring those grammars.
 
 The first generator implementation builds deterministic SLR parser tables:
 grammar parsing, production validation, nullable/FIRST/FOLLOW sets, LR(0)
 states, indexed action/goto tables, source-aware syntax diagnostics, and
-structured conflict reporting. The current broad Antfly SQL seed grammar
-generates deterministic parser metadata with tracked conflict reporting. The
+structured conflict reporting. Generator tests cover URL-bearing reference
+metadata so `https://` references are not confused with grammar comments. The
+current broad Antfly SQL seed grammar generates deterministic parser metadata
+with tracked conflict reporting. The
 first runtime integration observes the generated parser on the `ParsedSql` path
 but does not require grammar parity
 before the existing parser can handle a statement. When the generated parser
