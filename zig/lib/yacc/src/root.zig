@@ -805,7 +805,7 @@ fn emitZigMetadata(
         \\    return null;
         \\}
         \\
-        \\pub const Rule = enum {
+        \\const Rule = enum {
         \\
     );
     for (grammar.rules.items) |rule| try appendFmt(allocator, &out, "    {s},\n", .{rule.name});
@@ -1354,6 +1354,7 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbols") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Symbol") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Rule") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".scan_l = \"https://example.test/postgres/scan.l\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);

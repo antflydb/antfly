@@ -212999,7 +212999,7 @@ pub fn terminalIdByName(name: []const u8) ?u16 {
     return null;
 }
 
-pub const Rule = enum {
+const Rule = enum {
     statement,
     session_statement,
     transaction_statement,
