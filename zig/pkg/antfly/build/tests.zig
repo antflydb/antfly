@@ -380,12 +380,28 @@ fn assertBuildZigDoesNotOwnManifestTestRoots(source: []const u8) void {
     }
 }
 
+fn assertBuildZigDoesNotOwnAPISplitImplementationInventory(source: []const u8) void {
+    const api_split_implementation_paths = .{
+        "pkg/antfly/src/api/table_reads/",
+        "pkg/antfly/src/api/table_writes/",
+    };
+    inline for (api_split_implementation_paths) |path| {
+        if (std.mem.indexOf(u8, source, path)) |start| {
+            std.debug.panic(
+                "build.zig references API split implementation path '{s}' at line {}; aggregate leaf tests through the API test roots and pkg/antfly/build/tests.zig",
+                .{ path, lineNumberForOffset(source, start) },
+            );
+        }
+    }
+}
+
 pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
     assertBuildZigTestFiltersReferenceManifest(source);
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotOwnManifestTestRoots(source);
+    assertBuildZigDoesNotOwnAPISplitImplementationInventory(source);
 }
 
 fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {

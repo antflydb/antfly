@@ -218,6 +218,36 @@ They should not retain business logic after a chunk has been migrated.
 During the migration, the facades may still contain unmigrated code. The end
 state should make the facades boring and small.
 
+## Build And Test Registration
+
+`zig/build.zig` should stay at suite granularity. It should create durable
+aggregates such as `api-table-writes-docid-test`, `api-table-reads-docid-test`,
+`unit-test`, and `lib-api-docid-test`, but it should not become an inventory of
+every migrated leaf module or regression.
+
+Focused API test inventory belongs in `pkg/antfly/build/tests.zig`:
+
+- root test module paths live in the API test-root manifest
+- exact or prefix filters live in `APITestFilters`
+- aggregate dependency rules live in helper functions such as
+  `addAPIDocIdTestRootSteps`, `addAPIDocIdAggregateTestStep`, and
+  `dependOnAPIDocIdUnitTestRuns`
+
+Leaf modules are reached through root aggregators:
+
+- `src/api_table_reads_test_root.zig`
+- `src/api_table_writes_test_root.zig`
+
+When adding a new split module under `src/api/table_reads/` or
+`src/api/table_writes/`, add it to the relevant root aggregator and cover it
+with a stable module-prefix filter in `pkg/antfly/build/tests.zig`. Do not add a
+new `build.zig` step for each file, and avoid one-off exact test-title filters
+unless a test intentionally belongs to a narrow focused suite.
+
+The build guardrails enforce this boundary: `build.zig` may not inline test
+filters, directly pass test-filter arguments, reference manifest-owned API test
+roots, or reference API table read/write implementation paths.
+
 ## Migration Order
 
 1. Extract `table_writes/index_config.zig`.

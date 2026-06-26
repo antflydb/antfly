@@ -993,7 +993,7 @@ Unsupported DDL remains on the existing parser until
    lowering paths; generated scalar `OR`/`NOT` predicate groups now thread the
    same child metadata into scalar comparison, boolean-test, `IN`, and
    quantified-list expansion branches; scalar atom, access predicate, direct
-   join `WHERE` predicate, and joined expression-predicate lowering now
+   join `WHERE`/`ON` predicates, and joined expression-predicate lowering now
    consume generated metadata for containment, overlap, JSON key
    existence, JSON extract comparisons, pattern, range, membership, null-test,
    boolean-test, quantified, and comparison operator families; generated logical `OR`/`AND`
