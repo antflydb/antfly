@@ -18,6 +18,8 @@ const generated = @import("grammar/generated/root.zig");
 const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
+const generated_parse_stack_capacity = 512;
+
 pub const GeneratedSqlStatementKind = enum {
     session,
     transaction,
@@ -2178,8 +2180,16 @@ pub fn parseTokensAllocWithAstMode(
     }
     const token_ids = try tokenIdsAlloc(alloc, tokens);
     defer alloc.free(token_ids);
-    try generated.parse(alloc, token_ids);
+    try parseGeneratedTokenIds(alloc, token_ids);
     return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
+}
+
+fn parseGeneratedTokenIds(alloc: std.mem.Allocator, token_ids: []const u16) !void {
+    if (token_ids.len + 1 <= generated_parse_stack_capacity) {
+        var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
+        return try generated.parseWithStackBuffer(token_ids, &stack_buffer);
+    }
+    return try generated.parse(alloc, token_ids);
 }
 
 fn buildGeneratedParseResult(
@@ -2275,7 +2285,7 @@ pub fn isGeneratedGateTokens(tokens: []const token_mod.Token) bool {
 pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlDiagnostic {
     const token_ids = try tokenIdsAlloc(alloc, tokens);
     defer alloc.free(token_ids);
-    const info = try generated.parseError(alloc, token_ids) orelse return null;
+    const info = try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null;
     const actions = generated.actionsForState(info.state);
     const expected = try alloc.alloc([]const u8, actions.len);
     for (actions, 0..) |action, idx| expected[idx] = generated.symbolName(action.terminal);
@@ -2292,6 +2302,14 @@ pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token
         .expected = expected,
         .actual = span.actual,
     };
+}
+
+fn parseGeneratedTokenIdsError(alloc: std.mem.Allocator, token_ids: []const u16) !?generated.ParseErrorInfo {
+    if (token_ids.len + 1 <= generated_parse_stack_capacity) {
+        var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
+        return try generated.parseErrorWithStackBuffer(token_ids, &stack_buffer);
+    }
+    return try generated.parseError(alloc, token_ids);
 }
 
 pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) ![]u16 {

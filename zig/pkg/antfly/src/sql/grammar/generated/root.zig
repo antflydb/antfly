@@ -180607,6 +180607,7 @@ pub const state_item_count = 46009;
 
 pub const ParseError = error{
     InvalidGoto,
+    StackOverflow,
     StackUnderflow,
     UnexpectedToken,
 };
@@ -180644,6 +180645,37 @@ pub fn parse(allocator: std.mem.Allocator, token_ids: []const u16) !void {
     }
 }
 
+pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!void {
+    if (stack_buffer.len == 0) return ParseError.StackOverflow;
+    var stack_len: usize = 1;
+    stack_buffer[0] = 0;
+
+    var index: usize = 0;
+    while (true) {
+        const state = stack_buffer[stack_len - 1];
+        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
+        const action = findAction(state, lookahead) orelse return ParseError.UnexpectedToken;
+        switch (action.kind) {
+            .shift => {
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = action.target;
+                stack_len += 1;
+                index += 1;
+            },
+            .reduce => {
+                const production = productions[action.target];
+                if (production.rhs_len > stack_len - 1) return ParseError.StackUnderflow;
+                stack_len -= production.rhs_len;
+                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return ParseError.InvalidGoto;
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = goto_entry.target;
+                stack_len += 1;
+            },
+            .accept => return,
+        }
+    }
+}
+
 pub fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
     var stack: std.ArrayListUnmanaged(u16) = .empty;
     defer stack.deinit(allocator);
@@ -180665,6 +180697,37 @@ pub fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseE
                 stack.items.len -= production.rhs_len;
                 const goto_entry = findGoto(stack.items[stack.items.len - 1], production.lhs) orelse return .{ .state = stack.items[stack.items.len - 1], .lookahead = production.lhs, .token_index = index };
                 try stack.append(allocator, goto_entry.target);
+            },
+            .accept => return null,
+        }
+    }
+}
+
+pub fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
+    if (stack_buffer.len == 0) return ParseError.StackOverflow;
+    var stack_len: usize = 1;
+    stack_buffer[0] = 0;
+
+    var index: usize = 0;
+    while (true) {
+        const state = stack_buffer[stack_len - 1];
+        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
+        const action = findAction(state, lookahead) orelse return .{ .state = state, .lookahead = lookahead, .token_index = index };
+        switch (action.kind) {
+            .shift => {
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = action.target;
+                stack_len += 1;
+                index += 1;
+            },
+            .reduce => {
+                const production = productions[action.target];
+                if (production.rhs_len > stack_len - 1) return .{ .state = state, .lookahead = lookahead, .token_index = index };
+                stack_len -= production.rhs_len;
+                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return .{ .state = stack_buffer[stack_len - 1], .lookahead = production.lhs, .token_index = index };
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = goto_entry.target;
+                stack_len += 1;
             },
             .accept => return null,
         }

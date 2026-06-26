@@ -1078,7 +1078,10 @@ Important performance requirements:
   table size or lookup cost becomes material.
 - **Allocation-light AST construction**: allocate AST nodes in an arena owned
   by `ParsedSql`; avoid per-token heap allocation and avoid copying token text
-  unless normalized text is required.
+  unless normalized text is required. Generated parser metadata now also emits
+  stack-buffer parse and diagnostic entrypoints, and the SQL facade uses a
+  fixed parser-state buffer for normal statements with allocator-backed
+  fallback only for unusually large statements.
 - **Span by offset**: store byte offsets and lengths into the original SQL
   buffer instead of materializing substrings for every identifier, literal, or
   diagnostic target.
