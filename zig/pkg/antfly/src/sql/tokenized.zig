@@ -1228,8 +1228,14 @@ fn parseStatement(
             .session => return .{ .session = .{ .raw = raw_statement } },
             .transaction => return .{ .transaction = .{ .raw = raw_statement } },
             .prepared => return .{ .prepared = .{ .raw = raw_statement } },
-            .ddl => return .{ .ddl = .{ .raw = raw_statement } },
-            .extension_index => return .{ .ddl = .{ .raw = raw_statement } },
+            .ddl => |kind| if (generatedDdlAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .ddl = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
+            .extension_index => |kind| if (generatedDdlAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, generatedDdlKindFromExtensionIndexKind(kind)))
+                return .{ .ddl = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
             .dml => if (generatedDmlStatementKind(tokenized_sql.items(), generated_raw)) |generated| {
                 const classified_recursive_kind = if (generated.recursive) classifier.classifyRecursiveWriteStatement(tokenized_sql.items()) else null;
                 if (classified_recursive_kind orelse tokenized_sql.write_statement_kind) |classified_kind| {
@@ -1266,6 +1272,131 @@ fn parseStatement(
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
+    };
+}
+
+fn generatedDdlKindFromExtensionIndexKind(kind: generated_parser.GeneratedSqlExtensionIndexKind) generated_parser.GeneratedSqlDdlKind {
+    return switch (kind) {
+        .create_index => .create_index,
+        .drop_index => .drop_index,
+        .create_extension => .create_extension,
+        .drop_extension => .drop_extension,
+    };
+}
+
+fn generatedDdlAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlDdlKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const ddl_ast = switch (ast_value) {
+        .ddl => |ddl| ddl,
+        .extension_index => |ddl| ddl,
+        else => return false,
+    };
+    if (ddl_ast.kind != expected_kind) return false;
+    const end = generatedDdlStatementEnd(tokens, ddl_ast.statement_span) orelse return false;
+    if (!std.meta.eql(ddl_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.object_name_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.schema_name_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.version_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_table_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_method_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_elements_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_include_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_options_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_where_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.alter_table_operation_tokens)) return false;
+    return generatedDdlRequiredRangesArePresent(ddl_ast);
+}
+
+fn generatedDdlStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) {
+        end -= 1;
+    }
+    if (end == 0) return null;
+    if (tokens[0].sourceSpan().start != statement_span.start) return null;
+    if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
+    return end;
+}
+
+fn generatedDdlOptionalTokenRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
+    return true;
+}
+
+fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDdlAst) bool {
+    return switch (ddl_ast.kind) {
+        .create_database,
+        .create_schema,
+        .create_table,
+        .create_view,
+        .create_materialized_view,
+        .create_domain,
+        .create_sequence,
+        .create_enum_type,
+        .create_tablespace,
+        .create_publication,
+        .create_subscription,
+        .create_function,
+        .create_procedure,
+        .create_role,
+        .create_collation,
+        .create_aggregate,
+        .create_index,
+        .create_extension,
+        .alter_table,
+        .alter_database,
+        .alter_extension,
+        .alter_schema,
+        .alter_tablespace,
+        .alter_view,
+        .alter_domain,
+        .alter_sequence,
+        .alter_enum_type,
+        .alter_publication,
+        .alter_subscription,
+        .alter_role,
+        .alter_collation,
+        .drop_table,
+        .drop_view,
+        .drop_materialized_view,
+        .drop_domain,
+        .drop_sequence,
+        .drop_enum_type,
+        .drop_tablespace,
+        .drop_publication,
+        .drop_subscription,
+        .drop_function,
+        .drop_procedure,
+        .drop_role,
+        .drop_collation,
+        .drop_aggregate,
+        .drop_index,
+        .drop_schema,
+        .drop_database,
+        .drop_extension,
+        .refresh_materialized_view,
+        .relation_population,
+        => ddl_ast.object_name_tokens != null,
+        .create_policy,
+        .alter_policy,
+        .drop_policy,
+        => ddl_ast.object_name_tokens != null and ddl_ast.index_table_tokens != null,
+        .create_operator,
+        .create_cast,
+        .drop_operator,
+        .drop_cast,
+        .create_graph_index,
+        .create_graph_metric,
+        => true,
     };
 }
 
@@ -4199,6 +4330,52 @@ test "sql adapter parsed sql owns typed statement variants" {
         .read => |read_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.query, read_ast.kind),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "sql adapter parsed sql rejects malformed generated DDL classification payloads" {
+    const alloc = std.testing.allocator;
+
+    var publication = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records");
+    defer publication.deinit(alloc);
+    var missing_name = publication.generated_statement.?;
+    if (missing_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| ddl_ast.object_name_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(publication.raw_statement, missing_name, &publication.tokenized_sql)),
+    );
+
+    var policy = try ParsedSql.initAlloc(alloc, "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)");
+    defer policy.deinit(alloc);
+    var missing_policy_table = policy.generated_statement.?;
+    if (missing_policy_table.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| ddl_ast.index_table_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(policy.raw_statement, missing_policy_table, &policy.tokenized_sql)),
+    );
+
+    var extension_index = try ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)");
+    defer extension_index.deinit(alloc);
+    var mismatched_extension_kind = extension_index.generated_statement.?;
+    if (mismatched_extension_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .extension_index => |*ddl_ast| ddl_ast.kind = .drop_index,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(extension_index.raw_statement, mismatched_extension_kind, &extension_index.tokenized_sql)),
+    );
 }
 
 test "sql adapter parsed sql retains generated type system DDL nodes" {

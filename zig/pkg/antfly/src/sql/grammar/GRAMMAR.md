@@ -164,7 +164,11 @@ tablespace, publication, subscription, and policy statements, plus materialized
 view create/drop/refresh and routine create/drop statements. Malformed
 complete-looking catalog statements in those families fail through generated
 parser diagnostics instead of falling back to the legacy permissive DDL
-classifier.
+classifier. Parsed-statement classification for generated-covered DDL now also
+validates the retained generated DDL AST kind, statement span, command span,
+object/table ranges, index ranges, and operation-tail ranges before publishing
+the DDL family, so corrupted generated DDL payloads fail closed at the SQL
+ingress boundary instead of routing into typed catalog planning.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
