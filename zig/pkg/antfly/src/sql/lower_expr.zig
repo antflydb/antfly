@@ -2029,6 +2029,29 @@ fn generatedWhereClauseEnd(
     return error.UnsupportedSqlShape;
 }
 
+fn generatedWhereExpressionForClause(
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    const read = generated_read_ast orelse return null;
+    if (use_set_operation_right_side) {
+        if (read.set_operation.right_where_tokens) |right_range| {
+            if (right_range.start == pos) return &read.set_operation.right_where_expression;
+        }
+        return null;
+    }
+    if (read.where_tokens) |range| {
+        if (range.start == pos) return &read.where_expression;
+    }
+    if (read.kind == .set_operation) {
+        if (read.set_operation.right_where_tokens) |right_range| {
+            if (right_range.start == pos) return &read.set_operation.right_where_expression;
+        }
+    }
+    return null;
+}
+
 fn parseGeneratedLimitValueForClause(
     tokens: []const Token,
     keyword_index: usize,
@@ -3668,6 +3691,7 @@ pub fn parseWhereAlloc(
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (canParseBareBooleanWhereExpression(tokens, pos.*, schema)) {
         try parseBareBooleanWhereExpressionAlloc(alloc, tokens, pos, type_context, expression_predicates, bare_boolean_hooks);
@@ -3756,6 +3780,11 @@ pub fn parseWhereAlloc(
                 expression_condition_hooks,
             );
         } else {
+            const generated_atom_expression = if (generated_expression_ast) |expression| blk: {
+                const expression_tokens = expression.tokens orelse break :blk null;
+                if (expression_tokens.start != pos.* or whereHasTopLevelAndBeforeTailToken(tokens, pos.*)) break :blk null;
+                break :blk expression;
+            } else null;
             try parseWhereAtomAlloc(
                 alloc,
                 tokens,
@@ -3777,6 +3806,7 @@ pub fn parseWhereAlloc(
                 or_predicates,
                 false,
                 realtime_ns,
+                generated_atom_expression,
             );
         }
         if (!parser.matchKeyword(tokens, pos, "and")) break;
@@ -3887,6 +3917,27 @@ pub fn whereTopLevelOrHasAccessPredicate(tokens: []const Token, pos: usize) bool
                 {
                     return true;
                 }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn whereHasTopLevelAndBeforeTailToken(tokens: []const Token, pos: usize) bool {
+    var depth: usize = 0;
+    var index = pos;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) return false,
+            .identifier => if (depth == 0) {
+                if (sqlWhereTailClauseKeywordToken(token)) return false;
+                if (token.matchesKeywordTag(.@"and")) return true;
             },
             else => {},
         }
@@ -6237,6 +6288,7 @@ pub fn parseAccessPredicateAtomGroupAlloc(
         &nested_or_predicates,
         false,
         realtime_ns,
+        null,
     );
     if (nested_or_predicates.items.len > 0) return error.UnsupportedSqlShape;
 
@@ -12175,6 +12227,7 @@ fn parseAggregateFilterAtomAlloc(
         &or_predicates,
         false,
         realtime_ns,
+        null,
     );
 
     if (or_predicates.items.len > 0) return error.UnsupportedSqlShape;
@@ -18078,6 +18131,7 @@ pub fn parseSelectAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
+            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -18111,6 +18165,7 @@ pub fn parseSelectAlloc(
                 options.bare_boolean_hooks,
                 options.expression_alternatives_hooks,
                 options.expression_condition_hooks,
+                generated_where_expression,
             );
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -18466,6 +18521,7 @@ pub fn parseAggregateAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
+            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -18499,6 +18555,7 @@ pub fn parseAggregateAlloc(
                 options.bare_boolean_hooks,
                 options.expression_alternatives_hooks,
                 options.expression_condition_hooks,
+                generated_where_expression,
             );
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -18898,6 +18955,7 @@ pub fn parseWindowSelectAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
+            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -18931,6 +18989,7 @@ pub fn parseWindowSelectAlloc(
                 options.bare_boolean_hooks,
                 options.expression_alternatives_hooks,
                 options.expression_condition_hooks,
+                generated_where_expression,
             );
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -24999,6 +25058,13 @@ pub fn appendTextPatternPredicateAlloc(
     pattern_transferred = true;
 }
 
+fn validateGeneratedQuantifiedPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != .quantified_comparison) return error.UnsupportedSqlShape;
+}
+
 pub fn parseWhereAtomAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -25020,12 +25086,16 @@ pub fn parseWhereAtomAlloc(
     or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
     negated: bool,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (!negated and parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectToken(tokens, pos, .lparen);
-        try parseWhereAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, predicates, json_contains, json_path_eq, json_path_exists, array_any, array_contains, array_eq, in_predicates, text_patterns, or_predicates, true, realtime_ns);
+        try parseWhereAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, predicates, json_contains, json_path_eq, json_path_exists, array_any, array_contains, array_eq, in_predicates, text_patterns, or_predicates, true, realtime_ns, null);
         try parser.expectToken(tokens, pos, .rparen);
         return;
+    }
+    if (!negated and valueEqualsAnyArrayPredicateCanStart(tokens, pos.*)) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
     }
     if (!negated and try parseValueEqualsAnyArrayPredicateAlloc(
         alloc,
@@ -25270,6 +25340,7 @@ pub fn parseWhereAtomAlloc(
 
     const op = try parseComparisonOp(tokens, pos);
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25287,6 +25358,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25301,6 +25373,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25311,6 +25384,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -31738,6 +31812,23 @@ fn corruptGeneratedReadWhereQuantifierRange(parsed_sql: *tokenized.ParsedSql) !v
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadWhereQuantifiedKindToComparison(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.where_expression.kind != .quantified_comparison or read.where_expression.quantifier_tokens == null) return error.TestUnexpectedResult;
+                    read.where_expression.kind = .comparison;
+                    read.where_expression.quantifier_tokens = null;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -34086,6 +34177,20 @@ test "sql adapter lower expr lowers scalar any predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_quantifier_range,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_quantified_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])",
+    );
+    defer malformed_quantified_kind.deinit(alloc);
+    try corruptGeneratedReadWhereQuantifiedKindToComparison(&malformed_quantified_kind);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_quantified_kind,
         schema,
         &.{},
         .{},

@@ -982,7 +982,11 @@ Unsupported DDL remains on the existing parser until
    span. Generated read `WHERE` clauses on generated simple, aggregate,
    window, join, and lateral read lowerers now validate the retained generated
    predicate span and require typed predicate planning to consume the same
-   clause body; aggregate `HAVING` clauses apply the same guard.
+   clause body; simple generated read, aggregate, and window `WHERE` lowering
+   now also threads single-atom generated predicate ASTs into the typed atom
+   parser so quantified `ANY`/`SOME`/`ALL` branches fail closed when the
+   retained generated expression kind does not match; aggregate `HAVING`
+   clauses apply the same clause-span guard.
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
    before the typed window lowerer accepts a consumed `WINDOW` tail.

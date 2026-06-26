@@ -8255,6 +8255,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
                 options.bare_boolean_hooks,
                 options.expression_alternatives_hooks,
                 options.expression_condition_hooks,
+                null,
             );
         }
     }
@@ -8835,6 +8836,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 bare_boolean_hooks,
                 expression_alternatives_hooks,
                 expression_condition_hooks,
+                null,
             );
         } else if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (saw_returning) return error.UnsupportedSqlShape;
