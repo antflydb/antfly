@@ -1361,12 +1361,13 @@ Later statement-family cutovers should add closed variants for:
 Those variants should become the normal dispatch boundary for binder and lowerer
 code.
 
-Generated parser diagnostics expose the parser state, lookahead symbol, token
-index, source byte span, actual token text, and expected terminal names through
-generated per-state diagnostic helpers rather than SQL-layer action-table
-inspection. That is the parse-phase shape the dashboard REPL, CLI, HTTP SQL
-endpoint, and corpus tests should use instead of string-only unsupported
-reasons.
+Generated parser diagnostics expose bounded parse diagnostics with token index,
+source byte span, actual token text, and expected terminal names through the
+generated parser facade. Raw parser state, lookahead symbols, parse tables,
+rules, and symbol metadata stay private so the generated parser is a syntax
+boundary rather than a second SQL control plane. That is the parse-phase shape
+the dashboard REPL, CLI, HTTP SQL endpoint, and corpus tests should use instead
+of string-only unsupported reasons.
 
 ## Testing And Evidence
 
