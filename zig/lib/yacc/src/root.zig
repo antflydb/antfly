@@ -974,13 +974,20 @@ fn emitZigMetadata(
         \\    return actions[start .. start + range.len];
         \\}
         \\
-        \\pub fn expectedTerminalCountForState(state: u16) usize {
+        \\pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
+        \\    const expected_count = expectedTerminalCountForState(info.state);
+        \\    const expected = try allocator.alloc([]const u8, expected_count);
+        \\    for (expected, 0..) |*name, idx| name.* = expectedTerminalNameForState(info.state, idx);
+        \\    return expected;
+        \\}
+        \\
+        \\fn expectedTerminalCountForState(state: u16) usize {
         \\    return actionsForState(state).len;
         \\}
         \\
-        \\pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8 {
+        \\fn expectedTerminalNameForState(state: u16, index: usize) []const u8 {
         \\    const state_actions = actionsForState(state);
-        \\    if (index >= state_actions.len) return null;
+        \\    if (index >= state_actions.len) return "";
         \\    return symbolName(state_actions[index].terminal);
         \\}
         \\
@@ -1332,8 +1339,9 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn terminalIdByName(name: []const u8) ?u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenIdByName") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "symbols[idx]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalCountForState(state: u16) usize") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalCountForState") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn actionsForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolName") == null);
 }

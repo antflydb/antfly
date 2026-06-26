@@ -213391,13 +213391,20 @@ fn actionsForState(state: u16) []const Action {
     return actions[start .. start + range.len];
 }
 
-pub fn expectedTerminalCountForState(state: u16) usize {
+pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
+    const expected_count = expectedTerminalCountForState(info.state);
+    const expected = try allocator.alloc([]const u8, expected_count);
+    for (expected, 0..) |*name, idx| name.* = expectedTerminalNameForState(info.state, idx);
+    return expected;
+}
+
+fn expectedTerminalCountForState(state: u16) usize {
     return actionsForState(state).len;
 }
 
-pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8 {
+fn expectedTerminalNameForState(state: u16, index: usize) []const u8 {
     const state_actions = actionsForState(state);
-    if (index >= state_actions.len) return null;
+    if (index >= state_actions.len) return "";
     return symbolName(state_actions[index].terminal);
 }
 

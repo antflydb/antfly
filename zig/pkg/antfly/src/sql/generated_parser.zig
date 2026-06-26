@@ -2380,11 +2380,7 @@ pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token
 
     const info = try parseGeneratedTokenIdsError(alloc, diagnostic_tokens.token_ids) orelse return null;
     const source_token_index = diagnostic_tokens.sourceTokenIndex(info.token_index);
-    const expected_count = generated.expectedTerminalCountForState(info.state);
-    const expected = try alloc.alloc([]const u8, expected_count);
-    for (expected, 0..) |*name, idx| {
-        name.* = generated.expectedTerminalNameForState(info.state, idx) orelse return error.UnsupportedSqlShape;
-    }
+    const expected = try generated.expectedTerminalNamesAlloc(alloc, info);
     const span: DiagnosticSpan = if (source_token_index < tokens.len)
         .{ .start = tokens[source_token_index].source_start, .end = tokens[source_token_index].source_end, .actual = tokens[source_token_index].text }
     else
