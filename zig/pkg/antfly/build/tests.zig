@@ -515,14 +515,6 @@ fn assertDBTestRootImportsDBAggregateRoot(source: []const u8) void {
     }
 }
 
-fn assertDBTestRootImportsPath(test_root_source: []const u8, import_path: []const u8) void {
-    if (std.mem.indexOf(u8, test_root_source, import_path) != null) return;
-    std.debug.panic(
-        "{s} must explicitly import {s} because that DB implementation module owns inline tests",
-        .{ db_test_root_path, import_path },
-    );
-}
-
 fn assertDBStandaloneTestFilesReachable(b: *std.Build, test_root_source: []const u8) void {
     var dir = b.build_root.handle.openDir(b.graph.io, db_source_root, .{ .iterate = true }) catch |err| {
         std.debug.panic("failed to open {s} for DB standalone test reachability guardrail: {}", .{ db_source_root, err });
@@ -548,85 +540,6 @@ fn assertDBStandaloneTestFilesReachable(b: *std.Build, test_root_source: []const
             "{s} must explicitly import {s} so standalone DB test files stay reachable from lib-db-test/db-test",
             .{ db_test_root_path, import_path },
         );
-    }
-}
-
-fn importPathForAlias(source: []const u8, alias: []const u8) ?[]const u8 {
-    var line_start: usize = 0;
-    while (line_start < source.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
-        const line = std.mem.trim(u8, source[line_start..line_end], " \t");
-        defer line_start = if (line_end == source.len) source.len else line_end + 1;
-
-        if (!std.mem.startsWith(u8, line, "const ")) continue;
-        const binding = line["const ".len..];
-        const name_end = std.mem.indexOfAny(u8, binding, " \t=") orelse continue;
-        if (!std.mem.eql(u8, binding[0..name_end], alias)) continue;
-
-        const import_start = std.mem.indexOf(u8, line, "@import(\"") orelse continue;
-        const path_start = import_start + "@import(\"".len;
-        const path_end = std.mem.indexOfScalarPos(u8, line, path_start, '"') orelse continue;
-        return line[path_start..path_end];
-    }
-    return null;
-}
-
-fn assertDBImplModuleContract(
-    b: *std.Build,
-    db_source: []const u8,
-    test_root_source: []const u8,
-    module_alias: []const u8,
-    impl_offset: usize,
-) void {
-    const import_path = importPathForAlias(db_source, module_alias) orelse {
-        std.debug.panic(
-            "storage/db/db.zig instantiates {s}.Impl at line {}, but no matching const import was found",
-            .{ module_alias, lineNumberForOffset(db_source, impl_offset) },
-        );
-    };
-    if (std.mem.startsWith(u8, import_path, "../") or std.mem.indexOfScalar(u8, import_path, '/') != null) {
-        std.debug.panic(
-            "storage/db/db.zig instantiates {s}.Impl from {s} at line {}; DB implementation modules must live directly under storage/db",
-            .{ module_alias, import_path, lineNumberForOffset(db_source, impl_offset) },
-        );
-    }
-
-    const module_path = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ db_source_root, import_path }) catch |err| {
-        std.debug.panic("failed to build storage/db module path for {s}: {}", .{ import_path, err });
-    };
-    const module_source = readBuildRootFileAlloc(
-        b,
-        module_path,
-        max_db_module_zig_bytes,
-        "DB implementation module contract guardrail",
-    );
-    if (std.mem.indexOf(u8, module_source, "pub fn Impl(comptime DB: type) type") == null) {
-        std.debug.panic(
-            "storage/db/{s} is instantiated from db.zig at line {} but does not declare pub fn Impl(comptime DB: type) type",
-            .{ import_path, lineNumberForOffset(db_source, impl_offset) },
-        );
-    }
-
-    if (std.mem.indexOf(u8, module_source, "\ntest \"") != null or std.mem.startsWith(u8, module_source, "test \"")) {
-        const test_import_path = std.fmt.allocPrint(b.allocator, "storage/db/{s}", .{import_path}) catch |err| {
-            std.debug.panic("failed to build DB test import path for {s}: {}", .{ import_path, err });
-        };
-        assertDBTestRootImportsPath(test_root_source, test_import_path);
-    }
-}
-
-fn assertDBInstantiatedImplContracts(b: *std.Build, db_source: []const u8, test_root_source: []const u8) void {
-    var line_start: usize = 0;
-    while (line_start < db_source.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, db_source, line_start, '\n') orelse db_source.len;
-        const line = std.mem.trim(u8, db_source[line_start..line_end], " \t");
-        defer line_start = if (line_end == db_source.len) db_source.len else line_end + 1;
-
-        const suffix = ".Impl(@This());";
-        const suffix_start = std.mem.indexOf(u8, line, suffix) orelse continue;
-        const equals_start = std.mem.indexOf(u8, line, " = ") orelse continue;
-        const module_alias = line[equals_start + " = ".len .. suffix_start];
-        assertDBImplModuleContract(b, db_source, test_root_source, module_alias, line_start);
     }
 }
 
@@ -713,7 +626,6 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     assertDBRootMetadataForwardersHaveSyncPreflight(source);
     assertDBTestRootImportsDBAggregateRoot(test_root_source);
     assertDBStandaloneTestFilesReachable(b, test_root_source);
-    assertDBInstantiatedImplContracts(b, source, test_root_source);
     assertDBImplementationModuleContract(b);
 }
 
