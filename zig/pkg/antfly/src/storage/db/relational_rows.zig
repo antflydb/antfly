@@ -9798,6 +9798,12 @@ fn cteNameExists(
     return false;
 }
 
+const relationalRowsAdmitSetOperationRows = admitRelationalRowsSetOperationRows;
+const relationalRowsAdmitSetOperationRowsAllowSpill = admitRelationalRowsSetOperationRowsAllowSpill;
+const relationalRowsAdmitCteMaterialization = admitRelationalRowsCteMaterialization;
+const relationalRowsAdmitCteMaterializationAllowSpill = admitRelationalRowsCteMaterializationAllowSpill;
+const relationalRowsSetOperationRowsAllocFn = relationalRowsSetOperationRowsAlloc;
+
 pub fn Impl(comptime DB: type) type {
     return struct {
         const RelationalRowsQueryCandidate = QueryCandidate;
@@ -9829,6 +9835,82 @@ pub fn Impl(comptime DB: type) type {
         const relationalRowsTemporalDerivedDocKeyAlloc = temporalDerivedDocKeyAlloc;
         const relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc = physicalPrimaryKeyFromRowJsonAlloc;
         const validateRelationalRowsMutationSourceRequest = validateMutationSourceRequest;
+
+        pub fn validateRelationalRowsInsertSourceRequest(
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsInsertSourceRequest,
+        ) !void {
+            return validateInsertSourceRequest(runtime_schema, req);
+        }
+
+        pub fn validateRelationalRowsInsertSourceRequestWithSchemas(
+            target_schema: schema_mod.TableSchema,
+            source_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsInsertSourceRequest,
+        ) !void {
+            return validateInsertSourceRequestWithSchemas(target_schema, source_schema, req);
+        }
+
+        pub fn admitRelationalRowsSetOperationRows(
+            plan: types.RelationalRowsSetOperationPlan,
+            rows: []const []const u8,
+        ) !void {
+            return relationalRowsAdmitSetOperationRows(plan, rows);
+        }
+
+        pub fn admitRelationalRowsSetOperationRowsAllowSpill(
+            plan: types.RelationalRowsSetOperationPlan,
+            rows: []const []const u8,
+        ) !void {
+            return relationalRowsAdmitSetOperationRowsAllowSpill(plan, rows);
+        }
+
+        pub fn admitRelationalRowsCteMaterialization(
+            cte: types.RelationalRowsCte,
+            observed_rows: usize,
+            observed_bytes: u64,
+        ) !void {
+            return relationalRowsAdmitCteMaterialization(cte, observed_rows, observed_bytes);
+        }
+
+        pub fn admitRelationalRowsCteMaterializationAllowSpill(
+            cte: types.RelationalRowsCte,
+            observed_rows: usize,
+            observed_bytes: u64,
+        ) !void {
+            return relationalRowsAdmitCteMaterializationAllowSpill(cte, observed_rows, observed_bytes);
+        }
+
+        pub fn relationalRowsSetOperationRowsAlloc(
+            alloc: Allocator,
+            operation: types.RelationalRowsSetOperation,
+            left: []const []const u8,
+            right: []const []const u8,
+        ) ![]const []const u8 {
+            return relationalRowsSetOperationRowsAllocFn(alloc, operation, left, right);
+        }
+
+        pub fn cloneRelationalRowsMutationSourceCandidateAlloc(
+            alloc: Allocator,
+            candidate: RelationalRowsMutationSourceCandidate,
+        ) !RelationalRowsMutationSourceCandidate {
+            return cloneMutationSourceCandidateAlloc(alloc, candidate);
+        }
+
+        pub fn validateRelationalRowsExpressionAgainstSchema(
+            runtime_schema: schema_mod.TableSchema,
+            expression: schema_mod.RelationalRowsExpression,
+        ) !void {
+            return validateExpressionAgainstSchema(runtime_schema, expression);
+        }
+
+        pub fn relationalRowsQueryPredicatePasses(
+            alloc: Allocator,
+            row: std.json.Value,
+            predicate: schema_mod.RelationalCheck,
+        ) !bool {
+            return queryPredicatePasses(alloc, row, predicate);
+        }
 
         fn tryClaimRowForTransaction(self: *DB, txn_id: types.TxnId, row_key: []const u8, claim: types.RowClaimRequest) !bool {
             self.claimRowsForTransaction(txn_id, &.{row_key}, claim) catch |err| switch (err) {
@@ -12092,9 +12174,9 @@ pub fn Impl(comptime DB: type) type {
             var right = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.right);
             defer right.deinit(alloc);
 
-            const combined = try relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left.rows, right.rows);
+            const combined = try relationalRowsSetOperationRowsAllocFn(alloc, plan.operation, left.rows, right.rows);
             defer freeOwnedConstStringSlice(alloc, combined);
-            try admitRelationalRowsSetOperationRowsAllowSpill(plan, combined);
+            try relationalRowsAdmitSetOperationRowsAllowSpill(plan, combined);
 
             const tail_query = types.RelationalRowsQueryRequest{
                 .order_by = plan.order_by,
@@ -12266,7 +12348,7 @@ pub fn Impl(comptime DB: type) type {
                     }
                 }
                 const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
-                try admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
+                try relationalRowsAdmitCteMaterialization(cte, result.rows.len, materialized_bytes);
                 const output_fields = if (cte.table_function) |table_function|
                     try tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
                 else

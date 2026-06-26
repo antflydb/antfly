@@ -2700,7 +2700,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsInsertSourceRequest,
     ) !void {
-        return relational_rows.validateInsertSourceRequest(runtime_schema, req);
+        return relational_rows_impl.validateRelationalRowsInsertSourceRequest(runtime_schema, req);
     }
 
     pub fn validateRelationalRowsInsertSourceRequestWithSchemas(
@@ -2708,7 +2708,7 @@ pub const DB = struct {
         source_schema: schema_mod.TableSchema,
         req: types.RelationalRowsInsertSourceRequest,
     ) !void {
-        return relational_rows.validateInsertSourceRequestWithSchemas(target_schema, source_schema, req);
+        return relational_rows_impl.validateRelationalRowsInsertSourceRequestWithSchemas(target_schema, source_schema, req);
     }
 
     pub fn planRelationalRowsMutationSourceAlloc(
@@ -2949,14 +2949,14 @@ pub const DB = struct {
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
     ) !void {
-        try relational_rows.admitRelationalRowsSetOperationRows(plan, rows);
+        try relational_rows_impl.admitRelationalRowsSetOperationRows(plan, rows);
     }
 
     pub fn admitRelationalRowsSetOperationRowsAllowSpill(
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
     ) !void {
-        try relational_rows.admitRelationalRowsSetOperationRowsAllowSpill(plan, rows);
+        try relational_rows_impl.admitRelationalRowsSetOperationRowsAllowSpill(plan, rows);
     }
 
     pub fn admitRelationalRowsCteMaterialization(
@@ -2964,7 +2964,7 @@ pub const DB = struct {
         observed_rows: usize,
         observed_bytes: u64,
     ) !void {
-        try relational_rows.admitRelationalRowsCteMaterialization(cte, observed_rows, observed_bytes);
+        try relational_rows_impl.admitRelationalRowsCteMaterialization(cte, observed_rows, observed_bytes);
     }
 
     pub fn admitRelationalRowsCteMaterializationAllowSpill(
@@ -2972,7 +2972,7 @@ pub const DB = struct {
         observed_rows: usize,
         observed_bytes: u64,
     ) !void {
-        try relational_rows.admitRelationalRowsCteMaterializationAllowSpill(cte, observed_rows, observed_bytes);
+        try relational_rows_impl.admitRelationalRowsCteMaterializationAllowSpill(cte, observed_rows, observed_bytes);
     }
 
     pub fn relationalRowsSetOperationRowsAlloc(
@@ -2981,7 +2981,7 @@ pub const DB = struct {
         left: []const []const u8,
         right: []const []const u8,
     ) ![]const []const u8 {
-        return try relational_rows.relationalRowsSetOperationRowsAlloc(alloc, operation, left, right);
+        return try relational_rows_impl.relationalRowsSetOperationRowsAlloc(alloc, operation, left, right);
     }
 
     pub fn queryRelationalRowsAcrossRanges(
@@ -3221,7 +3221,7 @@ pub const DB = struct {
         alloc: Allocator,
         candidate: RelationalRowsMutationSourceCandidate,
     ) !RelationalRowsMutationSourceCandidate {
-        return try relational_rows.cloneMutationSourceCandidateAlloc(alloc, candidate);
+        return try relational_rows_impl.cloneRelationalRowsMutationSourceCandidateAlloc(alloc, candidate);
     }
 
     pub const RelationalRowsMutationSourcePlan = relational_rows.MutationSourcePlan;
@@ -3238,7 +3238,7 @@ pub const DB = struct {
         expression: schema_mod.RelationalRowsExpression,
     ) !void {
         _ = self;
-        return try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
+        return try relational_rows_impl.validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
     }
 
     pub fn relationalRowsExpressionValueJsonAlloc(
@@ -3278,7 +3278,7 @@ pub const DB = struct {
         predicate: schema_mod.RelationalCheck,
     ) !bool {
         _ = self;
-        return try relational_rows.queryPredicatePasses(alloc, row, predicate);
+        return try relational_rows_impl.relationalRowsQueryPredicatePasses(alloc, row, predicate);
     }
 
     pub fn relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
