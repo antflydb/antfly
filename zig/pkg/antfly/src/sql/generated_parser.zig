@@ -18,6 +18,7 @@ const generated = @import("grammar/generated/root.zig");
 const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
+const generated_token_id_stack_capacity = 1024;
 const generated_parse_stack_capacity = 512;
 
 pub const GeneratedSqlStatementKind = enum {
@@ -2178,9 +2179,17 @@ pub fn parseTokensAllocWithAstMode(
     if (generatedSavepointTransactionBypassesLrParse(tokens, statement)) {
         return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
     }
-    const token_ids = try tokenIdsAlloc(alloc, tokens);
-    defer alloc.free(token_ids);
-    try parseGeneratedTokenIds(alloc, token_ids);
+    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
+        try parseGeneratedTokenIds(alloc, token_ids);
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {
+            const token_ids = try tokenIdsAlloc(alloc, tokens);
+            defer alloc.free(token_ids);
+            try parseGeneratedTokenIds(alloc, token_ids);
+        },
+        else => return err,
+    }
     return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
 }
 
@@ -2283,9 +2292,17 @@ pub fn isGeneratedGateTokens(tokens: []const token_mod.Token) bool {
 }
 
 pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlDiagnostic {
-    const token_ids = try tokenIdsAlloc(alloc, tokens);
-    defer alloc.free(token_ids);
-    const info = try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null;
+    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    const info = if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids|
+        try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null
+    else |err| switch (err) {
+        error.NoSpaceLeft => fallback: {
+            const token_ids = try tokenIdsAlloc(alloc, tokens);
+            defer alloc.free(token_ids);
+            break :fallback try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null;
+        },
+        else => return err,
+    };
     const actions = generated.actionsForState(info.state);
     const expected = try alloc.alloc([]const u8, actions.len);
     for (actions, 0..) |action, idx| expected[idx] = generated.symbolName(action.terminal);
@@ -2315,18 +2332,56 @@ fn parseGeneratedTokenIdsError(alloc: std.mem.Allocator, token_ids: []const u16)
 pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) ![]u16 {
     var ids: std.ArrayListUnmanaged(u16) = .empty;
     errdefer ids.deinit(alloc);
+    var sink = TokenIdSink{ .list = .{ .items = &ids, .alloc = alloc } };
     for (tokens, 0..) |tok, index| {
         if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
         const prev = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
-        try appendTokenIds(alloc, &ids, tokens, index, tok, prev, next);
+        try appendTokenIds(&sink, tokens, index, tok, prev, next);
     }
     return try ids.toOwnedSlice(alloc);
 }
 
+fn tokenIdsIntoBuffer(tokens: []const token_mod.Token, buffer: []u16) ![]const u16 {
+    var sink = TokenIdSink{ .buffer = .{ .items = buffer } };
+    for (tokens, 0..) |tok, index| {
+        if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
+        const prev = if (index > 0) tokens[index - 1] else null;
+        const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
+        try appendTokenIds(&sink, tokens, index, tok, prev, next);
+    }
+    return sink.buffer.items[0..sink.buffer.len];
+}
+
+const TokenIdSink = union(enum) {
+    list: struct {
+        items: *std.ArrayListUnmanaged(u16),
+        alloc: std.mem.Allocator,
+    },
+    buffer: struct {
+        items: []u16,
+        len: usize = 0,
+    },
+
+    fn append(self: *TokenIdSink, id: u16) !void {
+        switch (self.*) {
+            .list => |list| try list.items.append(list.alloc, id),
+            .buffer => |*buffer| {
+                if (buffer.len == buffer.items.len) return error.NoSpaceLeft;
+                buffer.items[buffer.len] = id;
+                buffer.len += 1;
+            },
+        }
+    }
+
+    fn appendSymbol(self: *TokenIdSink, name: []const u8) !void {
+        const id = generated.symbolId(name) orelse return error.UnsupportedSqlShape;
+        try self.append(id);
+    }
+};
+
 fn appendTokenIds(
-    alloc: std.mem.Allocator,
-    ids: *std.ArrayListUnmanaged(u16),
+    ids: *TokenIdSink,
     tokens: []const token_mod.Token,
     index: usize,
     tok: token_mod.Token,
@@ -2336,54 +2391,54 @@ fn appendTokenIds(
     switch (tok.kind) {
         .identifier => {
             if (try contextualKeywordSymbolId(tokens, index, tok, prev)) |id| {
-                try ids.append(alloc, id);
+                try ids.append(id);
                 return;
             }
             if (generatedParserTreatsKeywordAsIdentifier(tok, prev, next)) {
-                try appendIdentifierIds(alloc, ids, tok.text, false);
+                try appendIdentifierIds(ids, tok.text, false);
                 return;
             }
-            if (try keywordSymbolIdAlloc(alloc, tok)) |id| {
-                try ids.append(alloc, id);
+            if (try keywordSymbolId(tok)) |id| {
+                try ids.append(id);
                 return;
             }
             const allow_trailing_dot = next != null and next.?.kind == .star;
-            try appendIdentifierIds(alloc, ids, tok.text, allow_trailing_dot);
+            try appendIdentifierIds(ids, tok.text, allow_trailing_dot);
         },
-        .string => try appendSymbol(ids, alloc, "STRING"),
-        .number => try appendSymbol(ids, alloc, "NUMBER"),
-        .placeholder => try appendSymbol(ids, alloc, "PLACEHOLDER"),
-        .comma => try appendSymbol(ids, alloc, "COMMA"),
-        .star => try appendSymbol(ids, alloc, "STAR"),
-        .eq => try appendSymbol(ids, alloc, "EQ"),
-        .neq => try appendSymbol(ids, alloc, "NEQ"),
-        .gt => try appendSymbol(ids, alloc, "GT"),
-        .gte => try appendSymbol(ids, alloc, "GTE"),
-        .lt => try appendSymbol(ids, alloc, "LT"),
-        .lte => try appendSymbol(ids, alloc, "LTE"),
-        .plus => try appendSymbol(ids, alloc, "PLUS"),
-        .minus => try appendSymbol(ids, alloc, "MINUS"),
-        .slash => try appendSymbol(ids, alloc, "SLASH"),
-        .percent => try appendSymbol(ids, alloc, "PERCENT"),
-        .pipe_concat => try appendSymbol(ids, alloc, "PIPE_CONCAT"),
-        .at_contains => try appendSymbol(ids, alloc, "AT_CONTAINS"),
-        .range_overlap => try appendSymbol(ids, alloc, "RANGE_OVERLAP"),
-        .question => try appendSymbol(ids, alloc, "QUESTION"),
-        .question_any => try appendSymbol(ids, alloc, "QUESTION_ANY"),
-        .question_all => try appendSymbol(ids, alloc, "QUESTION_ALL"),
-        .regex_match => try appendSymbol(ids, alloc, "REGEX_MATCH"),
-        .regex_imatch => try appendSymbol(ids, alloc, "REGEX_IMATCH"),
-        .regex_not_match => try appendSymbol(ids, alloc, "REGEX_NOT_MATCH"),
-        .regex_not_imatch => try appendSymbol(ids, alloc, "REGEX_NOT_IMATCH"),
-        .lparen => try appendSymbol(ids, alloc, "LPAREN"),
-        .rparen => try appendSymbol(ids, alloc, "RPAREN"),
-        .lbracket => try appendSymbol(ids, alloc, "LBRACKET"),
-        .rbracket => try appendSymbol(ids, alloc, "RBRACKET"),
-        .arrow_json => try appendSymbol(ids, alloc, "ARROW_JSON"),
-        .arrow_text => try appendSymbol(ids, alloc, "ARROW_TEXT"),
-        .path_arrow_json => try appendSymbol(ids, alloc, "PATH_ARROW_JSON"),
-        .path_arrow_text => try appendSymbol(ids, alloc, "PATH_ARROW_TEXT"),
-        .semicolon => try appendSymbol(ids, alloc, "SEMICOLON"),
+        .string => try ids.appendSymbol("STRING"),
+        .number => try ids.appendSymbol("NUMBER"),
+        .placeholder => try ids.appendSymbol("PLACEHOLDER"),
+        .comma => try ids.appendSymbol("COMMA"),
+        .star => try ids.appendSymbol("STAR"),
+        .eq => try ids.appendSymbol("EQ"),
+        .neq => try ids.appendSymbol("NEQ"),
+        .gt => try ids.appendSymbol("GT"),
+        .gte => try ids.appendSymbol("GTE"),
+        .lt => try ids.appendSymbol("LT"),
+        .lte => try ids.appendSymbol("LTE"),
+        .plus => try ids.appendSymbol("PLUS"),
+        .minus => try ids.appendSymbol("MINUS"),
+        .slash => try ids.appendSymbol("SLASH"),
+        .percent => try ids.appendSymbol("PERCENT"),
+        .pipe_concat => try ids.appendSymbol("PIPE_CONCAT"),
+        .at_contains => try ids.appendSymbol("AT_CONTAINS"),
+        .range_overlap => try ids.appendSymbol("RANGE_OVERLAP"),
+        .question => try ids.appendSymbol("QUESTION"),
+        .question_any => try ids.appendSymbol("QUESTION_ANY"),
+        .question_all => try ids.appendSymbol("QUESTION_ALL"),
+        .regex_match => try ids.appendSymbol("REGEX_MATCH"),
+        .regex_imatch => try ids.appendSymbol("REGEX_IMATCH"),
+        .regex_not_match => try ids.appendSymbol("REGEX_NOT_MATCH"),
+        .regex_not_imatch => try ids.appendSymbol("REGEX_NOT_IMATCH"),
+        .lparen => try ids.appendSymbol("LPAREN"),
+        .rparen => try ids.appendSymbol("RPAREN"),
+        .lbracket => try ids.appendSymbol("LBRACKET"),
+        .rbracket => try ids.appendSymbol("RBRACKET"),
+        .arrow_json => try ids.appendSymbol("ARROW_JSON"),
+        .arrow_text => try ids.appendSymbol("ARROW_TEXT"),
+        .path_arrow_json => try ids.appendSymbol("PATH_ARROW_JSON"),
+        .path_arrow_text => try ids.appendSymbol("PATH_ARROW_TEXT"),
+        .semicolon => try ids.appendSymbol("SEMICOLON"),
     }
 }
 
@@ -2442,7 +2497,7 @@ fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_m
     return false;
 }
 
-fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), text: []const u8, allow_trailing_dot: bool) !void {
+fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: bool) !void {
     if (text.len == 0) return error.UnsupportedSqlShape;
     const has_trailing_dot = text[text.len - 1] == '.';
     if (has_trailing_dot and !allow_trailing_dot) return error.UnsupportedSqlShape;
@@ -2453,27 +2508,24 @@ fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u1
     var emitted = false;
     while (parts.next()) |part| {
         if (part.len == 0) return error.UnsupportedSqlShape;
-        if (emitted) try appendSymbol(ids, alloc, "DOT");
-        try appendSymbol(ids, alloc, "IDENT");
+        if (emitted) try ids.appendSymbol("DOT");
+        try ids.appendSymbol("IDENT");
         emitted = true;
     }
-    if (has_trailing_dot) try appendSymbol(ids, alloc, "DOT");
+    if (has_trailing_dot) try ids.appendSymbol("DOT");
 }
 
-fn appendSymbol(ids: *std.ArrayListUnmanaged(u16), alloc: std.mem.Allocator, name: []const u8) !void {
-    const id = generated.symbolId(name) orelse return error.UnsupportedSqlShape;
-    try ids.append(alloc, id);
-}
-
-fn keywordSymbolIdAlloc(alloc: std.mem.Allocator, tok: token_mod.Token) !?u16 {
+fn keywordSymbolId(tok: token_mod.Token) !?u16 {
     if (tok.keyword == null) return null;
-    const name = try uppercaseKeywordAlloc(alloc, tok.text);
-    defer alloc.free(name);
+    if (tok.text.len > 128) return error.UnsupportedSqlShape;
+    var name_buffer: [128]u8 = undefined;
+    const name = uppercaseKeyword(&name_buffer, tok.text);
     return generated.symbolId(name);
 }
 
-fn uppercaseKeywordAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = try alloc.alloc(u8, text.len);
+fn uppercaseKeyword(buffer: []u8, text: []const u8) []const u8 {
+    std.debug.assert(text.len <= buffer.len);
+    const out = buffer[0..text.len];
     for (text, 0..) |ch, idx| {
         out[idx] = switch (ch) {
             'a'...'z' => ch - 'a' + 'A',
