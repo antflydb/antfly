@@ -41,6 +41,14 @@ pub const StandaloneModuleTestStep = struct {
     description: []const u8,
 };
 
+pub const StorageBackendTestStep = struct {
+    name: []const u8,
+    description: []const u8,
+    filters: ?[]const []const u8 = null,
+    select_filters: bool = false,
+    simple_runner: bool = false,
+};
+
 pub const StandaloneModuleTestModules = struct {
     regex: *std.Build.Module,
     jsonschema: *std.Build.Module,
@@ -93,6 +101,56 @@ pub const StandaloneModuleTestRuns = struct {
     casbin: ModuleTestRun,
     usermgr: ModuleTestRun,
     template: ModuleTestRun,
+};
+
+pub const StorageBackendTestModules = struct {
+    lmdb_engine: *std.Build.Module,
+    storage_lmdb: *std.Build.Module,
+    storage_lmdb_soak: *std.Build.Module,
+    storage_sim_runtime: *std.Build.Module,
+    docstore: *std.Build.Module,
+    shard: *std.Build.Module,
+    wal: *std.Build.Module,
+    wal_soak: *std.Build.Module,
+    persistent: *std.Build.Module,
+    persistent_soak: *std.Build.Module,
+    index_manager: *std.Build.Module,
+    sparse: *std.Build.Module,
+    derived_log: *std.Build.Module,
+};
+
+pub const StorageBackendTestDependencies = struct {
+    lsm_backend_sim: *std.Build.Step.Run,
+};
+
+pub const StorageBackendTestRuns = struct {
+    lmdb: ModuleTestRun,
+    storage_lmdb: ModuleTestRun,
+    storage_lmdb_replay: ModuleTestRun,
+    storage_sim_runtime: ModuleTestRun,
+    storage_lmdb_soak: ModuleTestRun,
+    docstore: ModuleTestRun,
+    shard: ModuleTestRun,
+    wal: ModuleTestRun,
+    wal_sim: ModuleTestRun,
+    wal_vopr: ModuleTestRun,
+    wal_replay: ModuleTestRun,
+    wal_soak: ModuleTestRun,
+    persistent: ModuleTestRun,
+    persistent_sim: ModuleTestRun,
+    persistent_replay: ModuleTestRun,
+    persistent_vopr: ModuleTestRun,
+    persistent_soak: ModuleTestRun,
+    index_manager: ModuleTestRun,
+    index_manager_resource: ModuleTestRun,
+    index_manager_sim: ModuleTestRun,
+    index_manager_replay: ModuleTestRun,
+    index_manager_vopr: ModuleTestRun,
+    sparse: ModuleTestRun,
+    derived_log: ModuleTestRun,
+    storage_sim: *std.Build.Step,
+    storage_vopr: *std.Build.Step,
+    storage_sim_soak: *std.Build.Step,
 };
 
 pub const ModuleTestOptions = struct {
@@ -287,6 +345,14 @@ fn isStandaloneModuleTestStepName(name: []const u8) bool {
     return false;
 }
 
+fn isStorageBackendTestStepName(name: []const u8) bool {
+    inline for (std.meta.fields(@TypeOf(storage_backend_test_steps))) |field| {
+        const step = @field(storage_backend_test_steps, field.name);
+        if (std.mem.eql(u8, name, step.name)) return true;
+    }
+    return false;
+}
+
 fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
@@ -295,7 +361,10 @@ fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
         const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
             std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
         const name = source[name_start..name_end];
-        if (isDBFocusedTestStepName(name) or isStandaloneModuleTestStepName(name)) {
+        if (isDBFocusedTestStepName(name) or
+            isStandaloneModuleTestStepName(name) or
+            isStorageBackendTestStepName(name))
+        {
             std.debug.panic(
                 "build.zig declares test inventory step '{s}' at line {}; move test inventories to pkg/antfly/build/tests.zig",
                 .{ name, lineNumberForOffset(source, start) },
@@ -2411,6 +2480,136 @@ const standalone_module_test_steps = .{
     .template = StandaloneModuleTestStep{
         .name = "lib-template-test",
         .description = "Run template rendering tests",
+    },
+};
+
+const storage_backend_test_steps = .{
+    .lmdb = StorageBackendTestStep{
+        .name = "lmdb-test",
+        .description = "Run Zig LMDB port unit tests",
+    },
+    .storage_lmdb = StorageBackendTestStep{
+        .name = "storage-lmdb-test",
+        .description = "Run storage/lmdb wrapper unit tests",
+    },
+    .storage_lmdb_replay = StorageBackendTestStep{
+        .name = "lmdb-replay-fixtures",
+        .description = "Run only the LMDB replay fixture test",
+        .filters = &StorageBackendTestFilters.lmdb_replay,
+    },
+    .storage_sim_runtime = StorageBackendTestStep{
+        .name = "storage-sim-runtime-test",
+        .description = "Run storage simulation runtime and modeled device tests",
+    },
+    .storage_lmdb_soak = StorageBackendTestStep{
+        .name = "lmdb-sim-soak",
+        .description = "Run only the LMDB simulation soak test",
+        .filters = &StorageBackendTestFilters.lmdb_soak,
+    },
+    .docstore = StorageBackendTestStep{
+        .name = "docstore-test",
+        .description = "Run storage/docstore unit tests",
+    },
+    .shard = StorageBackendTestStep{
+        .name = "shard-test",
+        .description = "Run storage/shard unit tests",
+    },
+    .wal = StorageBackendTestStep{
+        .name = "wal-test",
+        .description = "Run storage/wal unit tests",
+        .simple_runner = true,
+    },
+    .wal_sim = StorageBackendTestStep{
+        .name = "wal-sim-test",
+        .description = "Run only the WAL simulation workload tests",
+        .filters = &StorageBackendTestFilters.wal_sim,
+    },
+    .wal_vopr = StorageBackendTestStep{
+        .name = "wal-vopr-test",
+        .description = "Run WAL modeled-time VOPR smoke tests",
+        .filters = &StorageBackendTestFilters.wal_vopr,
+    },
+    .wal_replay = StorageBackendTestStep{
+        .name = "wal-replay-fixtures",
+        .description = "Run only the WAL replay fixture tests",
+        .filters = &StorageBackendTestFilters.wal_replay,
+    },
+    .wal_soak = StorageBackendTestStep{
+        .name = "wal-sim-soak",
+        .description = "Run only the WAL simulation soak test",
+        .filters = &StorageBackendTestFilters.wal_soak,
+    },
+    .persistent = StorageBackendTestStep{
+        .name = "persistent-test",
+        .description = "Run storage/persistent unit tests",
+        .simple_runner = true,
+    },
+    .persistent_sim = StorageBackendTestStep{
+        .name = "persistent-sim-test",
+        .description = "Run only the persistent simulation workload tests",
+        .filters = &StorageBackendTestFilters.persistent_sim,
+    },
+    .persistent_replay = StorageBackendTestStep{
+        .name = "persistent-replay-fixtures",
+        .description = "Run only the persistent replay fixture tests",
+        .filters = &StorageBackendTestFilters.persistent_replay,
+    },
+    .persistent_vopr = StorageBackendTestStep{
+        .name = "persistent-vopr-test",
+        .description = "Run persistent modeled-storage VOPR smoke tests",
+        .filters = &StorageBackendTestFilters.persistent_vopr,
+    },
+    .persistent_soak = StorageBackendTestStep{
+        .name = "persistent-sim-soak",
+        .description = "Run only the persistent simulation soak test",
+        .filters = &StorageBackendTestFilters.persistent_soak,
+    },
+    .index_manager = StorageBackendTestStep{
+        .name = "index-manager-test",
+        .description = "Run storage/db/catalog/index_manager unit tests",
+        .filters = &no_default_filters,
+        .select_filters = true,
+        .simple_runner = true,
+    },
+    .index_manager_resource = StorageBackendTestStep{
+        .name = "index-manager-resource-test",
+        .description = "Run index manager resource-manager accounting tests",
+        .filters = &StorageBackendTestFilters.index_manager_resource,
+    },
+    .index_manager_sim = StorageBackendTestStep{
+        .name = "index-manager-sim-test",
+        .description = "Run only the index manager simulation workload tests",
+        .filters = &StorageBackendTestFilters.index_manager_sim,
+    },
+    .index_manager_replay = StorageBackendTestStep{
+        .name = "index-manager-replay-fixtures",
+        .description = "Run only the index manager replay fixture tests",
+        .filters = &StorageBackendTestFilters.index_manager_replay,
+    },
+    .index_manager_vopr = StorageBackendTestStep{
+        .name = "index-manager-vopr-test",
+        .description = "Run index manager modeled-storage VOPR smoke tests",
+        .filters = &StorageBackendTestFilters.index_manager_vopr,
+    },
+    .sparse = StorageBackendTestStep{
+        .name = "sparse-test",
+        .description = "Run sparse index unit tests",
+    },
+    .derived_log = StorageBackendTestStep{
+        .name = "derived-log-test",
+        .description = "Run storage/db/derived/derived_log unit tests",
+    },
+    .storage_sim = StorageBackendTestStep{
+        .name = "storage-sim-test",
+        .description = "Run legacy deterministic storage workload simulations that still use real storage I/O",
+    },
+    .storage_vopr = StorageBackendTestStep{
+        .name = "storage-vopr-test",
+        .description = "Run storage modeled-time/model-I/O VOPR smoke and simulation checks",
+    },
+    .storage_sim_soak = StorageBackendTestStep{
+        .name = "storage-sim-soak",
+        .description = "Run the LMDB and WAL simulation soak tests",
     },
 };
 
