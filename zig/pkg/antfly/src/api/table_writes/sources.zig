@@ -13182,21 +13182,18 @@ test "write cache prunes stale visible root generations instead of clearing curr
     source.write_cache = &write_cache;
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
-    var cached_first = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    var cached_first = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
     cached_first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);
 
     generation = 2;
-    var cached_second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    var cached_second = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
     cached_second.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
 
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 }
 
 test "hosted write cache opens current visible root generation" {
