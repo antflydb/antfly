@@ -1008,7 +1008,10 @@ Unsupported DDL remains on the existing parser until
    AST-to-plan wrappers for typed graph index and graph metric index plans.
    Runtime parsing requires generated-parser success for migrated `CREATE GRAPH`
    and `ALTER GRAPH` DDL heads, so incomplete graph DDL fails closed instead of
-   falling back to the legacy DDL classifier.
+   falling back to the legacy DDL classifier. Parsed-statement classification
+   for generated graph DDL now validates retained graph AST kind and
+   statement/command spans before publishing the DDL family, so corrupted graph
+   AST payloads fail closed before typed graph catalog planning.
    Canonical `antfly.*` query table-function sources now have generated
    grammar coverage, named-argument coverage, source/name/argument AST ranges,
    owned named-argument item/name/operator/value ranges, list-based Antfly

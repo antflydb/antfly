@@ -1250,7 +1250,10 @@ fn parseStatement(
                 }
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
             } else return .{ .unknown = raw_statement },
-            .graph => return .{ .ddl = .{ .raw = raw_statement } },
+            .graph => |kind| if (generatedGraphAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .ddl = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
             .cursor => |kind| return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } },
             .unsupported => |kind| {
                 if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
@@ -1398,6 +1401,34 @@ fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDd
         .create_graph_metric,
         => true,
     };
+}
+
+fn generatedGraphAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlGraphKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const graph_ast = switch (ast_value) {
+        .graph => |graph| graph,
+        else => return false,
+    };
+    if (graph_ast.kind != expected_kind) return false;
+    const end = generatedGraphStatementEnd(tokens, graph_ast.statement_span) orelse return false;
+    _ = end;
+    return std.meta.eql(graph_ast.command_span, tokens[0].sourceSpan());
+}
+
+fn generatedGraphStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) {
+        end -= 1;
+    }
+    if (end == 0) return null;
+    if (tokens[0].sourceSpan().start != statement_span.start) return null;
+    if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
+    return end;
 }
 
 fn generatedCursorUnsupportedKind(kind: generated_parser.GeneratedSqlCursorKind) generated_parser.GeneratedSqlUnsupportedKind {
@@ -4375,6 +4406,34 @@ test "sql adapter parsed sql rejects malformed generated DDL classification payl
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(extension_index.raw_statement, mismatched_extension_kind, &extension_index.tokenized_sql)),
+    );
+
+    var graph_index = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges");
+    defer graph_index.deinit(alloc);
+    var mismatched_graph_kind = graph_index.generated_statement.?;
+    if (mismatched_graph_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| graph_ast.kind = .create_metric,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_index.raw_statement, mismatched_graph_kind, &graph_index.tokenized_sql)),
+    );
+
+    var graph_metric = try ParsedSql.initAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges");
+    defer graph_metric.deinit(alloc);
+    var malformed_graph_span = graph_metric.generated_statement.?;
+    if (malformed_graph_span.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| graph_ast.statement_span.end -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_metric.raw_statement, malformed_graph_span, &graph_metric.tokenized_sql)),
     );
 }
 
