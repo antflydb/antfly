@@ -1551,48 +1551,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const lib_toon_conformance = b.addExecutable(.{
-        .name = "lib-toon-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/toon/toon_conformance.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const run_lib_toon_conformance_after_fetch_quiet_step = antfly_conformance_build.addToonConformanceSteps(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .toon_mod = toon_mod,
     });
-    lib_toon_conformance.root_module.addImport("antfly_toon", toon_mod);
-
-    const fetch_lib_toon_conformance = b.addRunArtifact(lib_toon_conformance);
-    fetch_lib_toon_conformance.addArg("fetch");
-    fetch_lib_toon_conformance.addArg("/tmp/toon-format-spec");
-    const lib_toon_conformance_fetch_step = b.step("lib-toon-conformance-fetch", "Fetch the lib/toon upstream conformance fixtures");
-    lib_toon_conformance_fetch_step.dependOn(&fetch_lib_toon_conformance.step);
-
-    const fetch_lib_toon_conformance_quiet = b.addRunArtifact(lib_toon_conformance);
-    fetch_lib_toon_conformance_quiet.addArg("fetch");
-    fetch_lib_toon_conformance_quiet.addArg("/tmp/toon-format-spec");
-    const fetch_lib_toon_conformance_quiet_step = expectQuietSuccess(fetch_lib_toon_conformance_quiet);
-
-    const run_lib_toon_conformance = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance.addArg("run");
-    run_lib_toon_conformance.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance.addArg("--no-fetch");
-    const lib_toon_conformance_run_step = b.step("lib-toon-conformance-run", "Run lib/toon conformance suite without fetching fixtures");
-    lib_toon_conformance_run_step.dependOn(&run_lib_toon_conformance.step);
-
-    const run_lib_toon_conformance_after_fetch = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance_after_fetch.addArg("run");
-    run_lib_toon_conformance_after_fetch.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_toon_conformance_after_fetch.step.dependOn(&fetch_lib_toon_conformance.step);
-    const lib_toon_conformance_step = b.step("lib-toon-conformance", "Fetch and run lib/toon conformance suite");
-    lib_toon_conformance_step.dependOn(&run_lib_toon_conformance_after_fetch.step);
-
-    const run_lib_toon_conformance_after_fetch_quiet = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance_after_fetch_quiet.addArg("run");
-    run_lib_toon_conformance_after_fetch_quiet.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_toon_conformance_after_fetch_quiet.step.dependOn(fetch_lib_toon_conformance_quiet_step);
-    const run_lib_toon_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_toon_conformance_after_fetch_quiet);
 
     const httpx_json_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/httpx/src/util/json.zig"),
