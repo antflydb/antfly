@@ -300,7 +300,7 @@ pub const DB = struct {
     };
     pub const HAReplicationCallbacks = struct {
         pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
-        pub const apply_ha_derived_effect_record = applyHADerivedEffectRecord;
+        pub const append_replicated_ha_derived_effect_context = derived_async_impl.appendReplicatedHADerivedEffectContext;
         pub const set_schema_with_local_lite_sql_table_record_json_replicated_apply = schema_runtime_impl.setSchemaWithLocalLiteSqlTableRecordJsonReplicatedApply;
     };
 
@@ -548,8 +548,7 @@ pub const DB = struct {
     }
 
     pub fn applyHADerivedEffectRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!u64 {
-        var ctx = self.batchContext();
-        return try derived_async_impl.appendReplicatedHADerivedEffectContext(&ctx, record);
+        return try ha_replication_impl.applyDerivedEffectRecord(self, record);
     }
 
     pub fn haAppliedReplicationLsn(self: *DB) anyerror!u64 {
@@ -1667,7 +1666,7 @@ pub const DB = struct {
         alloc: Allocator,
         derived_batch: derived_types.DerivedBatch,
     ) !ManagedSyncTargets {
-        return try derived_async_impl.collectManagedSyncTargets(alloc, self.core.index_manager, derived_batch);
+        return try derived_async_impl.collectManagedSyncTargetsForDB(self, alloc, derived_batch);
     }
 
     pub fn derivedAsyncBatchAffectsManagedIndex(
@@ -1675,7 +1674,7 @@ pub const DB = struct {
         derived_batch: derived_types.DerivedBatch,
         index_ref: index_manager_mod.ManagedIndexRef,
     ) bool {
-        return derived_async_impl.batchAffectsManagedIndex(self.core.index_manager, derived_batch, index_ref);
+        return derived_async_impl.batchAffectsManagedIndexForDB(self, derived_batch, index_ref);
     }
 
     pub fn derivedAsyncBatchAffectsManagedIndexForReplay(
@@ -1683,7 +1682,7 @@ pub const DB = struct {
         derived_batch: derived_types.DerivedBatch,
         index_ref: index_manager_mod.ManagedIndexRef,
     ) !bool {
-        return try derived_async_impl.batchAffectsManagedIndexForReplay(self.core.index_manager, derived_batch, index_ref);
+        return try derived_async_impl.batchAffectsManagedIndexForReplayForDB(self, derived_batch, index_ref);
     }
 
     pub fn derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(
@@ -1691,7 +1690,7 @@ pub const DB = struct {
         derived_batch: derived_types.DerivedBatch,
         index_ref: index_manager_mod.ManagedIndexRef,
     ) !bool {
-        return try derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(self.core.index_manager, derived_batch, index_ref);
+        return try derived_async_impl.batchAdvancesManagedIndexApplyStateForReplayForDB(self, derived_batch, index_ref);
     }
 
     pub fn runUntilIdle(self: *DB) !void {
@@ -3603,7 +3602,7 @@ pub const DB = struct {
     }
 
     pub fn searchRuntimeTextIndexIsChunkBacked(self: *DB, alloc: Allocator, index_name: ?[]const u8) !bool {
-        return try self.core.textIndexIsChunkBacked(alloc, index_name);
+        return try search_runtime_impl.textIndexIsChunkBacked(self, alloc, index_name);
     }
 
     pub fn searchRuntimeLoadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {

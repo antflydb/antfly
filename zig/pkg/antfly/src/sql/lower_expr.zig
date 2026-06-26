@@ -16726,6 +16726,11 @@ const DirectGraphTableFunctionSource = struct {
     }
 };
 
+const GeneratedGraphTableFunctionSource = struct {
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+};
+
 fn cloneTableAliasAlloc(alloc: std.mem.Allocator, value: plan_mod.TableAlias) !plan_mod.TableAlias {
     const name = try alloc.dupe(u8, value.name);
     var name_transferred = false;
@@ -16738,12 +16743,34 @@ fn cloneTableAliasAlloc(alloc: std.mem.Allocator, value: plan_mod.TableAlias) !p
     return .{ .name = name, .alias = alias };
 }
 
+fn generatedGraphTableFunctionSourceAt(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    function_start: usize,
+) ?GeneratedGraphTableFunctionSource {
+    const read = generated_read_ast orelse return null;
+    for (read.source_graph_function_items) |graph_item| {
+        if (graph_item.tokens.start != function_start) continue;
+        for (read.source_antfly_function_items) |antfly_item| {
+            if (antfly_item.tokens.start == graph_item.tokens.start and
+                antfly_item.tokens.end == graph_item.tokens.end)
+            {
+                return .{
+                    .antfly_item = antfly_item,
+                    .graph_item = graph_item,
+                };
+            }
+        }
+    }
+    return null;
+}
+
 fn parseGraphTableFunctionSourceAtAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     function_start: usize,
     default_alias: []const u8,
     available_ctes: []const db_mod.types.RelationalRowsCte,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?DirectGraphTableFunctionSource {
     if (function_start + 1 >= tokens.len) return null;
     if (tokens[function_start].kind != .identifier or tokens[function_start + 1].kind != .lparen) return null;
@@ -16773,14 +16800,21 @@ fn parseGraphTableFunctionSourceAtAlloc(
     } else default_alias;
 
     if (plan_mod.findCteByName(available_ctes, alias_source) != null) return error.UnsupportedSqlShape;
-    var wrapped = std.ArrayListUnmanaged(Token).empty;
-    defer wrapped.deinit(alloc);
-    try wrapped.append(alloc, .{ .kind = .identifier, .text = "select" });
-    try wrapped.append(alloc, .{ .kind = .star, .text = "*" });
-    try wrapped.append(alloc, .{ .kind = .identifier, .text = "from" });
-    try wrapped.appendSlice(alloc, tokens[function_start..function_end]);
 
-    const table_function = try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, wrapped.items);
+    const generated_source = generatedGraphTableFunctionSourceAt(generated_read_ast, function_start);
+    if (generated_read_ast != null and generated_source == null) return error.UnsupportedSqlShape;
+
+    const table_function = if (generated_source) |source|
+        try query_function.lowerAntflyGraphTableFunctionGeneratedAstAlloc(alloc, tokens, source.antfly_item, source.graph_item)
+    else table_function: {
+        var wrapped = std.ArrayListUnmanaged(Token).empty;
+        defer wrapped.deinit(alloc);
+        try wrapped.append(alloc, .{ .kind = .identifier, .text = "select" });
+        try wrapped.append(alloc, .{ .kind = .star, .text = "*" });
+        try wrapped.append(alloc, .{ .kind = .identifier, .text = "from" });
+        try wrapped.appendSlice(alloc, tokens[function_start..function_end]);
+        break :table_function try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, wrapped.items);
+    };
     var table_function_transferred = false;
     errdefer if (!table_function_transferred) {
         var owned = table_function;
@@ -16820,9 +16854,10 @@ fn parseDirectGraphTableFunctionSourceAlloc(
     tokens: []const Token,
     select_body_pos: usize,
     available_ctes: []const db_mod.types.RelationalRowsCte,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?DirectGraphTableFunctionSource {
     const from_index = parser.findTopLevelKeywordFromIndex(tokens, select_body_pos, "from") orelse return null;
-    return try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, from_index + 1, "__antfly_graph_table_function", available_ctes);
+    return try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, from_index + 1, "__antfly_graph_table_function", available_ctes, generated_read_ast);
 }
 
 pub fn parseSelectAlloc(
@@ -16837,7 +16872,7 @@ pub fn parseSelectAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes, options.generated_read_ast);
     var direct_graph_source_transferred = false;
     defer if (!direct_graph_source_transferred) {
         if (direct_graph_source) |*source| source.deinit(alloc);
@@ -17197,7 +17232,7 @@ pub fn parseAggregateAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes, options.generated_read_ast);
     var direct_graph_source_transferred = false;
     defer if (!direct_graph_source_transferred) {
         if (direct_graph_source) |*source| source.deinit(alloc);
@@ -17641,7 +17676,7 @@ pub fn parseWindowSelectAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes, options.generated_read_ast);
     var direct_graph_source_transferred = false;
     defer if (!direct_graph_source_transferred) {
         if (direct_graph_source) |*source| source.deinit(alloc);
@@ -18021,7 +18056,7 @@ pub fn parseJoinAlloc(
 
     try parser.expectKeyword(tokens, pos, "from");
     const left_tokens_start = pos.*;
-    var left_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join_left", options.available_ctes);
+    var left_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join_left", options.available_ctes, options.generated_read_ast);
     var left_graph_source_transferred = false;
     defer if (!left_graph_source_transferred) {
         if (left_graph_source) |*source| source.deinit(alloc);
@@ -18044,7 +18079,7 @@ pub fn parseJoinAlloc(
     };
     const right_tokens_start = pos.*;
 
-    var right_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join", options.available_ctes);
+    var right_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join", options.available_ctes, options.generated_read_ast);
     var right_graph_source_transferred = false;
     defer if (!right_graph_source_transferred) {
         if (right_graph_source) |*source| source.deinit(alloc);
@@ -30681,6 +30716,22 @@ fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstGraphFunctionSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.source_graph_function_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.source_graph_function_items[0].tokens = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadWindowRangeToProjection(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -31182,6 +31233,20 @@ test "sql adapter lower expr treats direct graph table functions as relation sou
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqualStrings("neighbors", neighbors_query.plan.query.source_cte);
+
+    var malformed_graph_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
+    );
+    defer malformed_graph_source.deinit(alloc);
+    try corruptGeneratedReadFirstGraphFunctionSourceRange(&malformed_graph_source);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_graph_source,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var shortest_path_query = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,

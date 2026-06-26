@@ -1058,12 +1058,16 @@ Unsupported DDL remains on the existing parser until
    generated-covered graph-query and metric source shapes through typed
    relation source planning, supports joins between graph-match and
    graph-metric table functions, and materializes direct graph query and graph
-   metric rows through the existing graph table-function row contract. CTE
-   bodies now retain the same Antfly and graph table-function source metadata,
-   validate it at the CTE boundary, and rebase it into the direct generated
-   read AST used by child body planning. Broader graph DSL cutover still
-   requires direct generated graph-query planning beyond retained semantic
-   payload validation and broader unsupported-shape diagnostics.
+   metric rows through the existing graph table-function row contract. The
+   generated-covered relation-source lowerer now consumes the retained
+   generated Antfly and graph table-function AST payload directly instead of
+   wrapping graph table-function tokens in synthetic `SELECT * FROM ...`
+   statements for reparsing, and fail-closes when generated source payloads are
+   missing or corrupted. CTE bodies now retain the same Antfly and graph
+   table-function source metadata, validate it at the CTE boundary, and rebase
+   it into the direct generated read AST used by child body planning. Broader
+   graph DSL cutover still requires deeper graph-query semantic planning for
+   non-table-function graph syntax and broader unsupported-shape diagnostics.
 
 ## Generator Performance
 

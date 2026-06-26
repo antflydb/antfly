@@ -1302,6 +1302,10 @@ pub fn Impl(comptime DB: type) type {
             return try self.internalLookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
         }
 
+        pub fn textIndexIsChunkBacked(self: *DB, alloc: Allocator, index_name: ?[]const u8) !bool {
+            return try self.core.textIndexIsChunkBacked(alloc, index_name);
+        }
+
         pub fn loadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
             const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "chunk");
             defer alloc.free(prefix);

@@ -1750,6 +1750,11 @@ pub fn Impl(comptime DB: type) type {
             if (applied_lsn_marker) |lsn| try Self.markReplicationRecordApplied(self, lsn);
         }
 
+        pub fn applyDerivedEffectRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!u64 {
+            var ctx = self.batchContext();
+            return try DB.HAReplicationCallbacks.append_replicated_ha_derived_effect_context(&ctx, record);
+        }
+
         pub fn applyReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
             if (try Self.replicationRecordAlreadyApplied(self, record)) return;
 
@@ -1779,7 +1784,7 @@ pub fn Impl(comptime DB: type) type {
                     }
                 },
                 .derived_effect => {
-                    _ = try DB.HAReplicationCallbacks.apply_ha_derived_effect_record(self, record);
+                    _ = try Self.applyDerivedEffectRecord(self, record);
                     try Self.markReplicationRecordApplied(self, record.lsn);
                 },
                 .backup_start,

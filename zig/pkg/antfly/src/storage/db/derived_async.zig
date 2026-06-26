@@ -1618,6 +1618,10 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        pub fn collectManagedSyncTargetsForDB(self: *DB, alloc: Allocator, batch: derived_types.DerivedBatch) !ManagedSyncTargets {
+            return try collectManagedSyncTargets(alloc, self.core.index_manager, batch);
+        }
+
         fn appendUniqueOwnedName(
             alloc: Allocator,
             items: *std.ArrayListUnmanaged([]const u8),
@@ -1882,6 +1886,22 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        pub fn batchAffectsManagedIndexForDB(
+            self: *DB,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) bool {
+            return batchAffectsManagedIndex(self.core.index_manager, batch, index_ref);
+        }
+
+        pub fn batchAffectsManagedIndexForReplayForDB(
+            self: *DB,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !bool {
+            return try batchAffectsManagedIndexForReplay(self.core.index_manager, batch, index_ref);
+        }
+
         pub fn batchAdvancesManagedIndexApplyState(
             index_manager: *index_manager_mod.IndexManager,
             batch: derived_types.DerivedBatch,
@@ -1919,6 +1939,14 @@ pub fn Impl(comptime DB: type) type {
                 .missing_dependency => true,
                 .relevant => try batchAdvancesManagedIndexApplyState(index_manager, batch, index_ref),
             };
+        }
+
+        pub fn batchAdvancesManagedIndexApplyStateForReplayForDB(
+            self: *DB,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !bool {
+            return try batchAdvancesManagedIndexApplyStateForReplay(self.core.index_manager, batch, index_ref);
         }
 
         pub fn batchAffectsManagedIndex(

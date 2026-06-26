@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
+const generated_parser = @import("generated_parser.zig");
 const query_contract = @import("../api/query_contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
@@ -51,6 +52,35 @@ fn antflyQueryFunctionFromKeyword(keyword: TokenKeyword) ?AntflyQueryFunction {
         .graph_metric => .graph_metric,
         .graph_metric_rerank => .graph_metric_rerank,
         .hybrid_search => .hybrid_search,
+        else => null,
+    };
+}
+
+fn antflyQueryFunctionFromGeneratedKind(kind: generated_parser.GeneratedSqlAntflyTableFunctionKind) AntflyQueryFunction {
+    return switch (kind) {
+        .full_text_search => .full_text_search,
+        .semantic_search => .semantic_search,
+        .vector_search => .vector_search,
+        .graph_traverse => .graph_traverse,
+        .graph_neighbors => .graph_neighbors,
+        .graph_shortest_path => .graph_shortest_path,
+        .graph_k_shortest_paths => .graph_k_shortest_paths,
+        .graph_match => .graph_match,
+        .graph_metric => .graph_metric,
+        .graph_metric_rerank => .graph_metric_rerank,
+        .hybrid_search => .hybrid_search,
+    };
+}
+
+fn generatedGraphTableFunctionKindFromAntfly(kind: generated_parser.GeneratedSqlAntflyTableFunctionKind) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
+    return switch (kind) {
+        .graph_traverse => .traverse,
+        .graph_neighbors => .neighbors,
+        .graph_shortest_path => .shortest_path,
+        .graph_k_shortest_paths => .k_shortest_paths,
+        .graph_match => .match,
+        .graph_metric => .metric,
+        .graph_metric_rerank => .metric_rerank,
         else => null,
     };
 }
@@ -582,6 +612,111 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
         },
         else => return error.UnsupportedSqlShape,
     }
+}
+
+pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+) !db_mod.types.RelationalRowsTableFunction {
+    if (!std.meta.eql(antfly_item.tokens, graph_item.tokens) or
+        !std.meta.eql(antfly_item.name_tokens, graph_item.name_tokens) or
+        !std.meta.eql(antfly_item.argument_tokens, graph_item.argument_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const expected_graph_kind = generatedGraphTableFunctionKindFromAntfly(antfly_item.kind) orelse return error.UnsupportedSqlShape;
+    if (graph_item.kind != expected_graph_kind) return error.UnsupportedSqlShape;
+
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer args.deinit(alloc);
+    try args.ensureTotalCapacity(alloc, antfly_item.argument_items.len);
+    for (antfly_item.argument_items) |argument| {
+        if (argument.name_tokens.end != argument.name_tokens.start + 1 or argument.name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        args.appendAssumeCapacity(.{
+            .name = tokens[argument.name_tokens.start].text,
+            .value = try generatedAntflyQueryFunctionArgValue(tokens, argument.value_tokens),
+        });
+    }
+
+    const function = antflyQueryFunctionFromGeneratedKind(antfly_item.kind);
+    if (function != .graph_traverse and
+        function != .graph_neighbors and
+        function != .graph_shortest_path and
+        function != .graph_k_shortest_paths and
+        function != .graph_match and
+        function != .graph_metric and
+        function != .graph_metric_rerank)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    var lowered = try lowerParsedAntflyQueryFunctionAlloc(alloc, null, function, args.items);
+    defer lowered.deinit(alloc);
+    if (lowered.req.dense != null or lowered.req.sparse != null or lowered.req.merge_config != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    switch (function) {
+        .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_queries.len != 1 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const graph_queries = lowered.req.graph_queries;
+            const graph_query = graph_queries[0];
+            lowered.req.graph_queries = &.{};
+            if (graph_queries.len > 0) alloc.free(@constCast(graph_queries));
+            return .{ .graph_query = .{
+                .table_name = owned_table_name,
+                .query = graph_query,
+            } };
+        },
+        .graph_metric => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_metric_queries.len != 1 or lowered.req.graph_queries.len != 0) return error.UnsupportedSqlShape;
+            const graph_metric_queries = lowered.req.graph_metric_queries;
+            const graph_metric_query = graph_metric_queries[0];
+            lowered.req.graph_metric_queries = &.{};
+            if (graph_metric_queries.len > 0) alloc.free(@constCast(graph_metric_queries));
+            return .{ .graph_metric_query = .{
+                .table_name = owned_table_name,
+                .query = graph_metric_query,
+            } };
+        },
+        .graph_metric_rerank => {
+            if (lowered.req.full_text == null or lowered.req.graph_metric_rerank == null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_queries.len != 0 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const request = lowered.req;
+            lowered.req = .{};
+            return .{ .graph_metric_rerank_query = .{
+                .table_name = owned_table_name,
+                .request = request,
+            } };
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedAntflyQueryFunctionArgValue(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !SqlQueryFunctionArgValue {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const value_token = tokens[range.start];
+    return switch (value_token.kind) {
+        .string => .{ .string = value_token.text },
+        .number => .{ .number = value_token.text },
+        .identifier => blk: {
+            if (value_token.matchesKeywordTag(.true)) break :blk .{ .boolean = true };
+            if (value_token.matchesKeywordTag(.false)) break :blk .{ .boolean = false };
+            break :blk .{ .string = value_token.text };
+        },
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 fn lowerParsedAntflyQueryFunctionAlloc(
