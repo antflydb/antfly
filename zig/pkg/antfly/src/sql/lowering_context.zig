@@ -3872,7 +3872,7 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
             .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
-            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql);
@@ -3915,7 +3915,7 @@ fn lowerGeneratedReadPlanForLoweringContextTestAlloc(
             .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
-            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
     return try lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast);
@@ -4142,15 +4142,36 @@ fn lowerRecursiveCteParsedSqlForLoweringContextTestAlloc(
     );
 }
 
-fn unsupportedSetOperationParsedSqlForLoweringContextTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: ?runtime_schema.TableSchema,
-    _: []const value_mod.SqlValue,
-    _: lower_expr.SqlFunctionBindings,
-) anyerror!plan.LoweredSetOperationPlan {
-    return error.UnsupportedSqlShape;
+fn lowerSetOperationParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredSetOperationPlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema) |joined_source_schema| {
+        if (joined_source_schema.storage_mode != .relational or joined_source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    }
+    const tokens = parsed_sql.items();
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = source_schema orelse schema,
+        .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
+        .function_bindings = function_bindings,
+    };
+    return try plan.parseSetOperationPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        source_schema orelse schema,
+        source_schema != null,
+        parser_context.ParserState.ContextAccessors.setOperationParserHooks(&parser_state),
+    );
 }
 
 test "sql adapter lowering context lowers generated read AST through typed read plans" {
@@ -4167,6 +4188,8 @@ test "sql adapter lowering context lowers generated read AST through typed read 
         "SELECT status, SUM(amount) AS total FROM usage_records WHERE kind = 'order' GROUP BY status LIMIT 5",
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' LIMIT 5",
         "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' LIMIT 10",
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+        "SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT id FROM usage_records WHERE kind = 'return'",
         "WITH open_usage AS (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(amount) AS total FROM open_usage GROUP BY tenant LIMIT 5",
         "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.customer_id = parent.id) SELECT id FROM source_rows",
     };
@@ -4213,7 +4236,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
             .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
-            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
 

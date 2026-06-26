@@ -3332,3 +3332,179 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "orders", key_schema, .{}, .read_index));
     try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "oversized", schema, .{}, .read_index));
 }
+
+test "lowered sql cross-table read plans execute through routed scans" {
+    const alloc = std.testing.allocator;
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_orders = try schema_api.parseValidatedTableSchema(alloc, orders_schema_json);
+    defer parsed_orders.deinit(alloc);
+    const orders_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_orders);
+    defer storage_schema.freeSchema(alloc, orders_schema);
+
+    var parsed_customers = try schema_api.parseValidatedTableSchema(alloc, customers_schema_json);
+    defer parsed_customers.deinit(alloc);
+    const customers_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_customers);
+    defer storage_schema.freeSchema(alloc, customers_schema);
+
+    const FakeCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json, .placement_role = "data" },
+            .{ .table_id = 8, .name = "customers", .schema_json = customers_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                    .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalog,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                "{\"key\":\"o1\",\"id\":\"o1\",\"status\":\"open\",\"customer_id\":\"c1\",\"amount\":10}\n{\"key\":\"o2\",\"id\":\"o2\",\"status\":\"closed\",\"customer_id\":\"c2\",\"amount\":5}\n"
+            else if (std.mem.eql(u8, table_name, "customers"))
+                "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+            else
+                return error.TableNotFound;
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn rowsQueryPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsSetOperationPlanCatalog(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), plan.max_rows);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), plan.max_bytes);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), plan.spill_after_bytes);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var fake = FakeRoutedSource{};
+    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
+        orders_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered.deinit(alloc);
+
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "orders",
+        orders_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    switch (result) {
+        .join => |join_result| {
+            try std.testing.expectEqual(@as(u32, 2), join_result.total_rows);
+            try std.testing.expectEqual(@as(usize, 2), join_result.rows.len);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", join_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", join_result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

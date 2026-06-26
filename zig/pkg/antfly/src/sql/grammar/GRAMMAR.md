@@ -884,8 +884,9 @@ Unsupported DDL remains on the existing parser until
    coverage stable as more expression metadata is retained.
    Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
-   validation, and aggregate, join, and lateral reads now have direct generated
-   AST-to-read-family dispatch boundaries after clause-range validation;
+   validation, and aggregate, join, lateral, window, and set-operation reads
+   now have direct generated AST-to-read-family dispatch boundaries after
+   clause-range validation;
    generated read classification and generated aggregate-read validation now
    recognize aggregate-function projections such as global `COUNT(*)` reads
    and aggregate CTE bodies without requiring `GROUP BY` or `HAVING` side
@@ -1464,7 +1465,8 @@ Generated grammar work needs evidence at multiple levels:
   boundary metadata, projection/source/join/predicate/group/window/order/result-tail
   ranges, and CTE count/first/last/body range compatibility before publishing
   the parsed read family, and generated-family validation wrappers over
-  representative query, aggregate, join, lateral, and non-recursive CTE plans,
+  representative query, aggregate, join, lateral, window, set-operation, and
+  non-recursive CTE plans,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
   prefixes, binary `JOIN ... USING (...)` lowering through schema-checked
