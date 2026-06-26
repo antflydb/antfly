@@ -23,7 +23,94 @@ const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("tables.zig");
 
+pub fn applyDurablePlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: *sql_adapter.DurableSqlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    switch (plan.*) {
+        .ddl => |ddl| return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, ddl, session),
+        .session => |session_plan| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .session_catalog = session_plan.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .transaction => |transaction| switch (transaction.*) {
+            .control => |control| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .transaction_control = control };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+            .prepared => |prepared| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .prepared_transaction = prepared };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+            .savepoint => |savepoint| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .savepoint_transaction = savepoint };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+        },
+        .prepared_statement => |prepared_statement| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .prepared_statement = prepared_statement.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .cursor => |cursor| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .cursor_portal = cursor.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .notification => |notification| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .notification_channel = notification.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .routine => |routine| switch (routine.*) {
+            .function_catalog => |function| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .function_catalog = function };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+            .trigger_catalog => |trigger| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .trigger_catalog = trigger };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+            .procedure_call => |procedure| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .procedure_call = procedure };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+        },
+        .auth => |auth| switch (auth.*) {
+            .authorization_catalog => |authorization| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .authorization_catalog = authorization };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+            .row_security_catalog => |row_security| {
+                var ddl: sql_adapter.LoweredDdlPlan = .{ .row_security_catalog = row_security };
+                return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+            },
+        },
+        .extension => |extension| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .extension_catalog = extension.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .maintenance => |maintenance| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .maintenance_job = maintenance.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+        .bulk_io => |bulk_io| {
+            var ddl: sql_adapter.LoweredDdlPlan = .{ .bulk_io = bulk_io.* };
+            return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+        },
+    }
+}
+
 pub fn applyPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: *sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var durable = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+    return try applyDurablePlanOnServiceWithSessionAlloc(alloc, svc, &durable, session);
+}
+
+fn applyDdlPayloadOnServiceWithSessionAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     plan: *sql_adapter.LoweredDdlPlan,

@@ -148,7 +148,7 @@ pub const AdminSource = struct {
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
-        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -228,7 +228,8 @@ pub const AdminSource = struct {
         defer parsed_sql.deinit(alloc);
         var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
         defer logical_plan.deinit(alloc);
-        return try AdminSource.applyLogicalRelationalSqlDdlPlanOnAdminSource(self.ptr, fn_ptr, alloc, &logical_plan, catalog_resources.SqlCatalogSession.default());
+        var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+        return try fn_ptr(self.ptr, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
     }
 
     pub fn applyRelationalSqlDdlPlanWithSession(
@@ -238,86 +239,8 @@ pub const AdminSource = struct {
         session: catalog_resources.SqlCatalogSession,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, plan, session);
-    }
-
-    fn applyLogicalRelationalSqlDdlPlanOnAdminSource(
-        ptr: *anyopaque,
-        fn_ptr: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord,
-        alloc: std.mem.Allocator,
-        logical_plan: *sql_adapter.LogicalSqlPlan,
-        session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
-        switch (logical_plan.*) {
-            .ddl => |*plan| return try fn_ptr(ptr, alloc, plan, session),
-            .session => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .session_catalog = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .transaction => |transaction_plan| switch (transaction_plan) {
-                .control => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .transaction_control = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-                .prepared => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .prepared_transaction = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-                .savepoint => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .savepoint_transaction = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-            },
-            .prepared_statement => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .prepared_statement = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .cursor => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .cursor_portal = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .notification => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .notification_channel = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .routine => |routine_plan| switch (routine_plan) {
-                .function_catalog => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .function_catalog = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-                .trigger_catalog => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .trigger_catalog = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-                .procedure_call => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .procedure_call = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-            },
-            .auth => |auth_plan| switch (auth_plan) {
-                .authorization_catalog => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .authorization_catalog = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-                .row_security_catalog => |plan| {
-                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .row_security_catalog = plan };
-                    return try fn_ptr(ptr, alloc, &ddl_plan, session);
-                },
-            },
-            .extension => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .extension_catalog = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .maintenance => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .maintenance_job = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .bulk_io => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .bulk_io = plan };
-                return try fn_ptr(ptr, alloc, &ddl_plan, session);
-            },
-            .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
-        }
+        var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+        return try fn_ptr(self.ptr, alloc, &durable_plan, session);
     }
 
     pub fn updateForeignKeyValidationState(
@@ -676,11 +599,11 @@ pub const AdminSource = struct {
     fn metadataServiceApplyRelationalSqlDdlPlanWithSession(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        plan: *sql_adapter.LoweredDdlPlan,
+        plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
+        var applied = try applyDurableSqlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
         try flushMetadataServiceMutation(svc);
         return applied;
@@ -1034,11 +957,11 @@ pub const AdminSource = struct {
     fn metadataHttpServiceApplyRelationalSqlDdlPlanWithSession(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        plan: *sql_adapter.LoweredDdlPlan,
+        plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
+        var applied = try applyDurableSqlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
         try flushMetadataHttpServiceMutation(svc);
         return applied;
@@ -2317,7 +2240,17 @@ fn applyRelationalSqlDdlPlanOnMetadataServiceWithSession(
     plan: *sql_adapter.LoweredDdlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    return try relational_sql_ddl.applyPlanOnServiceWithSessionAlloc(alloc, service_impl, plan, session);
+    var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+    return try applyDurableSqlPlanOnMetadataServiceWithSession(service_impl, alloc, &durable_plan, session);
+}
+
+fn applyDurableSqlPlanOnMetadataServiceWithSession(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    plan: *sql_adapter.DurableSqlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, service_impl, plan, session);
 }
 
 fn applyRelationalDropTableCascadeReferences(

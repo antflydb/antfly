@@ -606,7 +606,7 @@ pub const StatusSource = struct {
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         drop_catalog_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
-        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         compare_and_swap_table_schema: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) anyerror!void = null,
         apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
@@ -704,7 +704,7 @@ pub const StatusSource = struct {
     pub fn applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(
         self: StatusSource,
         alloc: std.mem.Allocator,
-        plan: *sql_adapter.LoweredDdlPlan,
+        plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
         function_bindings: sql_adapter.SqlFunctionBindings,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -930,7 +930,7 @@ pub const StatusSource = struct {
             fn applyRelationalSqlDdlPlanWithSession(
                 ptr: *anyopaque,
                 alloc: std.mem.Allocator,
-                plan: *sql_adapter.LoweredDdlPlan,
+                plan: *sql_adapter.DurableSqlPlan,
                 session: catalog_resources.SqlCatalogSession,
             ) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
                 return try api_http_server.applyRelationalSqlDdlPlanOnServiceWithSession(cast(ptr), alloc, plan, session);
@@ -1321,10 +1321,10 @@ fn setNamespaceTablespaceOnService(svc: anytype, database_name: []const u8, name
 fn applyRelationalSqlDdlPlanOnServiceWithSession(
     svc: anytype,
     alloc: std.mem.Allocator,
-    plan: *sql_adapter.LoweredDdlPlan,
+    plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    var applied = try relational_sql_ddl.applyPlanOnServiceWithSessionAlloc(alloc, svc, plan, session);
+    var applied = try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, svc, plan, session);
     errdefer applied.deinit(alloc);
     try svc.runRound();
     return applied;
@@ -1857,7 +1857,7 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             _ = plan;
@@ -2016,7 +2016,7 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             _ = plan;
@@ -4397,16 +4397,47 @@ pub const ApiHttpServer = struct {
                 },
             },
             .extension => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .extension_catalog = plan };
-                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                _ = plan;
+                const timing = context.statement_timing orelse SqlStatementExecutionTiming{
+                    .timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session()),
+                    .start_ns = platform_time.monotonicNs(),
+                };
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
+                errdefer applied.deinit(self.alloc);
+                try self.refreshSqlExtensionQueryFunctions();
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
             },
             .maintenance => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .maintenance_job = plan };
-                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                _ = plan;
+                const timing = context.statement_timing orelse SqlStatementExecutionTiming{
+                    .timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session()),
+                    .start_ns = platform_time.monotonicNs(),
+                };
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
             },
             .bulk_io => |plan| {
-                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .bulk_io = plan };
-                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                _ = plan;
+                const timing = context.statement_timing orelse SqlStatementExecutionTiming{
+                    .timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session()),
+                    .start_ns = platform_time.monotonicNs(),
+                };
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
             },
             .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
         }
@@ -4530,7 +4561,8 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
             .extension_catalog => {
-                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, plan, session.session(), context.function_bindings);
+                var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
                 errdefer applied.deinit(self.alloc);
                 try self.refreshSqlExtensionQueryFunctions();
                 try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
@@ -4550,7 +4582,8 @@ pub const ApiHttpServer = struct {
                 return applied;
             }
         }
-        var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, plan, session.session(), context.function_bindings);
+        var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+        var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
         errdefer applied.deinit(self.alloc);
         try self.scheduleSchemaRewriteRuntimeHintForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
@@ -26664,7 +26697,7 @@ test "api http server applies authorization SQL DDL through user manager" {
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -27034,11 +27067,15 @@ test "api http server applies SQL DDL with explicit catalog session" {
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             alloc_arg: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc_arg, plan.*, session);
+            const ddl_plan = switch (plan.*) {
+                .ddl => |ddl| ddl,
+                else => return error.TestUnexpectedResult,
+            };
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc_arg, ddl_plan.*, session);
             defer target.deinit(alloc_arg);
             try std.testing.expect(target.createsTable());
             try std.testing.expectEqualStrings("tenant_ops", target.database_name);
@@ -27188,7 +27225,7 @@ test "api http server enforces SQL statement timeout on session-backed DDL" {
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             alloc_arg: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -29971,7 +30008,7 @@ test "api http server executes SQL notification channel plans through native run
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -30056,7 +30093,7 @@ test "api http server applies SQL routine catalog plans through native runtime" 
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -30233,7 +30270,7 @@ test "api http server routes routine-backed SQL trigger DDL through routine runt
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -30299,7 +30336,7 @@ test "api http server keeps updated-at trigger DDL on table source path" {
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             _ = plan;
@@ -30581,7 +30618,7 @@ test "api http server exposes SQL routine bindings to catalog read planning" {
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -30653,7 +30690,7 @@ test "api http server freezes routine settings from current SQL session" {
         fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: *sql_adapter.LoweredDdlPlan,
+            _: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -30734,13 +30771,17 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.binding_aware_calls += 1;
 
-            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan.*, session);
+            const ddl_plan = switch (plan.*) {
+                .ddl => |ddl| ddl,
+                else => return error.TestUnexpectedResult,
+            };
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, ddl_plan.*, session);
             defer target.deinit(allocator);
 
             var base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
@@ -30860,12 +30901,12 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             alloc_arg: std.mem.Allocator,
-            plan: *sql_adapter.LoweredDdlPlan,
+            plan: *sql_adapter.DurableSqlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (plan.*) {
-                .extension_catalog => |extension_plan| switch (extension_plan) {
+                .extension => |extension_plan| switch (extension_plan.*) {
                     .create => self.installed_ready = true,
                     .drop => self.installed_ready = false,
                     else => return error.TestUnexpectedResult,

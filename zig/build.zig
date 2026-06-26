@@ -1443,8 +1443,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lake_scaffold_test_mod,
     });
     const run_lake_scaffold_tests = b.addRunArtifact(lake_scaffold_tests);
-    const lake_scaffold_test_step = b.step("lake-scaffold-test", "Run Antfly-owned lake-native scaffold tests");
-    lake_scaffold_test_step.dependOn(&run_lake_scaffold_tests.step);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     root_test_step.dependOn(&run_lake_scaffold_tests.step);
 
     const graph_metric_tests = antfly_tests_build.addGraphMetricTestSteps(b, .{
@@ -1457,16 +1457,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, lite_native_test_mod, true, true);
-    const run_lite_native_tests = antfly_tests_build.addModuleTestStep(
-        b,
-        lite_native_test_mod,
-        "lite-native-test",
-        "Run Lite native backend tests",
-        .{
-            .filters = &antfly_tests_build.PackageTestFilters.lite_native,
-            .simple_runner = true,
+    const lite_native_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_native),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
-    ).run;
+    });
+    const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
 
     const lite_cli_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
@@ -1482,16 +1481,15 @@ pub fn build(b: *std.Build) void {
     lite_cli_test_mod.addImport("antfly_platform", platform_mod);
     lite_cli_test_mod.addImport("handlebars", handlebars_mod);
     lite_cli_test_mod.addOptions("build_options", build_options);
-    const run_lite_cli_tests = antfly_tests_build.addModuleTestStep(
-        b,
-        lite_cli_test_mod,
-        "lite-cli-test",
-        "Run Antfly Lite CLI tests",
-        .{
-            .filters = &antfly_tests_build.PackageTestFilters.lite_cli,
-            .simple_runner = true,
+    const lite_cli_tests = b.addTest(.{
+        .root_module = lite_cli_test_mod,
+        .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_cli),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
-    ).run;
+    });
+    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
 
     const recall_test_run = antfly_tests_build.addModuleTestStep(
         b,
@@ -2104,8 +2102,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
-    const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
-    antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
 
     const graph_metric_operations_command_tests = b.addTest(.{
@@ -2117,6 +2113,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_graph_metric_operations_command_tests = b.addRunArtifact(graph_metric_operations_command_tests);
+    const cli_test_step = b.step("cli-test", "Run Antfly command-line tests");
+    cli_test_step.dependOn(&run_antfly_main_tests.step);
+    cli_test_step.dependOn(&run_lite_cli_tests.step);
+    cli_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
     unit_test_step.dependOn(&graph_metric_tests.operations.step);
     unit_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
 
