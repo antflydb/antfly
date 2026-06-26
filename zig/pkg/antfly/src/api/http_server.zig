@@ -12158,6 +12158,7 @@ pub const ApiHttpServer = struct {
                 };
 
                 var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+                    error.NotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
                     error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
                     else => {

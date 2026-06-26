@@ -3728,6 +3728,7 @@ test "table manager applies schema rewrite job lifecycle operations" {
         .reason = "row_images",
         .start_row_key = "",
         .end_row_key = null,
+        .full_row_rewrite = true,
     });
 
     try std.testing.expectError(error.InvalidSchemaRewriteJobLease, manager.beginSchemaRewriteJob(.{
@@ -3822,6 +3823,7 @@ test "table manager applies schema rewrite job lifecycle operations" {
         .reason = "row_images",
         .start_row_key = "m",
         .end_row_key = null,
+        .full_row_rewrite = true,
     });
     try manager.beginSchemaRewriteJob(.{
         .job_id = 9102,

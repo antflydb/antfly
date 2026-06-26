@@ -3114,6 +3114,14 @@ fn validateGeneratedTransactionAstSpans(
         .rollback => .rollback,
     };
     if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+    if (ast.boundary_tail_tokens) |tail| {
+        if (tail.start != 1 or tail.end != 2 or tail.end > tokens.len) return error.UnsupportedSqlShape;
+        if (!tokens[tail.start].matchesKeyword("work") and !tokens[tail.start].matchesKeyword("transaction")) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (generatedStatementEnd(tokens, ast.statement_span).? > 1) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 pub fn sessionDdlPlanFromGeneratedAstAlloc(
@@ -15158,8 +15166,14 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
 
     const cases = [_][]const u8{
         "BEGIN;",
+        "BEGIN WORK;",
+        "BEGIN TRANSACTION;",
         "COMMIT;",
+        "COMMIT WORK;",
+        "COMMIT TRANSACTION;",
         "ROLLBACK;",
+        "ROLLBACK WORK;",
+        "ROLLBACK TRANSACTION;",
     };
     for (cases) |sql| {
         const generated = try generatedTransactionBoundaryPlanForTestAlloc(alloc, sql);
@@ -15211,6 +15225,32 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         transactionBoundaryPlanFromGeneratedAst(mismatched_kind.items(), mismatched_kind_ast),
+    );
+
+    var missing_tail = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT WORK;");
+    defer missing_tail.deinit(alloc);
+    const missing_tail_raw = missing_tail.generated_statement orelse return error.TestUnexpectedResult;
+    var missing_tail_ast = switch (missing_tail_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    missing_tail_ast.boundary_tail_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(missing_tail.items(), missing_tail_ast),
+    );
+
+    var malformed_tail = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK TRANSACTION;");
+    defer malformed_tail.deinit(alloc);
+    const malformed_tail_raw = malformed_tail.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_tail_ast = switch (malformed_tail_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_tail_ast.boundary_tail_tokens = .{ .start = 0, .end = 1 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(malformed_tail.items(), malformed_tail_ast),
     );
 }
 

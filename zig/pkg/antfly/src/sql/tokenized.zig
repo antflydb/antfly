@@ -325,6 +325,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
+    if (isGeneratedTransactionBoundaryStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
@@ -348,6 +349,22 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
         .ddl => true,
         .select, .with => false,
     };
+}
+
+fn isGeneratedTransactionBoundaryStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    if (!tokenMatchesKeyword(first, .begin) and
+        !tokenMatchesKeyword(first, .commit) and
+        !tokenMatchesKeyword(first, .rollback))
+    {
+        return false;
+    }
+    if (end == start + 1) return true;
+    return end == start + 2 and
+        (tokenMatchesText(tokens[start + 1], "work") or tokenMatchesText(tokens[start + 1], "transaction"));
 }
 
 fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -3012,6 +3029,21 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
     switch (session.statement) {
         .session => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var transaction = try ParsedSql.initAlloc(alloc, "COMMIT WORK");
+    defer transaction.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.transaction, transaction.generatedStatementKind().?);
+    switch (transaction.generated_statement.?.ast.?) {
+        .transaction => |generated_transaction| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.commit, generated_transaction.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_transaction.boundary_tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (transaction.statement) {
+        .ddl => {},
         else => return error.TestUnexpectedResult,
     }
 

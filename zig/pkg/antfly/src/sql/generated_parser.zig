@@ -970,6 +970,7 @@ pub const GeneratedSqlTransactionAst = struct {
     kind: GeneratedSqlTransactionKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    boundary_tail_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlPreparedAst = struct {
@@ -1789,8 +1790,14 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SHOW search_path", .kind = .session },
     .{ .sql = "DISCARD ALL", .kind = .session },
     .{ .sql = "BEGIN", .kind = .transaction },
+    .{ .sql = "BEGIN WORK", .kind = .transaction },
+    .{ .sql = "BEGIN TRANSACTION", .kind = .transaction },
     .{ .sql = "COMMIT", .kind = .transaction },
+    .{ .sql = "COMMIT WORK", .kind = .transaction },
+    .{ .sql = "COMMIT TRANSACTION", .kind = .transaction },
     .{ .sql = "ROLLBACK", .kind = .transaction },
+    .{ .sql = "ROLLBACK WORK", .kind = .transaction },
+    .{ .sql = "ROLLBACK TRANSACTION", .kind = .transaction },
     .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
     .{ .sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1", .kind = .prepared },
     .{ .sql = "EXECUTE read_stmt()", .kind = .prepared },
@@ -2199,6 +2206,10 @@ pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) 
 fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) !void {
     switch (tok.kind) {
         .identifier => {
+            if (try contextualKeywordSymbolId(tok, prev)) |id| {
+                try ids.append(alloc, id);
+                return;
+            }
             if (generatedParserTreatsKeywordAsIdentifier(tok, prev, next)) {
                 try appendIdentifierIds(alloc, ids, tok.text, false);
                 return;
@@ -2245,6 +2256,19 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .path_arrow_text => try appendSymbol(ids, alloc, "PATH_ARROW_TEXT"),
         .semicolon => try appendSymbol(ids, alloc, "SEMICOLON"),
     }
+}
+
+fn contextualKeywordSymbolId(tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
+    const previous = prev orelse return null;
+    if (!previous.matchesKeywordTag(.begin) and
+        !previous.matchesKeywordTag(.commit) and
+        !previous.matchesKeywordTag(.rollback))
+    {
+        return null;
+    }
+    if (tok.matchesKeyword("work")) return generated.symbolId("WORK") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("transaction")) return generated.symbolId("TRANSACTION") orelse error.UnsupportedSqlShape;
+    return null;
 }
 
 fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
@@ -2914,11 +2938,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
     const command_span = tokens[command_start].sourceSpan();
     return switch (statement) {
         .session => |kind| .{ .session = buildSessionAst(tokens, end, kind, statement_span, command_span) },
-        .transaction => |kind| .{ .transaction = .{
-            .kind = kind,
-            .statement_span = statement_span,
-            .command_span = command_span,
-        } },
+        .transaction => |kind| .{ .transaction = buildTransactionAst(end, kind, statement_span, command_span) },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
@@ -2936,6 +2956,20 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         } },
         .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
         else => null,
+    };
+}
+
+fn buildTransactionAst(
+    end: usize,
+    kind: GeneratedSqlTransactionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlTransactionAst {
+    return .{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+        .boundary_tail_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
     };
 }
 
@@ -7079,13 +7113,14 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
-    const transaction_sql = "ROLLBACK;";
+    const transaction_sql = "ROLLBACK TRANSACTION;";
     const transaction_result = try parseSqlAlloc(alloc, transaction_sql);
     switch (transaction_result.ast.?) {
         .transaction => |transaction| {
             try std.testing.expectEqual(GeneratedSqlTransactionKind.rollback, transaction.kind);
-            try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("ROLLBACK TRANSACTION", spanText(transaction_sql, transaction.statement_span));
             try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, transaction.boundary_tail_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
