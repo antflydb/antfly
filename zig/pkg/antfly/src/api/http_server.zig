@@ -27574,6 +27574,26 @@ test "api http server decodes public sql params into owned sql values" {
     try std.testing.expectEqualStrings("{\"ok\":true}", params.values[4].json);
 }
 
+fn expectPublicSqlDiagnosticBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    expected_phase: []const u8,
+    expected_code: []const u8,
+    expected_message: []const u8,
+    expected_span_start: ?i64,
+    expected_span_end: ?i64,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const err_obj = parsed.value.object.get("error") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_phase, err_obj.object.get("phase").?.string);
+    try std.testing.expectEqualStrings(expected_code, err_obj.object.get("code").?.string);
+    try std.testing.expectEqualStrings(expected_message, err_obj.object.get("message").?.string);
+    const span = err_obj.object.get("span").?.object;
+    if (expected_span_start) |span_start| try std.testing.expectEqual(span_start, span.get("start").?.integer);
+    if (expected_span_end) |span_end| try std.testing.expectEqual(span_end, span.get("end").?.integer);
+}
+
 test "api http server exposes psql-style SQL session endpoint" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -27682,7 +27702,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer readonly_execute_write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_execute_write_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_execute_write_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_execute_write_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", 0, 30);
 
     const set_transaction_readonly_body = try std.fmt.allocPrint(
         alloc,
@@ -27759,7 +27779,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer request_readonly_set_readwrite_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), request_readonly_set_readwrite_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", request_readonly_set_readwrite_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, request_readonly_set_readwrite_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
     const request_readonly_not_persisted_body = try std.fmt.allocPrint(
         alloc,
@@ -27943,7 +27963,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer default_readonly_write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), default_readonly_write_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", default_readonly_write_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, default_readonly_write_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
     const set_transaction_readwrite_body = try std.fmt.allocPrint(
         alloc,
@@ -27959,7 +27979,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer set_transaction_readwrite_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), set_transaction_readwrite_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", set_transaction_readwrite_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, set_transaction_readwrite_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
     const set_default_readwrite_body = try std.fmt.allocPrint(
         alloc,
@@ -27975,7 +27995,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer set_default_readwrite_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), set_default_readwrite_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", set_default_readwrite_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, set_default_readwrite_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
     var missing_session_resp = try server.handle(.{
         .method = .POST,
@@ -28005,7 +28025,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer readonly_write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_write_resp.status);
-    try std.testing.expectEqualStrings("cannot execute write statement in a read-only transaction", readonly_write_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_write_resp.body, "execute", "read_only_transaction", "cannot execute write statement in a read-only transaction", null, null);
 
     var readonly_ddl_resp = try server.handle(.{
         .method = .POST,
@@ -28015,7 +28035,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer readonly_ddl_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_ddl_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_ddl_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_ddl_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
     var trigger_function_resp = try server.handle(.{
         .method = .POST,
@@ -28034,7 +28054,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer readonly_trigger_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_trigger_resp.status);
-    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_trigger_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_trigger_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
     try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
 }
 
@@ -29331,7 +29351,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer view_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), view_resp.status);
-    try std.testing.expectEqualStrings("document_sql_view_mapping_unsupported", view_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, view_resp.body, "plan", "document_sql_view_mapping_unsupported", "document_sql_view_mapping_unsupported", 0, 68);
 }
 
 test "api http server executes SQL point writes through typed row batch ingress" {

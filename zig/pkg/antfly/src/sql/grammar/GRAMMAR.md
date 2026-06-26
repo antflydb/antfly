@@ -1174,6 +1174,11 @@ contract until storage and API row plans grow those outer-join semantics.
    `AS`, optional `MATERIALIZED`/`NOT MATERIALIZED`, body parentheses, comma
    separation, and final item boundary before CTE body planning consumes the
    generated metadata.
+   Specialized generated expression nodes now validate exact token layout for
+   `INTERVAL` literals, typed `TIMESTAMP`/`TIMESTAMPTZ` literals,
+   `CURRENT_TIMESTAMP[(precision)]`, `EXTRACT(field FROM source)`, and
+   `ARRAY[...]` constructors before read lowering consumes their retained
+   expression payloads.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
@@ -1187,7 +1192,8 @@ contract until storage and API row plans grow those outer-join semantics.
    semantic planning outside the currently range-validated generic, aggregate,
    and window function surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery semantic planning/lowering beyond retained generated payload
-   validation, remaining specialized expression operators, richer
+   validation, remaining specialized expression operator semantics beyond
+   exact generated token-layout validation, richer
    inline window-expression semantic planning beyond current generated exact `OVER`
    layout and argument-range validation, broader recursive CTE semantic planning beyond the
    current generated-first lowering boundary and validated CTE prefix/item/body

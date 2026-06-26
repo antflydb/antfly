@@ -2982,6 +2982,93 @@ fn validateGeneratedGroupedExpressionClauseMetadata(
     }
 }
 
+fn validateGeneratedIntervalExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const value_tokens = expression.interval_value_tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end != expression_tokens.start + 2) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.interval)) return error.UnsupportedSqlShape;
+    if (tokens[expression_tokens.start + 1].kind != .string) return error.UnsupportedSqlShape;
+    if (value_tokens.start != expression_tokens.start + 1 or value_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedTimestampExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const type_tokens = expression.timestamp_type_tokens orelse return error.UnsupportedSqlShape;
+    const value_tokens = expression.timestamp_value_tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end != expression_tokens.start + 2) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.timestamp) and !tokens[expression_tokens.start].matchesKeywordTag(.timestamptz)) {
+        return error.UnsupportedSqlShape;
+    }
+    if (tokens[expression_tokens.start + 1].kind != .string) return error.UnsupportedSqlShape;
+    if (type_tokens.start != expression_tokens.start or type_tokens.end != expression_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (value_tokens.start != expression_tokens.start + 1 or value_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedCurrentTimestampExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.current_timestamp)) return error.UnsupportedSqlShape;
+    if (expression.current_timestamp_precision_tokens) |precision_tokens| {
+        if (expression_tokens.end != expression_tokens.start + 4) return error.UnsupportedSqlShape;
+        if (tokens[expression_tokens.start + 1].kind != .lparen or tokens[expression_tokens.end - 1].kind != .rparen) {
+            return error.UnsupportedSqlShape;
+        }
+        if (precision_tokens.start != expression_tokens.start + 2 or precision_tokens.end != expression_tokens.start + 3) return error.UnsupportedSqlShape;
+        if (tokens[precision_tokens.start].kind != .number) return error.UnsupportedSqlShape;
+    } else if (expression_tokens.end != expression_tokens.start + 1) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedExtractExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const field_tokens = expression.extract_field_tokens orelse return error.UnsupportedSqlShape;
+    const source_tokens = expression.extract_source_tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 5) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.extract) or
+        tokens[expression_tokens.start + 1].kind != .lparen or
+        tokens[expression_tokens.end - 1].kind != .rparen)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (field_tokens.start != expression_tokens.start + 2 or field_tokens.end != expression_tokens.start + 3) return error.UnsupportedSqlShape;
+    if (tokens[field_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    if (!tokens[field_tokens.end].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    if (source_tokens.start != field_tokens.end + 1 or source_tokens.end != expression_tokens.end - 1) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedArrayExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 2) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.array) or
+        tokens[expression_tokens.start + 1].kind != .lbracket or
+        tokens[expression_tokens.end - 1].kind != .rbracket)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.array_tokens) |array_tokens| {
+        if (array_tokens.start != expression_tokens.start + 2 or array_tokens.end != expression_tokens.end - 1) return error.UnsupportedSqlShape;
+        if (expression.array_items.count == 0) return error.UnsupportedSqlShape;
+    } else if (expression_tokens.end != expression_tokens.start + 3 or expression.array_items.count != 0) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedCastExpressionClauseMetadata(
     tokens: []const tokenized.Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
@@ -3225,6 +3312,11 @@ fn validateGeneratedExpressionAstRanges(
         .grouped => try validateGeneratedGroupedExpressionClauseMetadata(tokens, expression),
         .cast => try validateGeneratedCastExpressionClauseMetadata(tokens, expression),
         .case_expression => try validateGeneratedCaseExpressionClauseMetadata(tokens, expression),
+        .interval_literal => try validateGeneratedIntervalExpressionClauseMetadata(tokens, expression),
+        .timestamp_literal => try validateGeneratedTimestampExpressionClauseMetadata(tokens, expression),
+        .current_timestamp => try validateGeneratedCurrentTimestampExpressionClauseMetadata(tokens, expression),
+        .extract_expression => try validateGeneratedExtractExpressionClauseMetadata(tokens, expression),
+        .array_constructor => try validateGeneratedArrayExpressionClauseMetadata(tokens, expression),
         .function_call => try validateGeneratedFunctionCallClauseMetadata(tokens, expression),
         else => {},
     }
@@ -5684,6 +5776,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_extract_expression_parsed_sql, malformed_extract_expression_read_ast),
     );
+    malformed_extract_expression_read_ast = switch (malformed_extract_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_extract_source_tokens = malformed_extract_expression_read_ast.projection_items.expressions[0].extract_source_tokens orelse return error.UnsupportedSqlShape;
+    malformed_extract_expression_read_ast.projection_items.expressions[0].extract_source_tokens = .{
+        .start = malformed_extract_source_tokens.start - 1,
+        .end = malformed_extract_source_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_extract_expression_parsed_sql.items(), &malformed_extract_expression_read_ast),
+    );
 
     var malformed_array_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -5700,6 +5805,20 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_array_expression_parsed_sql, malformed_array_expression_read_ast),
+    );
+    malformed_array_expression_read_ast = switch (malformed_array_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_array_inner_expression = malformed_array_expression_read_ast.where_expression.right_expression.?.inner_expression orelse return error.UnsupportedSqlShape;
+    const malformed_array_tokens = malformed_array_inner_expression.array_tokens orelse return error.UnsupportedSqlShape;
+    malformed_array_inner_expression.array_tokens = .{
+        .start = malformed_array_tokens.start - 1,
+        .end = malformed_array_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_array_expression_parsed_sql.items(), &malformed_array_expression_read_ast),
     );
 
     var malformed_logical_not_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5735,6 +5854,25 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_current_timestamp_parsed_sql, malformed_current_timestamp_read_ast),
     );
+    var malformed_current_timestamp_precision_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CURRENT_TIMESTAMP(6) FROM usage_records WHERE id = 'u1'",
+    );
+    defer malformed_current_timestamp_precision_parsed_sql.deinit(alloc);
+    const malformed_current_timestamp_precision_generated_raw = malformed_current_timestamp_precision_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_current_timestamp_precision_read_ast = switch (malformed_current_timestamp_precision_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_current_timestamp_precision_tokens = malformed_current_timestamp_precision_read_ast.projection_items.expressions[0].current_timestamp_precision_tokens orelse return error.UnsupportedSqlShape;
+    malformed_current_timestamp_precision_read_ast.projection_items.expressions[0].current_timestamp_precision_tokens = .{
+        .start = malformed_current_timestamp_precision_tokens.start - 1,
+        .end = malformed_current_timestamp_precision_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_current_timestamp_precision_parsed_sql.items(), &malformed_current_timestamp_precision_read_ast),
+    );
 
     var malformed_interval_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -5750,6 +5888,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_interval_literal_parsed_sql, malformed_interval_literal_read_ast),
+    );
+    malformed_interval_literal_read_ast = switch (malformed_interval_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_interval_value_tokens = malformed_interval_literal_read_ast.projection_items.expressions[0].interval_value_tokens orelse return error.UnsupportedSqlShape;
+    malformed_interval_literal_read_ast.projection_items.expressions[0].interval_value_tokens = .{
+        .start = malformed_interval_value_tokens.start - 1,
+        .end = malformed_interval_value_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_interval_literal_parsed_sql.items(), &malformed_interval_literal_read_ast),
     );
 
     var malformed_timestamp_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5767,6 +5918,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_timestamp_literal_parsed_sql, malformed_timestamp_literal_read_ast),
+    );
+    malformed_timestamp_literal_read_ast = switch (malformed_timestamp_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_timestamp_type_tokens = malformed_timestamp_literal_read_ast.projection_items.expressions[0].timestamp_type_tokens orelse return error.UnsupportedSqlShape;
+    malformed_timestamp_literal_read_ast.projection_items.expressions[0].timestamp_type_tokens = .{
+        .start = malformed_timestamp_type_tokens.start,
+        .end = malformed_timestamp_type_tokens.end + 1,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_timestamp_literal_parsed_sql.items(), &malformed_timestamp_literal_read_ast),
     );
 
     var malformed_join_tree_parsed_sql = try tokenized.ParsedSql.initAlloc(
