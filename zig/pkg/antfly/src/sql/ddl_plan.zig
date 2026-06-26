@@ -10034,6 +10034,7 @@ pub const DdlExpressionOptions = struct {
     row_expression_hooks: lower_expr.RowExpressionParserHooks,
     arithmetic_hooks: lower_expr.ArithmeticExpressionParserHooks,
     variadic_hooks: lower_expr.VariadicRowExpressionParserHooks,
+    routine_expression: lower_expr.RoutineExpressionRowExpressionParserOptions,
     condition_alternatives: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
 };
 
@@ -10084,6 +10085,48 @@ fn parseDdlRowExpressionAlloc(
     );
 }
 
+fn parseDdlRoutineRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    options: DdlExpressionOptions,
+) !db_mod.types.RelationalRowsExpression {
+    if (!lower_expr.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions)) return error.UnsupportedSqlShape;
+    const name = tokens[pos.*].text;
+    _ = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    defer {
+        for (operands.items) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .rparen) == null) {
+        while (true) {
+            const operand = try parseDdlRowExpressionAlloc(alloc, tokens, pos, options, false);
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+            try operands.append(alloc, operand);
+            operand_transferred = true;
+            if (parser.matchToken(tokens, pos, .comma) != null) continue;
+            break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    const binding = try lower_expr.routineExpressionBinding(options.function_bindings.routine_expressions, name, operands.items.len) orelse return error.UnsupportedSqlShape;
+    if (binding.null_input == .returns_null) {
+        for (operands.items) |operand| {
+            if (lower_expr.routineArgumentExpressionIsNullLiteral(operand)) {
+                return .{
+                    .kind = .value,
+                    .value_json = try alloc.dupe(u8, "null"),
+                };
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
+    return try lower_expr.cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
+}
+
 fn parseDdlConditionAlternativesAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -10115,7 +10158,10 @@ pub fn parseDdlGeneratedValueAlloc(
     if (cursor.matchKeyword("always")) {
         try cursor.expectKeyword("as");
         try cursor.expectToken(.lparen);
-        const expression = parseDdlRowExpressionAlloc(alloc, tokens, pos, options, true) catch |err| {
+        const expression = (if (lower_expr.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions))
+            parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options)
+        else
+            parseDdlRowExpressionAlloc(alloc, tokens, pos, options, true)) catch |err| {
             pos.* = start;
             if (err == error.OutOfMemory) return err;
             return try grammar.parseDdlStoredGeneratedValueAlloc(alloc, tokens, pos);
@@ -10266,7 +10312,67 @@ fn parseDdlCheckExpressionPredicateFactorAlternatives(
         return;
     }
 
+    if (try parseDdlRoutineExpressionConditionAlternativesAlloc(alloc, tokens, pos, options, alternatives)) return;
+
     try parseDdlConditionAlternativesAlloc(alloc, tokens, pos, alternatives, options);
+}
+
+fn parseDdlRoutineExpressionConditionAlternativesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    options: DdlExpressionOptions,
+    alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+) !bool {
+    if (!lower_expr.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions)) return false;
+
+    const lhs = try parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+
+    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const rhs = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            const rhs_start = pos.*;
+            out[0] = (if (lower_expr.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions))
+                parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options)
+            else
+                parseDdlRowExpressionAlloc(alloc, tokens, pos, options, false)) catch |err| switch (err) {
+                error.UnsupportedSqlShape => blk_value: {
+                    pos.* = rhs_start;
+                    break :blk_value .{
+                        .kind = .value,
+                        .value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, options.params),
+                    };
+                },
+                else => return err,
+            };
+            var rhs_expression_transferred = false;
+            errdefer if (!rhs_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, out[0]);
+            rhs_expression_transferred = true;
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
+        alloc.free(rhs);
+    };
+
+    const condition: db_mod.types.RelationalRowsExpressionCondition = .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+    lhs_transferred = true;
+    rhs_transferred = true;
+    try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+    return true;
 }
 
 fn parseDdlCheckNegatedPredicateGroupsAlloc(

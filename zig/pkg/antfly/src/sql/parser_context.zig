@@ -302,6 +302,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
                 .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
+                .routine_expression = Accessors.routineExpressionRowExpressionParserOptions(ptr),
                 .condition_alternatives = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
             };
         }

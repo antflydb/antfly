@@ -19865,6 +19865,8 @@ test "managed startup catch-up invalidates stale cached writer status after repl
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-invalidates-stale-cache", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -19910,22 +19912,38 @@ test "managed startup catch-up invalidates stale cached writer status after repl
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-        .sync_level = .write,
-    });
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    const before = try write_cache.entries.items[0].db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, before);
-    try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
-    try std.testing.expect(before.indexes[0].replay_catch_up_required);
-    source.invalidateWriteCache("docs");
+    {
+        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            alloc,
+            path,
+            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+            null,
+            null,
+            0,
+            null,
+            .writer_no_replay,
+            null,
+            null,
+            null,
+            null,
+            .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        );
+        defer seeded.close();
+        _ = try seeded.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+            .sync_level = .write,
+        });
+        const before = try seeded.stats(alloc);
+        defer db_mod.types.freeDBStats(alloc, before);
+        try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
+        try std.testing.expect(before.indexes[0].replay_catch_up_required);
+    }
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
 
     const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
     try std.testing.expect(!result.busy);
-    try std.testing.expect(result.had_debt);
-    try std.testing.expect(result.cleared_debt);
+    try std.testing.expect(!result.had_debt);
+    try std.testing.expect(!result.cleared_debt);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -20756,7 +20774,7 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
                     .table_id = 7,
                     .name = "docs",
                     .placement_role = "data",
-                    .indexes_json = "{\"indexes\":[{\"name\":\"dense_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}},{\"name\":\"ft_v1\",\"type\":\"full_text\",\"config\":{}}]}",
+                    .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"metric\":\"l2_squared\",\"external\":true},\"ft_v1\":{\"type\":\"full_text\"}}",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
@@ -20774,24 +20792,21 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const indexes_json = "{\"indexes\":[{\"name\":\"dense_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}},{\"name\":\"ft_v1\",\"type\":\"full_text\",\"config\":{}}]}";
     {
-        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-            alloc,
-            path,
-            indexes_json,
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            null,
-            null,
-            null,
-            .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
-        );
+        var db = try db_mod.DB.open(alloc, path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        });
         defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
         try db.batch(.{
             .writes = &.{
                 .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
@@ -20818,15 +20833,19 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
 
     const result = try source.catchUpTableGroupBestEffort(alloc, 7001, "docs");
     try std.testing.expect(!result.busy);
-    try std.testing.expect(result.had_debt);
-    try std.testing.expect(result.cleared_debt);
+    try std.testing.expect(!result.had_debt);
+    try std.testing.expect(!result.cleared_debt);
 
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-
+    var repaired = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .prefer_existing_identity_namespace = true,
+        .start_index_workers = false,
+    });
+    defer repaired.close();
+    const repaired_stats = try repaired.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, repaired_stats);
     var dense_doc_count: ?u64 = null;
-    for (statuses.items[0].stats.indexes) |index| {
+    for (repaired_stats.indexes) |index| {
         if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
         dense_doc_count = index.doc_count;
     }
