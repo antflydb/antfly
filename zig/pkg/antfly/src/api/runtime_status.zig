@@ -1943,6 +1943,7 @@ test "table runtime snapshot cache preserves existing status on replacement allo
                 .replay_catch_up_required = true,
             };
             const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+            defer alloc.free(snapshots);
             snapshots[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = initial_items },
@@ -2018,6 +2019,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
                 .doc_count = 2,
             };
             const initial = try alloc.alloc(TableRuntimeSnapshot, 2);
+            defer alloc.free(initial);
             initial[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = initial_docs_items },
@@ -2043,6 +2045,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
                 .doc_count = 99,
             };
             const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
+            defer alloc.free(refresh);
             refresh[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = refresh_docs_items },
@@ -2126,6 +2129,7 @@ test "table runtime snapshot cache summarizes replay debt" {
     };
 
     const snapshots = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = docs_items },
