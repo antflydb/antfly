@@ -896,6 +896,76 @@ test "storage.ha db fail-closed sync policy rejects before local batch commit" {
     try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
 }
 
+test "storage.ha db fail-closed metadata sync policy rejects before local lite table metadata commit" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 253,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var rejected = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_metadata_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .fail_closed,
+            },
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_reject_count = &rejected,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, db.applyLiteSqlTableRecord(alloc, .{
+        .table_id = 42,
+        .name = "usage_records",
+        .database_name = "tenant_db",
+        .namespace_name = "billing",
+        .placement_role = "data",
+        .desired_replica_count = 1,
+        .schema_json = schema_json,
+        .indexes_json = "{\"algebraic_index_v0\":{\"kind\":\"algebraic\",\"source\":\"lite_sql\"}}",
+    }));
+
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
+    try std.testing.expect((try db.getSchemaJson(alloc)) == null);
+    try std.testing.expect((try db.getLiteSqlTableRecordAlloc(alloc)) == null);
+
+    const durable_schema = try schema_mod.loadSchema(db.core.store, alloc);
+    defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    try std.testing.expect(durable_schema == null);
+}
+
 test "storage.ha db mirrors and applies schema metadata mutation records" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -979,6 +1049,124 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     try std.testing.expectEqualStrings("doc", replicated_schema.default_type);
     try std.testing.expectEqual(@as(u64, 456), replicated_schema.ttl_duration_ns);
     try std.testing.expectEqualStrings("expires_at", replicated_schema.ttl_field);
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+}
+
+test "storage.ha db mirrors and applies lite sql table metadata mutation records" {
+    const DB = @import("mod.zig").DB;
+    const metadata_table_manager = @import("../../metadata/table_manager.zig");
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 251,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const indexes_json =
+        \\{"algebraic_index_v0":{"kind":"algebraic","source":"lite_sql"}}
+    ;
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_metadata_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.applyLiteSqlTableRecord(alloc, .{
+            .table_id = 42,
+            .name = "usage_records",
+            .database_name = "tenant_db",
+            .namespace_name = "billing",
+            .placement_role = "data",
+            .desired_replica_count = 1,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    try std.testing.expectError(error.HAReadOnlyStandby, standby_db.applyLiteSqlTableRecord(alloc, .{
+        .table_id = 43,
+        .name = "denied_records",
+        .database_name = "tenant_db",
+        .namespace_name = "billing",
+        .placement_role = "data",
+        .desired_replica_count = 1,
+        .schema_json = schema_json,
+        .indexes_json = indexes_json,
+    }));
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
+    defer schema_mod.freeSchema(alloc, replicated_schema);
+    try std.testing.expectEqual(@as(u32, 1), replicated_schema.version);
+    try std.testing.expectEqualStrings("row", replicated_schema.default_type);
+
+    const local_schema_json = (try standby_db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(local_schema_json);
+    try std.testing.expectEqualStrings(schema_json, local_schema_json);
+
+    const table_record = (try standby_db.getLiteSqlTableRecordAlloc(alloc)) orelse return error.TestUnexpectedResult;
+    defer metadata_table_manager.freeTable(alloc, table_record);
+    try std.testing.expectEqual(@as(u64, 42), table_record.table_id);
+    try std.testing.expectEqualStrings("usage_records", table_record.name);
+    try std.testing.expectEqualStrings("tenant_db", table_record.database_name);
+    try std.testing.expectEqualStrings("billing", table_record.namespace_name);
+    try std.testing.expectEqualStrings(schema_json, table_record.schema_json);
+    try std.testing.expectEqualStrings(indexes_json, table_record.indexes_json);
 
     try standby_db.applyHAReplicationRecord(entry.record);
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
@@ -1522,6 +1710,23 @@ pub fn Impl(comptime DB: type) type {
             try mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema);
         }
 
+        pub fn mirrorDBLiteSqlTableMetadataCommit(
+            self: *DB,
+            table_schema: schema_mod.TableSchema,
+            schema_json: []const u8,
+            table_record_json: []const u8,
+        ) !void {
+            const resources = self.core.batchExecutionResources();
+            try mirrorLiteSqlTableMetadataCommit(
+                self.alloc,
+                resources.log_mutex,
+                self.ha_async_metadata_mirror,
+                table_schema,
+                schema_json,
+                table_record_json,
+            );
+        }
+
         pub fn appliedReplicationLsn(self: *DB) anyerror!u64 {
             return try readAppliedReplicationLsn(self.alloc, self.core.store);
         }
@@ -1555,9 +1760,23 @@ pub fn Impl(comptime DB: type) type {
                     try DB.HAReplicationCallbacks.batch_replicated_apply_with_marker(self, decoded.value.request, record.lsn);
                 },
                 .metadata_mutation => {
-                    const decoded_schema = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
+                    var decoded = try ha_effects_mod.decodeMetadataMutation(self.alloc, record);
+                    defer decoded.deinit();
+                    if (decoded.value.kind != .schema) return error.UnsupportedMetadataMutationKind;
+                    const decoded_schema = try schema_mod.deserializeSchema(self.alloc, decoded.value.schema_bytes);
                     defer schema_mod.freeSchema(self.alloc, decoded_schema);
-                    try Self.setSchemaReplicatedApplyWithMarker(self, decoded_schema, record.lsn);
+                    if (decoded.value.lite_sql_table_record_json) |table_record_json| {
+                        const schema_json = decoded.value.local_schema_json orelse return error.InvalidMetadataMutationPayload;
+                        try DB.HAReplicationCallbacks.set_schema_with_local_lite_sql_table_record_json_replicated_apply(
+                            self,
+                            decoded_schema,
+                            schema_json,
+                            table_record_json,
+                        );
+                        try Self.markReplicationRecordApplied(self, record.lsn);
+                    } else {
+                        try Self.setSchemaReplicatedApplyWithMarker(self, decoded_schema, record.lsn);
+                    }
                 },
                 .derived_effect => {
                     _ = try DB.HAReplicationCallbacks.apply_ha_derived_effect_record(self, record);
@@ -1690,6 +1909,38 @@ pub fn mirrorSchemaMetadataCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex
         defer log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{}) catch |err| {
             noteMirrorFailure(configured, "metadata mutation", err);
+            if (mirrorSyncEnabled(configured)) return err;
+            return;
+        };
+        if (configured.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
+    };
+    try evaluateMirrorCommitGate(configured, lsn);
+}
+
+pub fn mirrorLiteSqlTableMetadataCommit(
+    alloc: Allocator,
+    log_mutex: *std.atomic.Mutex,
+    mirror: ?AsyncMetadataMirror,
+    table_schema: schema_mod.TableSchema,
+    schema_json: []const u8,
+    table_record_json: []const u8,
+) !void {
+    const configured = mirror orelse return;
+    const lsn = blk: {
+        platform.sync.lockYielding(log_mutex);
+        defer log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendSchemaMetadataMutationWithPayloadOptions(
+            alloc,
+            configured.primary,
+            table_schema,
+            .{
+                .local_schema_json = schema_json,
+                .lite_sql_table_record_json = table_record_json,
+            },
+            .{},
+        ) catch |err| {
+            noteMirrorFailure(configured, "lite sql metadata mutation", err);
             if (mirrorSyncEnabled(configured)) return err;
             return;
         };

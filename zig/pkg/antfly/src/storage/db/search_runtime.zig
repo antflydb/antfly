@@ -65,6 +65,28 @@ const applyGraphUnion = db_query_graph.applyGraphUnion;
 const applyGraphIntersection = db_query_graph.applyGraphIntersection;
 const AlgebraicIndex = @import("algebraic/index.zig").Index;
 
+pub const Edge = graph_mod.Edge;
+pub const EdgeDirection = graph_mod.EdgeDirection;
+pub const TraversalRules = traversal_mod.TraversalRules;
+pub const TraversalResult = traversal_mod.TraversalResult;
+pub const PathWeightMode = paths_mod.PathWeightMode;
+pub const Path = paths_mod.Path;
+pub const PatternStep = graph_pattern_mod.PatternStep;
+pub const PatternMatch = graph_pattern_mod.PatternMatch;
+pub const ExpandStrategy = graph_query_mod.ExpandStrategy;
+pub const GraphResultNode = graph_query_mod.GraphResultNode;
+pub const GraphQuery = graph_query_mod.GraphQuery;
+pub const GraphQueryResult = graph_query_mod.GraphQueryResult;
+pub const GraphNamedResultSet = db_query_graph.NamedResultSet;
+pub const GraphMetricBuildWorkerStepResult = graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult;
+pub const GraphMetricPlannedDrainOptions = graph_mod.GraphIndex.GraphMetricPlannedDrainOptions;
+pub const SearchQuery = search_mod.SearchQuery;
+pub const TextFieldStats = distributed_stats_mod.TextFieldStats;
+pub const RuntimePreflightSummary = db_query_search.RuntimePreflightSummary;
+pub const ExplicitTextStatRequest = db_query_search.ExplicitTextStatRequest;
+pub const ExplicitBackgroundTextStatRequest = db_query_search.ExplicitBackgroundTextStatRequest;
+pub const ProfiledDenseSearchResult = db_query_search.ProfiledDenseSearchResult;
+
 const TestHelpers = if (builtin.is_test) struct {
     const support = @import("test_support.zig");
 

@@ -638,6 +638,82 @@ pub fn runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(
     return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
 }
 
+pub fn runLocalForeignKeyIntegritySchemaControllerMaintenancePass(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+) !ForeignKeyIntegritySchemaControllerResult {
+    try validateForeignKeyIntegritySchemaControllerOptions(options);
+    var summary = ForeignKeyIntegritySchemaControllerResult{};
+    var results = std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult).empty;
+    var action_schedules = std.ArrayListUnmanaged(ForeignKeyActionScheduleStatus).empty;
+    var action_jobs = std.ArrayListUnmanaged(ForeignKeyActionJobStatus).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+        for (action_schedules.items) |*schedule| schedule.deinit(alloc);
+        action_schedules.deinit(alloc);
+        for (action_jobs.items) |*job| job.deinit(alloc);
+        action_jobs.deinit(alloc);
+    }
+
+    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse {
+        return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
+    };
+    defer alloc.free(schema_json);
+
+    if (schema_json.len > 0) {
+        summary.tables_scanned = 1;
+        if (try tableSchemaHasForeignKeysAlloc(alloc, schema_json)) {
+            try runForeignKeyIntegritySchemaControllerMaintenanceForTable(
+                alloc,
+                source,
+                table_name,
+                schema_json,
+                options,
+                &summary,
+                &results,
+            );
+            try runForeignKeyIntegrityJobControllerMaintenanceForTable(
+                alloc,
+                source,
+                table_name,
+                options,
+                &summary,
+                &results,
+            );
+            try runForeignKeyActionScheduleControllerMaintenanceForTable(
+                alloc,
+                source,
+                table_name,
+                options,
+                &summary,
+                &action_schedules,
+            );
+            try runForeignKeyActionJobControllerMaintenanceForTable(
+                alloc,
+                source,
+                table_name,
+                options,
+                &summary,
+                &action_jobs,
+            );
+            for (results.items) |entry| {
+                if (!entry.schema_adoption) continue;
+                try promoteLocalForeignKeyAfterSchemaControllerResult(
+                    alloc,
+                    db,
+                    entry.result,
+                );
+            }
+        }
+    }
+
+    return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
+}
+
 pub fn runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(
     alloc: std.mem.Allocator,
     source: TableWriteSource,
@@ -675,6 +751,53 @@ pub fn runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(
             _ = try table_catalog.promoteUniqueConstraintEnforced(alloc, catalog, entry.table_name, entry.constraint_name);
         }
         if (summary.tables_executed >= options.max_tables) break;
+    }
+
+    return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
+}
+
+pub fn runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    options: UniqueConstraintIntegritySchemaControllerOptions,
+) !UniqueConstraintIntegritySchemaControllerResult {
+    try validateUniqueConstraintIntegritySchemaControllerOptions(options);
+    var summary = UniqueConstraintIntegritySchemaControllerResult{};
+    var results = std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+    }
+
+    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse {
+        return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
+    };
+    defer alloc.free(schema_json);
+
+    if (schema_json.len > 0) {
+        summary.tables_scanned = 1;
+        if (try tableSchemaHasUniqueConstraintsAlloc(alloc, schema_json)) {
+            try runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+                alloc,
+                source,
+                table_name,
+                schema_json,
+                options,
+                &summary,
+                &results,
+            );
+            for (results.items) |entry| {
+                if (!entry.schema_adoption) continue;
+                try promoteLocalUniqueConstraintAfterSchemaControllerResult(
+                    alloc,
+                    db,
+                    entry.constraint_name,
+                    entry.result,
+                );
+            }
+        }
     }
 
     return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
@@ -3560,6 +3683,180 @@ test "foreign key integrity diagnostics deduplicates violation samples" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.sample_count);
     try std.testing.expect(!diagnostics.truncated);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "\"child_key\":\"order:1\"") != null);
+}
+
+const LocalUniqueConstraintIntegrityTestSource = struct {
+    table_name: []const u8,
+    db: *db_mod.DB,
+
+    fn source(self: *@This()) TableWriteSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .batch = batch,
+                .unique_constraint_integrity = uniqueConstraintIntegrity,
+            },
+        };
+    }
+
+    fn batch(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: db_mod.types.BatchRequest,
+    ) !?void {
+        return error.UnsupportedOperation;
+    }
+
+    fn uniqueConstraintIntegrity(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        action: UniqueConstraintIntegrityAction,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?UniqueConstraintIntegrityResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try runUniqueConstraintIntegrityOnDb(alloc, self.db, 0, action, lower_doc_key, upper_doc_key);
+    }
+};
+
+test "unique schema controller maintenance repairs and promotes unvalidated local constraint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unique-schema-controller-maintenance/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"unvalidated"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const before = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expectEqual(@as(u64, 2), before.missing_unique_rows);
+
+    var source = LocalUniqueConstraintIntegrityTestSource{ .table_name = "users", .db = &db };
+    var summary = try runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
+        alloc,
+        source.source(),
+        &db,
+        "users",
+        .{
+            .action = .repair,
+            .worker_id = "worker:unique-maintenance",
+            .max_tables = 4,
+        },
+    );
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_executed);
+    try std.testing.expect(summary.complete);
+    try std.testing.expect(summary.valid);
+    try std.testing.expectEqual(@as(usize, 1), summary.terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 0), summary.terminal_invalid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.results.len);
+    try std.testing.expectEqualStrings("users", summary.results[0].table_name);
+    try std.testing.expectEqualStrings("users_email_key", summary.results[0].constraint_name);
+    try std.testing.expectEqual(@as(u64, 2), summary.results[0].result.report.repaired_unique_rows);
+
+    const after = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(after.valid());
+
+    const promoted_schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(promoted_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, promoted_schema_json, "\"validation_state\":\"enforced\"") != null);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:duplicate", .value = "{\"id\":\"user:duplicate\",\"email\":\"ada@example.test\"}" }},
+        .sync_level = .write,
+    }));
+
+    var second_summary = try runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
+        alloc,
+        source.source(),
+        &db,
+        "users",
+        .{
+            .action = .repair,
+            .worker_id = "worker:unique-maintenance",
+            .max_tables = 4,
+        },
+    );
+    defer second_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.tables_executed);
+    try std.testing.expect(second_summary.complete);
+    try std.testing.expect(second_summary.valid);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.results.len);
+}
+
+test "unique schema controller maintenance keeps invalid unvalidated local constraint pending" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unique-schema-controller-maintenance-invalid/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"unvalidated"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"same@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"same@example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var source = LocalUniqueConstraintIntegrityTestSource{ .table_name = "users", .db = &db };
+    var summary = try runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
+        alloc,
+        source.source(),
+        &db,
+        "users",
+        .{
+            .action = .repair,
+            .worker_id = "worker:unique-maintenance",
+            .max_tables = 4,
+        },
+    );
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_executed);
+    try std.testing.expect(summary.complete);
+    try std.testing.expect(!summary.valid);
+    try std.testing.expectEqual(@as(usize, 0), summary.terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.terminal_invalid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.results.len);
+    try std.testing.expectEqualStrings("users_email_key", summary.results[0].constraint_name);
+    try std.testing.expectEqual(@as(u64, 1), summary.results[0].result.report.duplicate_unique_rows);
+
+    const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"validation_state\":\"unvalidated\"") != null);
 }
 
 test "foreign key action page transaction id is stable for durable page retry" {

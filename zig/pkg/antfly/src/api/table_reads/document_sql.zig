@@ -24,6 +24,7 @@ const sql_adapter_runtime = @import("../../sql/runtime.zig");
 const raft_mod = @import("../../raft/mod.zig");
 const core = @import("core.zig");
 const cache = @import("cache.zig");
+const remote_wire = @import("remote_wire.zig");
 
 pub const RuntimeSourceAdapter = struct {
     source: core.TableReadSource,
@@ -179,6 +180,219 @@ pub const RuntimeSourceAdapter = struct {
         return owned;
     }
 };
+
+pub fn aggregationContextForDb(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    db: *db_mod.DB,
+) !db_mod.aggregations.Context {
+    const identity_read_generation = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
+    return .{
+        .index_manager = db.core.index_manager,
+        .doc_store = db.core.store,
+        .full_text_index_name = req.index_name,
+        .algebraic_index_name = req.index_name,
+        .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
+        .identity_read_generation = identity_read_generation,
+    };
+}
+
+pub fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
+    return try db.currentIdentityReadGenerationForRequest(requested);
+}
+
+pub fn algebraicIndexFreshEnoughForRequest(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    db: *db_mod.DB,
+) !bool {
+    return try algebraicIndexFreshEnoughForName(alloc, req.index_name, db);
+}
+
+pub fn algebraicIndexFreshEnoughForName(
+    alloc: std.mem.Allocator,
+    index_name_opt: ?[]const u8,
+    db: *db_mod.DB,
+) !bool {
+    // The request's index_name selects the text index; the algebraic index used
+    // for aggregation pushdown is resolved independently (an explicit algebraic
+    // index name, else the table's default algebraic index).
+    const entry = db.core.index_manager.aggregationAlgebraicIndex(index_name_opt) orelse return false;
+    if (entry.index.hasErrors()) return false;
+    const target_sequence = db.core.nextDerivedSequence();
+    var applied_sequence = try db.core.loadAppliedSequence(alloc, entry.config.name);
+    if (db.executor.appliedSequence(entry.config.name)) |live_applied| {
+        applied_sequence = @max(applied_sequence, live_applied);
+    }
+    return applied_sequence >= target_sequence;
+}
+
+pub fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
+    return req.full_text == null and
+        req.exclusion_query_json.len == 0 and
+        req.full_text_queries.len == 0 and
+        req.dense == null and
+        req.sparse == null and
+        req.dense_queries.len == 0 and
+        req.sparse_queries.len == 0 and
+        req.graph_queries.len == 0 and
+        req.merge_config == null and
+        req.reranker == null and
+        req.pruner == null and
+        req.filter_prefix.len == 0 and
+        req.filter_ids.len == 0 and
+        req.exclude_ids.len == 0 and
+        req.filter_doc_ids.len == 0 and
+        !req.filter_doc_ids_positive and
+        req.exclude_doc_ids.len == 0 and
+        !remote_wire.searchRequestHasResolvedDocFilter(req) and
+        req.distance_over == null and
+        req.distance_under == null;
+}
+
+pub fn requestWithResultIdentityGeneration(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) db_mod.types.SearchRequest {
+    var out = req;
+    if (out.identity_read_generation == null) out.identity_read_generation = result.identity_read_generation;
+    return out;
+}
+
+pub fn identityGenerationForAggregationFullResultRerun(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) !?u64 {
+    if (!req.count_only and result.hits.len == result.total_hits) return req.identity_read_generation orelse result.identity_read_generation;
+    if (result.total_hits == 0) return req.identity_read_generation orelse result.identity_read_generation;
+    return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
+}
+
+/// True when the first-pass search already materialized every matching document,
+/// so its hits can be aggregated directly without a full-scan re-fetch. This
+/// only holds when the request did not bound the result below the match count:
+/// the page is complete (hits == total_hits) AND the caller asked for at least
+/// as many hits as matched (the limit did not truncate). The hits must also
+/// include stored data because scan-based aggregations read hit `stored_data`.
+/// A `limit` of 0 (aggregation-only) never qualifies -- total_hits is then a
+/// truncated 0.
+pub fn aggregationFirstPassIsComplete(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) bool {
+    if (!req.include_stored) return false;
+    if (req.limit == 0) return false;
+    if (result.hits.len != result.total_hits) return false;
+    // hits == total_hits but the page was filled to the limit: there may be more
+    // matches the limit hid, so a full scan is still required.
+    return result.hits.len < req.limit;
+}
+
+/// Limit to use when re-fetching all matching documents for scan-based
+/// aggregation. total_hits is unreliable (truncated to the page), so bound the
+/// re-fetch by the shard's primary document count, which is an exact upper bound
+/// on the number of matches. Falls back to the observed total_hits if the count
+/// is unavailable.
+pub fn aggregationFullScanLimit(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    result: db_mod.types.SearchResult,
+) !u32 {
+    const doc_count = db.primaryDocCount(alloc) catch return @max(result.total_hits, 1);
+    const capped = std.math.cast(u32, doc_count) orelse std.math.maxInt(u32);
+    return @max(capped, result.total_hits);
+}
+
+/// Re-fetch limit for scan-based aggregation across multiple groups, where a
+/// single primary doc count is not available. An unbounded limit makes every
+/// shard return all of its matching documents so the merge aggregates over the
+/// full match set.
+pub fn aggregationDistributedFullScanLimit(result: db_mod.types.SearchResult) u32 {
+    return @max(result.total_hits, std.math.maxInt(u32));
+}
+
+test "aggregation context rejects non-current identity generation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/aggregation-context-identity-generation", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"v\":1}" }},
+        .sync_level = .write,
+    });
+
+    const current = db.core.nextDerivedSequence();
+    const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
+    try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
+        .identity_read_generation = current + 1,
+    }, &db));
+}
+
+test "aggregation full-result rerun can reuse snapped result identity generation" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    };
+    defer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, identityGenerationForAggregationFullResultRerun(.{}, result));
+    try std.testing.expectEqual(@as(?u64, 9), try identityGenerationForAggregationFullResultRerun(.{ .identity_read_generation = 9 }, result));
+    result.identity_read_generation = 11;
+    try std.testing.expectEqual(@as(?u64, 11), try identityGenerationForAggregationFullResultRerun(.{}, result));
+    try std.testing.expectEqual(@as(?u64, 9), try identityGenerationForAggregationFullResultRerun(.{ .identity_read_generation = 9 }, result));
+    try std.testing.expectEqual(@as(?u64, 11), requestWithResultIdentityGeneration(.{}, result).identity_read_generation);
+    try std.testing.expectEqual(@as(?u64, 9), requestWithResultIdentityGeneration(.{ .identity_read_generation = 9 }, result).identity_read_generation);
+
+    const complete = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    try std.testing.expectEqual(@as(?u64, null), try identityGenerationForAggregationFullResultRerun(.{}, complete));
+
+    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = false, .limit = 10 }, result));
+    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 1 }, result));
+    result.total_hits = 1;
+    try std.testing.expect(aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
+}
+
+test "aggregation full-scan limit uses primary count and distributed fallback is unbounded" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/aggregation-full-scan-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"v\":1}" },
+            .{ .key = "doc:b", .value = "{\"v\":2}" },
+        },
+        .sync_level = .write,
+    });
+
+    const result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 1,
+    };
+    try std.testing.expectEqual(@as(u32, 2), try aggregationFullScanLimit(alloc, &db, result));
+    try std.testing.expectEqual(std.math.maxInt(u32), aggregationDistributedFullScanLimit(result));
+}
 
 pub fn aggregateFromDbAlloc(
     alloc: std.mem.Allocator,

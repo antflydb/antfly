@@ -18,6 +18,7 @@ const max_build_zig_bytes = 2 * 1024 * 1024;
 const max_db_zig_bytes = 1024 * 1024;
 const max_db_module_zig_bytes = 64 * 1024 * 1024;
 const db_source_root = "pkg/antfly/src/storage/db";
+const db_test_root_path = "pkg/antfly/src/db_test_root.zig";
 
 pub const no_default_filters = [_][]const u8{};
 
@@ -504,12 +505,12 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
 }
 
 fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {
-    if (std.mem.indexOf(u8, source, "\ntest \"")) |start| {
-        std.debug.panic(
-            "storage/db/db.zig declares an inline test at line {}; move implementation-local tests to the owning DB module",
-            .{lineNumberForOffset(source, start + 1)},
-        );
-    }
+    const starts_with_test = std.mem.startsWith(u8, source, "test \"");
+    const start = if (starts_with_test) 0 else std.mem.indexOf(u8, source, "\ntest \"") orelse return;
+    std.debug.panic(
+        "storage/db/db.zig declares an inline test at line {}; move implementation-local tests to the owning DB module",
+        .{lineNumberForOffset(source, if (starts_with_test) start else start + 1)},
+    );
 }
 
 fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
@@ -517,7 +518,8 @@ fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
     while (line_start < source.len) {
         const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
         const line = source[line_start..line_end];
-        if (std.mem.startsWith(u8, line, "fn ") or std.mem.startsWith(u8, line, "    fn ")) {
+        const trimmed_line = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed_line, "fn ")) {
             std.debug.panic(
                 "storage/db/db.zig declares private helper function at line {}; move implementation details to a coarse DB module",
                 .{lineNumberForOffset(source, line_start)},
@@ -525,6 +527,36 @@ fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
         }
         line_start = if (line_end == source.len) source.len else line_end + 1;
     }
+}
+
+fn assertDBSourceDoesNotUseMixins(path: []const u8, source: []const u8) void {
+    if (std.mem.indexOf(u8, source, "usingnamespace")) |start| {
+        std.debug.panic(
+            "storage/db/{s} uses usingnamespace at line {}; DB refactor uses explicit forwarding methods, not mixin injection",
+            .{ path, lineNumberForOffset(source, start) },
+        );
+    }
+}
+
+fn assertDBTestRootImportsDBAggregateRoot(source: []const u8) void {
+    const import_path = "storage/db/mod.zig";
+    const needle = "_ = @import(\"" ++ import_path ++ "\");";
+    if (std.mem.indexOf(u8, source, needle) == null) {
+        std.debug.panic(
+            "{s} must explicitly import {s} so DB aggregate tests stay reachable from lib-db-test/db-test",
+            .{ db_test_root_path, import_path },
+        );
+    }
+}
+
+fn assertDBTestRootAggregation(b: *std.Build) void {
+    const source = readBuildRootFileAlloc(
+        b,
+        db_test_root_path,
+        max_build_zig_bytes,
+        "DB test root aggregation guardrail",
+    );
+    assertDBTestRootImportsDBAggregateRoot(source);
 }
 
 fn dbSourceMayImportDBRoot(path: []const u8) bool {
@@ -584,6 +616,7 @@ fn assertDBImplementationModuleContract(b: *std.Build) void {
                 .{ entry.path, err },
             );
         };
+        assertDBSourceDoesNotUseMixins(entry.path, source);
         assertDBSourceDoesNotImportDBRoot(entry.path, source);
         assertDBSourceDoesNotInstantiateSiblingImpl(entry.path, source);
     }
@@ -598,6 +631,7 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     );
     assertDBRootDoesNotOwnInlineTests(source);
     assertDBRootDoesNotOwnPrivateHelpers(source);
+    assertDBTestRootAggregation(b);
     assertDBImplementationModuleContract(b);
 }
 
@@ -609,6 +643,7 @@ pub const capi_default_filters = [_][]const u8{
     "capi execute graph queries honors identity read generation",
     "capi search rejects stale identity generation before readable lease hook",
     "capi search json returns stamped identity generation",
+    "capi schema json uses table schema lifecycle",
     "packed dense response exposes public ids not doc ordinals",
     "dense response identity generation footer",
     "capi aggregate hits rejects stale identity generation before aggregation materialization",
@@ -1497,6 +1532,9 @@ pub const APITestFilters = struct {
         "table write startup configured index parser supports object and array forms",
         "api auto bulk ingest does not open sessions for normal online writes",
         "weak sync levels do not drain managed db after batch",
+        "write coalesce queue helpers reuse and prune idle queues",
+        "write coalesce queue helpers keep active queues and count entries",
+        "write coalesce take helper enforces compatibility and operation limits",
         "provisioning detects model backed graph shorthand assets inside config_json strings",
         "provisioning does not require asset producer for copy graph shorthand assets inside config_json strings",
         "provisioned table write source rejects stale doc identity namespace before write",
@@ -1509,6 +1547,7 @@ pub const APITestFilters = struct {
         "full text memory attribution aggregation includes norm bytes",
         "startup catch-up stats for path include table and index-local wal retention",
         "runtime status startup snapshot builds synthetic status from object-form indexes json",
+        "runtime status startup snapshot builds synthetic status from array-form indexes json",
         "table write source core forwards required batch and defaults optional capabilities",
         "remote batch request encoder preserves writes deletes transforms and escaping",
         "primary lookup adopts seeded write cache across visible generation bump",
@@ -1524,6 +1563,8 @@ pub const APITestFilters = struct {
         "provisioned schema rewrite worker pass drains projected catalog range job",
         "schema rewrite worker pass treats unclaimed terminal jobs as terminal",
         "secondary index promotion ignores stale ready rebuild generation",
+        "provisioned table write source drop table does not hold local db mutex during background delete",
+        "provisioned table write source drop table waits for in-flight group batch on same table",
         "foreign key integrity job diagnostics merge samples across passes",
         "foreign key integrity job records diagnostics across incomplete passes",
         "managed startup catch-up open disables optional runtimes and workers",
@@ -1561,6 +1602,7 @@ pub const APITestFilters = struct {
         "fanout planner uses io cap and request shape",
         "merge distributed text stats sums shard corpus stats by field and term",
         "merge distributed background text stats keys preserve embedded separators",
+        "merge runtime preflight summary preserves structured filter exact counts only when every shard is exact",
         "collect significant terms field requests gathers unique field terms from hits",
         "graph hydrate resolved doc filter applies include and exclude sets",
         "graph edge local read rejects stale identity generation",
@@ -1570,15 +1612,20 @@ pub const APITestFilters = struct {
         "external lake rows query and aggregate plans route through lake scan hook",
         "external lake row plan helpers execute through lake source hooks",
         "pinned external lake rows scanner validates schema binding against inventory",
+        "pinned external lake rows scanner forwards sidecar freshness policy",
         "object storage pinned external lake source routes row plans through scanner",
         "owned object storage lake source discovers and pins parquet prefix inventory",
         "opened object storage lake source owns store and pins parquet prefix inventory",
+        "opened object storage lake source can own serving object range cache",
+        "opened object storage lake source resolves iceberg table root inventory",
+        "opened object storage iceberg source applies position delete files",
         "external lake routing source resolves object store for external row plans",
         "configured external lake resolver opens credentialed filesystem connection",
         "lowered sql cross-table read plans execute through routed scans",
         "lowered sql set operation plans preserve overlapping union all rows",
         "lowered sql set operation materialization admission distinguishes spill from hard caps",
         "lowered sql recursive cte materialization admission uses stream spill policy",
+        "routed rows materialization budget fails closed on row and byte caps",
         "lowered sql recursive cte plans execute bounded materialization",
         "lowered sql insert source plans build batches from routed scans",
         "lowered sql merge mutation plans build batches from routed scans",
@@ -1588,10 +1635,23 @@ pub const APITestFilters = struct {
         "document sql catalog read producers treat catalog misses as terminal",
         "lowered document sql aggregate executes native grouped avg materialization",
         "lowered document sql aggregate uses catalog target for non-default namespace materialization",
+        "aggregation context rejects non-current identity generation",
+        "aggregation full-result rerun can reuse snapped result identity generation",
+        "aggregation full-scan limit uses primary count and distributed fallback is unbounded",
         "explicit text stats requests preserve identity generation",
         "explicit text stats requests carry resolved doc filters and apply exact projection",
         "explicit text stats requests reject stale identity generation",
         "api.table_reads.remote_wire.test.algebraic partial request ",
+        "remote query parser preserves graph metric results",
+        "encode query request round-trips composed bleve full_text queries",
+        "encode query request includes named vector embeddings for routed semantic search",
+        "encode query request includes graph metric read and rerank",
+        "encode query request includes merge config and pruner but omits reranker",
+        "encode query request includes distributed text stats for internal shard scoring",
+        "encode query request with distributed text stats parses through query contract",
+        "encode query request carries internal native doc id constraints through query contract",
+        "encode query request rejects in-memory resolved doc filters",
+        "encode query request preserves empty positive internal doc id filter",
         "vector worker envelope converts to constrained search request",
         "algebraic partial request fails closed when lifecycle is stale",
         "algebraic partial request accepts current identity generation and rejects stale",

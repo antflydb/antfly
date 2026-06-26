@@ -7906,7 +7906,7 @@ test "capi schema json uses table schema lifecycle" {
     }));
 
     const handle = asHandle(handle_ptr).?;
-    const stored_schema_json = try handle.db.core.store.get(alloc, db_mod.local_schema_json_key);
+    const stored_schema_json = (try handle.db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
     defer alloc.free(stored_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"dynamic_templates\":{\"ids\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"match\":\"*_id\"") != null);

@@ -18,6 +18,7 @@ const backups_api = @import("../backups.zig");
 const metadata_mod = @import("../../metadata/mod.zig");
 const platform_time = @import("../../platform/time.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
@@ -59,6 +60,61 @@ pub const DroppedTableDeleteWork = struct {
         std.heap.page_allocator.destroy(self);
     }
 };
+
+pub fn scheduleDroppedGroupDelete(
+    runtime: *db_mod.background_runtime.BackendRuntime,
+    owner_id: u64,
+    path: []const u8,
+    before_delete: ?DroppedTableDeleteHook,
+) !void {
+    const work = try std.heap.page_allocator.create(DroppedTableDeleteWork);
+    errdefer std.heap.page_allocator.destroy(work);
+    const owned_path = try std.heap.page_allocator.dupe(u8, path);
+    errdefer std.heap.page_allocator.free(owned_path);
+    work.* = .{
+        .path = owned_path,
+        .before_delete = before_delete,
+    };
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner_id,
+        .class = .cleanup,
+        .ptr = work,
+        .run = DroppedTableDeleteWork.run,
+        .deinit = DroppedTableDeleteWork.deinit,
+    });
+}
+
+pub fn deleteDroppedGroupPath(
+    alloc: std.mem.Allocator,
+    path: []u8,
+    runtime: ?*db_mod.background_runtime.BackendRuntime,
+    owner_id: ?u64,
+    before_delete: ?DroppedTableDeleteHook,
+) !void {
+    defer alloc.free(path);
+    if (runtime) |job_runtime| {
+        if (owner_id) |id| {
+            scheduleDroppedGroupDelete(job_runtime, id, path, before_delete) catch {
+                try DroppedTableDeleteWork.deletePath(path, false, before_delete);
+                return;
+            };
+            return;
+        }
+    }
+    try DroppedTableDeleteWork.deletePath(path, false, before_delete);
+}
+
+fn sleepNs(duration_ns: u64) void {
+    var req = std.posix.timespec{
+        .sec = @intCast(duration_ns / std.time.ns_per_s),
+        .nsec = @intCast(duration_ns % std.time.ns_per_s),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
 
 pub fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -107,6 +163,145 @@ pub fn exportPortableBackupShard(
         .snapshot_path = rel_path,
     };
     return shards;
+}
+
+pub fn backupOpenDbShard(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    backup_root: []const u8,
+    backup_id: []const u8,
+    group_id: u64,
+    snapshot_token: []const u8,
+    format: backups_api.BackupFormat,
+) ![]backups_api.ShardSnapshot {
+    if (format == .portable) {
+        return try exportPortableBackupShard(alloc, db, backup_root, backup_id, group_id);
+    }
+
+    _ = try db.snapshot(snapshot_token);
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
+    defer alloc.free(snapshot_root);
+    const dest_root = try backups_api.shardSnapshotPath(alloc, backup_root, backup_id, group_id);
+    defer alloc.free(dest_root);
+    try backups_api.copyDirectoryRecursive(alloc, snapshot_root, dest_root);
+
+    const rel_path = try backups_api.shardSnapshotRelPath(alloc, backup_id, group_id);
+    errdefer alloc.free(rel_path);
+    const byte_range = db.getRange();
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = group_id,
+        .start_key = try alloc.dupe(u8, byte_range.start),
+        .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
+        .snapshot_path = rel_path,
+    };
+    return shards;
+}
+
+pub fn backupLocalTable(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    plan: backups_api.TableBackupPlan,
+) ![]backups_api.ShardSnapshot {
+    const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
+    defer alloc.free(snapshot_token);
+    return try backupOpenDbShard(alloc, db, plan.backup_root, plan.backup_id, 0, snapshot_token, plan.format);
+}
+
+pub fn restoreLocalTable(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    plan: backups_api.TableRestorePlan,
+) !void {
+    if (plan.manifest.shards.len != 1) return error.UnsupportedBackupFormat;
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
+    defer alloc.free(snapshot_root);
+    if (std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb")) {
+        const body = try readBackupFileAlloc(alloc, snapshot_root);
+        defer alloc.free(body);
+        try portable_backup.importPortable(alloc, db.core.store, body);
+        return;
+    }
+
+    const db_path = try alloc.dupe(u8, db.core.path);
+    defer alloc.free(db_path);
+    const primary_backend = db.primary_backend;
+    var owned_backend_runtime = db.owned_backend_runtime;
+    db.owned_backend_runtime = null;
+    errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
+    const backend_runtime = if (owned_backend_runtime) |*runtime|
+        runtime.runtime
+    else
+        db.backend_runtime;
+    const identity_namespace = db.core.identity_namespace;
+
+    db.close();
+    try db_mod.DB.restoreSnapshotTo(alloc, snapshot_root, db_path, .{
+        .primary_backend = primary_backend,
+        .identity_namespace = identity_namespace,
+    });
+    db.* = try db_mod.DB.open(alloc, db_path, .{
+        .primary_backend = primary_backend,
+        .backend_runtime = backend_runtime,
+    });
+    db.owned_backend_runtime = owned_backend_runtime;
+    owned_backend_runtime = null;
+}
+
+pub fn restoreProvisionedTableGroupDeferredRuntimeRepair(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    table_name: []const u8,
+    group_id: u64,
+    identity_namespace: ?doc_identity.Namespace,
+    plan: backups_api.TableRestorePlan,
+    before_restore_work: ?*const fn () void,
+) !void {
+    const snapshot_path = plan.manifest.shards[0].snapshot_path;
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, snapshot_path });
+    defer alloc.free(snapshot_root);
+
+    var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer restore_io_impl.deinit();
+
+    const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
+        if (platform_time.monotonicNs() >= ready_deadline_ns) break;
+        sleepNs(50 * std.time.ns_per_ms);
+    }
+
+    if (before_restore_work) |run| run();
+    try prepareLocalTablePathForRestore(alloc, path);
+    db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
+        .identity_namespace = identity_namespace,
+    }, .{
+        .backup_id = plan.manifest.backup_id,
+        .location = plan.backup_root,
+        .snapshot_path = snapshot_path,
+        .group_id = group_id,
+    }) catch |err| {
+        if (err == error.IdentityNamespaceMismatch) {
+            std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_root={s} err={}", .{
+                table_name,
+                group_id,
+                path,
+                snapshot_root,
+                err,
+            });
+        } else {
+            std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_root={s} err={}", .{
+                table_name,
+                group_id,
+                path,
+                snapshot_root,
+                err,
+            });
+        }
+        return err;
+    };
 }
 
 pub fn writeBackupFile(path: []const u8, body: []const u8) !void {

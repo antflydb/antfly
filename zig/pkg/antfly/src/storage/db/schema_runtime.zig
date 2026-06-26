@@ -169,8 +169,7 @@ pub fn Impl(comptime DB: type) type {
                 .key = local_schema_json_key,
                 .value = schema_json,
             }};
-            try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
-            Self.refreshRuntimeSideEffects(self);
+            try Self.setSchemaWithMetadataNoMirror(self, table_schema, metadata_puts[0..]);
             try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
         }
 
@@ -191,9 +190,37 @@ pub fn Impl(comptime DB: type) type {
                     .value = table_record_json,
                 },
             };
+            try Self.setSchemaWithMetadataNoMirror(self, table_schema, metadata_puts[0..]);
+            try DB.SchemaRuntimeCallbacks.mirror_ha_lite_sql_table_metadata_commit(self, table_schema, schema_json, table_record_json);
+        }
+
+        pub fn setSchemaWithLocalLiteSqlTableRecordJsonReplicatedApply(
+            self: *DB,
+            table_schema: schema_mod.TableSchema,
+            schema_json: []const u8,
+            table_record_json: []const u8,
+        ) !void {
+            try Self.validateRuntimeSchemaFeatureLevel(table_schema);
+            const metadata_puts = [_]schema_mod.SchemaMetadataPut{
+                .{
+                    .key = local_schema_json_key,
+                    .value = schema_json,
+                },
+                .{
+                    .key = local_lite_sql_table_record_json_key,
+                    .value = table_record_json,
+                },
+            };
+            try Self.setSchemaWithMetadataNoMirror(self, table_schema, metadata_puts[0..]);
+        }
+
+        fn setSchemaWithMetadataNoMirror(
+            self: *DB,
+            table_schema: schema_mod.TableSchema,
+            metadata_puts: []const schema_mod.SchemaMetadataPut,
+        ) !void {
             try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
             Self.refreshRuntimeSideEffects(self);
-            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
         }
 
         pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -1866,6 +1893,81 @@ test "db schema apply validates unvalidated check promotion" {
     const enforced_schema = db.core.schema orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[0].validation_state);
     try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[1].validation_state);
+}
+
+test "db schema runtime persists lite sql table record with local schema metadata" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const indexes_json =
+        \\{"algebraic_index_v0":{"kind":"algebraic","source":"lite_sql"}}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.applyLiteSqlTableRecord(alloc, .{
+            .table_id = 42,
+            .name = "usage_records",
+            .database_name = "tenant_db",
+            .namespace_name = "billing",
+            .placement_role = "data",
+            .desired_replica_count = 1,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+        });
+
+        const local_schema_json = (try db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_json, local_schema_json);
+
+        const table_record = (try db.getLiteSqlTableRecordAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer metadata_table_manager.freeTable(alloc, table_record);
+        try std.testing.expectEqual(@as(u64, 42), table_record.table_id);
+        try std.testing.expectEqualStrings("usage_records", table_record.name);
+        try std.testing.expectEqualStrings("tenant_db", table_record.database_name);
+        try std.testing.expectEqualStrings("billing", table_record.namespace_name);
+        try std.testing.expectEqualStrings(schema_json, table_record.schema_json);
+        try std.testing.expectEqualStrings(indexes_json, table_record.indexes_json);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .status_only });
+        defer reopened.close();
+
+        const local_schema_json = (try reopened.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_json, local_schema_json);
+
+        const table_record = (try reopened.getLiteSqlTableRecordAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer metadata_table_manager.freeTable(alloc, table_record);
+        try std.testing.expectEqual(@as(u64, 42), table_record.table_id);
+        try std.testing.expectEqualStrings("usage_records", table_record.name);
+        try std.testing.expectEqualStrings("tenant_db", table_record.database_name);
+        try std.testing.expectEqualStrings("billing", table_record.namespace_name);
+        try std.testing.expectEqualStrings(schema_json, table_record.schema_json);
+        try std.testing.expectEqualStrings(indexes_json, table_record.indexes_json);
+
+        try std.testing.expectError(error.ReadOnly, reopened.applyLiteSqlTableRecord(alloc, .{
+            .table_id = 43,
+            .name = "denied_records",
+            .database_name = "tenant_db",
+            .namespace_name = "billing",
+            .placement_role = "data",
+            .desired_replica_count = 1,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+        }));
+    }
 }
 
 test "db direct schema apply rejects storage mode switches" {

@@ -733,6 +733,42 @@ test "runtime status startup snapshot builds synthetic status from object-form i
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.async_indexing.startup.configured_full_text_indexes);
 }
 
+test "runtime status startup snapshot builds synthetic status from array-form indexes json" {
+    const alloc = std.testing.allocator;
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var configured_indexes = try table_write_index_config.parseStartupConfiguredIndexes(
+        alloc,
+        "{\"indexes\":[{\"name\":\"vec\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":768}},{\"name\":\"fts\",\"type\":\"full_text\",\"config\":{}}]}",
+    );
+    defer configured_indexes.deinit(alloc);
+
+    try publishStartupCatchUpRuntimeStatusSnapshot(&snapshot_cache, alloc, "docs", 7001, .{
+        .active = true,
+        .phase = .opening_db,
+        .configured_indexes = 2,
+        .configured_dense_indexes = 1,
+        .configured_full_text_indexes = 1,
+        .wal_retained_segments = 7,
+        .wal_retained_bytes = 321,
+    }, null, &configured_indexes);
+    try publishStartupCatchUpRuntimeStatusSnapshot(&snapshot_cache, alloc, "docs", 7001, .{}, null, null);
+
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 2), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqualStrings("vec", statuses.items[0].stats.indexes[0].name);
+    try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, statuses.items[0].stats.indexes[0].kind);
+    try std.testing.expectEqualStrings("fts", statuses.items[0].stats.indexes[1].name);
+    try std.testing.expectEqual(db_mod.types.IndexKind.full_text, statuses.items[0].stats.indexes[1].kind);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
+    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.opening_db, statuses.items[0].stats.async_indexing.startup.phase);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.async_indexing.startup.configured_indexes);
+}
+
 fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {
     alloc.free(item.name);
     if (item.algebraic_capability_fingerprint) |value| alloc.free(value);

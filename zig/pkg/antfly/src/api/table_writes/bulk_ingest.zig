@@ -28,6 +28,8 @@ const validateTableBatchAgainstSchemaJson = table_write_managed_db.validateTable
 pub const min_batch_ops: usize = 100;
 pub const max_window_ops: usize = 25_000;
 pub const max_hbc_leaf_splits_per_publish: usize = 256;
+pub const write_coalesce_max_waiters: usize = 64;
+pub const write_coalesce_max_ops: usize = 10_000;
 
 // Client-side bulk loads often arrive as serial HTTP chunks. Finish implicit
 // dense bulk ingest windows on max ops or idle, not elapsed open time, so an
@@ -145,8 +147,106 @@ pub const WriteCoalesceEntry = struct {
     err: ?anyerror = null,
 };
 
+pub fn deinitWriteCoalesceQueues(
+    alloc: std.mem.Allocator,
+    queues: *std.ArrayListUnmanaged(WriteCoalesceQueue),
+) void {
+    for (queues.items) |*queue| {
+        alloc.free(queue.table_name);
+        queue.entries.deinit(alloc);
+    }
+    queues.deinit(alloc);
+    queues.* = .empty;
+}
+
+pub fn findWriteCoalesceQueue(
+    queues: []const WriteCoalesceQueue,
+    table_name: []const u8,
+    group_id: u64,
+) ?usize {
+    for (queues, 0..) |queue, index| {
+        if (queue.group_id == group_id and std.mem.eql(u8, queue.table_name, table_name)) return index;
+    }
+    return null;
+}
+
+pub fn pruneWriteCoalesceQueue(
+    alloc: std.mem.Allocator,
+    queues: *std.ArrayListUnmanaged(WriteCoalesceQueue),
+    index: usize,
+) void {
+    const queue = &queues.items[index];
+    if (queue.draining or queue.entries.items.len > 0) return;
+    alloc.free(queue.table_name);
+    queue.entries.deinit(alloc);
+    _ = queues.orderedRemove(index);
+}
+
+pub fn ensureWriteCoalesceQueue(
+    alloc: std.mem.Allocator,
+    queues: *std.ArrayListUnmanaged(WriteCoalesceQueue),
+    table_name: []const u8,
+    group_id: u64,
+) !*WriteCoalesceQueue {
+    if (findWriteCoalesceQueue(queues.items, table_name, group_id)) |index| return &queues.items[index];
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    try queues.append(alloc, .{
+        .table_name = owned_table_name,
+        .group_id = group_id,
+    });
+    return &queues.items[queues.items.len - 1];
+}
+
+pub fn writeCoalesceQueueActive(queue: *const WriteCoalesceQueue) bool {
+    return queue.draining or queue.entries.items.len != 0;
+}
+
+pub fn writeCoalesceQueueEntryCount(
+    queues: []const WriteCoalesceQueue,
+    table_name: []const u8,
+    group_id: u64,
+) usize {
+    const index = findWriteCoalesceQueue(queues, table_name, group_id) orelse return 0;
+    return queues[index].entries.items.len;
+}
+
 pub fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
     return first.sync_level == candidate.sync_level and first.timestamp_ns == candidate.timestamp_ns;
+}
+
+pub fn writeCoalesceEntryOps(entry: *const WriteCoalesceEntry) usize {
+    return entry.group.writes.items.len + entry.group.deletes.items.len + entry.group.relational_identity_rewrites.items.len;
+}
+
+pub fn takeWriteCoalesceEntries(
+    alloc: std.mem.Allocator,
+    queue: *WriteCoalesceQueue,
+    out_entries: *std.ArrayListUnmanaged(*WriteCoalesceEntry),
+) !void {
+    std.debug.assert(queue.entries.items.len > 0);
+    const first = queue.entries.items[0];
+    var take: usize = 0;
+    var ops: usize = 0;
+    while (take < queue.entries.items.len and take < write_coalesce_max_waiters) : (take += 1) {
+        const candidate = queue.entries.items[take];
+        if (!coalesceCompatibleEntry(first, candidate)) break;
+        const candidate_ops = writeCoalesceEntryOps(candidate);
+        if (take > 0 and ops + candidate_ops > write_coalesce_max_ops) break;
+        ops += candidate_ops;
+    }
+    try out_entries.appendSlice(alloc, queue.entries.items[0..take]);
+    std.mem.copyForwards(*WriteCoalesceEntry, queue.entries.items[0 .. queue.entries.items.len - take], queue.entries.items[take..]);
+    queue.entries.items.len -= take;
+}
+
+pub fn failAndClearWriteCoalesceQueue(queue: *WriteCoalesceQueue, err: anyerror) void {
+    for (queue.entries.items) |entry| {
+        entry.err = err;
+        entry.done = true;
+    }
+    queue.entries.clearRetainingCapacity();
+    queue.draining = false;
 }
 
 pub fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
@@ -232,4 +332,100 @@ pub fn freeWriteCoalesceGroupBatch(alloc: std.mem.Allocator, group: *GroupBatch)
 test "weak sync levels do not drain managed db after batch" {
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.propose));
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.write));
+}
+
+test "write coalesce queue helpers reuse and prune idle queues" {
+    const alloc = std.testing.allocator;
+    var queues = std.ArrayListUnmanaged(WriteCoalesceQueue).empty;
+    defer deinitWriteCoalesceQueues(alloc, &queues);
+
+    const docs = try ensureWriteCoalesceQueue(alloc, &queues, "docs", 7001);
+    try std.testing.expectEqual(@as(u64, 7001), docs.group_id);
+    try std.testing.expectEqualStrings("docs", docs.table_name);
+
+    const reused = try ensureWriteCoalesceQueue(alloc, &queues, "docs", 7001);
+    try std.testing.expectEqual(@as(usize, 1), queues.items.len);
+    try std.testing.expectEqual(docs, reused);
+
+    const other = try ensureWriteCoalesceQueue(alloc, &queues, "docs", 7002);
+    try std.testing.expectEqual(@as(usize, 2), queues.items.len);
+    try std.testing.expectEqual(@as(u64, 7002), other.group_id);
+
+    pruneWriteCoalesceQueue(alloc, &queues, 0);
+    try std.testing.expectEqual(@as(usize, 1), queues.items.len);
+    try std.testing.expectEqual(@as(?usize, null), findWriteCoalesceQueue(queues.items, "docs", 7001));
+    try std.testing.expectEqual(@as(?usize, 0), findWriteCoalesceQueue(queues.items, "docs", 7002));
+}
+
+test "write coalesce queue helpers keep active queues and count entries" {
+    const alloc = std.testing.allocator;
+    var queues = std.ArrayListUnmanaged(WriteCoalesceQueue).empty;
+    defer deinitWriteCoalesceQueues(alloc, &queues);
+
+    const queue = try ensureWriteCoalesceQueue(alloc, &queues, "docs", 7001);
+    var entry = WriteCoalesceEntry{};
+    try queue.entries.append(alloc, &entry);
+
+    try std.testing.expect(writeCoalesceQueueActive(queue));
+    try std.testing.expectEqual(@as(usize, 1), writeCoalesceQueueEntryCount(queues.items, "docs", 7001));
+    pruneWriteCoalesceQueue(alloc, &queues, 0);
+    try std.testing.expectEqual(@as(usize, 1), queues.items.len);
+
+    queue.entries.clearRetainingCapacity();
+    queue.draining = true;
+    try std.testing.expect(writeCoalesceQueueActive(queue));
+    pruneWriteCoalesceQueue(alloc, &queues, 0);
+    try std.testing.expectEqual(@as(usize, 1), queues.items.len);
+
+    queue.draining = false;
+    pruneWriteCoalesceQueue(alloc, &queues, 0);
+    try std.testing.expectEqual(@as(usize, 0), queues.items.len);
+}
+
+test "write coalesce take helper enforces compatibility and operation limits" {
+    const alloc = std.testing.allocator;
+
+    var queue = WriteCoalesceQueue{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .group_id = 7001,
+    };
+    defer {
+        alloc.free(queue.table_name);
+        queue.entries.deinit(alloc);
+    }
+
+    var first = WriteCoalesceEntry{ .timestamp_ns = 10 };
+    defer first.group.deinit(alloc);
+    try first.group.writes.appendNTimes(alloc, .{ .key = "", .value = "" }, 6000);
+
+    var too_large = WriteCoalesceEntry{ .timestamp_ns = 10 };
+    defer too_large.group.deinit(alloc);
+    try too_large.group.writes.appendNTimes(alloc, .{ .key = "", .value = "" }, 5000);
+
+    var incompatible = WriteCoalesceEntry{ .timestamp_ns = 11 };
+    defer incompatible.group.deinit(alloc);
+    try incompatible.group.writes.append(alloc, .{ .key = "", .value = "" });
+
+    try queue.entries.append(alloc, &first);
+    try queue.entries.append(alloc, &too_large);
+    try queue.entries.append(alloc, &incompatible);
+
+    var selected = std.ArrayListUnmanaged(*WriteCoalesceEntry).empty;
+    defer selected.deinit(alloc);
+
+    try takeWriteCoalesceEntries(alloc, &queue, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqual(&first, selected.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), queue.entries.items.len);
+
+    selected.clearRetainingCapacity();
+    try takeWriteCoalesceEntries(alloc, &queue, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqual(&too_large, selected.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), queue.entries.items.len);
+
+    failAndClearWriteCoalesceQueue(&queue, error.TestExpectedError);
+    try std.testing.expectEqual(@as(usize, 0), queue.entries.items.len);
+    try std.testing.expect(incompatible.done);
+    try std.testing.expectEqual(error.TestExpectedError, incompatible.err.?);
 }

@@ -4520,7 +4520,7 @@ test "db schema apply supports unvalidated foreign key then enforced validation 
         .deletes = &.{"customer:missing"},
     }));
 
-    const local_schema_json = try db.core.store.get(alloc, db_mod.local_schema_json_key);
+    const local_schema_json = (try db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
     defer alloc.free(local_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, local_schema_json, "\"validation_state\":\"enforced\"") != null);
 }

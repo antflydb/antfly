@@ -58,18 +58,10 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
     @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
-const graph_mod = @import("../../graph/graph.zig");
-const traversal_mod = @import("../../graph/traversal.zig");
-const paths_mod = @import("../../graph/paths.zig");
-const graph_query_mod = @import("../../graph/query.zig");
-const graph_pattern_mod = @import("../../graph/pattern.zig");
-const search_mod = @import("../../search/search.zig");
 const mapper = @import("document_mapper.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_store_mod = @import("relational_store.zig");
 const planning_stats_mod = @import("planning_stats.zig");
-const db_query_graph = @import("query/graph_exec.zig");
-const db_query_search = @import("query/search_exec.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
@@ -304,10 +296,12 @@ pub const DB = struct {
         pub const save_index_status_snapshot = schema_runtime_impl.saveIndexStatusSnapshot;
         pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
         pub const mirror_ha_schema_metadata_commit = ha_replication_impl.mirrorDBSchemaMetadataCommit;
+        pub const mirror_ha_lite_sql_table_metadata_commit = ha_replication_impl.mirrorDBLiteSqlTableMetadataCommit;
     };
     pub const HAReplicationCallbacks = struct {
         pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
         pub const apply_ha_derived_effect_record = applyHADerivedEffectRecord;
+        pub const set_schema_with_local_lite_sql_table_record_json_replicated_apply = schema_runtime_impl.setSchemaWithLocalLiteSqlTableRecordJsonReplicatedApply;
     };
 
     pub fn batchContext(self: *DB) BatchExecutionContext {
@@ -1319,8 +1313,8 @@ pub const DB = struct {
         index_name: []const u8,
         key: []const u8,
         edge_type: []const u8,
-        direction: graph_mod.EdgeDirection,
-    ) ![]graph_mod.Edge {
+        direction: search_runtime.EdgeDirection,
+    ) ![]search_runtime.Edge {
         return try search_runtime_impl.getEdges(self, alloc, index_name, key, edge_type, direction);
     }
 
@@ -1329,8 +1323,8 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
         start_key: []const u8,
-        rules: traversal_mod.TraversalRules,
-    ) ![]traversal_mod.TraversalResult {
+        rules: search_runtime.TraversalRules,
+    ) ![]search_runtime.TraversalResult {
         return try search_runtime_impl.traverseEdges(self, alloc, index_name, start_key, rules);
     }
 
@@ -1340,8 +1334,8 @@ pub const DB = struct {
         index_name: []const u8,
         key: []const u8,
         edge_type: []const u8,
-        direction: graph_mod.EdgeDirection,
-    ) ![]traversal_mod.TraversalResult {
+        direction: search_runtime.EdgeDirection,
+    ) ![]search_runtime.TraversalResult {
         return try search_runtime_impl.getNeighbors(self, alloc, index_name, key, edge_type, direction);
     }
 
@@ -1352,12 +1346,12 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         edge_types: []const []const u8,
-        direction: graph_mod.EdgeDirection,
-        weight_mode: paths_mod.PathWeightMode,
+        direction: search_runtime.EdgeDirection,
+        weight_mode: search_runtime.PathWeightMode,
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
-    ) !?paths_mod.Path {
+    ) !?search_runtime.Path {
         return try search_runtime_impl.findShortestPath(self, alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight);
     }
 
@@ -1369,12 +1363,12 @@ pub const DB = struct {
         target: []const u8,
         k: u32,
         edge_types: []const []const u8,
-        direction: graph_mod.EdgeDirection,
-        weight_mode: paths_mod.PathWeightMode,
+        direction: search_runtime.EdgeDirection,
+        weight_mode: search_runtime.PathWeightMode,
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
-    ) ![]paths_mod.Path {
+    ) ![]search_runtime.Path {
         return try search_runtime_impl.findKShortestPaths(self, alloc, index_name, source, target, k, edge_types, direction, weight_mode, max_depth, min_weight, max_weight);
     }
 
@@ -1383,10 +1377,10 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
         start_keys: []const []const u8,
-        pattern: []const graph_pattern_mod.PatternStep,
+        pattern: []const search_runtime.PatternStep,
         max_results: u32,
         return_aliases: []const []const u8,
-    ) ![]graph_pattern_mod.PatternMatch {
+    ) ![]search_runtime.PatternMatch {
         return try search_runtime_impl.matchPattern(self, alloc, index_name, start_keys, pattern, max_results, return_aliases);
     }
 
@@ -1766,7 +1760,7 @@ pub const DB = struct {
         index_name: []const u8,
         metric_name: []const u8,
         worker_id: []const u8,
-    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    ) !search_runtime.GraphMetricBuildWorkerStepResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStep(self, index_name, metric_name, worker_id);
     }
@@ -1777,7 +1771,7 @@ pub const DB = struct {
         metric_name: []const u8,
         worker_id: []const u8,
         now_ms: u64,
-    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    ) !search_runtime.GraphMetricBuildWorkerStepResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStepAt(self, index_name, metric_name, worker_id, now_ms);
     }
@@ -1786,7 +1780,7 @@ pub const DB = struct {
         self: *DB,
         index_name: []const u8,
         metric_name: []const u8,
-    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    ) !search_runtime.GraphMetricBuildWorkerStepResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStep(self, index_name, metric_name);
     }
@@ -1796,7 +1790,7 @@ pub const DB = struct {
         index_name: []const u8,
         metric_name: []const u8,
         now_ms: u64,
-    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    ) !search_runtime.GraphMetricBuildWorkerStepResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStepAt(self, index_name, metric_name, now_ms);
     }
@@ -1818,7 +1812,7 @@ pub const DB = struct {
         index_name: []const u8,
         metric_name: []const u8,
         target_generation: u64,
-        options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+        options: search_runtime.GraphMetricPlannedDrainOptions,
     ) !types.GraphMetricStatus {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try search_runtime_impl.runGraphMetricPlannedDrain(self, alloc, index_name, metric_name, target_generation, options);
@@ -3347,7 +3341,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         result: *types.SearchResult,
-        strategy: ?graph_query_mod.ExpandStrategy,
+        strategy: ?search_runtime.ExpandStrategy,
     ) !void {
         try search_runtime_impl.applyGraphExpandStrategy(self, alloc, result, strategy);
     }
@@ -3355,7 +3349,7 @@ pub const DB = struct {
     pub fn searchRuntimeCloneNamedSetAsResult(
         self: *DB,
         alloc: Allocator,
-        set: db_query_graph.NamedResultSet,
+        set: search_runtime.GraphNamedResultSet,
         include_stored: bool,
     ) !types.SearchResult {
         return try search_runtime_impl.cloneNamedSetAsResult(self, alloc, set, include_stored);
@@ -3374,7 +3368,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
-        nodes: []const graph_query_mod.GraphResultNode,
+        nodes: []const search_runtime.GraphResultNode,
     ) !doc_set.ResolvedDocSet {
         return try search_runtime_impl.resolveGraphNodesToDocSet(self, alloc, req, nodes);
     }
@@ -3479,14 +3473,14 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
-    ) ![]graph_pattern_mod.PatternMatch {
+    ) ![]search_runtime.PatternMatch {
         return try search_runtime_impl.matchNamedPattern(self, alloc, named, start_key_refs);
     }
 
     pub fn searchRuntimeLoadPatternProjectedDocument(
         self: *DB,
         alloc: Allocator,
-        query: graph_query_mod.GraphQuery,
+        query: search_runtime.GraphQuery,
         key: []const u8,
     ) !?[]u8 {
         return try search_runtime_impl.loadPatternProjectedDocument(self, alloc, query, key);
@@ -3536,7 +3530,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        query: search_mod.SearchQuery,
+        query: search_runtime.SearchQuery,
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         return try search_runtime_impl.resolveRelationalFilterDocSet(self, alloc, runtime_schema, query, generation);
@@ -3546,7 +3540,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        query: search_mod.SearchQuery,
+        query: search_runtime.SearchQuery,
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         return try search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(self, alloc, runtime_schema, query, generation);
@@ -3556,7 +3550,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        query: search_mod.SearchQuery,
+        query: search_runtime.SearchQuery,
         implications: relational_store_mod.PredicateImplications,
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
@@ -3862,10 +3856,10 @@ pub const DB = struct {
     pub fn searchRuntimeExecuteSearchGraphQuery(
         self: *DB,
         alloc: Allocator,
-        graph_query: graph_query_mod.GraphQuery,
+        graph_query: search_runtime.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
-    ) !graph_query_mod.GraphQueryResult {
+    ) !search_runtime.GraphQueryResult {
         return try search_runtime_impl.executeSearchGraphQuery(self, alloc, graph_query, start_key_refs, target_keys);
     }
 
@@ -3886,11 +3880,11 @@ pub const DB = struct {
         return try search_runtime_impl.filterExpiredSearchResult(self, alloc, raw);
     }
 
-    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const search_runtime.TextFieldStats {
         return try search_runtime_impl.collectSearchRequestTextStats(self, alloc, req);
     }
 
-    pub fn preflightSearchRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32) !db_query_search.RuntimePreflightSummary {
+    pub fn preflightSearchRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32) !search_runtime.RuntimePreflightSummary {
         return try search_runtime_impl.preflightSearchRequest(self, alloc, req, max_work);
     }
 
@@ -3900,7 +3894,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         max_work: u32,
         exec_ctx: types.ExecutionContext,
-    ) !db_query_search.RuntimePreflightSummary {
+    ) !search_runtime.RuntimePreflightSummary {
         return try search_runtime_impl.preflightSearchRequestWithExecutionContext(self, alloc, req, max_work, exec_ctx);
     }
 
@@ -3927,19 +3921,19 @@ pub const DB = struct {
         return search_runtime_impl.planningStatsProvider(self);
     }
 
-    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const search_runtime.ExplicitTextStatRequest) ![]const search_runtime.TextFieldStats {
         return try search_runtime_impl.collectExplicitTextStats(self, alloc, requests);
     }
 
     pub fn collectExplicitBackgroundTextStats(
         self: *DB,
         alloc: Allocator,
-        requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        requests: []const search_runtime.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
         return try search_runtime_impl.collectExplicitBackgroundTextStats(self, alloc, requests);
     }
 
-    pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+    pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !search_runtime.ProfiledDenseSearchResult {
         return try search_runtime_impl.searchDenseProfiled(self, alloc, req, dense);
     }
 

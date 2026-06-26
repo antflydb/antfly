@@ -1000,6 +1000,15 @@ pub const BoundTableReadSource = struct {
 const documentAlgebraicAggregateFromDbAlloc = table_read_document_sql.aggregateFromDbAlloc;
 const documentAlgebraicAggregateMergeResponsesAlloc = table_read_document_sql.mergeResponsesAlloc;
 const documentAlgebraicAggregateProvisionedHostedLocal = table_read_document_sql.aggregateProvisionedHostedLocal;
+const aggregationContextForDb = table_read_document_sql.aggregationContextForDb;
+const algebraicIndexFreshEnoughForRequest = table_read_document_sql.algebraicIndexFreshEnoughForRequest;
+const algebraicIndexFreshEnoughForName = table_read_document_sql.algebraicIndexFreshEnoughForName;
+const canConsiderAlgebraicAggregations = table_read_document_sql.canConsiderAlgebraicAggregations;
+const requestWithResultIdentityGeneration = table_read_document_sql.requestWithResultIdentityGeneration;
+const identityGenerationForAggregationFullResultRerun = table_read_document_sql.identityGenerationForAggregationFullResultRerun;
+const aggregationFirstPassIsComplete = table_read_document_sql.aggregationFirstPassIsComplete;
+const aggregationFullScanLimit = table_read_document_sql.aggregationFullScanLimit;
+const aggregationDistributedFullScanLimit = table_read_document_sql.aggregationDistributedFullScanLimit;
 
 pub const ProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
@@ -5148,75 +5157,6 @@ fn openProvisionedLookupDbForTable(
     return db;
 }
 
-fn aggregationContextForDb(
-    alloc: std.mem.Allocator,
-    req: db_mod.types.SearchRequest,
-    db: *db_mod.DB,
-) !db_mod.aggregations.Context {
-    const identity_read_generation = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
-    return .{
-        .index_manager = db.core.index_manager,
-        .doc_store = db.core.store,
-        .full_text_index_name = req.index_name,
-        .algebraic_index_name = req.index_name,
-        .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
-        .identity_read_generation = identity_read_generation,
-    };
-}
-
-fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
-    return try db.currentIdentityReadGenerationForRequest(requested);
-}
-
-fn algebraicIndexFreshEnoughForRequest(
-    alloc: std.mem.Allocator,
-    req: db_mod.types.SearchRequest,
-    db: *db_mod.DB,
-) !bool {
-    return try algebraicIndexFreshEnoughForName(alloc, req.index_name, db);
-}
-
-fn algebraicIndexFreshEnoughForName(
-    alloc: std.mem.Allocator,
-    index_name_opt: ?[]const u8,
-    db: *db_mod.DB,
-) !bool {
-    // The request's index_name selects the text index; the algebraic index used
-    // for aggregation pushdown is resolved independently (an explicit algebraic
-    // index name, else the table's default algebraic index).
-    const entry = db.core.index_manager.aggregationAlgebraicIndex(index_name_opt) orelse return false;
-    if (entry.index.hasErrors()) return false;
-    const target_sequence = db.core.nextDerivedSequence();
-    var applied_sequence = try db.core.loadAppliedSequence(alloc, entry.config.name);
-    if (db.executor.appliedSequence(entry.config.name)) |live_applied| {
-        applied_sequence = @max(applied_sequence, live_applied);
-    }
-    return applied_sequence >= target_sequence;
-}
-
-fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
-    return req.full_text == null and
-        req.exclusion_query_json.len == 0 and
-        req.full_text_queries.len == 0 and
-        req.dense == null and
-        req.sparse == null and
-        req.dense_queries.len == 0 and
-        req.sparse_queries.len == 0 and
-        req.graph_queries.len == 0 and
-        req.merge_config == null and
-        req.reranker == null and
-        req.pruner == null and
-        req.filter_prefix.len == 0 and
-        req.filter_ids.len == 0 and
-        req.exclude_ids.len == 0 and
-        req.filter_doc_ids.len == 0 and
-        !req.filter_doc_ids_positive and
-        req.exclude_doc_ids.len == 0 and
-        !searchRequestHasResolvedDocFilter(req) and
-        req.distance_over == null and
-        req.distance_under == null;
-}
-
 fn algebraicConstraintsForRequestAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
@@ -8099,67 +8039,6 @@ fn applyAggregationResults(
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
     }
     meta.aggregation_results = aggregation_results;
-}
-
-fn requestWithResultIdentityGeneration(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-) db_mod.types.SearchRequest {
-    var out = req;
-    if (out.identity_read_generation == null) out.identity_read_generation = result.identity_read_generation;
-    return out;
-}
-
-fn identityGenerationForAggregationFullResultRerun(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-) !?u64 {
-    if (!req.count_only and result.hits.len == result.total_hits) return req.identity_read_generation orelse result.identity_read_generation;
-    if (result.total_hits == 0) return req.identity_read_generation orelse result.identity_read_generation;
-    return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
-}
-
-/// True when the first-pass search already materialized every matching document,
-/// so its hits can be aggregated directly without a full-scan re-fetch. This
-/// only holds when the request did not bound the result below the match count:
-/// the page is complete (hits == total_hits) AND the caller asked for at least
-/// as many hits as matched (the limit did not truncate). The hits must also
-/// include stored data because scan-based aggregations read hit `stored_data`.
-/// A `limit` of 0 (aggregation-only) never qualifies -- total_hits is then a
-/// truncated 0.
-fn aggregationFirstPassIsComplete(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-) bool {
-    if (!req.include_stored) return false;
-    if (req.limit == 0) return false;
-    if (result.hits.len != result.total_hits) return false;
-    // hits == total_hits but the page was filled to the limit: there may be more
-    // matches the limit hid, so a full scan is still required.
-    return result.hits.len < req.limit;
-}
-
-/// Limit to use when re-fetching all matching documents for scan-based
-/// aggregation. total_hits is unreliable (truncated to the page), so bound the
-/// re-fetch by the shard's primary document count, which is an exact upper bound
-/// on the number of matches. Falls back to the observed total_hits if the count
-/// is unavailable.
-fn aggregationFullScanLimit(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    result: db_mod.types.SearchResult,
-) !u32 {
-    const doc_count = db.primaryDocCount(alloc) catch return @max(result.total_hits, 1);
-    const capped = std.math.cast(u32, doc_count) orelse std.math.maxInt(u32);
-    return @max(capped, result.total_hits);
-}
-
-/// Re-fetch limit for scan-based aggregation across multiple groups, where a
-/// single primary doc count is not available. An unbounded limit makes every
-/// shard return all of its matching documents so the merge aggregates over the
-/// full match set.
-fn aggregationDistributedFullScanLimit(result: db_mod.types.SearchResult) u32 {
-    return @max(result.total_hits, std.math.maxInt(u32));
 }
 
 fn applyBoundQueryAggregations(
@@ -13311,75 +13190,6 @@ test "bound table read source preflights query requests" {
     try std.testing.expect(summary.dense_epsilon_max >= 1.0);
 }
 
-test "merge runtime preflight summary preserves structured filter exact counts only when every shard is exact" {
-    const alloc = std.testing.allocator;
-
-    var exact_left: db_mod.RuntimePreflightSummary = .{
-        .structured_filter_doc_count_estimate = 2,
-        .structured_filter_count_exact = true,
-    };
-    defer exact_left.deinit(alloc);
-    try mergeRuntimePreflightSummary(alloc, &exact_left, .{
-        .structured_filter_doc_count_estimate = 3,
-        .structured_filter_count_exact = true,
-    });
-    try std.testing.expectEqual(@as(?u64, 5), exact_left.structured_filter_doc_count_estimate);
-    try std.testing.expect(exact_left.structured_filter_count_exact);
-    try std.testing.expectEqual(@as(?u32, 5), exact_left.result_doc_estimate);
-
-    var mixed: db_mod.RuntimePreflightSummary = .{
-        .structured_filter_doc_count_estimate = 2,
-        .structured_filter_count_exact = true,
-        .vector_worker_candidate_count = 1,
-        .vector_worker_filter_constraint_count = 2,
-        .vector_worker_requires_algebraic_filter_resolution = true,
-    };
-    defer mixed.deinit(alloc);
-    try mergeRuntimePreflightSummary(alloc, &mixed, .{
-        .structured_filter_doc_count_estimate = 7,
-        .structured_filter_count_exact = false,
-        .vector_worker_fallback_count = 1,
-        .vector_worker_filter_constraint_count = 1,
-    });
-    try std.testing.expectEqual(@as(?u64, null), mixed.structured_filter_doc_count_estimate);
-    try std.testing.expect(!mixed.structured_filter_count_exact);
-    try std.testing.expectEqual(@as(?u64, 9), mixed.structured_filter_doc_count_lower_bound);
-    try std.testing.expectEqual(@as(?u32, null), mixed.result_doc_estimate);
-    try std.testing.expectEqual(@as(u32, 1), mixed.vector_worker_candidate_count);
-    try std.testing.expectEqual(@as(u32, 1), mixed.vector_worker_fallback_count);
-    try std.testing.expectEqual(@as(u32, 3), mixed.vector_worker_filter_constraint_count);
-    try std.testing.expect(mixed.vector_worker_requires_algebraic_filter_resolution);
-
-    var lower_bounds: db_mod.RuntimePreflightSummary = .{
-        .structured_filter_doc_count_lower_bound = 4,
-        .structured_filter_count_exact = false,
-    };
-    defer lower_bounds.deinit(alloc);
-    try mergeRuntimePreflightSummary(alloc, &lower_bounds, .{
-        .structured_filter_doc_count_lower_bound = 6,
-        .structured_filter_count_exact = false,
-    });
-    try std.testing.expectEqual(@as(?u64, 10), lower_bounds.structured_filter_doc_count_lower_bound);
-    try std.testing.expect(!lower_bounds.structured_filter_count_exact);
-    try std.testing.expectEqual(@as(?u32, null), lower_bounds.result_doc_estimate);
-
-    var sampled: db_mod.RuntimePreflightSummary = .{
-        .structured_filter_doc_count_sample_estimate = 4,
-        .structured_filter_count_sample_size = 8,
-        .structured_filter_count_exact = false,
-    };
-    defer sampled.deinit(alloc);
-    try mergeRuntimePreflightSummary(alloc, &sampled, .{
-        .structured_filter_doc_count_sample_estimate = 6,
-        .structured_filter_count_sample_size = 12,
-        .structured_filter_count_exact = false,
-    });
-    try std.testing.expectEqual(@as(?u64, 10), sampled.structured_filter_doc_count_sample_estimate);
-    try std.testing.expectEqual(@as(u32, 20), sampled.structured_filter_count_sample_size);
-    try std.testing.expect(!sampled.structured_filter_count_exact);
-    try std.testing.expectEqual(@as(?u32, 10), sampled.result_doc_estimate);
-}
-
 test "bound table read source reranks hits after materialization" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-table-rerank";
@@ -15615,63 +15425,6 @@ test "explicit text stats requests reject stale identity generation" {
     var parsed_background = try parseTextStatsRequest(alloc, "docs", background_body);
     defer parsed_background.deinit(alloc);
     try std.testing.expectError(error.UnsupportedQueryRequest, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
-}
-
-test "aggregation context rejects non-current identity generation" {
-    const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-aggregation-context-identity-generation";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"v\":1}" }},
-        .sync_level = .write,
-    });
-
-    const current = db.core.nextDerivedSequence();
-    const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
-    try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
-        .identity_read_generation = current + 1,
-    }, &db));
-}
-
-test "aggregation full-result rerun can reuse snapped result identity generation" {
-    const alloc = std.testing.allocator;
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 2,
-    };
-    defer result.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, identityGenerationForAggregationFullResultRerun(.{}, result));
-    try std.testing.expectEqual(@as(?u64, 9), try identityGenerationForAggregationFullResultRerun(.{ .identity_read_generation = 9 }, result));
-    result.identity_read_generation = 11;
-    try std.testing.expectEqual(@as(?u64, 11), try identityGenerationForAggregationFullResultRerun(.{}, result));
-    try std.testing.expectEqual(@as(?u64, 9), try identityGenerationForAggregationFullResultRerun(.{ .identity_read_generation = 9 }, result));
-    try std.testing.expectEqual(@as(?u64, 11), requestWithResultIdentityGeneration(.{}, result).identity_read_generation);
-    try std.testing.expectEqual(@as(?u64, 9), requestWithResultIdentityGeneration(.{ .identity_read_generation = 9 }, result).identity_read_generation);
-
-    const complete = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-    };
-    try std.testing.expectEqual(@as(?u64, null), try identityGenerationForAggregationFullResultRerun(.{}, complete));
-
-    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = false, .limit = 10 }, result));
-    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 1 }, result));
-    result.total_hits = 1;
-    try std.testing.expect(aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
 }
 
 test "provisioned distributed aggregations collect path terms nested cardinality" {

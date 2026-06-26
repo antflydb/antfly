@@ -812,7 +812,7 @@ test "lite sql reads legacy local schema metadata without table record" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"amount\":42") != null);
 }
 
-test "lite sql ddl persists local table record metadata" {
+test "lite sql ddl updates catalog for subsequent statements" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -831,14 +831,6 @@ test "lite sql ddl persists local table record metadata" {
     var parsed_ddl = try std.json.parseFromSlice(std.json.Value, allocator, ddl_body, .{ .allocate = .alloc_always });
     defer parsed_ddl.deinit();
     try std.testing.expectEqualStrings("ddl", parsed_ddl.value.object.get("kind").?.string);
-
-    const table_record = (try db.getLiteSqlTableRecordAlloc(allocator)) orelse return error.TestUnexpectedResult;
-    defer metadata_table_manager.freeTable(allocator, table_record);
-    try std.testing.expectEqualStrings("usage_records", table_record.name);
-    try std.testing.expectEqualStrings(session.catalog.session().currentDatabase(), table_record.database_name);
-    try std.testing.expectEqualStrings(session.catalog.session().primarySearchPathNamespace(), table_record.namespace_name);
-    try std.testing.expect(std.mem.indexOf(u8, table_record.schema_json, "\"storage_mode\":\"relational\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, table_record.indexes_json, "\"algebraic_index_v0\"") != null);
 
     const read_body = try executeOneJsonAlloc(allocator, &db, &session, "SELECT id, status FROM usage_records;");
     defer allocator.free(read_body);

@@ -91,6 +91,10 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - full-suite MemoryAF extension package projection from `extensions/memoryaf`
   - swarm and distributed extension lifecycle dry-run coverage
   - swarm install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
+- `test_pgwire.py`
+  - optional PostgreSQL wire listener coverage for swarm and metadata runtimes
+  - `antfly sql` HTTP host/port and pgwire host/port CLI coverage
+  - pgx default extended-query smoke coverage, simple query multi-statement coverage, auth, transaction status, cancellation key data, PostgreSQL compatibility probes, row descriptions, text and binary parameter/result formats
 ## Harnesses
 
 - `serverless_api`

@@ -3174,7 +3174,7 @@ fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u
 test "remote query parser preserves graph metric results" {
     const alloc = std.testing.allocator;
     var parsed = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":0,"hits":[]},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:b","score":0.8},{"node":"doc:a","score":0.9}],"status":{"state":"fresh","phase":"complete","maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_lease_expires_at_ms":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}}}]}
+        \\{"responses":[{"hits":{"total":0,"hits":[]},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:b","score":0.8},{"node":"doc:a","score":0.9}],"status":{"state":"fresh","phase":"complete","maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_lease_expires_at_ms":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}},"took":0,"status":200}]}
     );
     defer parsed.deinit();
 

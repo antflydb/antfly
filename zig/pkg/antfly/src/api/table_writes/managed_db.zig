@@ -25,7 +25,6 @@ const db_mod = @import("../../storage/db/mod.zig");
 const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const hbc_mod = @import("../../storage/hbc_adapter.zig");
-const lmdb = @import("../../storage/lmdb.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
@@ -35,7 +34,6 @@ const table_write_core = @import("core.zig");
 const table_write_index_config = @import("index_config.zig");
 
 const backend_current_root_generation = table_write_core.backend_current_root_generation;
-const local_schema_json_key = db_mod.local_schema_json_key;
 const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
 const parseIndexKind = table_write_index_config.parseIndexKind;
 
@@ -75,10 +73,7 @@ pub fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAA
 }
 
 pub fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
-    return db.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
-        lmdb.Error.NotFound => null,
-        else => return err,
-    };
+    return try db.getSchemaJson(alloc);
 }
 
 pub fn applyLocalTableSchemaJson(

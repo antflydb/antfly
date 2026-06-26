@@ -273,6 +273,26 @@ stable focused test roots and registered through the grouped API test helper in
 such as API table reads, API table writes, rows, DOCID lifecycle, and graph
 metric coverage, not individual implementation test names.
 
+Treat this as a build-file ownership contract:
+
+- `zig/build.zig` may create modules, pass them to grouped helper functions, and
+  connect durable suite-level steps into the default test aggregates.
+- `pkg/antfly/build/tests.zig` owns focused test inventories, exact test-title
+  filters, and API read/write focused-step registration.
+- Focused test roots import the facade and migrated leaf modules so moved tests
+  keep running under the existing `zig build api-table-reads-docid-test` and
+  `zig build api-table-writes-docid-test` commands.
+- A new extracted helper should not introduce a new top-level `zig/build.zig`
+  test step unless it is a durable product-level suite rather than an
+  implementation regression bucket.
+
+The build also enforces this convention with guardrails in
+`pkg/antfly/build/tests.zig`: inline filter lists, direct `--test-filter`
+arguments, and manifest-owned API read/write test steps are rejected from
+`zig/build.zig`. If a refactor needs another implementation-focused bucket, add
+it to the package test manifest or an existing grouped helper instead of growing
+the top-level build file.
+
 Yes: tests should generally move with the production behavior they prove. The
 important caveat is that this is an ownership move, not a mechanical file move.
 Leaf implementation tests should travel with the extracted leaf module; boundary

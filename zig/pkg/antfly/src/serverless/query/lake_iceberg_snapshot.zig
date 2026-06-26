@@ -257,8 +257,8 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
     }
 
     var delete_files = std.ArrayListUnmanaged(IcebergDeleteFile).empty;
-    errdefer deinitDeleteFileItems(alloc, delete_files.items);
     defer delete_files.deinit(alloc);
+    errdefer deinitDeleteFileItems(alloc, delete_files.items);
 
     for (manifest_list.entries) |manifest_entry| {
         switch (manifest_entry.content) {
@@ -341,8 +341,8 @@ pub fn readSnapshotDeletePlanAlloc(
     defer manifest_list.deinit(alloc);
 
     var delete_files = std.ArrayListUnmanaged(IcebergDeleteFile).empty;
-    errdefer deinitDeleteFileItems(alloc, delete_files.items);
     defer delete_files.deinit(alloc);
+    errdefer deinitDeleteFileItems(alloc, delete_files.items);
 
     for (manifest_list.entries) |manifest_entry| {
         if (manifest_entry.content != .deletes) continue;
@@ -919,19 +919,27 @@ fn appendDeleteFileFromEntryAlloc(
     entry: iceberg_avro.DataFileEntry,
     metadata_plan: iceberg_metadata.Plan,
 ) !void {
-    var delete_file = IcebergDeleteFile{
+    const file_path = try alloc.dupe(u8, entry.file_path);
+    errdefer alloc.free(file_path);
+    const file_format = try alloc.dupe(u8, entry.file_format);
+    errdefer alloc.free(file_format);
+    const equality_ids = try cloneI32SliceAlloc(alloc, entry.equality_ids);
+    errdefer if (equality_ids.len > 0) alloc.free(equality_ids);
+    const equality_columns = try cloneEqualityColumnNamesAlloc(alloc, entry.equality_ids, metadata_plan);
+    errdefer freeEqualityColumnNames(alloc, equality_columns);
+
+    const delete_file = IcebergDeleteFile{
         .content = entry.content,
-        .file_path = try alloc.dupe(u8, entry.file_path),
-        .file_format = try alloc.dupe(u8, entry.file_format),
+        .file_path = file_path,
+        .file_format = file_format,
         .snapshot_id = entry.snapshot_id,
         .data_sequence_number = entry.data_sequence_number,
         .file_sequence_number = entry.file_sequence_number,
-        .equality_ids = try cloneI32SliceAlloc(alloc, entry.equality_ids),
-        .equality_columns = try cloneEqualityColumnNamesAlloc(alloc, entry.equality_ids, metadata_plan),
+        .equality_ids = equality_ids,
+        .equality_columns = equality_columns,
         .record_count = entry.record_count,
         .file_size_in_bytes = entry.file_size_in_bytes,
     };
-    errdefer delete_file.deinit(alloc);
     try delete_file.validate();
     try out.append(alloc, delete_file);
 }
@@ -959,6 +967,11 @@ fn cloneEqualityColumnNamesAlloc(
         initialized += 1;
     }
     return columns;
+}
+
+fn freeEqualityColumnNames(alloc: Allocator, columns: [][]u8) void {
+    for (columns) |column| alloc.free(column);
+    if (columns.len > 0) alloc.free(columns);
 }
 
 fn deinitDeleteFileItems(alloc: Allocator, files: []IcebergDeleteFile) void {

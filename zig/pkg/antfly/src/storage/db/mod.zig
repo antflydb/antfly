@@ -90,6 +90,7 @@ pub const OpenOptions = db_impl.OpenOptions;
 pub const OpenMode = db_impl.OpenMode;
 pub const PrimaryBackend = db_config.PrimaryBackend;
 pub const local_schema_json_key = db_impl.local_schema_json_key;
+pub const local_lite_sql_table_record_json_key = db_impl.local_lite_sql_table_record_json_key;
 pub const HAAsyncEffectMirror = ha_types.AsyncEffectMirror;
 pub const HAAsyncBatchMirror = ha_types.AsyncBatchMirror;
 pub const HAAsyncMetadataMirror = ha_types.AsyncMetadataMirror;

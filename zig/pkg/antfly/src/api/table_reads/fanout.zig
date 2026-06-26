@@ -672,6 +672,75 @@ pub fn mergeRuntimePreflightSummaryNoFree(
     db_mod.deriveRuntimePreflightEstimates(target);
 }
 
+test "merge runtime preflight summary preserves structured filter exact counts only when every shard is exact" {
+    const alloc = std.testing.allocator;
+
+    var exact_left: db_mod.RuntimePreflightSummary = .{
+        .structured_filter_doc_count_estimate = 2,
+        .structured_filter_count_exact = true,
+    };
+    defer exact_left.deinit(alloc);
+    try mergeRuntimePreflightSummary(alloc, &exact_left, .{
+        .structured_filter_doc_count_estimate = 3,
+        .structured_filter_count_exact = true,
+    });
+    try std.testing.expectEqual(@as(?u64, 5), exact_left.structured_filter_doc_count_estimate);
+    try std.testing.expect(exact_left.structured_filter_count_exact);
+    try std.testing.expectEqual(@as(?u32, 5), exact_left.result_doc_estimate);
+
+    var mixed: db_mod.RuntimePreflightSummary = .{
+        .structured_filter_doc_count_estimate = 2,
+        .structured_filter_count_exact = true,
+        .vector_worker_candidate_count = 1,
+        .vector_worker_filter_constraint_count = 2,
+        .vector_worker_requires_algebraic_filter_resolution = true,
+    };
+    defer mixed.deinit(alloc);
+    try mergeRuntimePreflightSummary(alloc, &mixed, .{
+        .structured_filter_doc_count_estimate = 7,
+        .structured_filter_count_exact = false,
+        .vector_worker_fallback_count = 1,
+        .vector_worker_filter_constraint_count = 1,
+    });
+    try std.testing.expectEqual(@as(?u64, null), mixed.structured_filter_doc_count_estimate);
+    try std.testing.expect(!mixed.structured_filter_count_exact);
+    try std.testing.expectEqual(@as(?u64, 9), mixed.structured_filter_doc_count_lower_bound);
+    try std.testing.expectEqual(@as(?u32, null), mixed.result_doc_estimate);
+    try std.testing.expectEqual(@as(u32, 1), mixed.vector_worker_candidate_count);
+    try std.testing.expectEqual(@as(u32, 1), mixed.vector_worker_fallback_count);
+    try std.testing.expectEqual(@as(u32, 3), mixed.vector_worker_filter_constraint_count);
+    try std.testing.expect(mixed.vector_worker_requires_algebraic_filter_resolution);
+
+    var lower_bounds: db_mod.RuntimePreflightSummary = .{
+        .structured_filter_doc_count_lower_bound = 4,
+        .structured_filter_count_exact = false,
+    };
+    defer lower_bounds.deinit(alloc);
+    try mergeRuntimePreflightSummary(alloc, &lower_bounds, .{
+        .structured_filter_doc_count_lower_bound = 6,
+        .structured_filter_count_exact = false,
+    });
+    try std.testing.expectEqual(@as(?u64, 10), lower_bounds.structured_filter_doc_count_lower_bound);
+    try std.testing.expect(!lower_bounds.structured_filter_count_exact);
+    try std.testing.expectEqual(@as(?u32, null), lower_bounds.result_doc_estimate);
+
+    var sampled: db_mod.RuntimePreflightSummary = .{
+        .structured_filter_doc_count_sample_estimate = 4,
+        .structured_filter_count_sample_size = 8,
+        .structured_filter_count_exact = false,
+    };
+    defer sampled.deinit(alloc);
+    try mergeRuntimePreflightSummary(alloc, &sampled, .{
+        .structured_filter_doc_count_sample_estimate = 6,
+        .structured_filter_count_sample_size = 12,
+        .structured_filter_count_exact = false,
+    });
+    try std.testing.expectEqual(@as(?u64, 10), sampled.structured_filter_doc_count_sample_estimate);
+    try std.testing.expectEqual(@as(u32, 20), sampled.structured_filter_count_sample_size);
+    try std.testing.expect(!sampled.structured_filter_count_exact);
+    try std.testing.expectEqual(@as(?u32, 10), sampled.result_doc_estimate);
+}
+
 fn mergeRuntimePreflightTextQueryStats(
     alloc: std.mem.Allocator,
     target: *[]const distributed_stats_mod.TextFieldStats,

@@ -2306,12 +2306,12 @@ test "opened object storage lake source resolves iceberg table root inventory" {
     defer version_hint.deinit(alloc);
     var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", icebergRoutingMetadataJson(), .{});
     defer metadata_file.deinit(alloc);
-    var manifest_list = try buildIcebergRoutingManifestListFixture(alloc);
+    var data_manifest = try buildIcebergRoutingDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildIcebergRoutingManifestListFixture(alloc, data_manifest.items.len);
     defer manifest_list.deinit(alloc);
     var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
     defer manifest_list_put.deinit(alloc);
-    var data_manifest = try buildIcebergRoutingDataManifestFixture(alloc);
-    defer data_manifest.deinit(alloc);
     var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
     defer data_manifest_put.deinit(alloc);
     const data_a = try alloc.alloc(u8, 4096);
@@ -2381,11 +2381,12 @@ test "opened object storage iceberg source applies position delete files" {
     defer metadata_file.deinit(alloc);
 
     const data_file_path = "s3://bucket/events/data/a.parquet";
-    const data_object = try serverless_query.buildLakeParquetTestSingleColumnPlainI64ObjectAlloc(
-        alloc,
-        "amount",
-        &[_]i64{ 10, 20, 30 },
-    );
+    const data_columns = [_]serverless_query.LakeParquetTestPlainI64Column{.{
+        .column_id = "amount",
+        .values = &[_]i64{ 10, 20, 30 },
+        .field_id = 1,
+    }};
+    const data_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &data_columns, &.{});
     defer alloc.free(data_object);
     var data_put = try client.putObject("bucket", "events/data/a.parquet", data_object, .{});
     defer data_put.deinit(alloc);
@@ -2624,14 +2625,14 @@ fn icebergRoutingMetadataJson() []const u8 {
     ;
 }
 
-fn buildIcebergRoutingManifestListFixture(alloc: std.mem.Allocator) !std.ArrayListUnmanaged(u8) {
+fn buildIcebergRoutingManifestListFixture(alloc: std.mem.Allocator, data_manifest_len: usize) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingManifestListSchema(), "0123456789abcdef");
 
     var block = std.ArrayListUnmanaged(u8).empty;
     defer block.deinit(alloc);
-    try appendIcebergRoutingManifestListRecord(alloc, &block, "s3://bucket/events/metadata/m-a.avro", 512, 0, .{});
+    try appendIcebergRoutingManifestListRecord(alloc, &block, "s3://bucket/events/metadata/m-a.avro", data_manifest_len, 0, .{});
 
     try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "0123456789abcdef");
     return out;
