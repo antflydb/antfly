@@ -3259,7 +3259,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try validateIndexConfig(alloc, index_name, index_json);
+        try table_write_index_config.validateIndexConfig(alloc, index_name, index_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
@@ -7294,7 +7294,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         index_json: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try validateIndexConfig(alloc, index_name, index_json);
+        try table_write_index_config.validateIndexConfig(alloc, index_name, index_json);
         self.invalidateManagedCache(table_name);
         try self.reconcileCachedIndexCreate(alloc, table_name, index_name);
     }
@@ -9875,10 +9875,6 @@ const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
 const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
 const parseStartupConfiguredIndexes = table_write_index_config.parseStartupConfiguredIndexes;
 const encodeRemoteBatchRequest = table_write_remote_wire.encodeRemoteBatchRequest;
-pub const validateIndexConfig = table_write_index_config.validateIndexConfig;
-pub const validateIndexConfigWithOptions = table_write_index_config.validateIndexConfigWithOptions;
-pub const normalizeManagedEmbeddingIndexDimensionJsonWithOptions = table_write_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions;
-pub const normalizeManagedEmbeddingIndexDimensionsJsonWithOptions = table_write_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions;
 
 fn reconcileCachedLocalTableIndexCreate(
     self: *ProvisionedTableWriteSource,

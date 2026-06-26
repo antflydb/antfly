@@ -128,7 +128,6 @@ const encodeTextStatsResponse = table_read_remote_wire.encodeTextStatsResponse;
 const parseTextStatsResponse = table_read_remote_wire.parseTextStatsResponse;
 const encodeBackgroundTextStatsResponse = table_read_remote_wire.encodeBackgroundTextStatsResponse;
 const parseBackgroundTextStatsResponse = table_read_remote_wire.parseBackgroundTextStatsResponse;
-pub const parseTextStatsHttpResponse = table_read_remote_wire.parseTextStatsHttpResponse;
 const encodeAlgebraicPartialsRequest = table_read_remote_wire.encodeAlgebraicPartialsRequest;
 const encodeAlgebraicPartialsRequestWithProgram = table_read_remote_wire.encodeAlgebraicPartialsRequestWithProgram;
 const encodeAlgebraicPartialsRequestWithProgramAtGeneration = table_read_remote_wire.encodeAlgebraicPartialsRequestWithProgramAtGeneration;
@@ -148,11 +147,9 @@ const freeAlgebraicConstraints = table_read_fanout.freeAlgebraicConstraints;
 const ParallelFanoutKind = table_read_fanout.ParallelFanoutKind;
 const FanoutPlanReason = table_read_fanout.FanoutPlanReason;
 const FanoutPlan = table_read_fanout.FanoutPlan;
-pub const ParallelFanoutMetricsSnapshot = table_read_fanout.ParallelFanoutMetricsSnapshot;
 const recordFanoutPlan = table_read_fanout.recordFanoutPlan;
 const recordParallelFanout = table_read_fanout.recordParallelFanout;
 const recordParallelFanoutFallback = table_read_fanout.recordParallelFanoutFallback;
-pub const parallelFanoutMetricsSnapshot = table_read_fanout.parallelFanoutMetricsSnapshot;
 const ioAsyncLimitCap = table_read_fanout.ioAsyncLimitCap;
 const planFanout = table_read_fanout.planFanout;
 const planQueryFanout = table_read_fanout.planQueryFanout;
@@ -184,24 +181,21 @@ fn benchQueryApiPhaseProfileEnabled() bool {
 fn nsToUsFloat(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
-pub const LookupResponse = table_read_core.LookupResponse;
-pub const ScanResponse = table_read_core.ScanResponse;
-pub const TextStatsResponse = table_read_core.TextStatsResponse;
-pub const BackgroundTextStatsResponse = table_read_core.BackgroundTextStatsResponse;
+const LookupResponse = table_read_core.LookupResponse;
+const ScanResponse = table_read_core.ScanResponse;
+const TextStatsResponse = table_read_core.TextStatsResponse;
+const BackgroundTextStatsResponse = table_read_core.BackgroundTextStatsResponse;
 
-pub const LoweredSqlReadPlanResult = table_read_relational_rows.LoweredSqlReadPlanResult;
-pub const LoweredRelationPopulationRowsResult = table_read_relational_rows.LoweredRelationPopulationRowsResult;
 const takeLoweredSqlReadRows = table_read_relational_rows.takeLoweredSqlReadRows;
 
-pub const LsmStorageStats = table_read_core.LsmStorageStats;
-pub const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
+const LsmStorageStats = table_read_core.LsmStorageStats;
 const appendScanLine = table_read_core.appendScanLine;
-pub const HAReadGate = table_read_core.HAReadGate;
-pub const ReadPreparation = table_read_core.ReadPreparation;
-pub const backend_current_root_generation = table_read_core.backend_current_root_generation;
-pub const GroupVisibleRootGenerationSource = table_read_core.GroupVisibleRootGenerationSource;
-pub const PrimaryLookupDbLease = table_read_core.PrimaryLookupDbLease;
-pub const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
+const HAReadGate = table_read_core.HAReadGate;
+const ReadPreparation = table_read_core.ReadPreparation;
+const backend_current_root_generation = table_read_core.backend_current_root_generation;
+const GroupVisibleRootGenerationSource = table_read_core.GroupVisibleRootGenerationSource;
+const PrimaryLookupDbLease = table_read_core.PrimaryLookupDbLease;
+const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
 const routePolicyForConsistency = table_read_core.routePolicyForConsistency;
 
 pub const testing = if (builtin.is_test) struct {
@@ -223,7 +217,7 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
-pub const ProvisionedTableReadCache = table_read_cache.ProvisionedTableReadCache;
+const ProvisionedTableReadCache = table_read_cache.ProvisionedTableReadCache;
 const openProvisionedQueryDbForTable = table_read_cache.openProvisionedQueryDbForTable;
 const openProvisionedQueryDbForTableWithRuntime = table_read_cache.openProvisionedQueryDbForTableWithRuntime;
 const openProvisionedQueryDbForTableWithCache = table_read_cache.openProvisionedQueryDbForTableWithCache;
@@ -249,10 +243,9 @@ const ProfiledDenseQuery = struct {
 };
 
 const ParsedAlgebraicPartialsRequest = table_read_remote_wire.ParsedAlgebraicPartialsRequest;
-pub const searchRequestFromVectorWorkerEnvelope = table_read_remote_wire.searchRequestFromVectorWorkerEnvelope;
 
-pub const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
-pub const TableReadSource = table_read_core.TableReadSource;
+const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
+const TableReadSource = table_read_core.TableReadSource;
 
 fn algebraicVectorWorkerFilterJsonSupported(alloc: std.mem.Allocator, filter_query_json: []const u8) bool {
     if (filter_query_json.len == 0) return true;
@@ -2979,12 +2972,8 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 };
 
-pub const executeLoweredSqlReadPlanAlloc = table_read_relational_rows.executeLoweredSqlReadPlanAlloc;
-pub const executeLoweredSqlReadPlanWithSessionAlloc = table_read_relational_rows.executeLoweredSqlReadPlanWithSessionAlloc;
-pub const executeLoweredRelationPopulationPlanAlloc = table_read_relational_rows.executeLoweredRelationPopulationPlanAlloc;
-pub const RecursiveCteMaterializedRows = table_read_relational_rows.RecursiveCteMaterializedRows;
-pub const materializeLoweredSqlRecursiveCteRowsAlloc = table_read_relational_rows.materializeLoweredRecursiveCteRowsAlloc;
-pub const materializeLoweredSqlRecursiveCteRowsWithSessionAlloc = table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc;
+const executeLoweredSqlReadPlanAlloc = table_read_relational_rows.executeLoweredSqlReadPlanAlloc;
+const executeLoweredSqlReadPlanWithSessionAlloc = table_read_relational_rows.executeLoweredSqlReadPlanWithSessionAlloc;
 
 const catalogTargetForLoweredSqlTable = table_read_relational_rows.catalogTargetForLoweredSqlTable;
 const loweredSqlSetOperationToRowsOperation = table_read_relational_rows.loweredSetOperationToRowsOperation;
@@ -2992,14 +2981,6 @@ const loweredSqlSetOperationToRowsOperation = table_read_relational_rows.lowered
 const catalogRuntimeSchemaUnlessDefaultAlloc = table_read_relational_rows.catalogRuntimeSchemaUnlessDefaultAlloc;
 
 const loweredSqlReadJoinCteTableName = table_read_relational_rows.loweredReadJoinCteTableName;
-
-pub const rowsInsertSourceBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsInsertSourceBatchFromRoutedScansWithSchemasAlloc;
-pub const rowsInsertSourceBatchFromRecursiveCtePlanAlloc = table_read_relational_rows.rowsInsertSourceBatchFromRecursiveCtePlanAlloc;
-pub const rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc = table_read_relational_rows.rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc;
-pub const rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc;
-pub const rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc;
-pub const rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc;
-pub const rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc = table_read_relational_rows.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc;
 
 fn rowsQueryPlanFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
@@ -3050,26 +3031,6 @@ const rowsWindowPlanFromLakeScanAlloc = table_read_external_lake.rowsWindowPlanF
 const rowsJoinPlanFromLakeScanAlloc = table_read_external_lake.rowsJoinPlanFromLakeScanAlloc;
 const rowsLateralPlanFromLakeScanAlloc = table_read_external_lake.rowsLateralPlanFromLakeScanAlloc;
 
-pub const PinnedExternalLakeRowsScanner = table_read_external_lake.PinnedExternalLakeRowsScanner;
-pub const PinnedExternalLakeSidecarContext = table_read_external_lake.PinnedExternalLakeSidecarContext;
-
-pub const PinnedExternalObjectStorageLakeRowsScanner = table_read_external_lake.PinnedExternalObjectStorageLakeRowsScanner;
-
-pub const PinnedExternalObjectStorageLakeRowsSource = table_read_external_lake.PinnedExternalObjectStorageLakeRowsSource;
-
-pub const ExternalObjectStorageLakeRowsSourceOptions = table_read_external_lake.ExternalObjectStorageLakeRowsSourceOptions;
-pub const ExternalLakePinnedSourceState = table_read_external_lake.ExternalLakePinnedSourceState;
-pub const ExternalLakePhysicalScanSummary = table_read_external_lake.ExternalLakePhysicalScanSummary;
-pub const OwnedExternalObjectStorageLakeRowsSource = table_read_external_lake.OwnedExternalObjectStorageLakeRowsSource;
-pub const OpenedExternalObjectStorageLakeRowsSource = table_read_external_lake.OpenedExternalObjectStorageLakeRowsSource;
-pub const ExternalLakeObjectStoreResolver = table_read_external_lake.ExternalLakeObjectStoreResolver;
-pub const RemoteUriExternalLakeObjectStoreResolver = table_read_external_lake.RemoteUriExternalLakeObjectStoreResolver;
-pub const ConfiguredExternalLakeObjectStoreResolver = table_read_external_lake.ConfiguredExternalLakeObjectStoreResolver;
-
-pub const ExternalLakeRoutingTableReadSource = table_read_external_lake.ExternalLakeRoutingTableReadSource;
-
-pub const executePinnedExternalLakeRowsScanAlloc = table_read_external_lake.executePinnedExternalLakeRowsScanAlloc;
-
 fn rowsWindowPlanFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -3111,7 +3072,7 @@ fn rowsJoinPlanFromRoutedScansAlloc(
     );
 }
 
-pub const rowsJoinPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsJoinPlanFromRoutedScansWithSchemasAlloc;
+const rowsJoinPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsJoinPlanFromRoutedScansWithSchemasAlloc;
 
 fn rowsLateralPlanFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
@@ -3140,7 +3101,7 @@ fn rowsLateralPlanFromRoutedScansAlloc(
     );
 }
 
-pub const rowsLateralPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsLateralPlanFromRoutedScansWithSchemasAlloc;
+const rowsLateralPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsLateralPlanFromRoutedScansWithSchemasAlloc;
 const relationalRowsEffectiveSideTable = table_read_relational_rows.effectiveSideTable;
 
 const RoutedRows = table_read_relational_rows.RoutedRows;

@@ -4526,15 +4526,16 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
     if (column.field_type == .array or column.field_type == .json) return error.UnsupportedSqlShape;
 
     if (parser.matchKeyword(tokens, pos, "not")) {
+        const negation_token_index = pos.* - 1;
         try parser.expectKeyword(tokens, pos, "in");
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne);
         return true;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq);
@@ -4825,7 +4826,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         try appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, alternatives, lhs);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -4833,7 +4834,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "between")) {
-        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .between);
+        const operator_token_index = pos.* - 1;
+        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
+        try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const lower_expression = try parseRowExpressionAlloc(
             alloc,
@@ -5101,7 +5104,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         try appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_or_predicates, lhs);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -5109,6 +5112,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "not")) {
+        const negation_token_index = pos.* - 1;
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
@@ -5127,14 +5131,16 @@ pub fn parseExpressionWhereConditionsAlloc(
             return;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
-            try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .not_in_list);
+            try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             try appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_not_predicates, lhs);
             freeExpression(alloc, lhs);
             lhs_transferred = true;
             return;
         }
         try parser.expectKeyword(tokens, pos, "between");
-        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .not_between);
+        const operator_token_index = pos.* - 1;
+        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
+        try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const lower_expression = try parseExpressionWhereConditionRowExpressionAlloc(alloc, tokens, pos, type_context, options);
         var lower_transferred = false;
@@ -5206,7 +5212,9 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "between")) {
-        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .between);
+        const operator_token_index = pos.* - 1;
+        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
+        try validateGeneratedSetOrBetweenPredicateExpression(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const upper_lhs = try cloneExpressionAlloc(alloc, lhs);
         var upper_lhs_transferred = false;
@@ -25450,6 +25458,84 @@ fn validateGeneratedExpressionPredicateKind(
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
 }
 
+fn betweenModifierTokenIndex(tokens: []const Token, index: usize) ?usize {
+    if (index >= tokens.len) return null;
+    if (tokens[index].matchesKeywordTag(.asymmetric) or tokens[index].matchesKeywordTag(.symmetric)) return index;
+    return null;
+}
+
+fn validateGeneratedSetOrBetweenPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+    tokens: []const Token,
+    operator_token_index: usize,
+    negation_token_index: ?usize,
+    between_modifier_token_index: ?usize,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
+
+    switch (expected_kind) {
+        .not_in_list, .not_between => {
+            const index = negation_token_index orelse return error.UnsupportedSqlShape;
+            const negation_tokens = expression.negation_tokens orelse return error.UnsupportedSqlShape;
+            if (index >= tokens.len or
+                negation_tokens.start != index or
+                negation_tokens.end != index + 1 or
+                negation_tokens.end != operator_tokens.start or
+                !tokens[index].matchesKeywordTag(.not))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .in_list, .between => {
+            if (negation_token_index != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+
+    switch (expected_kind) {
+        .in_list, .not_in_list => {
+            if (between_modifier_token_index != null or expression.between_modifier_tokens != null or expression.between_modifier != null) return error.UnsupportedSqlShape;
+            const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+        },
+        .between, .not_between => {
+            const lower_tokens = expression.between_lower_tokens orelse return error.UnsupportedSqlShape;
+            const upper_tokens = expression.between_upper_tokens orelse return error.UnsupportedSqlShape;
+            const lower_start = if (between_modifier_token_index) |index| blk: {
+                const modifier_tokens = expression.between_modifier_tokens orelse return error.UnsupportedSqlShape;
+                if (index >= tokens.len or
+                    modifier_tokens.start != index or
+                    modifier_tokens.end != index + 1 or
+                    operator_tokens.end != modifier_tokens.start)
+                {
+                    return error.UnsupportedSqlShape;
+                }
+                const modifier = expression.between_modifier orelse return error.UnsupportedSqlShape;
+                switch (modifier) {
+                    .asymmetric => if (!tokens[index].matchesKeywordTag(.asymmetric)) return error.UnsupportedSqlShape,
+                    .symmetric => if (!tokens[index].matchesKeywordTag(.symmetric)) return error.UnsupportedSqlShape,
+                }
+                break :blk modifier_tokens.end;
+            } else blk: {
+                if (expression.between_modifier_tokens != null or expression.between_modifier != null) return error.UnsupportedSqlShape;
+                break :blk operator_tokens.end;
+            };
+            if (lower_start != lower_tokens.start or lower_tokens.end >= upper_tokens.start) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 fn validateGeneratedRegexPredicateExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
     tokens: []const Token,
@@ -25746,7 +25832,9 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "between")) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .between);
+        const operator_token_index = pos.* - 1;
+        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
+        try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
         defer alloc.free(lower_json);
@@ -25757,8 +25845,11 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "not")) {
+        const negation_token_index = pos.* - 1;
         if (parser.matchKeyword(tokens, pos, "between")) {
-            try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_between);
+            const operator_token_index = pos.* - 1;
+            const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
+            try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
             const symmetric = matchBetweenSymmetricMode(tokens, pos);
             const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
             defer alloc.free(lower_json);
@@ -25777,7 +25868,7 @@ pub fn parseWhereAtomAlloc(
             return;
         }
         try parser.expectKeyword(tokens, pos, "in");
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -25793,7 +25884,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .in_list);
+        try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -25997,6 +26088,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "not")) {
+            const negation_token_index = pos.* - 1;
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
@@ -26007,7 +26099,7 @@ pub fn parseJoinWhereAlloc(
                 continue;
             }
             try parser.expectKeyword(tokens, pos, "in");
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .not_in_list);
+            try validateGeneratedSetOrBetweenPredicateExpression(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -26023,7 +26115,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .in_list);
+            try validateGeneratedSetOrBetweenPredicateExpression(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -38836,6 +38928,59 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, false, false),
+    );
+    const in_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "in", .keyword = .in },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .string, .text = "active" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    const in_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .in_list,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+        .right_tokens = .{ .start = 2, .end = 5 },
+    };
+    try validateGeneratedSetOrBetweenPredicateExpression(&in_expression, .in_list, &in_tokens, 1, null, null);
+    const not_in_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "not", .keyword = .not },
+        .{ .kind = .identifier, .text = "in", .keyword = .in },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .string, .text = "active" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    const not_in_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .not_in_list,
+        .negation_tokens = .{ .start = 1, .end = 2 },
+        .operator_tokens = .{ .start = 2, .end = 3 },
+        .right_tokens = .{ .start = 3, .end = 6 },
+    };
+    try validateGeneratedSetOrBetweenPredicateExpression(&not_in_expression, .not_in_list, &not_in_tokens, 2, 1, null);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedSetOrBetweenPredicateExpression(&not_in_expression, .not_in_list, &not_in_tokens, 2, null, null),
+    );
+    const between_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .identifier, .text = "between", .keyword = .between },
+        .{ .kind = .identifier, .text = "symmetric", .keyword = .symmetric },
+        .{ .kind = .number, .text = "1" },
+        .{ .kind = .identifier, .text = "and", .keyword = .@"and" },
+        .{ .kind = .number, .text = "3" },
+    };
+    const between_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .between,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+        .between_modifier_tokens = .{ .start = 2, .end = 3 },
+        .between_modifier = .symmetric,
+        .between_lower_tokens = .{ .start = 3, .end = 4 },
+        .between_upper_tokens = .{ .start = 5, .end = 6 },
+    };
+    try validateGeneratedSetOrBetweenPredicateExpression(&between_expression, .between, &between_tokens, 1, null, 2);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedSetOrBetweenPredicateExpression(&between_expression, .between, &between_tokens, 1, null, null),
     );
     const json_key_set_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },

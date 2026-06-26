@@ -1034,7 +1034,10 @@ contract until storage and API row plans grow those outer-join semantics.
    token, or quantifier token does not match the typed parser branch; typed
    expression predicate lowering similarly consumes generated single-atom
    metadata for comparison, null/boolean/distinct `IS` predicates,
-   `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates; generated regex
+   `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates; generated
+   `IN`/`BETWEEN` predicate metadata must now agree with exact operator,
+   optional `NOT`, and optional `SYMMETRIC`/`ASYMMETRIC` token payloads;
+   generated regex
    predicate metadata must now agree with the exact `~`/`~*`/`!~`/`!~*`
    operator token, and generated pattern predicate metadata must agree with
    the typed `LIKE`/`ILIKE` operator

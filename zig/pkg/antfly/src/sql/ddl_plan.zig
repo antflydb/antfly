@@ -3422,14 +3422,23 @@ pub fn cursorPortalPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlCursorAst,
 ) !LoweredDdlPlan {
+    const cursor = try cursorPortalLogicalPlanFromGeneratedAstAlloc(alloc, tokens, ast);
+    return .{ .cursor_portal = cursor };
+}
+
+pub fn cursorPortalLogicalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlCursorAst,
+) !CursorPortalPlan {
     try validateGeneratedCursorAstSpans(tokens, ast);
     const tail = ast.tail_tokens orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
-    var plan: LoweredDdlPlan = switch (ast.kind) {
-        .declare => .{ .cursor_portal = .{ .declare = try parseDeclareCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
-        .fetch => .{ .cursor_portal = .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
-        .move => .{ .cursor_portal = .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
-        .close => .{ .cursor_portal = .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
+    var plan: CursorPortalPlan = switch (ast.kind) {
+        .declare => .{ .declare = try parseDeclareCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
+        .fetch => .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
+        .move => .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
+        .close => .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
     };
     errdefer plan.deinit(alloc);
     if (pos != tail.end - tail.start) return error.UnsupportedSqlShape;
@@ -3505,15 +3514,35 @@ pub fn transactionControlPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
 ) !LoweredDdlPlan {
+    const logical = transactionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, ast) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {
+            try validateGeneratedTransactionAstSpans(tokens, ast);
+            if (ast.name_tokens != null or ast.mode_tokens != null) return err;
+            return .{ .adapter_noop = .{ .reason = .transaction_control } };
+        },
+        else => return err,
+    };
+    return switch (logical) {
+        .control => |payload| .{ .transaction_control = payload },
+        .savepoint => |payload| .{ .savepoint_transaction = payload },
+        .prepared => |payload| .{ .prepared_transaction = payload },
+    };
+}
+
+pub fn transactionLogicalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !binder.TransactionLogicalPlan {
     try validateGeneratedTransactionAstSpans(tokens, ast);
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     if (ast.name_tokens) |name_tokens| {
         if (name_tokens.end != end) return error.UnsupportedSqlShape;
         var pos: usize = 0;
-        var plan: LoweredDdlPlan = switch (ast.kind) {
-            .savepoint => .{ .savepoint_transaction = .{ .savepoint = try parseSavepointTransactionPlanTailAlloc(alloc, tokens[1..end], &pos) } },
-            .release_savepoint => .{ .savepoint_transaction = .{ .release = try parseReleaseSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
-            .rollback_to_savepoint => .{ .savepoint_transaction = .{ .rollback_to = try parseRollbackToSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+        var plan: binder.TransactionLogicalPlan = switch (ast.kind) {
+            .savepoint => .{ .savepoint = .{ .savepoint = try parseSavepointTransactionPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            .release_savepoint => .{ .savepoint = .{ .release = try parseReleaseSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            .rollback_to_savepoint => .{ .savepoint = .{ .rollback_to = try parseRollbackToSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
             else => return error.UnsupportedSqlShape,
         };
         errdefer plan.deinit(alloc);
@@ -3536,9 +3565,9 @@ pub fn transactionControlPlanFromGeneratedAstAlloc(
         };
         const mode = try parseTransactionModePlanTail(tokens[mode_tokens.start..mode_tokens.end], &pos, starter);
         if (pos != mode_tokens.end - mode_tokens.start) return error.UnsupportedSqlShape;
-        return .{ .transaction_control = .{ .transaction_mode = mode } };
+        return .{ .control = .{ .transaction_mode = mode } };
     }
-    return .{ .adapter_noop = .{ .reason = .transaction_control } };
+    return error.UnsupportedSqlShape;
 }
 
 pub fn transactionBoundaryPlanFromGeneratedAst(
@@ -12090,13 +12119,17 @@ pub fn planGeneratedLogicalDdlAstAlloc(
         .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
         .prepared_transaction => |prepared_transaction_ast| return .{ .transaction = .{ .prepared = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) } },
         .transaction => |transaction_ast| {
-            var lowered = try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast);
-            return logicalPlanFromLoweredDdlPlan(&lowered);
+            const transaction = transactionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast) catch |err| switch (err) {
+                error.UnsupportedSqlShape => {
+                    try validateGeneratedTransactionAstSpans(tokens, transaction_ast);
+                    if (transaction_ast.name_tokens != null or transaction_ast.mode_tokens != null) return err;
+                    return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .transaction_control } } };
+                },
+                else => return err,
+            };
+            return .{ .transaction = transaction };
         },
-        .cursor => |cursor_ast| {
-            var lowered = try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast);
-            return logicalPlanFromLoweredDdlPlan(&lowered);
-        },
+        .cursor => |cursor_ast| return .{ .cursor = try cursorPortalLogicalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast) },
         .ddl, .extension_index => |ddl_ast| {
             if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
                 var lowered = try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
