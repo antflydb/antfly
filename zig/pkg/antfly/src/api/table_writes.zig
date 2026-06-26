@@ -439,7 +439,7 @@ pub const BoundTableWriteSource = table_write_sources.BoundTableWriteSource;
 pub const ProvisionedTableWriteSource = table_write_sources.ProvisionedTableWriteSource;
 pub const HostedProvisionedTableWriteSource = table_write_sources.HostedProvisionedTableWriteSource;
 
-test "docid focused provisioned secondary index rebuild worker pass repairs projected catalog range" {
+test "api.table_writes.docid provisioned secondary index rebuild worker pass repairs projected catalog range" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -612,7 +612,7 @@ test "docid focused provisioned secondary index rebuild worker pass repairs proj
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, inactive_amount_key));
 }
 
-test "docid focused provisioned schema rewrite worker pass drains projected catalog range job" {
+test "api.table_writes.docid provisioned schema rewrite worker pass drains projected catalog range job" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -894,7 +894,7 @@ test "provisioned table write source seeds doc identity namespace from table ran
     }));
 }
 
-test "docid focused provisioned table write source rejects stale doc identity namespace before write" {
+test "api.table_writes.docid provisioned table write source rejects stale doc identity namespace before write" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1101,7 +1101,7 @@ test "provisioned table write source backs up and restores a local table" {
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "docid focused provisioned table write source backs up a portable local table" {
+test "api.table_writes.docid provisioned table write source backs up a portable local table" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup");
     defer alloc.free(path);
@@ -1195,7 +1195,7 @@ test "docid focused provisioned table write source backs up a portable local tab
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "docid focused provisioned table restore rejects mismatched doc identity namespace" {
+test "api.table_writes.docid provisioned table restore rejects mismatched doc identity namespace" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-docid-mismatch");
     defer alloc.free(path);
@@ -1428,7 +1428,7 @@ test "provisioned table write source backs up and restores full_text writes from
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned query visibility read preparation invalidates readers without closing dirty writer cache" {
+test "api.table_writes.query_visibility read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
 
@@ -2085,7 +2085,7 @@ test "dirty auto bulk writer publishes runtime status before read invalidation c
     try std.testing.expect(statuses.items[0].stats.index_count > 0);
 }
 
-test "provisioned query visibility managed publish hook updates runtime status cache from live writer" {
+test "api.table_writes.query_visibility managed publish hook updates runtime status cache from live writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2129,7 +2129,7 @@ test "provisioned query visibility managed publish hook updates runtime status c
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned query visibility read preparation does not block on same-table batch after early dirty publication" {
+test "api.table_writes.query_visibility read preparation does not block on same-table batch after early dirty publication" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-provisioned-read-prep-active-batch";
 
@@ -2402,7 +2402,7 @@ test "provisioned table write source routes batch writes across ranges" {
     try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
 }
 
-test "docid focused provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
+test "api.table_writes.docid provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-identity-rewrite-routing";
 
@@ -2560,7 +2560,7 @@ const ProvisionedWriteCoalesceBatchWorker = struct {
     }
 };
 
-test "docid focused provisioned table write source coalesces same-group waiters" {
+test "api.table_writes.docid provisioned table write source coalesces same-group waiters" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-waiters");
     defer alloc.free(path);
@@ -2617,7 +2617,7 @@ test "docid focused provisioned table write source coalesces same-group waiters"
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
 }
 
-test "docid focused provisioned table write coalescer isolates failed waiters" {
+test "api.table_writes.docid provisioned table write coalescer isolates failed waiters" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-failure-isolation");
     defer alloc.free(path);
@@ -3091,7 +3091,7 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
 }
 
-test "provisioned query visibility table write source invalidates cached query db after managed dense replay becomes visible" {
+test "api.table_writes.query_visibility table write source invalidates cached query db after managed dense replay becomes visible" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-query-visibility";
 
@@ -3403,251 +3403,6 @@ test "provisioned table write source persists chunk artifacts when chunker enabl
     }
 
     try std.testing.expect(chunk_count >= 2);
-}
-
-test "provisioned table write source runtime status serves cached snapshot during active same-table work" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-    items[0] = .{
-        .group_id = 7001,
-        .stats = .{
-            .doc_count = 9,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    items[0].stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .doc_count = 9,
-    };
-
-    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
-    defer alloc.free(snapshots);
-    snapshots[0] = .{
-        .table_name = try alloc.dupe(u8, "docs"),
-        .statuses = .{ .items = items },
-    };
-    snapshot_cache.replaceOwned(snapshots);
-
-    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-snapshot-active", NoCatalog.iface());
-    source.runtime_status_cache = &snapshot_cache;
-
-    source.beginGroupOperation("docs", 7001);
-    defer source.endGroupOperation("docs", 7001);
-
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
-}
-
-test "provisioned table write source runtime status serves cached snapshot while dirty and request busy" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-    items[0] = .{
-        .group_id = 7001,
-        .stats = .{
-            .doc_count = 9,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    items[0].stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .doc_count = 9,
-    };
-
-    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
-    defer alloc.free(snapshots);
-    snapshots[0] = .{
-        .table_name = try alloc.dupe(u8, "docs"),
-        .statuses = .{ .items = items },
-    };
-    snapshot_cache.replaceOwned(snapshots);
-
-    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-request-busy-dirty", NoCatalog.iface());
-    source.runtime_status_cache = &snapshot_cache;
-    source.markWriteCacheDirty("docs");
-    source.beginTableRequest("docs");
-    defer source.endTableRequest("docs");
-
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
-}
-
-test "provisioned table write source runtime status still serves sibling groups while one group is active" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 2);
-    items[0] = .{
-        .group_id = 7001,
-        .stats = .{
-            .doc_count = 9,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    items[0].stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .doc_count = 9,
-    };
-    items[1] = .{
-        .group_id = 7002,
-        .stats = .{
-            .doc_count = 3,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    items[1].stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .doc_count = 3,
-    };
-
-    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
-    defer alloc.free(snapshots);
-    snapshots[0] = .{
-        .table_name = try alloc.dupe(u8, "docs"),
-        .statuses = .{ .items = items },
-    };
-    snapshot_cache.replaceOwned(snapshots);
-
-    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-snapshot-active-sibling", NoCatalog.iface());
-    source.runtime_status_cache = &snapshot_cache;
-
-    source.beginGroupOperation("docs", 7001);
-    defer source.endGroupOperation("docs", 7001);
-
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
-    try std.testing.expectEqual(@as(u64, 7002), statuses.items[1].group_id);
-    try std.testing.expectEqual(@as(u64, 3), statuses.items[1].stats.doc_count);
-}
-
-test "provisioned table write source runtime status filtering transfers owned statuses" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-status-filter-ownership", NoCatalog.iface());
-
-    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-    errdefer alloc.free(items);
-    items[0] = .{
-        .group_id = 7001,
-        .stats = .{
-            .doc_count = 9,
-            .index_count = 1,
-            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-        },
-    };
-    errdefer items[0].deinit(alloc);
-    items[0].stats.indexes[0] = .{
-        .name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .doc_count = 9,
-    };
-
-    var owned: runtime_status.LocalTableRuntimeStatuses = .{ .items = items };
-    defer owned.deinit(alloc);
-
-    var filtered = (try source.takeStatusesWithoutActiveGroups(alloc, &owned, &.{7002})).?;
-    defer filtered.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.items.len);
-    try std.testing.expectEqual(@as(usize, 1), filtered.items.len);
-    try std.testing.expectEqual(@as(u64, 7001), filtered.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 9), filtered.items[0].stats.doc_count);
 }
 
 test "provisioned table write source runtime status still serves unrelated table snapshot while source mutex is busy" {
@@ -4208,7 +3963,7 @@ test "provisioned table write source runtime status remains cache-only when dirt
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned query visibility table write source runtime status does not inspect read cache hbc stats when dirty" {
+test "api.table_writes.query_visibility table write source runtime status does not inspect read cache hbc stats when dirty" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -4317,7 +4072,7 @@ test "provisioned query visibility table write source runtime status does not in
     try std.testing.expectEqual(read_cache_stats_before.miss_count, read_cache_stats_after.miss_count);
 }
 
-test "provisioned query visibility table write source read cache overlay preserves live replay status" {
+test "api.table_writes.query_visibility table write source read cache overlay preserves live replay status" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -4557,7 +4312,7 @@ test "provisioned table write source restore repair completion retires cached ve
     try std.testing.expectEqual(stats_before.miss_count + 1, stats_after.miss_count);
 }
 
-test "docid focused provisioned restore repair open rejects stale doc identity namespace" {
+test "api.table_writes.docid provisioned restore repair open rejects stale doc identity namespace" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -4794,7 +4549,7 @@ test "provisioned replicated sync marks local runtime status dirty" {
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 }
 
-test "docid focused provisioned table write source consistent visibility hook does not block on busy apply lock" {
+test "api.table_writes.docid provisioned table write source consistent visibility hook does not block on busy apply lock" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -4844,7 +4599,7 @@ test "docid focused provisioned table write source consistent visibility hook do
     try std.testing.expect(published == null);
 }
 
-test "docid focused provisioned table write source consistent visibility refreshes stale dense status" {
+test "api.table_writes.docid provisioned table write source consistent visibility refreshes stale dense status" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -5805,7 +5560,7 @@ test "provisioned table write source runtime status does not lease writer during
     try write_cache.finishAutoBulkIngestLocked(7001, "docs");
 }
 
-test "provisioned query visibility read preparation keeps write cache dirty while auto bulk ingest is active" {
+test "api.table_writes.query_visibility read preparation keeps write cache dirty while auto bulk ingest is active" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -6146,7 +5901,7 @@ test "provisioned table write source maintenance probes are best effort when loc
     try std.testing.expect(!try source.runLsmMaintenanceRoundBestEffort());
 }
 
-test "docid focused provisioned foreign key action job drains owner range page" {
+test "api.table_writes.docid provisioned foreign key action job drains owner range page" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-fk-action-job-owner-range";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -6261,7 +6016,7 @@ test "docid focused provisioned foreign key action job drains owner range page" 
     try std.testing.expectEqualStrings("{\"status\":\"open\"}", child);
 }
 
-test "docid focused provisioned same-table foreign key action job routes runtime parent through catalog owner range" {
+test "api.table_writes.docid provisioned same-table foreign key action job routes runtime parent through catalog owner range" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-fk-action-job-same-table-owner-range";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -6795,7 +6550,7 @@ test "provisioned table write source group batch does not hold local db mutex du
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
 }
 
-test "docid focused provisioned table write source drop table does not hold local db mutex during background delete" {
+test "api.table_writes.docid provisioned table write source drop table does not hold local db mutex during background delete" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -6882,7 +6637,7 @@ test "docid focused provisioned table write source drop table does not hold loca
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path, .{}));
 }
 
-test "docid focused provisioned table write source drop table waits for in-flight group batch on same table" {
+test "api.table_writes.docid provisioned table write source drop table waits for in-flight group batch on same table" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -7303,7 +7058,7 @@ test "provisioned table write source restore table does not hold local db mutex 
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned query visibility table write source deinit drains restore repair work group" {
+test "api.table_writes.query_visibility table write source deinit drains restore repair work group" {
     if (builtin.os.tag == .freestanding) return;
 
     const NoCatalog = struct {
@@ -7528,7 +7283,7 @@ test "managed startup catch-up defers while shared bulk ingest state is active" 
     try std.testing.expectEqual(startup_hits_before, startup_write_cache.hit_count.load(.monotonic));
 }
 
-test "provisioned query visibility managed startup catch-up ignores stale dirty bit after writer cache entry is gone" {
+test "api.table_writes.query_visibility managed startup catch-up ignores stale dirty bit after writer cache entry is gone" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -7931,7 +7686,7 @@ test "write cache adopts just-created db across reconcile generation bump" {
     try std.testing.expect(write_cache.hit_count.load(.monotonic) > 0);
 }
 
-test "docid focused primary lookup adopts seeded write cache across visible generation bump" {
+test "api.table_writes.docid primary lookup adopts seeded write cache across visible generation bump" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

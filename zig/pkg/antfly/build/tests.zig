@@ -1608,6 +1608,10 @@ pub const APITestFilters = struct {
         "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
     };
 
+    const table_writes_docid_prefix = "api.table_writes.docid ";
+    const table_reads_docid_prefix = "api.table_reads.docid ";
+    const table_writes_query_visibility_prefix = "api.table_writes.query_visibility ";
+
     pub const table_writes_docid = [_][]const u8{
         // Prefer owner-module and suite-name prefixes. Exact test names should
         // move with their owner module instead of accumulating here.
@@ -1622,11 +1626,11 @@ pub const APITestFilters = struct {
         "api.table_writes.remote_wire.test.",
         "api.table_writes.schema_jobs.test.",
         "api.table_writes.sources.test.",
-        "api.table_writes.test.docid focused ",
+        table_writes_docid_prefix,
     };
 
     pub const provisioned_query_visibility = [_][]const u8{
-        "provisioned query visibility ",
+        table_writes_query_visibility_prefix,
     };
 
     pub const table_reads_docid = [_][]const u8{
@@ -1641,7 +1645,7 @@ pub const APITestFilters = struct {
         "api.table_reads.relational_rows.test.",
         "api.table_reads.remote_wire.test.",
         "api.http_internal_group_read_routes.test.",
-        "api.table_reads.test.docid focused ",
+        table_reads_docid_prefix,
     };
 
     pub const table_reads_graph_metric = [_][]const u8{

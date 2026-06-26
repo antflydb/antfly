@@ -3978,6 +3978,7 @@ fn lowerWindowParsedSqlForLoweringContextTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
     };
     var lowered = plan.parseWindowPlanAlloc(
         alloc,
@@ -4014,6 +4015,7 @@ fn lowerAggregateParsedSqlForLoweringContextTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
     };
     var lowered = plan.parseAggregatePlanAlloc(
         alloc,
@@ -4053,6 +4055,7 @@ fn lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
     };
     var lowered = plan.parseJoinPlanAlloc(
         alloc,
@@ -4092,6 +4095,7 @@ fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
     };
     var lowered = plan.parseLateralPlanAlloc(
         alloc,

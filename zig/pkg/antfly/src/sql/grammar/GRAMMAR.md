@@ -1432,7 +1432,9 @@ Generated grammar work needs evidence at multiple levels:
   generated AST metadata is malformed, and generated-family validation over
   other representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
-  dispatch, generated read AST kind now drives parsed-statement read-family
+  dispatch with the same generated read AST handoff into simple, aggregate,
+  join, lateral, window, CTE, and recursive CTE typed lowerers that production
+  runtime uses; generated read AST kind now drives parsed-statement read-family
   classification for generated-covered reads with fail-closed classifier
   disagreement checks plus generated pagination payload consistency checks
   before a parsed read family is assigned; generated read classification also

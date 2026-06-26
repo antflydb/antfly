@@ -6131,7 +6131,7 @@ fn queryRemote(
     );
 }
 
-test "docid focused routed rows query plan executes over scanned owner rows with ctes" {
+test "api.table_reads.docid routed rows query plan executes over scanned owner rows with ctes" {
     const alloc = std.testing.allocator;
 
     var columns = [_]storage_schema.RelationalColumn{
@@ -6482,7 +6482,7 @@ test "docid focused routed rows query plan executes over scanned owner rows with
     try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "oversized", schema, .{}, .read_index));
 }
 
-test "docid focused external lake rows query and aggregate plans route through lake scan hook" {
+test "api.table_reads.docid external lake rows query and aggregate plans route through lake scan hook" {
     const alloc = std.testing.allocator;
 
     var columns = [_]storage_schema.RelationalColumn{
@@ -7338,7 +7338,7 @@ test "docid focused external lake rows query and aggregate plans route through l
     try std.testing.expectEqualStrings("{\"count_all\":1,\"sum_amount\":30}", cte_aggregate_result.rows[0]);
 }
 
-test "docid focused lowered sql cross-table read plans execute through routed scans" {
+test "api.table_reads.docid lowered sql cross-table read plans execute through routed scans" {
     const alloc = std.testing.allocator;
     const orders_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -7514,7 +7514,7 @@ test "docid focused lowered sql cross-table read plans execute through routed sc
     }
 }
 
-test "docid focused lowered sql set operation plans preserve overlapping union all rows" {
+test "api.table_reads.docid lowered sql set operation plans preserve overlapping union all rows" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -8257,7 +8257,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     );
 }
 
-test "docid focused lowered document sql read plans execute native lookup and bounded scan" {
+test "api.table_reads.docid lowered document sql read plans execute native lookup and bounded scan" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-document-sql-read";
 
@@ -8765,7 +8765,7 @@ test "docid focused lowered document sql read plans execute native lookup and bo
     }
 }
 
-test "docid focused document sql catalog read producers treat catalog misses as terminal" {
+test "api.table_reads.docid document sql catalog read producers treat catalog misses as terminal" {
     const alloc = std.testing.allocator;
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
@@ -9011,7 +9011,7 @@ test "docid focused document sql catalog read producers treat catalog misses as 
     try std.testing.expectEqual(@as(usize, 0), scan_source.legacy_scan_calls);
 }
 
-test "docid focused lowered document sql aggregate executes native grouped avg materialization" {
+test "api.table_reads.docid lowered document sql aggregate executes native grouped avg materialization" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-document-sql-grouped-avg";
 
@@ -9124,7 +9124,7 @@ test "docid focused lowered document sql aggregate executes native grouped avg m
     }
 }
 
-test "docid focused lowered document sql aggregate uses catalog target for non-default namespace materialization" {
+test "api.table_reads.docid lowered document sql aggregate uses catalog target for non-default namespace materialization" {
     const alloc = std.testing.allocator;
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
@@ -9589,7 +9589,7 @@ test "provisioned table read source routes lookup and scan across ranges" {
     try std.testing.expectEqualStrings("zeta", rows[1].title);
 }
 
-test "docid focused provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
+test "api.table_reads.docid provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
     const alloc = std.testing.allocator;
     const root = ".zig-cache/tmp/table-reads-ha-read-gate";
 
@@ -11172,7 +11172,7 @@ test "remote preflight rejects resolved doc filters before query encoding" {
     try std.testing.expectEqual(@as(usize, 0), state.calls);
 }
 
-test "docid focused explicit text stats requests preserve identity generation" {
+test "api.table_reads.docid explicit text stats requests preserve identity generation" {
     const alloc = std.testing.allocator;
 
     var terms = [_][]const u8{"alpha"};
@@ -11274,7 +11274,7 @@ test "docid focused explicit text stats requests preserve identity generation" {
     try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(alloc, "docs", mismatched_envelope_generation));
 }
 
-test "docid focused explicit text stats requests carry resolved doc filters and apply exact projection" {
+test "api.table_reads.docid explicit text stats requests carry resolved doc filters and apply exact projection" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-text-stats-resolved-doc-filter";
 
@@ -11361,7 +11361,7 @@ test "docid focused explicit text stats requests carry resolved doc filters and 
     try std.testing.expectEqual(@as(u32, 0), gamma_bg);
 }
 
-test "docid focused explicit text stats requests reject stale identity generation" {
+test "api.table_reads.docid explicit text stats requests reject stale identity generation" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-text-stats-stale-identity-generation";
 
@@ -11618,7 +11618,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
     try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[1].aggregations[1].value_json.?);
 }
 
-test "docid focused algebraic partial request fails closed when lifecycle is stale" {
+test "api.table_reads.docid algebraic partial request fails closed when lifecycle is stale" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-algebraic-partials-stale-lifecycle";
 
@@ -11666,7 +11666,7 @@ test "docid focused algebraic partial request fails closed when lifecycle is sta
     try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
 }
 
-test "docid focused algebraic partial request accepts current identity generation and rejects stale" {
+test "api.table_reads.docid algebraic partial request accepts current identity generation and rejects stale" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-algebraic-partials-stale-identity-generation";
 

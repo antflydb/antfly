@@ -27,6 +27,7 @@ const public_table_http = @import("public_table_http.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
+const relational_sql_ddl = @import("relational_sql_ddl.zig");
 const sql_adapter_runtime = @import("../sql/runtime.zig");
 const catalog_jobs = @import("catalog_jobs.zig");
 const sql_adapter = @import("../sql/mod.zig");
@@ -718,6 +719,13 @@ pub const StatusSource = struct {
         session: catalog_resources.SqlCatalogSession,
         function_bindings: sql_adapter.SqlFunctionBindings,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (self.vtable.apply_relational_sql_ddl_plan_with_session) |fn_ptr| {
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+            defer parsed_sql.deinit(alloc);
+            var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
+            defer plan.deinit(alloc);
+            return try fn_ptr(self.ptr, alloc, &plan, session);
+        }
         if (self.vtable.apply_relational_sql_ddl_with_session_and_function_bindings) |fn_ptr| {
             return try fn_ptr(self.ptr, alloc, sql, session, function_bindings);
         }
@@ -1417,83 +1425,8 @@ fn applyRelationalSqlDdlPlanOnServiceWithSession(
     plan: *sql_adapter.LoweredDdlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(svc, alloc, plan.*)) |applied| {
-        try svc.runRound();
-        return applied;
-    }
-
-    var snapshot = try svc.adminSnapshot();
-    defer svc.freeAdminSnapshot(&snapshot);
-
-    if (try tables_api.applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan.*, session)) |applied| {
-        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
-        try svc.runRound();
-        return applied;
-    }
-
-    if (try tables_api.applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
-        try svc.runRound();
-        return applied;
-    }
-
-    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan.*, session);
-    defer target.deinit(alloc);
-
-    if (target.createsTable()) {
-        try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
-        if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
-        const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
-        var policy_table: ?metadata_table_manager.TableRecord = null;
-        defer if (policy_table) |record| metadata_table_manager.freeTable(alloc, record);
-        const resolved_table = if (tables_api.effectiveTablespaceForTarget(&snapshot, target.database_name, target.namespace_name, null)) |tablespace| blk: {
-            policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
-            break :blk policy_table.?;
-        } else base_table;
-        var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, plan, session);
-        errdefer applied.deinit(alloc);
-        applied.created_table = true;
-
-        const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
-        defer {
-            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-            alloc.free(ranges);
-        }
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        _ = try workflow.createTableWithRanges(svc, applied.table, ranges);
-        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
-        try svc.runRound();
-        return applied;
-    }
-
-    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
-        if (target.dropsTable() and target.if_exists) {
-            return try tables_api.missingQualifiedDropTableIfExistsNoopAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
-        }
-        return error.TableNotFound;
-    };
-    if (target.dropsTable()) {
-        if (target.cascade) {
-            try applyRelationalDropTableCascadeReferences(svc, alloc, &snapshot, table.*);
-        } else {
-            try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
-        }
-        var dropped = try droppedRelationalSqlTableRecordAlloc(alloc, table.*);
-        errdefer dropped.deinit(alloc);
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        _ = try workflow.dropTable(svc, table.table_id);
-        try svc.runRound();
-        return dropped;
-    }
-    if (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan.*)) |derived_applied| {
-        try svc.runRound();
-        return derived_applied;
-    }
-    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
+    var applied = try relational_sql_ddl.applyPlanOnServiceWithSessionAlloc(alloc, svc, plan, session);
     errdefer applied.deinit(alloc);
-    try svc.upsertTable(applied.table);
-    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
     try svc.runRound();
     return applied;
 }
