@@ -69,6 +69,28 @@ const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 
 const run_until_idle_max_replay_rounds: usize = 16;
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const TestTransactionRecoveryResolver = support.TestTransactionRecoveryResolver;
+    pub const TxnResolverRecorder = support.TxnResolverRecorder;
+    pub const putDenseEmbeddingArtifactForTest = support.putDenseEmbeddingArtifactForTest;
+    pub const corruptNonEmptyFilesUnderDir = support.corruptNonEmptyFilesUnderDir;
+    pub const expectObsoletePathsReclaimable = support.expectObsoletePathsReclaimable;
+    pub const waitForSearchResult = support.waitForSearchResult;
+    pub const SharedReadLockHold = support.SharedReadLockHold;
+    pub const ConcurrentReadProbe = support.ConcurrentReadProbe;
+    pub const ConcurrentWriteProbe = support.ConcurrentWriteProbe;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
+
 pub const DerivedReplayDebtStatus = struct {
     index_name: []const u8,
     kind: types.IndexKind,
@@ -3857,21 +3879,18 @@ fn replaceOptionalOwnedStringBestEffort(alloc: std.mem.Allocator, slot: *?[]cons
 
 test "db lifecycle open borrows shared backend runtime" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer runtime.deinit();
 
     var first_path_buf: [256]u8 = undefined;
-    const first_path = tempPath(&first_path_buf);
-    defer cleanupTempDir(first_path);
+    const first_path = TestHelpers.tempPath(&first_path_buf);
+    defer TestHelpers.cleanupTempDir(first_path);
 
     var second_path_buf: [256]u8 = undefined;
-    const second_path = tempPath(&second_path_buf);
-    defer cleanupTempDir(second_path);
+    const second_path = TestHelpers.tempPath(&second_path_buf);
+    defer TestHelpers.cleanupTempDir(second_path);
 
     var first = try DB.open(alloc, std.mem.span(first_path), .{
         .backend_runtime = runtime.ptr(),
@@ -3900,17 +3919,14 @@ test "db lifecycle open borrows shared backend runtime" {
 
 test "db lifecycle open downgrades borrowed manual backend runtime to manual executor" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .backend_runtime = runtime.ptr(),
@@ -3923,9 +3939,6 @@ test "db lifecycle open downgrades borrowed manual backend runtime to manual exe
 
 test "db lifecycle open wires algebraic HLL maintenance lane and adaptively backfills sketches" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     // A manual backend runtime drives durable jobs inline (synchronously on
@@ -3935,8 +3948,8 @@ test "db lifecycle open wires algebraic HLL maintenance lane and adaptively back
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const cfg =
         \\{
@@ -4019,17 +4032,14 @@ test "db lifecycle open wires algebraic HLL maintenance lane and adaptively back
 
 test "db lifecycle open text merge enabled requires backend runtime io" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
         .backend_runtime = runtime.ptr(),
@@ -4040,9 +4050,6 @@ test "db lifecycle open text merge enabled requires backend runtime io" {
 
 test "db lifecycle open enrichment enabled requires backend runtime io" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
@@ -4050,8 +4057,8 @@ test "db lifecycle open enrichment enabled requires backend runtime io" {
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
         .backend_runtime = runtime.ptr(),
@@ -4062,17 +4069,14 @@ test "db lifecycle open enrichment enabled requires backend runtime io" {
 
 test "db lifecycle open ttl cleanup enabled requires backend runtime io" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
         .backend_runtime = runtime.ptr(),
@@ -4083,18 +4087,15 @@ test "db lifecycle open ttl cleanup enabled requires backend runtime io" {
 
 test "db lifecycle open transaction recovery enabled requires backend runtime io" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const TestTransactionRecoveryResolver = db_test_support.TestTransactionRecoveryResolver;
+    const TestTransactionRecoveryResolver = TestHelpers.TestTransactionRecoveryResolver;
     const alloc = std.testing.allocator;
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var resolver_ctx: u8 = 0;
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
@@ -4110,14 +4111,11 @@ test "db lifecycle open transaction recovery enabled requires backend runtime io
 
 test "db lifecycle open status_only reads index catalog without loading index state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -4177,14 +4175,11 @@ test "db lifecycle open status_only reads index catalog without loading index st
 
 test "db lifecycle open query_readonly opens empty declared graph index" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -4216,15 +4211,12 @@ test "db lifecycle open query_readonly opens empty declared graph index" {
 
 test "db lifecycle open query_readonly skips pending derived replay on reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -4345,14 +4337,11 @@ test "db lifecycle open query_readonly skips pending derived replay on reopen" {
 
 test "db lifecycle open query_readonly lsm primary opens physical backend read-only" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -4509,14 +4498,11 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
 
 test "db lifecycle open query_readonly lmdb primary does not create missing database" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var readonly = DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .lmdb,
@@ -4533,14 +4519,11 @@ test "db lifecycle open query_readonly lmdb primary does not create missing data
 
 test "db lifecycle open query_readonly lmdb primary rejects writes after readonly open" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = DB.open(alloc, std.mem.span(path), .{
@@ -4578,14 +4561,11 @@ test "db lifecycle open query_readonly lmdb primary rejects writes after readonl
 test "db lifecycle open quarantines dense index with unsupported artifact version" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const dense_cfg: types.IndexConfig = .{
         .name = "dv_quarantine",
@@ -4694,14 +4674,11 @@ test "db lifecycle open quarantines dense index with unsupported artifact versio
 test "db lifecycle quarantine drops dense index after persisted index directory corruption" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const corruptNonEmptyFilesUnderDir = db_test_support.corruptNonEmptyFilesUnderDir;
+    const corruptNonEmptyFilesUnderDir = TestHelpers.corruptNonEmptyFilesUnderDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
     const path_slice = std.mem.span(path);
 
     const dense_cfg: types.IndexConfig = .{
@@ -4755,13 +4732,10 @@ test "db lifecycle quarantine drops dense index after persisted index directory 
 test "db lifecycle quarantine self-heals via retryQuarantinedIndexLoads" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -4855,13 +4829,10 @@ test "db lifecycle quarantine self-heals via retryQuarantinedIndexLoads" {
 test "db lifecycle open read-only propagates transient index load errors instead of quarantining" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -4900,15 +4871,12 @@ test "db lifecycle open read-only propagates transient index load errors instead
 
 test "db lifecycle open writer_no_replay defers pending derived replay until runUntilIdle" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -5006,15 +4974,12 @@ test "db lifecycle open writer_no_replay defers pending derived replay until run
 
 test "db lifecycle open dense replay progress target matches replay debt target" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -5098,15 +5063,12 @@ test "db lifecycle open dense replay progress target matches replay debt target"
 
 test "db lifecycle open writer_no_replay starts workers without resuming pending derived replay" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -5191,14 +5153,11 @@ test "db lifecycle open writer_no_replay starts workers without resuming pending
 
 test "db lifecycle open default primary backend survives reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5229,15 +5188,12 @@ test "db lifecycle open default primary backend survives reopen" {
 
 test "db lifecycle lsm maintenance reclaims due index obsolete paths before primary compaction" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const expectObsoletePathsReclaimable = db_test_support.expectObsoletePathsReclaimable;
+    const expectObsoletePathsReclaimable = TestHelpers.expectObsoletePathsReclaimable;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -5312,14 +5268,11 @@ test "db lifecycle lsm maintenance reclaims due index obsolete paths before prim
 
 test "db lifecycle primary lsm maintenance step does not reclaim index obsolete paths" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -5390,17 +5343,14 @@ test "db lifecycle primary lsm maintenance step does not reclaim index obsolete 
 
 test "db lifecycle dense target advance is blocked while catch-up bulk session is active" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const AsyncContext = db_internal.AsyncContext(DB);
     const beginDenseCatchUpSessionTracked = db_internal.beginDenseCatchUpSessionTracked;
     const finishDenseCatchUpSessionTracked = db_internal.finishDenseCatchUpSessionTracked;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -5439,14 +5389,11 @@ test "db lifecycle dense target advance is blocked while catch-up bulk session i
 
 test "db lifecycle persists configured doc identity namespace for batch writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 11, .range_id = 13 };
     {
@@ -5491,14 +5438,11 @@ test "db lifecycle persists configured doc identity namespace for batch writes" 
 
 test "db lifecycle preferred identity namespace seeds new stores but preserves existing namespace" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var managed_path_buf: [256]u8 = undefined;
-    const managed_path = tempPath(&managed_path_buf);
-    defer cleanupTempDir(managed_path);
+    const managed_path = TestHelpers.tempPath(&managed_path_buf);
+    defer TestHelpers.cleanupTempDir(managed_path);
 
     const managed_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
     {
@@ -5525,8 +5469,8 @@ test "db lifecycle preferred identity namespace seeds new stores but preserves e
     }
 
     var legacy_path_buf: [256]u8 = undefined;
-    const legacy_path = tempPath(&legacy_path_buf);
-    defer cleanupTempDir(legacy_path);
+    const legacy_path = TestHelpers.tempPath(&legacy_path_buf);
+    defer TestHelpers.cleanupTempDir(legacy_path);
 
     {
         var legacy = try DB.open(alloc, std.mem.span(legacy_path), .{
@@ -5551,15 +5495,12 @@ test "db lifecycle preferred identity namespace seeds new stores but preserves e
 
 test "db lifecycle can reassign identity namespace for rebuild" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const doc_set = @import("doc_set.zig");
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
     const new_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 802, .range_id = 8002 };
@@ -5632,15 +5573,12 @@ test "db lifecycle can reassign identity namespace for rebuild" {
 
 test "db lifecycle strict namespace reopen recovers after identity reassignment repair" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const doc_set = @import("doc_set.zig");
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3801, .range_id = 38001 };
     const new_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3802, .range_id = 38002 };
@@ -5700,15 +5638,12 @@ test "db lifecycle strict namespace reopen recovers after identity reassignment 
 
 test "db lifecycle identity namespace reassignment refreshes transaction recovery hook context" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2801, .range_id = 28001 };
     const new_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2802, .range_id = 28002 };
@@ -5750,16 +5685,13 @@ test "db lifecycle identity namespace reassignment refreshes transaction recover
 
 test "db lifecycle setSchema refreshes transaction recovery relational mode context" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     const schema_api_mod = @import("../../schema/mod.zig");
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var recorder = TxnResolverRecorder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -5790,14 +5722,11 @@ test "db lifecycle setSchema refreshes transaction recovery relational mode cont
 
 test "db lifecycle identity namespace reassignment is unavailable on status-only handles" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1801, .range_id = 18001 };
     const new_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1802, .range_id = 18002 };
@@ -5839,14 +5768,11 @@ test "db lifecycle identity namespace reassignment is unavailable on status-only
 
 test "db lifecycle doc identity stats expose coverage and tombstones" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -5923,14 +5849,11 @@ test "db lifecycle doc identity stats expose coverage and tombstones" {
 
 test "db lifecycle doc identity stats flag ordinal capacity exhaustion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -5955,14 +5878,11 @@ test "db lifecycle doc identity stats flag ordinal capacity exhaustion" {
 
 test "db lifecycle pending work stats track replay stream sequence" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5985,14 +5905,11 @@ test "db lifecycle pending work stats track replay stream sequence" {
 
 test "db lifecycle open preserves existing change journal records" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6022,14 +5939,11 @@ test "db lifecycle open preserves existing change journal records" {
 
 test "db lifecycle lsm primary reopens explicit dense replay stream state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6079,14 +5993,11 @@ test "db lifecycle lsm primary reopens explicit dense replay stream state" {
 
 test "db lifecycle lsm generated chunked enrichment publishes replay stream state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6165,14 +6076,11 @@ test "db lifecycle lsm generated chunked enrichment publishes replay stream stat
 
 test "db lifecycle basic batch/get works with in-memory lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm_memory = .{} },
@@ -6194,14 +6102,11 @@ test "db lifecycle basic batch/get works with in-memory lsm primary backend" {
 
 test "db lifecycle basic batch/get works with memory primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -6223,9 +6128,6 @@ test "db lifecycle basic batch/get works with memory primary backend" {
 
 test "db lifecycle in-memory primary backends keep derived log off disk" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     inline for ([_]db_config.PrimaryBackend{
@@ -6233,8 +6135,8 @@ test "db lifecycle in-memory primary backends keep derived log off disk" {
         .{ .lsm_memory = .{} },
     }) |primary_backend| {
         var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
-        defer cleanupTempDir(path);
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
 
         {
             var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6257,14 +6159,11 @@ test "db lifecycle in-memory primary backends keep derived log off disk" {
 
 test "db lifecycle can override change journal backend to lmdb" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6288,14 +6187,11 @@ test "db lifecycle can override change journal backend to lmdb" {
 
 test "db lifecycle basic batch/get survives reopen with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6326,14 +6222,11 @@ test "db lifecycle basic batch/get survives reopen with durable lsm primary back
 
 test "db lifecycle doc identity lsm primary compaction preserves ordinals" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     {
@@ -6400,14 +6293,11 @@ test "db lifecycle doc identity lsm primary compaction preserves ordinals" {
 
 test "db lifecycle group created-at metadata is written once and readable" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6420,16 +6310,13 @@ test "db lifecycle group created-at metadata is written once and readable" {
 
 test "db lifecycle rw lock allows search and scan while shared read lock is held" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
-    const ConcurrentReadProbe = db_test_support.ConcurrentReadProbe(DB);
+    const SharedReadLockHold = TestHelpers.SharedReadLockHold(DB);
+    const ConcurrentReadProbe = TestHelpers.ConcurrentReadProbe(DB);
     const alloc = std.heap.c_allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6471,16 +6358,13 @@ test "db lifecycle rw lock allows search and scan while shared read lock is held
 
 test "db lifecycle rw lock keeps batch writes blocked behind shared read lock" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
-    const ConcurrentWriteProbe = db_test_support.ConcurrentWriteProbe(DB);
+    const SharedReadLockHold = TestHelpers.SharedReadLockHold(DB);
+    const ConcurrentWriteProbe = TestHelpers.ConcurrentWriteProbe(DB);
     const alloc = std.heap.c_allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();

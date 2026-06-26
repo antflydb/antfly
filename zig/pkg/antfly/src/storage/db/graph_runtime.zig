@@ -13,17 +13,35 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const paths_mod = @import("../../graph/paths.zig");
+const traversal_mod = @import("../../graph/traversal.zig");
 const internal_keys = @import("../internal_keys.zig");
+const types = @import("types.zig");
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const TestAssetProducer = support.TestAssetProducer;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
 
 test "db graph runtime index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -68,8 +86,8 @@ test "db graph runtime relation artifact materializer uses mapping templates" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -115,8 +133,8 @@ test "db graph runtime relation artifact materializer resolves entity refs and a
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -161,8 +179,8 @@ test "db graph runtime relation artifact materializer replaces stale document ed
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -207,8 +225,8 @@ test "db graph runtime relation artifact materializer deletes edges when asset s
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -257,8 +275,8 @@ test "db graph runtime artifact source lifecycle reuses and protects asset enric
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -309,8 +327,8 @@ test "db graph runtime artifact source reuses user enrichment and rejects incomp
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -348,8 +366,8 @@ test "db graph runtime source artifact deletion clears materialized graph edges"
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -398,8 +416,8 @@ test "db graph runtime artifact edges are visible to graph search queries" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -451,8 +469,8 @@ test "db graph runtime artifact external node targets return ids without documen
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -505,10 +523,10 @@ test "db graph runtime async asset producer source materializes through replay" 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = @import("test_support.zig").TestAssetProducer{};
+    var fake = TestHelpers.TestAssetProducer{};
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -551,8 +569,8 @@ test "db graph runtime artifact source replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -603,8 +621,8 @@ test "db graph runtime edge artifact replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -644,4 +662,136 @@ test "db graph runtime edge artifact replay catches up after reopen" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
+}
+
+test "db graph runtime helpers expose edges neighbors and shortest path" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "citations",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "citations_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "citations", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
+            .{ .index_name = "citations", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    const edges = try db.getEdges(alloc, "citations", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+
+    const neighbors = try db.getNeighbors(alloc, "citations", "a", "cites", .out);
+    defer traversal_mod.freeOwnedResults(alloc, neighbors);
+    try std.testing.expectEqual(@as(usize, 2), neighbors.len);
+
+    const traversed = try db.traverseEdges(alloc, "citations", "a", .{
+        .direction = .out,
+        .edge_types = &.{"cites"},
+        .max_depth = 2,
+    });
+    defer traversal_mod.freeOwnedResults(alloc, traversed);
+    try std.testing.expectEqual(@as(usize, 3), traversed.len);
+
+    const shortest = (try db.findShortestPath(alloc, "citations", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    defer paths_mod.freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 2), shortest.length);
+    try std.testing.expectEqual(@as(usize, 3), shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
+    try std.testing.expectEqualStrings("d", shortest.nodes[2]);
+
+    const algebraic_shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    defer paths_mod.freePath(alloc, algebraic_shortest);
+    try std.testing.expectEqual(@as(u32, 2), algebraic_shortest.length);
+    try std.testing.expectEqual(@as(usize, 3), algebraic_shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", algebraic_shortest.nodes[0]);
+    try std.testing.expectEqualStrings("b", algebraic_shortest.nodes[1]);
+    try std.testing.expectEqualStrings("d", algebraic_shortest.nodes[2]);
+    try std.testing.expectEqual(@as(usize, 2), algebraic_shortest.edges.len);
+    try std.testing.expectEqualStrings("cites", algebraic_shortest.edges[0].edge_type);
+
+    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 8, 0, 0);
+    defer paths_mod.freePaths(alloc, algebraic_k_one);
+    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
+    try std.testing.expectEqual(@as(u32, 2), algebraic_k_one[0].length);
+    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[2]);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var found_alg_stats = false;
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "citations_alg")) continue;
+        found_alg_stats = true;
+        try std.testing.expect(item.algebraic_graph_traversal_attempt_count > 0);
+        try std.testing.expect(item.algebraic_graph_traversal_proven_count > 0);
+        try std.testing.expect(item.algebraic_graph_traversal_result_node_count > 0);
+    }
+    try std.testing.expect(found_alg_stats);
+}
+
+test "db graph runtime algebraic shortest path applies exact min-hop edge weight filters" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "citations_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 0.5 },
+            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "c", .target = "e", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "e", .target = "d", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "c", .target = "d", .edge_type = "cites", .weight = 5.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    const shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0)).?;
+    defer paths_mod.freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 3), shortest.length);
+    try std.testing.expectEqual(@as(usize, 4), shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
+    try std.testing.expectEqualStrings("c", shortest.nodes[1]);
+    try std.testing.expectEqualStrings("e", shortest.nodes[2]);
+    try std.testing.expectEqualStrings("d", shortest.nodes[3]);
+
+    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0);
+    defer paths_mod.freePaths(alloc, algebraic_k_one);
+    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
+    try std.testing.expectEqual(@as(u32, 3), algebraic_k_one[0].length);
+    try std.testing.expectEqualStrings("c", algebraic_k_one[0].nodes[1]);
+    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[3]);
 }

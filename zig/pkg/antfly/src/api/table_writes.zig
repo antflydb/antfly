@@ -242,6 +242,7 @@ const shouldDrainManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainManage
 const shouldDrainCachedManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainCachedManagedDbAfterBatch;
 const autoBulkIngestBatchOps = table_write_bulk_ingest.autoBulkIngestBatchOps;
 const autoBulkIngestGroupBatchOps = table_write_bulk_ingest.autoBulkIngestGroupBatchOps;
+const accumulateTextMemoryAttributionStats = table_write_cache.accumulateTextMemoryAttributionStats;
 
 const moveDroppedGroupPathToTrash = table_write_backup_restore.moveDroppedGroupPathToTrash;
 const deleteGroupPathIfPresent = table_write_backup_restore.deleteGroupPathIfPresent;
@@ -501,55 +502,6 @@ var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
 
-fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
-    dst.text_indexes +|= src.text_indexes;
-    dst.text_segments +|= src.text_segments;
-    dst.text_segment_bytes +|= src.text_segment_bytes;
-    dst.text_mmap_segment_bytes +|= src.text_mmap_segment_bytes;
-    dst.text_heap_segment_bytes +|= src.text_heap_segment_bytes;
-    dst.text_max_segment_bytes = @max(dst.text_max_segment_bytes, src.text_max_segment_bytes);
-    dst.stored_fields_bytes +|= src.stored_fields_bytes;
-    dst.inverted_text_bytes +|= src.inverted_text_bytes;
-    dst.inverted_header_bytes +|= src.inverted_header_bytes;
-    dst.inverted_norm_bytes +|= src.inverted_norm_bytes;
-    dst.inverted_term_dict_bytes +|= src.inverted_term_dict_bytes;
-    dst.inverted_term_block_bytes +|= src.inverted_term_block_bytes;
-    dst.inverted_term_index_bytes +|= src.inverted_term_index_bytes;
-    dst.inverted_fst_bytes +|= src.inverted_fst_bytes;
-    dst.inverted_bloom_bytes +|= src.inverted_bloom_bytes;
-    dst.inverted_postings_bytes +|= src.inverted_postings_bytes;
-    dst.inverted_postings_header_bytes +|= src.inverted_postings_header_bytes;
-    dst.inverted_block_max_bytes +|= src.inverted_block_max_bytes;
-    dst.inverted_chunk_meta_bytes +|= src.inverted_chunk_meta_bytes;
-    dst.inverted_postings_payload_bytes +|= src.inverted_postings_payload_bytes;
-    dst.inverted_positions_bytes +|= src.inverted_positions_bytes;
-    dst.inverted_skip_bytes +|= src.inverted_skip_bytes;
-    dst.inverted_one_hit_terms +|= src.inverted_one_hit_terms;
-    dst.inverted_postings_terms +|= src.inverted_postings_terms;
-    dst.typed_doc_values_bytes +|= src.typed_doc_values_bytes;
-    dst.doc_ordinals_bytes +|= src.doc_ordinals_bytes;
-    dst.section_index_bytes +|= src.section_index_bytes;
-    dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
-    dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
-}
-
-test "full text memory attribution aggregation includes norm bytes" {
-    var dst = db_mod.TextMemoryAttributionStats{
-        .inverted_header_bytes = 3,
-        .inverted_norm_bytes = 5,
-        .inverted_term_dict_bytes = 7,
-    };
-    accumulateTextMemoryAttributionStats(&dst, .{
-        .inverted_header_bytes = 11,
-        .inverted_norm_bytes = 13,
-        .inverted_term_dict_bytes = 17,
-    });
-
-    try std.testing.expectEqual(@as(u64, 14), dst.inverted_header_bytes);
-    try std.testing.expectEqual(@as(u64, 18), dst.inverted_norm_bytes);
-    try std.testing.expectEqual(@as(u64, 24), dst.inverted_term_dict_bytes);
-}
-
 fn runTestBeforeBatchExecutionHook() void {
     if (comptime builtin.is_test) {
         if (test_before_batch_execution_hook) |hook| hook.run(hook.ptr);
@@ -603,6 +555,7 @@ const DroppedTableDeleteWork = struct {
 };
 
 pub const ProvisionedTableWriteCache = table_write_cache.ProvisionedTableWriteCache;
+pub const HostedManagedDbCacheDiagnostics = table_write_cache.HostedManagedDbCacheDiagnostics;
 
 const HostedManagedDbCache = struct {
     replica_root_dir: []u8,
@@ -618,28 +571,6 @@ const HostedManagedDbCache = struct {
         };
         return cache;
     }
-};
-
-pub const HostedManagedDbCacheDiagnostics = struct {
-    present: bool = false,
-    cached_roots: u64 = 0,
-    cached_entries: u64 = 0,
-    retired_entries: u64 = 0,
-    table_metadata_entries: u64 = 0,
-    active_bulk_sessions: u64 = 0,
-    active_leases: u64 = 0,
-    retired_active_leases: u64 = 0,
-    bulk_ingest_open_entries: u64 = 0,
-    auto_bulk_ingest_open_entries: u64 = 0,
-    auto_bulk_ingest_finish_requested_entries: u64 = 0,
-    lsm_mutable_bytes: u64 = 0,
-    lsm_immutable_bytes: u64 = 0,
-    lsm_total_run_bytes: u64 = 0,
-    lsm_wal_retained_bytes: u64 = 0,
-    lsm_wal_retained_segments: u64 = 0,
-    lsm_active_readers: u64 = 0,
-    lsm_obsolete_paths: u64 = 0,
-    lsm_bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
 };
 
 var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;

@@ -1443,14 +1443,17 @@ pub const RelationalRowsCte = struct {
 
 pub const RelationalRowsTableFunctionKind = enum {
     graph_query,
+    graph_metric_query,
 };
 
 pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
     graph_query: RelationalRowsGraphTableFunction,
+    graph_metric_query: RelationalRowsGraphMetricTableFunction,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         switch (self.*) {
             .graph_query => |*query| query.deinit(alloc),
+            .graph_metric_query => |*query| query.deinit(alloc),
         }
         self.* = undefined;
     }
@@ -1463,6 +1466,17 @@ pub const RelationalRowsGraphTableFunction = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.table_name));
         freeNamedGraphQuery(alloc, &self.query);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphMetricTableFunction = struct {
+    table_name: []const u8,
+    query: NamedGraphMetricQuery,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeNamedGraphMetricQuery(alloc, &self.query);
         self.* = undefined;
     }
 };
@@ -1482,6 +1496,13 @@ pub const relational_rows_graph_table_function_fields = [_][]const u8{
 fn freeNamedGraphQuery(alloc: Allocator, named: *NamedGraphQuery) void {
     alloc.free(@constCast(named.name));
     freeGraphQuery(alloc, &named.query);
+    named.* = undefined;
+}
+
+fn freeNamedGraphMetricQuery(alloc: Allocator, named: *NamedGraphMetricQuery) void {
+    alloc.free(@constCast(named.name));
+    alloc.free(@constCast(named.query.index_name));
+    alloc.free(@constCast(named.query.metric_name));
     named.* = undefined;
 }
 

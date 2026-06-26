@@ -935,9 +935,13 @@ Unsupported DDL remains on the existing parser until
    start/target selectors, pattern returns, metric names, and query text, and
    fail-closed generated-read validation that rejects duplicate named
    arguments and corrupted or missing required graph payloads before typed
-   lowering.
-   Broader graph traversal, graph metric query planning, and graph DSL cutover
-   still require direct generated graph-query planning beyond retained semantic
+   lowering. Direct relational table-function lowering now accepts
+   `antfly.graph_metric(...)` alongside traversal and match table functions,
+   preserves the generated-covered metric source shape through typed relation
+   source planning, supports joins between graph-match and graph-metric table
+   functions, and materializes direct graph metric score rows through the
+   existing graph table-function row contract. Broader graph DSL cutover still
+   requires direct generated graph-query planning beyond retained semantic
    payload validation and broader unsupported-shape diagnostics.
 
 ## Generator Performance
@@ -1242,7 +1246,10 @@ Generated grammar work needs evidence at multiple levels:
   the generated parser instead of legacy DDL fallback, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
   including duplicate argument rejection and joined graph sources, plus
-  fail-closed malformed Antfly and graph-source validation.
+  fail-closed malformed Antfly and graph-source validation. Plan/lowering tests
+  now cover `antfly.graph_metric(...)` as a direct relational table-function
+  source and joined with graph match sources, and query-function tests cover
+  transfer of parsed graph metric queries into owned table-function CTEs.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

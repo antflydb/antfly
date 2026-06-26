@@ -26,6 +26,15 @@ pub const DBRootTestStep = struct {
     run: *std.Build.Step.Run,
 };
 
+pub const DBRootModuleTestSteps = struct {
+    result_shape: *std.Build.Step.Run,
+};
+
+pub const DBStorageTestSteps = struct {
+    all: *std.Build.Step.Run,
+    sim: *std.Build.Step.Run,
+};
+
 pub const db_root_step_name = "lib-db-test";
 pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
@@ -363,6 +372,7 @@ pub const APITestFilters = struct {
         "provisioned table restore rejects mismatched doc identity namespace",
         "provisioned restore repair open rejects stale doc identity namespace",
         "write cache reserves retirement slots when pruning multiple leased generations",
+        "full text memory attribution aggregation includes norm bytes",
         "table write source core forwards required batch and defaults optional capabilities",
         "primary lookup adopts seeded write cache across visible generation bump",
         "provisioned table write source coalesces same-group waiters",
@@ -409,6 +419,8 @@ pub const APITestFilters = struct {
         "provisioned query runtime db opens with catalog identity namespace",
         "provisioned query runtime db rejects stale identity namespace",
         "fanout planner uses io cap and request shape",
+        "merge distributed text stats sums shard corpus stats by field and term",
+        "merge distributed background text stats keys preserve embedded separators",
         "graph hydrate resolved doc filter applies include and exclude sets",
         "provisioned table read source executes relational row query plans across ranges",
         "routed rows query plan executes over scanned owner rows with ctes",
@@ -584,7 +596,7 @@ pub const APITestFilters = struct {
     };
 };
 
-pub const db_root_module_steps = [_]DBTestStep{
+const db_root_module_steps = [_]DBTestStep{
     .{
         .name = "lib-db-enrichment-test",
         .description = "Run root-module DB enrichment/replay/cutover tests",
@@ -643,7 +655,7 @@ pub const db_root_module_steps = [_]DBTestStep{
     },
 };
 
-pub const db_storage_module_steps = [_]DBTestStep{
+const db_storage_module_steps = [_]DBTestStep{
     .{
         .name = db_sim_step_name,
         .description = "Run DB simulation and replay tests",
@@ -814,7 +826,24 @@ pub fn addDBRootTestStep(
     };
 }
 
-pub fn addDBStorageTestStep(
+pub fn addDBRootModuleTestSteps(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+) DBRootModuleTestSteps {
+    var result_shape: ?*std.Build.Step.Run = null;
+    for (db_root_module_steps) |db_step| {
+        const run = addDBFilteredTestStep(b, root_module, db_step);
+        if (isDBResultShapeStep(db_step)) {
+            result_shape = run;
+        }
+    }
+
+    return .{
+        .result_shape = result_shape orelse @panic("missing DB result-shape test step"),
+    };
+}
+
+fn addDBStorageTestStep(
     b: *std.Build,
     root_module: *std.Build.Module,
 ) *std.Build.Step.Run {
@@ -831,6 +860,26 @@ pub fn addDBStorageTestStep(
     return run;
 }
 
+pub fn addDBStorageTestSteps(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+) DBStorageTestSteps {
+    const all = addDBStorageTestStep(b, root_module);
+
+    var sim: ?*std.Build.Step.Run = null;
+    for (db_storage_module_steps) |db_step| {
+        const run = addDBFilteredTestStep(b, root_module, db_step);
+        if (isDBSimStep(db_step)) {
+            sim = run;
+        }
+    }
+
+    return .{
+        .all = all,
+        .sim = sim orelse @panic("missing DB simulation test step"),
+    };
+}
+
 pub fn addDBFilteredTestStep(
     b: *std.Build,
     root_module: *std.Build.Module,
@@ -843,11 +892,11 @@ pub fn addDBFilteredTestStep(
     return run;
 }
 
-pub fn isDBResultShapeStep(db_step: DBTestStep) bool {
+fn isDBResultShapeStep(db_step: DBTestStep) bool {
     return std.mem.eql(u8, db_step.name, db_result_shape_step_name);
 }
 
-pub fn isDBSimStep(db_step: DBTestStep) bool {
+fn isDBSimStep(db_step: DBTestStep) bool {
     return std.mem.eql(u8, db_step.name, db_sim_step_name);
 }
 

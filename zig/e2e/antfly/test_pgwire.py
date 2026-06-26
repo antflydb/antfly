@@ -310,10 +310,13 @@ def test_pgwire_auth_uses_public_api_user_manager(auth_pgwire_server, antfly_bin
 
 
 def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
-    table = _table_name("pgwire_info_schema")
+    base_table = _table_name("pgwire_info_schema")
+    table = f"{base_table}_a"
+    later_table = f"{base_table}_b"
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)
         _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, amount numeric, active boolean);")
+        _pgwire_simple_query(sock, f"CREATE TABLE {later_table} (id text PRIMARY KEY);")
         version_messages = _pgwire_simple_query(sock, "SELECT version();")
         catalog_version_messages = _pgwire_simple_query(sock, "SELECT pg_catalog.version();")
         server_version_messages = _pgwire_simple_query(sock, "SHOW server_version;")
@@ -330,6 +333,16 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
             sock,
             "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns "
             f"WHERE table_catalog = 'default' AND table_name = '{table}' ORDER BY ordinal_position;",
+        )
+        information_schema_tables_desc_messages = _pgwire_simple_query(
+            sock,
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_catalog = 'default' AND table_schema = 'public' ORDER BY table_name DESC;",
+        )
+        information_schema_columns_desc_messages = _pgwire_simple_query(
+            sock,
+            "SELECT column_name, ordinal_position FROM information_schema.columns "
+            f"WHERE table_catalog = 'default' AND table_name = '{table}' ORDER BY ordinal_position DESC;",
         )
 
     assert [message for message in version_messages if message["type"] == "columns"] == [
@@ -397,6 +410,15 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
         ["id", "1", "text", "NO"],
         ["amount", "2", "numeric", "YES"],
         ["active", "3", "boolean", "YES"],
+    ]
+    info_schema_table_names_desc = [message["values"][0] for message in information_schema_tables_desc_messages if message["type"] == "row"]
+    assert later_table in info_schema_table_names_desc
+    assert table in info_schema_table_names_desc
+    assert info_schema_table_names_desc.index(later_table) < info_schema_table_names_desc.index(table)
+    assert [message["values"] for message in information_schema_columns_desc_messages if message["type"] == "row"] == [
+        ["active", "3"],
+        ["amount", "2"],
+        ["id", "1"],
     ]
 
 

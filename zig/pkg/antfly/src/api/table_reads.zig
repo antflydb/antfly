@@ -146,6 +146,8 @@ pub const parallelFanoutMetricsSnapshot = table_read_fanout.parallelFanoutMetric
 const ioAsyncLimitCap = table_read_fanout.ioAsyncLimitCap;
 const planFanout = table_read_fanout.planFanout;
 const planQueryFanout = table_read_fanout.planQueryFanout;
+const mergeDistributedTextStats = table_read_fanout.mergeDistributedTextStats;
+const mergeDistributedBackgroundTextStats = table_read_fanout.mergeDistributedBackgroundTextStats;
 
 fn benchQueryApiPhaseProfileEnabled() bool {
     return std.c.getenv("ANTFLY_BENCH_QUERY_API_PHASES\x00") != null or
@@ -168,6 +170,12 @@ pub const LoweredRelationPopulationRowsResult = table_read_relational_rows.Lower
 
 pub const LsmStorageStats = table_read_core.LsmStorageStats;
 pub const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
+pub const HAReadGate = table_read_core.HAReadGate;
+pub const ReadPreparation = table_read_core.ReadPreparation;
+pub const backend_current_root_generation = table_read_core.backend_current_root_generation;
+pub const GroupVisibleRootGenerationSource = table_read_core.GroupVisibleRootGenerationSource;
+pub const PrimaryLookupDbLease = table_read_core.PrimaryLookupDbLease;
+pub const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
 
 pub const testing = if (builtin.is_test) struct {
     pub fn rejectResolvedDocFilterForCrossGroup(req: db_mod.types.SearchRequest, group_count: usize) !void {
@@ -196,91 +204,6 @@ const loadTableIndexesJson = table_read_cache.loadTableIndexesJson;
 const loadTableIdentityNamespaceForGroup = table_read_cache.loadTableIdentityNamespaceForGroup;
 const validateProvisionedDbIdentityNamespace = table_read_cache.validateProvisionedDbIdentityNamespace;
 const validateOpenedProvisionedDbIdentityNamespace = table_read_cache.validateOpenedProvisionedDbIdentityNamespace;
-
-pub const ReadPreparation = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const Kind = enum {
-        general,
-        dense_query,
-    };
-
-    pub const VTable = struct {
-        prepare_for_read: *const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) void,
-    };
-
-    pub fn prepareForRead(self: ReadPreparation, table_name: []const u8, kind: Kind) void {
-        self.vtable.prepare_for_read(self.ptr, table_name, kind);
-    }
-};
-
-/// Shared LSM/HBC cache namespace used when callers want the storage backend's
-/// current root instead of a reconciled group-visible root snapshot.
-pub const backend_current_root_generation: u64 = 0;
-
-pub const GroupVisibleRootGenerationSource = struct {
-    ptr: *anyopaque,
-    visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
-
-    /// Shared LSM/HBC cache namespace for the currently visible replica root.
-    /// This is advanced when local root/catalog visibility is reconciled; it is
-    /// not the storage engine's physical per-write generation.
-    pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
-        return self.visible_root_generation_for_group(self.ptr, group_id);
-    }
-};
-
-pub const HAReadGate = struct {
-    standby: *const ha_standby_mod.Standby,
-
-    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
-        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
-            .consistency = switch (consistency) {
-                .stale => .stale_ok,
-                .leader_lease, .read_index => .primary,
-            },
-        });
-        switch (decision.action) {
-            .serve_standby => {},
-            .wait_for_apply => return error.HAReadWaitForApply,
-            .wait_for_metadata => return error.HAReadWaitForMetadata,
-            .route_to_primary => return error.HAReadRequiresPrimary,
-        }
-    }
-};
-
-pub const PrimaryLookupDbLease = struct {
-    ptr: *anyopaque,
-    db: *db_mod.DB,
-    release_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) void,
-
-    pub fn release(self: *PrimaryLookupDbLease, alloc: std.mem.Allocator) void {
-        self.release_fn(self.ptr, alloc);
-        self.* = undefined;
-    }
-};
-
-pub const PrimaryLookupDbSource = struct {
-    ptr: *anyopaque,
-    lease_group: *const fn (
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        group_id: u64,
-        lsm_root_generation: u64,
-    ) anyerror!?PrimaryLookupDbLease,
-
-    pub fn leaseGroup(
-        self: PrimaryLookupDbSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        group_id: u64,
-        lsm_root_generation: u64,
-    ) !?PrimaryLookupDbLease {
-        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation);
-    }
-};
 
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
@@ -13172,174 +13095,6 @@ fn parseBackgroundQueryRequestAlloc(
     return error.InvalidQueryRequest;
 }
 
-fn mergeDistributedTextStats(
-    alloc: std.mem.Allocator,
-    groups: []const []const distributed_stats_mod.TextFieldStats,
-) ![]const distributed_stats_mod.TextFieldStats {
-    var fields = std.StringHashMapUnmanaged(struct {
-        doc_count: u32 = 0,
-        total_field_len: u64 = 0,
-        terms: std.StringHashMapUnmanaged(u32) = .{},
-    }){};
-    defer {
-        var it = fields.iterator();
-        while (it.next()) |entry| {
-            var term_it = entry.value_ptr.terms.keyIterator();
-            while (term_it.next()) |term| alloc.free(term.*);
-            entry.value_ptr.terms.deinit(alloc);
-            alloc.free(entry.key_ptr.*);
-        }
-        fields.deinit(alloc);
-    }
-
-    for (groups) |items| {
-        for (items) |item| {
-            const gop = try fields.getOrPut(alloc, item.field);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try alloc.dupe(u8, item.field);
-                gop.value_ptr.* = .{};
-            }
-            gop.value_ptr.doc_count +|= item.global_doc_count;
-            gop.value_ptr.total_field_len +|= item.global_total_field_len;
-            for (item.term_doc_freqs) |term| {
-                const term_gop = try gop.value_ptr.terms.getOrPut(alloc, term.term);
-                if (!term_gop.found_existing) {
-                    term_gop.key_ptr.* = try alloc.dupe(u8, term.term);
-                    term_gop.value_ptr.* = 0;
-                }
-                term_gop.value_ptr.* +|= term.doc_freq;
-            }
-        }
-    }
-
-    const out = try alloc.alloc(distributed_stats_mod.TextFieldStats, fields.count());
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*item| item.deinit(alloc);
-        if (out.len > 0) alloc.free(out);
-    }
-    var it = fields.iterator();
-    while (it.next()) |entry| {
-        const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, entry.value_ptr.terms.count());
-        var initialized_terms: usize = 0;
-        errdefer {
-            for (term_doc_freqs[0..initialized_terms]) |*item| item.deinit(alloc);
-            if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
-        }
-        var term_it = entry.value_ptr.terms.iterator();
-        while (term_it.next()) |term_entry| {
-            term_doc_freqs[initialized_terms] = .{
-                .term = try alloc.dupe(u8, term_entry.key_ptr.*),
-                .doc_freq = term_entry.value_ptr.*,
-            };
-            initialized_terms += 1;
-        }
-        out[initialized] = .{
-            .field = try alloc.dupe(u8, entry.key_ptr.*),
-            .global_doc_count = entry.value_ptr.doc_count,
-            .global_total_field_len = entry.value_ptr.total_field_len,
-            .term_doc_freqs = term_doc_freqs,
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn mergeDistributedBackgroundTextStats(
-    alloc: std.mem.Allocator,
-    groups: []const []const db_mod.aggregations.DistributedBackgroundTextStats,
-) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
-    var fields = std.StringHashMapUnmanaged(struct {
-        aggregation_name: []const u8,
-        field: []const u8,
-        background_doc_count: u32 = 0,
-        terms: std.StringHashMapUnmanaged(u32) = .{},
-    }){};
-    defer {
-        var it = fields.iterator();
-        while (it.next()) |entry| {
-            var term_it = entry.value_ptr.terms.keyIterator();
-            while (term_it.next()) |term| alloc.free(term.*);
-            entry.value_ptr.terms.deinit(alloc);
-            alloc.free(entry.value_ptr.aggregation_name);
-            alloc.free(entry.value_ptr.field);
-            alloc.free(entry.key_ptr.*);
-        }
-        fields.deinit(alloc);
-    }
-
-    for (groups) |items| {
-        for (items) |item| {
-            const map_key = try textStatsTupleKeyAlloc(alloc, &.{ item.aggregation_name, item.field });
-            defer alloc.free(map_key);
-            const gop = try fields.getOrPut(alloc, map_key);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try alloc.dupe(u8, map_key);
-                gop.value_ptr.* = .{
-                    .aggregation_name = try alloc.dupe(u8, item.aggregation_name),
-                    .field = try alloc.dupe(u8, item.field),
-                };
-            }
-            gop.value_ptr.background_doc_count +|= item.background_doc_count;
-            for (item.term_doc_freqs) |term| {
-                const term_gop = try gop.value_ptr.terms.getOrPut(alloc, term.term);
-                if (!term_gop.found_existing) {
-                    term_gop.key_ptr.* = try alloc.dupe(u8, term.term);
-                    term_gop.value_ptr.* = 0;
-                }
-                term_gop.value_ptr.* +|= term.doc_freq;
-            }
-        }
-    }
-
-    const out = try alloc.alloc(db_mod.aggregations.DistributedBackgroundTextStats, fields.count());
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*item| item.deinit(alloc);
-        if (out.len > 0) alloc.free(out);
-    }
-    var it = fields.iterator();
-    while (it.next()) |entry| {
-        const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, entry.value_ptr.terms.count());
-        var initialized_terms: usize = 0;
-        errdefer {
-            for (term_doc_freqs[0..initialized_terms]) |*item| item.deinit(alloc);
-            if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
-        }
-        var term_it = entry.value_ptr.terms.iterator();
-        while (term_it.next()) |term_entry| {
-            term_doc_freqs[initialized_terms] = .{
-                .term = try alloc.dupe(u8, term_entry.key_ptr.*),
-                .doc_freq = term_entry.value_ptr.*,
-            };
-            initialized_terms += 1;
-        }
-        out[initialized] = .{
-            .aggregation_name = try alloc.dupe(u8, entry.value_ptr.aggregation_name),
-            .field = try alloc.dupe(u8, entry.value_ptr.field),
-            .background_doc_count = entry.value_ptr.background_doc_count,
-            .term_doc_freqs = term_doc_freqs,
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn textStatsTupleKeyAlloc(alloc: std.mem.Allocator, components: []const []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    for (components) |component| {
-        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
-        var len_buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
-        try out.appendSlice(alloc, &len_buf);
-        try out.appendSlice(alloc, component);
-    }
-
-    return try out.toOwnedSlice(alloc);
-}
-
 fn collectSignificantTermsFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
@@ -23384,102 +23139,6 @@ test "algebraic distributed planner honors pathfact datetime-string policy" {
     };
     const plan = try algebraicDistributedTensorProgramForRequestAlloc(alloc, &index, request, &.{});
     try std.testing.expect(plan == null);
-}
-
-test "merge distributed text stats sums shard corpus stats by field and term" {
-    const alloc = std.testing.allocator;
-
-    const merged = try mergeDistributedTextStats(alloc, &.{
-        &.{.{
-            .field = "body",
-            .global_doc_count = 2,
-            .global_total_field_len = 9,
-            .term_doc_freqs = &.{
-                .{ .term = "alpha", .doc_freq = 2 },
-                .{ .term = "beta", .doc_freq = 1 },
-            },
-        }},
-        &.{
-            .{
-                .field = "body",
-                .global_doc_count = 3,
-                .global_total_field_len = 15,
-                .term_doc_freqs = &.{
-                    .{ .term = "alpha", .doc_freq = 1 },
-                    .{ .term = "gamma", .doc_freq = 2 },
-                },
-            },
-            .{
-                .field = "title",
-                .global_doc_count = 3,
-                .global_total_field_len = 12,
-                .term_doc_freqs = &.{
-                    .{ .term = "hello", .doc_freq = 3 },
-                },
-            },
-        },
-    });
-    defer distributed_stats_mod.deinitTextFieldStats(alloc, merged);
-
-    try std.testing.expectEqual(@as(usize, 2), merged.len);
-
-    const body = for (merged) |item| {
-        if (std.mem.eql(u8, item.field, "body")) break item;
-    } else unreachable;
-    try std.testing.expectEqual(@as(u32, 5), body.global_doc_count);
-    try std.testing.expectEqual(@as(u64, 24), body.global_total_field_len);
-    try std.testing.expectEqual(@as(?u32, 3), body.termDocFreq("alpha"));
-    try std.testing.expectEqual(@as(?u32, 1), body.termDocFreq("beta"));
-    try std.testing.expectEqual(@as(?u32, 2), body.termDocFreq("gamma"));
-
-    const title = for (merged) |item| {
-        if (std.mem.eql(u8, item.field, "title")) break item;
-    } else unreachable;
-    try std.testing.expectEqual(@as(u32, 3), title.global_doc_count);
-    try std.testing.expectEqual(@as(?u32, 3), title.termDocFreq("hello"));
-}
-
-test "merge distributed background text stats keys preserve embedded separators" {
-    const alloc = std.testing.allocator;
-
-    const merged = try mergeDistributedBackgroundTextStats(alloc, &.{
-        &.{.{
-            .aggregation_name = "agg\x1ffield",
-            .field = "name",
-            .background_doc_count = 2,
-            .term_doc_freqs = &.{.{ .term = "alpha", .doc_freq = 2 }},
-        }},
-        &.{.{
-            .aggregation_name = "agg",
-            .field = "field\x1fname",
-            .background_doc_count = 3,
-            .term_doc_freqs = &.{.{ .term = "beta", .doc_freq = 3 }},
-        }},
-    });
-    defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, merged);
-
-    try std.testing.expectEqual(@as(usize, 2), merged.len);
-
-    const left = for (merged) |item| {
-        if (std.mem.eql(u8, item.aggregation_name, "agg\x1ffield")) break item;
-    } else unreachable;
-    try std.testing.expectEqualStrings("name", left.field);
-    try std.testing.expectEqual(@as(u32, 2), left.background_doc_count);
-    try std.testing.expectEqual(@as(?u32, 2), backgroundTermDocFreq(left.term_doc_freqs, "alpha"));
-
-    const right = for (merged) |item| {
-        if (std.mem.eql(u8, item.aggregation_name, "agg")) break item;
-    } else unreachable;
-    try std.testing.expectEqualStrings("field\x1fname", right.field);
-    try std.testing.expectEqual(@as(u32, 3), right.background_doc_count);
-    try std.testing.expectEqual(@as(?u32, 3), backgroundTermDocFreq(right.term_doc_freqs, "beta"));
-}
-
-fn backgroundTermDocFreq(items: []const distributed_stats_mod.TermDocFreq, term: []const u8) ?u32 {
-    for (items) |item| {
-        if (std.mem.eql(u8, item.term, term)) return item.doc_freq;
-    }
-    return null;
 }
 
 test "collect significant terms field requests gathers unique field terms from hits" {

@@ -3679,12 +3679,20 @@ pub const CatalogReadPlanLoweringContext = struct {
         catalog: table_catalog.CatalogSource,
         session: catalog_resources.SqlCatalogSession,
     ) !plan.LoweredReadPlan {
+        var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, catalog, session);
+        defer bound.deinit(self.alloc);
+        return try self.lowerBoundParsed(parsed_sql, &bound);
+    }
+
+    pub fn lowerBoundParsed(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        bound: *binder.BoundSqlStatement,
+    ) !plan.LoweredReadPlan {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, catalog, session);
-        defer bound.deinit(self.alloc);
-        return try binder.lowerReadPlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
+        return try binder.lowerReadPlanWithBoundStatementAlloc(self.alloc, bound, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.ReadPlanCatalogLoweringHooks {
@@ -6673,12 +6681,20 @@ pub const CatalogWritePlanLoweringContext = struct {
         catalog: table_catalog.CatalogSource,
         session: catalog_resources.SqlCatalogSession,
     ) !plan.LoweredWritePlan {
+        var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, options, catalog, session);
+        defer bound.deinit(self.alloc);
+        return try self.lowerBoundParsed(parsed_sql, &bound);
+    }
+
+    pub fn lowerBoundParsed(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        bound: *binder.BoundSqlStatement,
+    ) !plan.LoweredWritePlan {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, options, catalog, session);
-        defer bound.deinit(self.alloc);
-        return try binder.lowerWritePlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
+        return try binder.lowerWritePlanWithBoundStatementAlloc(self.alloc, bound, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.WritePlanCatalogLoweringHooks {

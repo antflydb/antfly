@@ -3528,13 +3528,7 @@ pub fn build(b: *std.Build) void {
     };
     const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &lib_data_storage_default_filters, .{ .simple_runner = true });
 
-    var run_lib_db_result_shape_tests: ?*std.Build.Step.Run = null;
-    for (antfly_tests_build.db_root_module_steps) |db_step| {
-        const run_db_step = antfly_tests_build.addDBFilteredTestStep(b, lib_test_mod, db_step);
-        if (antfly_tests_build.isDBResultShapeStep(db_step)) {
-            run_lib_db_result_shape_tests = run_db_step;
-        }
-    }
+    const lib_db_module_tests = antfly_tests_build.addDBRootModuleTestSteps(b, lib_test_mod);
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4616,7 +4610,7 @@ pub fn build(b: *std.Build) void {
     docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
+    docid_lifecycle_test_step.dependOn(&lib_db_module_tests.result_shape.step);
 
     const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
     docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
@@ -4641,7 +4635,7 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
+    lib_api_docid_test_step.dependOn(&lib_db_module_tests.result_shape.step);
 
     const lib_api_swarm_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5042,7 +5036,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&lib_db_test.run.step);
-    unit_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
+    unit_test_step.dependOn(&lib_db_module_tests.result_shape.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
@@ -5371,16 +5365,8 @@ pub fn build(b: *std.Build) void {
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
     sim_test_step.dependOn(storage_vopr_step);
 
-    const run_db_unit_tests = antfly_tests_build.addDBStorageTestStep(b, db_test_mod);
-
-    var run_db_sim_tests: ?*std.Build.Step.Run = null;
-    for (antfly_tests_build.db_storage_module_steps) |db_step| {
-        const run_db_step = antfly_tests_build.addDBFilteredTestStep(b, db_test_mod, db_step);
-        if (antfly_tests_build.isDBSimStep(db_step)) {
-            run_db_sim_tests = run_db_step;
-        }
-    }
-    sim_test_step.dependOn(&run_db_sim_tests.?.step);
+    const db_storage_tests = antfly_tests_build.addDBStorageTestSteps(b, db_test_mod);
+    sim_test_step.dependOn(&db_storage_tests.sim.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
@@ -5424,7 +5410,7 @@ pub fn build(b: *std.Build) void {
         &run_wal_unit_tests.step,
         &run_persistent_unit_tests.step,
         &run_index_manager_unit_tests.step,
-        &run_db_unit_tests.step,
+        &db_storage_tests.all.step,
         &run_sparse_unit_tests.step,
         &run_derived_log_unit_tests.step,
         &run_graph_metric_lifecycle_tests.step,

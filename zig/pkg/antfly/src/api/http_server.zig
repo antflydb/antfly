@@ -5872,22 +5872,27 @@ pub const ApiHttpServer = struct {
 
         const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
         if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
-        var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+
+        var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
             error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
-        }) orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
-        defer table_names.deinit(self.alloc);
-
-        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
-        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
-            self.alloc,
-            self.catalogSource(),
-            table_names.left,
-            session.session(),
-        ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            else => return err,
         };
+        defer bound.deinit(self.alloc);
+        const read_catalog = bound.readCatalog() catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        };
+        const target_binding = read_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const target = target_binding.target();
+        const target_table_name = try self.alloc.dupe(u8, target.table_name);
+        defer self.alloc.free(target_table_name);
+        const source_table_name: ?[]const u8 = if (read_catalog.source_binding) |binding|
+            try self.alloc.dupe(u8, binding.target().table_name)
+        else
+            null;
+        defer if (source_table_name) |name| self.alloc.free(name);
+        const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
         const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
@@ -5896,13 +5901,12 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
+            &bound,
             schema,
             params,
-            self.catalogSource(),
-            session.session(),
             function_bindings,
         ) catch |err| {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
@@ -5921,9 +5925,9 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         const result_columns = self.publicSqlReadResultColumnsAlloc(
-            table_names.left,
+            target_table_name,
             schema,
-            table_names.source,
+            source_table_name,
             lowered,
             session.session(),
         ) catch |err| switch (err) {
@@ -5938,7 +5942,7 @@ pub const ApiHttpServer = struct {
             read_source,
             self.catalogSource(),
             session.session(),
-            table_names.left,
+            target_table_name,
             schema,
             lowered,
             .read_index,
@@ -5966,6 +5970,12 @@ pub const ApiHttpServer = struct {
         } };
     }
 
+    fn clonePublicSqlRuntimeSchemaAlloc(alloc: std.mem.Allocator, schema: runtime_schema_mod.TableSchema) !runtime_schema_mod.TableSchema {
+        const serialized = try runtime_schema_mod.serializeSchema(alloc, schema);
+        defer alloc.free(serialized);
+        return try runtime_schema_mod.deserializeSchema(alloc, serialized);
+    }
+
     fn describePublicSqlReadColumnsAlloc(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
@@ -5978,22 +5988,27 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
-        var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
+        _ = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+
+        var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
             error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
-        }) orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
-        defer table_names.deinit(self.alloc);
-
-        _ = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
-        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
-            self.alloc,
-            self.catalogSource(),
-            table_names.left,
-            session.session(),
-        ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            else => return err,
         };
+        defer bound.deinit(self.alloc);
+        const read_catalog = bound.readCatalog() catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        };
+        const target_binding = read_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        const target = target_binding.target();
+        const target_table_name = try self.alloc.dupe(u8, target.table_name);
+        defer self.alloc.free(target_table_name);
+        const source_table_name: ?[]const u8 = if (read_catalog.source_binding) |binding|
+            try self.alloc.dupe(u8, binding.target().table_name)
+        else
+            null;
+        defer if (source_table_name) |name| self.alloc.free(name);
+        const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
         const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
@@ -6002,13 +6017,12 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
+            &bound,
             schema,
             params,
-            self.catalogSource(),
-            session.session(),
             function_bindings,
         ) catch |err| {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
@@ -6027,9 +6041,9 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         const result_columns = self.publicSqlReadResultColumnsAlloc(
-            table_names.left,
+            target_table_name,
             schema,
-            table_names.source,
+            source_table_name,
             lowered,
             session.session(),
         ) catch |err| switch (err) {
@@ -6604,7 +6618,7 @@ pub const ApiHttpServer = struct {
         order_by: []const PostgresCompatibilityInformationSchemaOrderKey = &.{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            alloc.free(self.order_by);
+            if (self.order_by.len != 0) alloc.free(self.order_by);
             self.* = undefined;
         }
     };
@@ -6617,7 +6631,7 @@ pub const ApiHttpServer = struct {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.columns);
-            alloc.free(self.order_by);
+            if (self.order_by.len != 0) alloc.free(self.order_by);
             self.* = undefined;
         }
     };
@@ -6642,7 +6656,7 @@ pub const ApiHttpServer = struct {
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.row.len != 0) alloc.free(@constCast(self.row));
             for (self.sort_values) |*value| value.deinit(alloc);
-            alloc.free(self.sort_values);
+            if (self.sort_values.len != 0) alloc.free(self.sort_values);
             self.* = undefined;
         }
     };
@@ -7292,6 +7306,7 @@ pub const ApiHttpServer = struct {
         order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
         table: metadata_table_manager.TableRecord,
     ) ![]PostgresCompatibilityInformationSchemaSortValue {
+        if (order_by.len == 0) return &.{};
         const out = try self.alloc.alloc(PostgresCompatibilityInformationSchemaSortValue, order_by.len);
         var initialized: usize = 0;
         errdefer {
@@ -7363,6 +7378,7 @@ pub const ApiHttpServer = struct {
         column: runtime_schema_mod.RelationalColumn,
         ordinal_position: usize,
     ) ![]PostgresCompatibilityInformationSchemaSortValue {
+        if (order_by.len == 0) return &.{};
         const out = try self.alloc.alloc(PostgresCompatibilityInformationSchemaSortValue, order_by.len);
         var initialized: usize = 0;
         errdefer {

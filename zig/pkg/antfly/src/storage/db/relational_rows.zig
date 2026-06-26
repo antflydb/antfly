@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const graph_query_mod = @import("../../graph/query.zig");
 const schema_mod = @import("../schema.zig");
@@ -33,6 +34,18 @@ const regex_mod = @import("antfly_regex");
 
 const Allocator = std.mem.Allocator;
 const physical_primary_key_prefix = "\x00antfly-rel-pk:";
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
 
 fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();
@@ -686,6 +699,26 @@ pub fn graphTableFunctionNodeRowJsonAlloc(
     try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
     try writer.writeAll(",\"score\":null");
     try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null);
+    return try out.toOwnedSlice();
+}
+
+pub fn graphMetricTableFunctionScoreRowJsonAlloc(
+    alloc: Allocator,
+    graph_name: []const u8,
+    score: types.GraphMetricScore,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"id\":");
+    try std.json.Stringify.value(.{ .string = score.node }, .{}, writer);
+    try writer.writeAll(",\"score\":");
+    try writer.print("{d}", .{score.score});
+    try writer.writeAll(",\"graph_name\":");
+    try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+    try writer.writeAll(",\"node_key\":");
+    try std.json.Stringify.value(.{ .string = score.node }, .{}, writer);
+    try writer.writeAll(",\"depth\":null,\"distance\":null,\"path_json\":null,\"match_json\":null,\"stored_json\":null}");
     return try out.toOwnedSlice();
 }
 
@@ -12854,6 +12887,7 @@ pub fn Impl(comptime DB: type) type {
         ) !types.RelationalRowsQueryResult {
             const rows = switch (table_function) {
                 .graph_query => |graph_query| try @This().materializeGraphQueryTableFunctionRowsAlloc(self, alloc, graph_query),
+                .graph_metric_query => |graph_metric_query| try @This().materializeGraphMetricTableFunctionRowsAlloc(self, alloc, graph_metric_query),
             };
             defer freeOwnedConstStringSlice(alloc, rows);
             var source_req = req;
@@ -12896,6 +12930,30 @@ pub fn Impl(comptime DB: type) type {
                 }
                 for (graph_result.hits) |hit| {
                     try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_result.name, hit, null, null));
+                }
+            }
+            return try rows.toOwnedSlice(alloc);
+        }
+
+        fn materializeGraphMetricTableFunctionRowsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            graph_metric_table_function: types.RelationalRowsGraphMetricTableFunction,
+        ) ![]const []const u8 {
+            const graph_metric_query = graph_metric_table_function.query;
+            var search_result = try self.search(alloc, .{
+                .graph_metric_queries = &.{graph_metric_query},
+                .include_stored = false,
+            });
+            defer search_result.deinit();
+
+            var rows = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer freeOwnedConstStringArrayList(alloc, &rows);
+
+            for (search_result.graph_metric_results) |metric_result| {
+                if (!std.mem.eql(u8, metric_result.name, graph_metric_query.name)) continue;
+                for (metric_result.scores) |score| {
+                    try rows.append(alloc, try graphMetricTableFunctionScoreRowJsonAlloc(alloc, metric_result.name, score));
                 }
             }
             return try rows.toOwnedSlice(alloc);
@@ -13481,13 +13539,10 @@ test "relational rows window plan computes row_number over ordered partitions" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14021,13 +14076,10 @@ test "relational rows window plan supports boolean aggregate windows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14117,13 +14169,10 @@ test "relational aggregate and join plans consume cte sources" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14533,13 +14582,10 @@ test "relational rows mutation source updates claimed base rows transactionally"
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14852,13 +14898,10 @@ test "relational rows mutation source plans across injected owner ranges" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14957,13 +15000,10 @@ test "relational rows mutation source stages primary key identity rewrites" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15049,13 +15089,10 @@ test "relational rows mutation source deletes all claimed base rows transactiona
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15109,13 +15146,10 @@ test "relational rows aggregate groups filtered row-query streams" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15175,13 +15209,10 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15267,13 +15298,10 @@ test "relational rows aggregate supports global metrics and windowing" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15340,13 +15368,10 @@ test "relational rows aggregate supports boolean folds" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15400,13 +15425,10 @@ test "relational rows aggregate supports distinct metric state" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15608,13 +15630,10 @@ test "relational rows aggregate folds json and array metric inputs" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15679,13 +15698,10 @@ test "relational rows aggregate groups by expression outputs" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -15748,13 +15764,10 @@ test "relational rows join composes typed row-query streams" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16044,13 +16057,10 @@ test "relational joined mutation source stages target-side updates from source r
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16339,13 +16349,10 @@ test "relational joined mutation source consumes bounded source CTEs" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16440,13 +16447,10 @@ test "relational joined mutation source plans across injected owner ranges" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16565,13 +16569,10 @@ test "relational joined mutation source stages target updates with separate sour
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16713,13 +16714,10 @@ test "relational joined mutation source stages primary key identity rewrites" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -16830,13 +16828,10 @@ test "relational rows lateral join runs bounded correlated right query per left 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -17161,13 +17156,10 @@ test "relational rows inner join supports joined result windowing" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -17266,14 +17258,11 @@ test "db relational rows check concatenation preserves expression metadata" {
 test "relational rows query uses indexed candidates and authoritative base rows" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -17462,14 +17451,11 @@ test "relational rows query planner orders candidate sets by estimated cardinali
 test "relational rows set operation plan executes typed set semantics" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -17597,14 +17583,11 @@ test "relational rows set operation plan executes typed set semantics" {
 test "relational rows query doc key range scopes indexed and scanned candidates" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -17671,14 +17654,11 @@ test "relational rows query doc key range scopes indexed and scanned candidates"
 test "relational rows query plan composes non-recursive ctes" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18060,14 +18040,11 @@ test "relational rows query plan composes non-recursive ctes" {
 test "relational rows query across ranges rejects overlapping ranges" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18091,14 +18068,11 @@ test "relational rows query across ranges rejects overlapping ranges" {
 test "relational rows query only uses partial secondary index when predicates imply it" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18166,14 +18140,11 @@ test "relational rows query only uses partial secondary index when predicates im
 test "relational rows query ignores building secondary indexes and scans base rows" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18229,14 +18200,11 @@ test "relational rows query ignores building secondary indexes and scans base ro
 test "relational rows query falls back to base scans for non-indexable predicates" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18281,14 +18249,11 @@ test "relational rows query falls back to base scans for non-indexable predicate
 test "relational rows query resolves primary key owner before column indexes" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18359,14 +18324,11 @@ test "relational rows query resolves primary key owner before column indexes" {
 test "relational rows query resolves unique owner before column indexes" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18424,14 +18386,11 @@ test "relational rows query resolves unique owner before column indexes" {
 test "relational rows query only uses partial unique owner when predicates imply it" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18509,13 +18468,10 @@ test "relational rows query row claim skip locked returns claimed subset" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18615,13 +18571,10 @@ test "relational rows query row claim skip locked limit fills from later candida
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18685,13 +18638,10 @@ test "relational rows query applies typed array and json predicates through inde
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -18750,13 +18700,10 @@ test "relational rows query projects typed expression outputs" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -19057,13 +19004,10 @@ test "relational rows query array_contains uses element index with authoritative
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -19221,13 +19165,10 @@ test "relational rows query uses generated expression columns as non-unique expr
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -19310,13 +19251,10 @@ test "relational rows query json_path_eq uses json value index with authoritativ
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -19432,13 +19370,10 @@ test "relational rows history captures durable system-versioned row history" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -19578,13 +19513,10 @@ test "relational rows query across ranges merges ordered windows globally" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -19980,15 +19912,12 @@ test "relational rows query across ranges merges ordered windows globally" {
 
 test "db relational rows table point reads use only the relational base store" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const table_schema_api = @import("../../schema/mod.zig");
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();

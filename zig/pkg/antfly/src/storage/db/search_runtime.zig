@@ -66,6 +66,23 @@ const applyGraphUnion = db_query_graph.applyGraphUnion;
 const applyGraphIntersection = db_query_graph.applyGraphIntersection;
 const AlgebraicIndex = @import("algebraic/index.zig").Index;
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const waitForSearchResult = support.waitForSearchResult;
+    pub const putDenseEmbeddingArtifactForTest = support.putDenseEmbeddingArtifactForTest;
+    pub const profileBenchTestsEnabled = support.profileBenchTestsEnabled;
+    pub const cacheBlockHitsForBench = support.cacheBlockHitsForBench;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
+
 pub const AlgebraicDocFilterRequest = struct {
     req: types.SearchRequest,
     index: ?*AlgebraicIndex = null,
@@ -263,13 +280,10 @@ test "relational table full-text search loads stored_data from base rows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -481,13 +495,10 @@ test "relational column filter pushdown declines stale identity generations" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -533,13 +544,10 @@ test "relational unindexed column filters fall back to base rows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -585,13 +593,10 @@ test "relational indexed array_any filters use array element indexes" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -676,13 +681,10 @@ test "relational indexed json_contains filters use json value indexes" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -753,13 +755,10 @@ test "relational embedded json search intersects with top-level relational filte
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -830,13 +829,10 @@ test "relational text backfill ignores generic primary rows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -891,13 +887,10 @@ test "relational derived replay reads base row keyspace" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -5436,13 +5429,10 @@ pub fn Impl(comptime DB: type) type {
 test "db search runtime reopen reopens persisted index catalog and text index" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5485,13 +5475,10 @@ test "db search runtime reopen reopens persisted index catalog and text index" {
 test "db search runtime reopen delete index persists across reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5529,13 +5516,10 @@ test "db search runtime reopen delete index persists across reopen" {
 test "db search runtime reopen delete index persists across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -5579,13 +5563,10 @@ test "db search runtime reopen delete index persists across reopen with durable 
 test "db search runtime reopen indexed delete removes hits across reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5639,13 +5620,10 @@ test "db search runtime reopen indexed delete removes hits across reopen" {
 test "db search runtime reopen indexed delete removes hits across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -5705,13 +5683,10 @@ test "db search runtime reopen indexed delete removes hits across reopen with du
 test "db search runtime reopen indexed overwrite replaces old hits across reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5780,13 +5755,10 @@ test "db search runtime reopen indexed overwrite replaces old hits across reopen
 test "db search runtime reopen indexed overwrite replaces old hits across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -5861,13 +5833,10 @@ test "db search runtime reopen indexed overwrite replaces old hits across reopen
 test "db search runtime reopen phrase query survives text compaction deletes and reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5951,13 +5920,10 @@ test "db search runtime reopen phrase query survives text compaction deletes and
 test "db search runtime reopen prefix wildcard and regexp queries use text dictionary filters" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6006,13 +5972,10 @@ test "db search runtime reopen prefix wildcard and regexp queries use text dicti
 test "db search runtime reopen typed and dictionary queries survive compaction delete and reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6203,13 +6166,10 @@ test "db search runtime reopen typed and dictionary queries survive compaction d
 test "db search runtime reopen mixed-type stored fields survive text compaction and reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6274,13 +6234,10 @@ test "db search runtime reopen mixed-type stored fields survive text compaction 
 test "db search runtime reopen persists byte range across reopen" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6314,13 +6271,10 @@ test "db search runtime reopen persists byte range across reopen" {
 test "db search runtime reopen updateRange constrains index backfill" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6348,14 +6302,11 @@ test "db search runtime reopen updateRange constrains index backfill" {
 
 test "db search runtime projection lookup projects nested document fields" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6386,14 +6337,11 @@ test "db search runtime projection lookup projects nested document fields" {
 
 test "db search runtime projection lookup returns full stored json by default" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6411,14 +6359,11 @@ test "db search runtime projection lookup returns full stored json by default" {
 
 test "db search runtime projection scan returns hashes and projected documents" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6448,14 +6393,11 @@ test "db search runtime projection scan returns hashes and projected documents" 
 
 test "db search runtime projection search projects stored fields for hydrated hits" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6495,14 +6437,11 @@ test "db search runtime projection search projects stored fields for hydrated hi
 
 test "db search runtime projection lookup includes chunk artifacts when _chunks is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6544,14 +6483,11 @@ test "db search runtime projection lookup includes chunk artifacts when _chunks 
 test "db search runtime full-text chunk consumer returns parent and chunk modes" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6619,14 +6555,11 @@ test "db search runtime full-text chunk consumer returns parent and chunk modes"
 test "db search runtime full-text chunk default index searches template chunk text when chunker full text indexing is enabled" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6670,13 +6603,10 @@ test "db search runtime full-text chunk default index searches template chunk te
 test "db search runtime full-text chunk full_text sync level covers template chunk routing" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6723,14 +6653,11 @@ test "db search runtime full-text chunk full_text sync level covers template chu
 test "db search runtime full-text chunk consumer filters expired parents under ttl" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6796,13 +6723,10 @@ test "db search runtime full-text chunk consumer filters expired parents under t
 test "db search runtime getArtifact loads stored chunk artifacts by public id" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -6828,14 +6752,11 @@ test "db search runtime getArtifact loads stored chunk artifacts by public id" {
 test "db search runtime full-text chunk parent paging applies after grouping" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6883,14 +6804,11 @@ test "db search runtime full-text chunk parent paging applies after grouping" {
 test "db search runtime dense chunk consumer supports parent and parent_with_chunks modes" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7041,14 +6959,11 @@ test "db search runtime dense chunk consumer supports parent and parent_with_chu
 test "db search runtime dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7136,13 +7051,10 @@ test "db search runtime dense chunk consumer supports parent and parent_with_chu
 test "db search runtime dense chunk full_index supports parent search for template chunked embeddings" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7183,13 +7095,10 @@ test "db search runtime dense chunk full_index supports parent search for templa
 test "db search runtime dense chunk full_index supports parent search when chunk artifacts are ephemeral" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7240,13 +7149,10 @@ test "db search runtime dense chunk full_index supports parent search when chunk
 test "db search runtime dense chunk reopened full_index supports parent search when chunk artifacts are ephemeral" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     {
@@ -7291,15 +7197,12 @@ test "db search runtime dense chunk reopened full_index supports parent search w
 
 test "db search runtime projection lookup includes unified artifact projection when _artifacts is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7393,14 +7296,11 @@ test "db search runtime projection lookup includes unified artifact projection w
 
 test "db search runtime projection search includes chunk artifacts on hydrated hits when _chunks is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7439,14 +7339,11 @@ test "db search runtime projection search includes chunk artifacts on hydrated h
 
 test "db search runtime projection scan includes chunk artifacts when _chunks is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7476,14 +7373,11 @@ test "db search runtime projection scan includes chunk artifacts when _chunks is
 
 test "db search runtime projection lookup does not load chunks for nested _chunks projection without explicit include-all selector" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7509,14 +7403,11 @@ test "db search runtime projection lookup does not load chunks for nested _chunk
 
 test "db search runtime projection lookup loads chunks for _chunks.* selector and allows nested projection" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7545,15 +7436,12 @@ test "db search runtime projection lookup loads chunks for _chunks.* selector an
 
 test "db search runtime projection lookup includes embedding artifacts when _embeddings is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7584,15 +7472,12 @@ test "db search runtime projection lookup includes embedding artifacts when _emb
 
 test "db search runtime projection search includes embedding artifacts on hydrated hits when _embeddings is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7631,15 +7516,12 @@ test "db search runtime projection search includes embedding artifacts on hydrat
 
 test "db search runtime projection scan includes embedding artifacts when _embeddings is requested" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7668,15 +7550,12 @@ test "db search runtime projection scan includes embedding artifacts when _embed
 
 test "db search runtime projection lookup does not load embeddings for nested _embeddings projection without explicit include-all selector" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7702,15 +7581,12 @@ test "db search runtime projection lookup does not load embeddings for nested _e
 
 test "db search runtime projection lookup loads embeddings for _embeddings.* selector and allows nested projection" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7787,14 +7663,11 @@ test "db search runtime projection field selection plan only enables chunk speci
 
 test "db search runtime indexing batch get match_all search and index registry" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7835,15 +7708,12 @@ test "db search runtime indexing batch get match_all search and index registry" 
 
 test "db search runtime indexing full-text index backfill and search routing" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7899,14 +7769,11 @@ test "db search runtime indexing full-text index backfill and search routing" {
 
 test "db search runtime indexing dense and sparse vector searches apply stored symbolic filters before final paging" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7966,14 +7833,11 @@ test "db search runtime indexing dense and sparse vector searches apply stored s
 
 test "db search runtime identity vector symbolic filters fail closed when algebraic lifecycle is stale" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8052,14 +7916,11 @@ test "db search runtime identity vector symbolic filters fail closed when algebr
 
 test "db search runtime identity algebraic doc facts feed native dense and sparse symbolic filters" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8786,14 +8647,11 @@ test "db search runtime identity algebraic doc facts feed native dense and spars
 
 test "db search runtime indexing lsm match-all query sees same latest value as point lookup" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -8840,14 +8698,11 @@ test "db search runtime indexing lsm match-all query sees same latest value as p
 
 test "db search runtime reopen full-text index and search survive reopen with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8901,14 +8756,11 @@ test "db search runtime reopen full-text index and search survive reopen with du
 
 test "db search runtime indexing full-text backfill resumes after interrupted reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -8979,14 +8831,11 @@ test "db search runtime indexing full-text backfill resumes after interrupted re
 
 test "db search runtime indexing sparse backfill resumes after interrupted reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -9069,14 +8918,11 @@ test "db search runtime indexing sparse backfill resumes after interrupted reope
 
 test "db search runtime indexing dense vector index routes knn search" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9111,14 +8957,11 @@ test "db search runtime indexing dense vector index routes knn search" {
 
 test "db search runtime indexing dense vector index routes knn search with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -9155,15 +8998,12 @@ test "db search runtime indexing dense vector index routes knn search with durab
 
 test "db search runtime indexing full text conjunction query" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9201,15 +9041,12 @@ test "db search runtime indexing full text conjunction query" {
 
 test "db search runtime indexing full text conjunction query with incremental full_index batches" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9252,15 +9089,12 @@ test "db search runtime indexing full text conjunction query with incremental fu
 
 test "db search runtime indexing full text count_only applies stored filters" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9294,14 +9128,11 @@ test "db search runtime indexing full text count_only applies stored filters" {
 
 test "db search runtime indexing full_index delete waits for full text visibility" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9346,14 +9177,11 @@ test "db search runtime indexing full_index delete waits for full text visibilit
 
 test "db search runtime indexing stats uses full text visible count when available" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9395,14 +9223,11 @@ test "db search runtime indexing stats uses full text visible count when availab
 
 test "db search runtime indexing schemaless full text indexes strings into _all for bare text search" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9442,14 +9267,11 @@ test "db search runtime indexing schemaless full text indexes strings into _all 
 
 test "db search runtime indexing stats does not scan primary docs when full text count is available" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -9485,14 +9307,11 @@ test "db search runtime indexing stats does not scan primary docs when full text
 
 test "db search runtime indexing sparse vector index routes knn search" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9531,14 +9350,11 @@ test "db search runtime indexing sparse vector index routes knn search" {
 
 test "db search runtime indexing sparse vector index routes knn search with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -9575,14 +9391,11 @@ test "db search runtime indexing sparse vector index routes knn search with dura
 
 test "db search runtime indexing graph index routes neighbor queries and doc deletes clean edges" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9646,14 +9459,11 @@ test "db search runtime indexing graph index routes neighbor queries and doc del
 
 test "db search runtime indexing direct graph writes persist graph artifacts and deletes remove them" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9703,15 +9513,12 @@ test "db search runtime indexing direct graph writes persist graph artifacts and
 
 test "db search runtime indexing delete artifact cleanup isolates binary document id prefixes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const putDenseEmbeddingArtifactForTest = TestHelpers.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const first_doc = "doc\x00a";
     const second_doc = "doc\x00a:child";
@@ -9752,14 +9559,11 @@ test "db search runtime indexing delete artifact cleanup isolates binary documen
 
 test "db search runtime indexing graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -9825,15 +9629,12 @@ test "db search runtime indexing graph index routes neighbor queries and doc del
 
 test "db search runtime indexing document _edges reconcile graph state and preserve base document" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -9908,15 +9709,12 @@ test "db search runtime indexing document _edges reconcile graph state and prese
 
 test "db search runtime indexing document _edges reconcile graph state and preserve base document with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const waitForSearchResult = db_test_support.waitForSearchResult;
+    const waitForSearchResult = TestHelpers.waitForSearchResult;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -9993,14 +9791,11 @@ test "db search runtime indexing document _edges reconcile graph state and prese
 
 test "db search runtime indexing document _embeddings update vector index and strip stored special fields" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10063,14 +9858,11 @@ test "db search runtime indexing document _embeddings update vector index and st
 
 test "db search runtime indexing dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10183,14 +9975,11 @@ test "db search runtime indexing dense and sparse field-backed vector indexes st
 
 test "db search runtime indexing document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -10255,14 +10044,11 @@ test "db search runtime indexing document _embeddings update vector index and st
 
 test "db search runtime indexing full_index persists explicit dense embeddings across reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var iter: usize = 0;
     while (iter < 4) : (iter += 1) {
@@ -10312,20 +10098,17 @@ test "db search runtime indexing full_index persists explicit dense embeddings a
             try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
         }
 
-        cleanupTempDir(path);
+        TestHelpers.cleanupTempDir(path);
     }
 }
 
 test "db search runtime graph composition search supports graph result_ref from full-text hits" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10381,14 +10164,11 @@ test "db search runtime graph composition search supports graph result_ref from 
 
 test "db search runtime graph composition search supports graph result_ref from dense hits without public id handoff" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10445,14 +10225,11 @@ test "db search runtime graph composition search supports graph result_ref from 
 
 test "db search runtime graph composition search rejects unbounded graph result_ref when base result is paged" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10497,14 +10274,11 @@ test "db search runtime graph composition search rejects unbounded graph result_
 
 test "db search runtime graph composition search supports graph-only named queries" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10552,14 +10326,11 @@ test "db search runtime graph composition search supports graph-only named queri
 
 test "db search runtime graph composition named graph input sets carry resolved doc sets" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10633,14 +10404,11 @@ test "db search runtime graph composition named graph input sets carry resolved 
 
 test "db search runtime graph composition search supports fused graph selectors for single-lane full-text searches" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10693,14 +10461,11 @@ test "db search runtime graph composition search supports fused graph selectors 
 
 test "db search runtime graph composition search fuses full_text and dense named searches before graph expansion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10774,14 +10539,11 @@ test "db search runtime graph composition search fuses full_text and dense named
 
 test "db search runtime graph composition hybrid search does not hard-filter dense leg with scoring full_text" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -10844,14 +10606,11 @@ test "db search runtime graph composition hybrid search does not hard-filter den
 
 test "db search runtime graph composition search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -10927,14 +10686,11 @@ test "db search runtime graph composition search fuses full_text and dense named
 
 test "db search runtime graph composition search supports named full_text queries fused with dense and sparse before graph expansion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -11031,14 +10787,11 @@ test "db search runtime graph composition search supports named full_text querie
 
 test "db search runtime graph composition search supports named full_text queries fused with dense and sparse before graph expansion with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -11137,14 +10890,11 @@ test "db search runtime graph composition search supports named full_text querie
 
 test "db search runtime graph composition search sorts graph queries by dependency and resolves prior graph results" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -11199,14 +10949,11 @@ test "db search runtime graph composition search sorts graph queries by dependen
 
 test "db search runtime graph composition search expand_strategy union and intersection apply graph hits to top level results" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -11363,14 +11110,11 @@ test "db search runtime graph composition graph intersection preserves artifact 
 
 test "db search runtime graph composition graph index reloads on reopen for neighbor queries" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -11420,14 +11164,11 @@ test "db search runtime graph composition graph index reloads on reopen for neig
 
 test "db search runtime graph composition graph index reloads on reopen for neighbor queries with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -11483,15 +11224,12 @@ test "db search runtime graph composition graph index reloads on reopen for neig
 
 test "db search runtime graph composition graph reverse rebuild resumes after interrupted reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -11588,14 +11326,11 @@ test "db search runtime graph composition graph reverse rebuild resumes after in
 
 test "db search runtime text schema runUntilIdle drains scheduled text merges after repeated writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -11638,14 +11373,11 @@ test "db search runtime text schema runUntilIdle drains scheduled text merges af
 
 test "db search runtime text schema runUntilIdle drains scheduled text merges without index workers" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -11688,14 +11420,11 @@ test "db search runtime text schema runUntilIdle drains scheduled text merges wi
 
 test "db search runtime text schema full_text sync does not require draining scheduled text merges" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -11735,14 +11464,11 @@ test "db search runtime text schema full_text sync does not require draining sch
 
 test "db search runtime text schema force compacts text index to searchable merge tier" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -11792,14 +11518,11 @@ test "db search runtime text schema force compacts text index to searchable merg
 
 test "db search runtime text schema text compaction preserves ordinal filters across reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const expected_ordinal: doc_set.DocOrdinal = 9;
     {
@@ -11907,9 +11630,6 @@ test "db search runtime text schema text compaction preserves ordinal filters ac
 
 test "db search runtime text schema best effort force compact leaves text merge debt under pressure" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -11932,8 +11652,8 @@ test "db search runtime text schema best effort force compact leaves text merge 
     defer resource_manager.observeUsage(.text_merge_buffers, &tracked_usage, 0);
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .resource_manager = &resource_manager,
@@ -12004,9 +11724,6 @@ test "db search runtime text schema best effort force compact leaves text merge 
 
 test "db search runtime text schema runUntilIdle defers full text merge pressure without failing" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -12025,8 +11742,8 @@ test "db search runtime text schema runUntilIdle defers full text merge pressure
     });
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .resource_manager = &resource_manager,
@@ -12067,15 +11784,12 @@ test "db search runtime text schema runUntilIdle defers full text merge pressure
 
 test "db search runtime text schema search_as_you_type schema emits Elasticsearch-style field variants" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -12177,15 +11891,12 @@ test "db search runtime text schema search_as_you_type schema emits Elasticsearc
 
 test "db search runtime text schema versioned full text indexes reload matching schema mappings after reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_v0_json =
         \\{
@@ -12311,15 +12022,12 @@ test "db search runtime text schema versioned full text indexes reload matching 
 
 test "db search runtime text schema additionalProperties true nested text fields survive reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12396,15 +12104,12 @@ test "db search runtime text schema additionalProperties true nested text fields
 
 test "db search runtime text schema explicit field analyzer override drives match queries" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12462,15 +12167,12 @@ test "db search runtime text schema explicit field analyzer override drives matc
 
 test "db search runtime text schema dynamic template match_mapping_type analyzer survives reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12552,15 +12254,12 @@ test "db search runtime text schema dynamic template match_mapping_type analyzer
 
 test "db search runtime text schema dynamic template precedence beats open additionalProperties fallback" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12620,15 +12319,12 @@ test "db search runtime text schema dynamic template precedence beats open addit
 
 test "db search runtime text schema patternProperties text fields survive reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12717,15 +12413,12 @@ test "db search runtime text schema patternProperties text fields survive reopen
 
 test "db search runtime text schema root additionalProperties true text fields survive reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12796,15 +12489,12 @@ test "db search runtime text schema root additionalProperties true text fields s
 
 test "db search runtime text schema schema-driven text query matrix covers explicit dynamic template and fallback modes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
         \\{
@@ -12952,15 +12642,12 @@ test "db search runtime text schema schema-driven text query matrix covers expli
 
 test "db search runtime text schema no-schema path recursively infers nested text and typed fields" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const jan2 = (try parsePatternRfc3339ToNs("2026-01-02T00:00:00Z")).?;
     const jan4 = (try parsePatternRfc3339ToNs("2026-01-04T00:00:00Z")).?;
@@ -13046,16 +12733,13 @@ test "db search runtime text schema no-schema path recursively infers nested tex
 
 test "db search runtime text schema schema-present infer_types opt-in recursively infers nested fields after reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const jan2 = (try parsePatternRfc3339ToNs("2026-01-02T00:00:00Z")).?;
     const jan4 = (try parsePatternRfc3339ToNs("2026-01-04T00:00:00Z")).?;
@@ -13169,14 +12853,11 @@ test "db search runtime text schema schema-present infer_types opt-in recursivel
 
 test "db search runtime identity match_all consumes resolved ordinal filter" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -13221,14 +12902,11 @@ test "db search runtime identity match_all consumes resolved ordinal filter" {
 
 test "db search runtime identity treats reserved namespace bytes as user document ids" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13268,14 +12946,11 @@ test "db search runtime identity treats reserved namespace bytes as user documen
 
 test "db search runtime identity batch and scan round trip adversarial document ids" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13350,14 +13025,11 @@ test "db search runtime identity batch and scan round trip adversarial document 
 
 test "db search runtime identity resolved doc-set projection honors identity read generation" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13467,14 +13139,11 @@ test "db search runtime identity resolved doc-set projection honors identity rea
 
 test "db search runtime identity search requests default to current identity generation snapshot" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13520,14 +13189,11 @@ test "db search runtime identity search requests default to current identity gen
 
 test "db search runtime identity validates internal resolved doc filter wire namespace and generation" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const namespace = doc_identity.Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -13580,14 +13246,11 @@ test "db search runtime identity validates internal resolved doc filter wire nam
 
 test "db search runtime identity explicit doc-id filter resolution honors identity generation" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13651,14 +13314,11 @@ test "db search runtime identity explicit doc-id filter resolution honors identi
 
 test "db search runtime identity doc set planning stats record ordinal bitmap promotion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -13702,13 +13362,10 @@ test "db search runtime identity doc set planning stats record ordinal bitmap pr
 
 test "db search runtime identity sparse index uses identity ordinals as physical doc nums for primary docs" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -13774,13 +13431,10 @@ test "db search runtime identity sparse index uses identity ordinals as physical
 
 test "db search runtime identity sparse hits resolve doc ordinals through identity not sparse doc nums" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -13824,13 +13478,10 @@ test "db search runtime identity sparse hits resolve doc ordinals through identi
 
 test "db search runtime identity dense index stores stable vector ids with ordinal filter mappings" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -13918,13 +13569,10 @@ test "db search runtime identity dense index stores stable vector ids with ordin
 
 test "db search runtime identity resolved doc filter normalizes doc keys before composing native ids" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -13970,13 +13618,10 @@ test "db search runtime identity resolved doc filter normalizes doc keys before 
 
 test "db search runtime identity vector full text filters project through doc identity ordinals" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14069,15 +13714,12 @@ test "db search runtime identity vector full text filters project through doc id
 
 test "db search runtime identity default dynamic schema vector term filters project through doc identity ordinals" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14161,13 +13803,10 @@ test "db search runtime identity default dynamic schema vector term filters proj
 
 test "db search runtime identity non chunked search paths apply broad live doc filter" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14243,14 +13882,11 @@ test "db search runtime identity non chunked search paths apply broad live doc f
 
 test "db search runtime preflight validates live lane bindings" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14567,14 +14203,11 @@ test "db search runtime preflight validates live lane bindings" {
 
 test "db search runtime preflight surfaces structured filter probe counts when count is budget limited" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14624,154 +14257,13 @@ test "db search runtime preflight surfaces structured filter probe counts when c
     try std.testing.expect(geo_summary.structured_filter_doc_count_lower_bound != null or geo_summary.structured_filter_doc_count_estimate != null);
 }
 
-test "db search runtime graph helpers expose edges neighbors and shortest path" {
-    const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
-
-    try db.addIndex(.{
-        .name = "citations",
-        .kind = .graph,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
-
-    try db.batch(.{
-        .graph_writes = &.{
-            .{ .index_name = "citations", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
-            .{ .index_name = "citations", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
-            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
-            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
-        },
-        .sync_level = .full_index,
-    });
-
-    const edges = try db.getEdges(alloc, "citations", "a", "", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-    try std.testing.expectEqual(@as(usize, 2), edges.len);
-
-    const neighbors = try db.getNeighbors(alloc, "citations", "a", "cites", .out);
-    defer traversal_mod.freeOwnedResults(alloc, neighbors);
-    try std.testing.expectEqual(@as(usize, 2), neighbors.len);
-
-    const traversed = try db.traverseEdges(alloc, "citations", "a", .{
-        .direction = .out,
-        .edge_types = &.{"cites"},
-        .max_depth = 2,
-    });
-    defer traversal_mod.freeOwnedResults(alloc, traversed);
-    try std.testing.expectEqual(@as(usize, 3), traversed.len);
-
-    const shortest = (try db.findShortestPath(alloc, "citations", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
-    defer paths_mod.freePath(alloc, shortest);
-    try std.testing.expectEqual(@as(u32, 2), shortest.length);
-    try std.testing.expectEqual(@as(usize, 3), shortest.nodes.len);
-    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
-    try std.testing.expectEqualStrings("d", shortest.nodes[2]);
-
-    const algebraic_shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
-    defer paths_mod.freePath(alloc, algebraic_shortest);
-    try std.testing.expectEqual(@as(u32, 2), algebraic_shortest.length);
-    try std.testing.expectEqual(@as(usize, 3), algebraic_shortest.nodes.len);
-    try std.testing.expectEqualStrings("a", algebraic_shortest.nodes[0]);
-    try std.testing.expectEqualStrings("b", algebraic_shortest.nodes[1]);
-    try std.testing.expectEqualStrings("d", algebraic_shortest.nodes[2]);
-    try std.testing.expectEqual(@as(usize, 2), algebraic_shortest.edges.len);
-    try std.testing.expectEqualStrings("cites", algebraic_shortest.edges[0].edge_type);
-
-    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 8, 0, 0);
-    defer paths_mod.freePaths(alloc, algebraic_k_one);
-    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
-    try std.testing.expectEqual(@as(u32, 2), algebraic_k_one[0].length);
-    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[2]);
-
-    const stats = try db.stats(alloc);
-    defer types.freeDBStats(alloc, stats);
-    var found_alg_stats = false;
-    for (stats.indexes) |item| {
-        if (!std.mem.eql(u8, item.name, "citations_alg")) continue;
-        found_alg_stats = true;
-        try std.testing.expect(item.algebraic_graph_traversal_attempt_count > 0);
-        try std.testing.expect(item.algebraic_graph_traversal_proven_count > 0);
-        try std.testing.expect(item.algebraic_graph_traversal_result_node_count > 0);
-    }
-    try std.testing.expect(found_alg_stats);
-}
-
-test "db search runtime graph helpers algebraic shortest path applies exact min-hop edge weight filters" {
-    const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
-
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
-
-    try db.batch(.{
-        .graph_writes = &.{
-            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 0.5 },
-            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations_alg", .source = "c", .target = "e", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations_alg", .source = "e", .target = "d", .edge_type = "cites", .weight = 2.0 },
-            .{ .index_name = "citations_alg", .source = "c", .target = "d", .edge_type = "cites", .weight = 5.0 },
-        },
-        .sync_level = .full_index,
-    });
-
-    const shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0)).?;
-    defer paths_mod.freePath(alloc, shortest);
-    try std.testing.expectEqual(@as(u32, 3), shortest.length);
-    try std.testing.expectEqual(@as(usize, 4), shortest.nodes.len);
-    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
-    try std.testing.expectEqualStrings("c", shortest.nodes[1]);
-    try std.testing.expectEqualStrings("e", shortest.nodes[2]);
-    try std.testing.expectEqualStrings("d", shortest.nodes[3]);
-
-    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0);
-    defer paths_mod.freePaths(alloc, algebraic_k_one);
-    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
-    try std.testing.expectEqual(@as(u32, 3), algebraic_k_one[0].length);
-    try std.testing.expectEqualStrings("c", algebraic_k_one[0].nodes[1]);
-    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[3]);
-}
-
 test "db search runtime writes and reads timestamp metadata" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14805,14 +14297,11 @@ test "db search runtime writes and reads timestamp metadata" {
 
 test "db search runtime full_text sync level does not wait for dense hbc visibility" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14851,15 +14340,12 @@ test "db search runtime full_text sync level does not wait for dense hbc visibil
 
 test "db search runtime relational dense HBC loader reads committed base rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const schema_api_mod = @import("../../schema/mod.zig");
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -14917,18 +14403,15 @@ test "db search runtime relational dense HBC loader reads committed base rows" {
 
 test "db search runtime dense lsm cache profile benchmark" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const cacheBlockHitsForBench = db_test_support.cacheBlockHitsForBench;
+    const profileBenchTestsEnabled = TestHelpers.profileBenchTestsEnabled;
+    const cacheBlockHitsForBench = TestHelpers.cacheBlockHitsForBench;
     const monotonicTimeNs = platform_time.monotonicNs;
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var lsm_cache = lsm_backend_mod.Cache.init(alloc, 64 * 1024 * 1024);
     defer lsm_cache.deinit();

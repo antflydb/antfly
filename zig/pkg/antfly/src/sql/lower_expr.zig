@@ -16629,6 +16629,7 @@ fn parseGraphTableFunctionSourceAtAlloc(
     const function = query_function.antflyQueryFunctionFromSqlToken(tokens[function_start]) orelse return null;
     switch (function) {
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {},
+        .graph_metric => {},
         else => return null,
     }
     const close_index = parser.findMatchingRParenIndex(tokens, function_start + 1) orelse return error.UnsupportedSqlShape;
@@ -17937,14 +17938,17 @@ pub fn parseJoinAlloc(
 
     const left_table_name_source = if (left_graph_source) |source| switch (source.cte.table_function.?) {
         .graph_query => |graph_query| graph_query.table_name,
+        .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
     } else left_table.name;
     const right_table_name_source = if (right_graph_source) |source| switch (source.cte.table_function.?) {
         .graph_query => |graph_query| graph_query.table_name,
+        .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
     } else right_table.name;
     if (left_graph_source != null and !std.mem.eql(u8, left_table_name_source, right_table_name_source)) return error.UnsupportedSqlShape;
     if (right_graph_source) |source| {
         const graph_table_name = switch (source.cte.table_function.?) {
             .graph_query => |graph_query| graph_query.table_name,
+            .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
         };
         if (!std.mem.eql(u8, left_table_name_source, graph_table_name)) return error.UnsupportedSqlShape;
     }
@@ -31030,6 +31034,36 @@ test "sql adapter lower expr treats direct graph table functions as relation sou
     try std.testing.expectEqualStrings("incoming", both_direct_join.join.right.source_cte);
     try std.testing.expectEqual(@as(usize, 1), both_direct_join.join.left.predicates.len);
     try std.testing.expectEqual(@as(usize, 1), both_direct_join.join.right.predicates.len);
+
+    var graph_metric_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked WHERE score >= 0 ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_metric_query.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_metric_query.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_metric_query.plan.ctes.len);
+    try std.testing.expectEqualStrings("ranked", graph_metric_query.plan.ctes[0].name);
+    try std.testing.expect(graph_metric_query.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("ranked", graph_metric_query.plan.query.source_cte);
+    try std.testing.expectEqualStrings("id", graph_metric_query.plan.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_metric_query.plan.query.select[1]);
+
+    var graph_match_metric_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT gm.id AS graph_id, ranked.score AS metric_score FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id WHERE ranked.score >= 0 ORDER BY metric_score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_match_metric_join.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_match_metric_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", graph_match_metric_join.right_table_name);
+    try std.testing.expectEqual(@as(usize, 2), graph_match_metric_join.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_match_metric_join.ctes[0].name);
+    try std.testing.expectEqualStrings("ranked", graph_match_metric_join.ctes[1].name);
+    try std.testing.expectEqualStrings("gm", graph_match_metric_join.join.left.source_cte);
+    try std.testing.expectEqualStrings("ranked", graph_match_metric_join.join.right.source_cte);
 }
 
 test "sql adapter lower expr lowers select all with named extra projections" {

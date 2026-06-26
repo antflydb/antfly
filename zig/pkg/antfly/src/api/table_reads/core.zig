@@ -20,6 +20,8 @@ const catalog_resources = @import("../catalog_resources.zig");
 const query_api = @import("../query.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const raft_mod = @import("../../raft/mod.zig");
+const ha_read_gate_mod = @import("../../storage/ha/read_gate.zig");
+const ha_standby_mod = @import("../../storage/ha/standby.zig");
 const serverless_query = @import("../../serverless/query/mod.zig");
 const distributed_graph = @import("../distributed_graph.zig");
 const runtime_status = @import("../runtime_status.zig");
@@ -58,6 +60,91 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
             .background_fields => |*value| value.deinit(alloc),
         }
         self.* = undefined;
+    }
+};
+
+pub const HAReadGate = struct {
+    standby: *const ha_standby_mod.Standby,
+
+    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
+        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
+            .consistency = switch (consistency) {
+                .stale => .stale_ok,
+                .leader_lease, .read_index => .primary,
+            },
+        });
+        switch (decision.action) {
+            .serve_standby => {},
+            .wait_for_apply => return error.HAReadWaitForApply,
+            .wait_for_metadata => return error.HAReadWaitForMetadata,
+            .route_to_primary => return error.HAReadRequiresPrimary,
+        }
+    }
+};
+
+pub const ReadPreparation = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Kind = enum {
+        general,
+        dense_query,
+    };
+
+    pub const VTable = struct {
+        prepare_for_read: *const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) void,
+    };
+
+    pub fn prepareForRead(self: ReadPreparation, table_name: []const u8, kind: Kind) void {
+        self.vtable.prepare_for_read(self.ptr, table_name, kind);
+    }
+};
+
+/// Shared LSM/HBC cache namespace used when callers want the storage backend's
+/// current root instead of a reconciled group-visible root snapshot.
+pub const backend_current_root_generation: u64 = 0;
+
+pub const GroupVisibleRootGenerationSource = struct {
+    ptr: *anyopaque,
+    visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+
+    /// Shared LSM/HBC cache namespace for the currently visible replica root.
+    /// This is advanced when local root/catalog visibility is reconciled; it is
+    /// not the storage engine's physical per-write generation.
+    pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
+        return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+};
+
+pub const PrimaryLookupDbLease = struct {
+    ptr: *anyopaque,
+    db: *db_mod.DB,
+    release_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) void,
+
+    pub fn release(self: *PrimaryLookupDbLease, alloc: std.mem.Allocator) void {
+        self.release_fn(self.ptr, alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PrimaryLookupDbSource = struct {
+    ptr: *anyopaque,
+    lease_group: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) anyerror!?PrimaryLookupDbLease,
+
+    pub fn leaseGroup(
+        self: PrimaryLookupDbSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) !?PrimaryLookupDbLease {
+        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation);
     }
 };
 
