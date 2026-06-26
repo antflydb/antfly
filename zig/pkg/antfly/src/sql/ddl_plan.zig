@@ -4612,11 +4612,14 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     try validateGeneratedGraphAstSpans(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
-    return switch (ast.kind) {
+    var plan: LoweredDdlPlan = switch (ast.kind) {
         .create_index => .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
         .create_metric => .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tail, &pos) },
         .alter_metric => .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tail, &pos) },
     };
+    errdefer plan.deinit(alloc);
+    try validateGeneratedGraphPlanMatchesAstAlloc(alloc, tokens, ast, plan);
+    return plan;
 }
 
 fn validateGeneratedGraphAstSpans(
@@ -4679,6 +4682,62 @@ fn validateGeneratedGraphOptions(
     } else if (required_end != end) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedGraphPlanMatchesAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+    plan: LoweredDdlPlan,
+) !void {
+    const create_index = switch (plan) {
+        .create_index => |create_index| create_index,
+        else => return error.UnsupportedSqlShape,
+    };
+    switch (ast.kind) {
+        .create_index => {
+            if (create_index.method != .antfly_graph) return error.UnsupportedSqlShape;
+            try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.object_name_tokens, create_index.index_name);
+            try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.source_name_tokens, create_index.table_name);
+        },
+        .create_metric => {
+            if (create_index.method != .antfly_graph_metric) return error.UnsupportedSqlShape;
+            try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.object_name_tokens, create_index.index_name);
+            try validateGeneratedGraphConfigIdentifierAlloc(alloc, tokens, ast.source_name_tokens, create_index.derived_index_config_json, "graph_index");
+        },
+        .alter_metric => {
+            if (create_index.method != .antfly_graph_metric) return error.UnsupportedSqlShape;
+            try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.object_name_tokens, create_index.index_name);
+            try validateGeneratedGraphConfigIdentifierAlloc(alloc, tokens, ast.source_name_tokens, create_index.derived_index_config_json, "graph_index");
+            try validateGeneratedGraphConfigIdentifierAlloc(alloc, tokens, ast.algorithm_tokens, create_index.derived_index_config_json, "algorithm");
+        },
+    }
+}
+
+fn validateGeneratedGraphPlanIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    actual: []const u8,
+) !void {
+    const expected = try generatedSqlObjectIdentifierAlloc(alloc, tokens, maybe_range orelse return error.UnsupportedSqlShape);
+    defer alloc.free(expected);
+    if (!std.mem.eql(u8, expected, actual)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphConfigIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_config_json: ?[]const u8,
+    field_name: []const u8,
+) !void {
+    const config_json = maybe_config_json orelse return error.UnsupportedSqlShape;
+    const expected = try generatedSqlObjectIdentifierAlloc(alloc, tokens, maybe_range orelse return error.UnsupportedSqlShape);
+    defer alloc.free(expected);
+    const pattern = try std.fmt.allocPrint(alloc, "\"{s}\":\"{s}\"", .{ field_name, expected });
+    defer alloc.free(pattern);
+    if (std.mem.indexOf(u8, config_json, pattern) == null) return error.UnsupportedSqlShape;
 }
 
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
