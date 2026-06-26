@@ -8597,6 +8597,38 @@ test "generated SQL parser facade builds read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const graph_metric_rerank_source_read_sql = "SELECT * FROM antfly.graph_metric_rerank(full_text_index => 'docs_body_fts', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25) AS ranked";
+    var graph_metric_rerank_source_tokens = try lexer.tokenizeAlloc(alloc, graph_metric_rerank_source_read_sql);
+    defer lexer.freeTokens(alloc, &graph_metric_rerank_source_tokens);
+    const graph_metric_rerank_source_read_result = try parseTokensAlloc(alloc, graph_metric_rerank_source_tokens.items);
+    switch (graph_metric_rerank_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_count);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_metric_rerank, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric_rerank, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqual(@as(usize, 6), read.source_graph_function_items[0].argument_count);
+            try std.testing.expectEqualStrings(
+                "antfly.graph_metric_rerank",
+                tokenRangeText(graph_metric_rerank_source_read_sql, graph_metric_rerank_source_tokens.items, read.source_graph_function_items[0].name_tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "'docs_edge_graph'",
+                tokenRangeText(graph_metric_rerank_source_read_sql, graph_metric_rerank_source_tokens.items, read.source_graph_function_items[0].index_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'pagerank'",
+                tokenRangeText(graph_metric_rerank_source_read_sql, graph_metric_rerank_source_tokens.items, read.source_graph_function_items[0].metric_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'refund'",
+                tokenRangeText(graph_metric_rerank_source_read_sql, graph_metric_rerank_source_tokens.items, read.source_graph_function_items[0].query_value_tokens.?),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const joined_graph_source_read_sql = "SELECT gm.id, ranked.score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id";
     var joined_graph_source_tokens = try lexer.tokenizeAlloc(alloc, joined_graph_source_read_sql);
     defer lexer.freeTokens(alloc, &joined_graph_source_tokens);

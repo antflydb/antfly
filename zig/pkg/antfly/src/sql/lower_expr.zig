@@ -36845,6 +36845,13 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("id", graph_direct_read.plan.query.select[0]);
     try std.testing.expectEqualStrings("score", graph_direct_read.plan.query.select[1]);
 
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_metric_rerank(table_name => 'usage_records', full_text_index => 'usage_records_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25) AS ranked",
+        schema,
+        &.{},
+    ));
+
     var inner_lowered = try lowerJoinForLowerExprTestAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
