@@ -327,6 +327,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -483,6 +484,30 @@ fn isGeneratedRoleDdlHead(tokens: []const Token, raw_statement: RawSqlStatement)
     return tokenMatchesKeyword(second, .role) or
         tokenMatchesText(second, "user") or
         tokenMatchesKeyword(second, .group);
+}
+
+fn isGeneratedTypeSystemDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    const second = tokens[start + 1];
+    if (tokenMatchesKeyword(first, .create)) {
+        return tokenMatchesKeyword(second, .collation) or
+            tokenMatchesKeyword(second, .operator) or
+            tokenMatchesKeyword(second, .aggregate) or
+            tokenMatchesKeyword(second, .cast);
+    }
+    if (tokenMatchesKeyword(first, .alter)) {
+        return tokenMatchesKeyword(second, .collation);
+    }
+    if (tokenMatchesKeyword(first, .drop)) {
+        return tokenMatchesKeyword(second, .collation) or
+            tokenMatchesKeyword(second, .operator) or
+            tokenMatchesKeyword(second, .aggregate) or
+            tokenMatchesKeyword(second, .cast);
+    }
+    return false;
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -2527,6 +2552,15 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER POLICY usage_policy ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP POLICY IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE COLLATION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP COLLATION IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OPERATOR"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP OPERATOR ==="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE AGGREGATE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP AGGREGATE first_value_text"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE CAST"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP CAST ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));

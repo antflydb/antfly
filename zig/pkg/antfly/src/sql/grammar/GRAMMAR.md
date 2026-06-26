@@ -145,7 +145,11 @@ Type-system catalog DDL heads, including `CREATE COLLATION`,
 `CREATE AGGREGATE`, `DROP AGGREGATE`, `CREATE CAST`, and `DROP CAST`, now use
 the generated DDL boundary with retained object-name or signature-tail ranges
 before delegating option/signature semantics to the existing typed type-system
-catalog planner.
+catalog planner. These supported type-system heads now require generated
+parser success at SQL ingress so malformed generated-owned catalog statements
+do not fall back to the permissive legacy DDL classifier; unsupported
+type-system variants such as operator class/family and aggregate/operator
+`ALTER` forms continue through the generated unsupported diagnostic path.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
