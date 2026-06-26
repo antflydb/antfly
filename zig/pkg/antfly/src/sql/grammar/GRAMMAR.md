@@ -403,13 +403,15 @@ Recursive CTEs still dispatch through the recursive CTE family after validating
 their generated recursive flag.
 Unsupported read shapes
 mostly still fall back, but complete top-level row-locking reads such as
-`SELECT ... FOR UPDATE`/`FOR SHARE` and CTE final reads with row-locking tails
-now parse through the generated read grammar as normal reads with retained
-`row_lock_tokens`; relational reads lower those tails through the existing
-typed `RowClaimRequest` planner, while document SQL rejects them with the
-explicit `DocumentSqlLockingUnsupported` diagnostic. The generated row-lock
-boundary is mode-aware so temporal `FOR SYSTEM_TIME` source clauses remain
-part of their relation source rather than being misclassified as lock tails.
+`SELECT ... FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, and
+`FOR KEY SHARE`, including `OF`, `NOWAIT`, and `SKIP LOCKED` tails, and CTE
+final reads with row-locking tails now parse through the generated read grammar
+as normal reads with retained `row_lock_tokens`; relational reads lower those
+tails through the existing typed `RowClaimRequest` planner, while document SQL
+rejects them with the explicit `DocumentSqlLockingUnsupported` diagnostic. The
+generated row-lock boundary is mode-aware so temporal `FOR SYSTEM_TIME` source
+clauses remain part of their relation source rather than being misclassified as
+lock tails.
 Generated CTE body metadata now retains and validates body-level
 `body_row_lock_tokens` as well as body-level Antfly and graph table-function
 source metadata, and rebases that metadata when a CTE body is cloned into the
@@ -976,8 +978,9 @@ Unsupported DDL remains on the existing parser until
    kind or child-expression payloads that lack a matching token range before
    lowering.
    Complete generated row-locking reads now retain generated `row_lock_tokens`
-   and lower through typed relational row-claim planning for supported
-   relational reads; document SQL returns the explicit
+   for all PostgreSQL row-lock strengths, target lists, and wait policies, and
+   lower through typed relational row-claim planning for supported relational
+   reads; document SQL returns the explicit
    `DocumentSqlLockingUnsupported` diagnostic. CTE read bodies now retain
    `body_row_lock_tokens`, validate the `FOR` row-lock boundary, and clone that
    metadata into direct generated read ASTs. CTE read bodies also retain,

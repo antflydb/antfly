@@ -2031,6 +2031,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records ORDER BY 1 USING > LIMIT 5", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records FOR NO KEY UPDATE OF usage_records NOWAIT", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records FOR KEY SHARE SKIP LOCKED", .kind = .read },
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)", .kind = .read },
@@ -10916,6 +10918,30 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqualStrings(row_lock_sql, spanText(row_lock_sql, read.statement_span));
             try std.testing.expectEqualStrings("SELECT", spanText(row_lock_sql, read.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.row_lock_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const no_key_update_row_lock_sql = "SELECT id FROM usage_records FOR NO KEY UPDATE OF usage_records NOWAIT";
+    const no_key_update_row_lock_result = try parseSqlAlloc(alloc, no_key_update_row_lock_sql);
+    switch (no_key_update_row_lock_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqualStrings(no_key_update_row_lock_sql, spanText(no_key_update_row_lock_sql, read.statement_span));
+            try std.testing.expectEqualStrings("SELECT", spanText(no_key_update_row_lock_sql, read.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 11 }, read.row_lock_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const key_share_row_lock_sql = "SELECT id FROM usage_records FOR KEY SHARE SKIP LOCKED";
+    const key_share_row_lock_result = try parseSqlAlloc(alloc, key_share_row_lock_sql);
+    switch (key_share_row_lock_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqualStrings(key_share_row_lock_sql, spanText(key_share_row_lock_sql, read.statement_span));
+            try std.testing.expectEqualStrings("SELECT", spanText(key_share_row_lock_sql, read.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 9 }, read.row_lock_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
