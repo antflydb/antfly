@@ -3553,6 +3553,42 @@ pub fn addAPIDocIdAggregateTestStep(
     return step;
 }
 
+pub fn addAPIDocIdLifecycleDependencies(
+    focused: APIFocusedTestRun,
+    runs: APIDocIdTestRuns,
+    db_result_shape: *std.Build.Step.Run,
+) *std.Build.Step {
+    const step = focused.step orelse
+        @panic("DOCID lifecycle focused run must expose a build step");
+    step.dependOn(&focused.run.step);
+    step.dependOn(&runs.transactions_docid.step);
+    step.dependOn(&runs.table_reads_docid.step);
+    step.dependOn(&runs.table_writes_docid.step);
+    step.dependOn(&runs.public_table_http_docid.step);
+    step.dependOn(&runs.raft_transition_runtime_docid.step);
+    step.dependOn(&db_result_shape.step);
+    return step;
+}
+
+pub fn dependOnAPIDocIdUnitTestRuns(
+    step: *std.Build.Step,
+    runs: APIDocIdTestRuns,
+) void {
+    step.dependOn(&runs.provisioned_query_visibility.step);
+    step.dependOn(&runs.docid.step);
+    step.dependOn(&runs.rows.step);
+    step.dependOn(&runs.sql_api_parity.step);
+    step.dependOn(&runs.internal_group_write_routes.step);
+    step.dependOn(&runs.table_reads_graph_metric.step);
+}
+
+pub fn dependOnAPIGeneratedChecks(
+    step: *std.Build.Step,
+    runs: APIDocIdTestRuns,
+) void {
+    step.dependOn(&runs.sql_api_parity_fixture_check.step);
+}
+
 pub fn addDBRootTestStep(
     b: *std.Build,
     root_module: *std.Build.Module,

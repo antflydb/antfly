@@ -3007,16 +3007,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }, antfly_imports);
-    unit_test_step.dependOn(&api_docid_tests.provisioned_query_visibility.step);
-    const run_lib_docid_lifecycle_tests = api_focused_tests.docid_lifecycle.run;
-    const docid_lifecycle_test_step = api_focused_tests.docid_lifecycle.step.?;
-    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
-    docid_lifecycle_test_step.dependOn(&api_docid_tests.transactions_docid.step);
-    docid_lifecycle_test_step.dependOn(&api_docid_tests.table_reads_docid.step);
-    docid_lifecycle_test_step.dependOn(&api_docid_tests.table_writes_docid.step);
-    docid_lifecycle_test_step.dependOn(&api_docid_tests.public_table_http_docid.step);
-    docid_lifecycle_test_step.dependOn(&api_docid_tests.raft_transition_runtime_docid.step);
-    docid_lifecycle_test_step.dependOn(&lib_db_module_tests.result_shape.step);
+    const docid_lifecycle_test_step = antfly_tests_build.addAPIDocIdLifecycleDependencies(
+        api_focused_tests.docid_lifecycle,
+        api_docid_tests,
+        lib_db_module_tests.result_shape,
+    );
 
     const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
     docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
@@ -3047,7 +3042,7 @@ pub fn build(b: *std.Build) void {
     if (snowball_sources_available) {
         generated_check_step.dependOn(snowball_check_step);
     }
-    generated_check_step.dependOn(&api_docid_tests.sql_api_parity_fixture_check.step);
+    antfly_tests_build.dependOnAPIGeneratedChecks(generated_check_step, api_docid_tests);
 
     const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
     const run_lib_metadata_service_tests = metadata_tests.service.run;
@@ -3290,10 +3285,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
-    unit_test_step.dependOn(&api_docid_tests.docid.step);
-    unit_test_step.dependOn(&api_docid_tests.rows.step);
-    unit_test_step.dependOn(&api_docid_tests.sql_api_parity.step);
-    unit_test_step.dependOn(&api_docid_tests.internal_group_write_routes.step);
+    antfly_tests_build.dependOnAPIDocIdUnitTestRuns(unit_test_step, api_docid_tests);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -3467,7 +3459,6 @@ pub fn build(b: *std.Build) void {
         &graph_metric_tests.cleanup.step,
         &graph_metric_tests.degree_canary.step,
         &graph_metric_tests.default_gate.step,
-        &api_docid_tests.table_reads_graph_metric.step,
         &run_public_api_graph_metric_e2e_tests.step,
     });
 

@@ -5018,11 +5018,10 @@ test "foreign key local action schedule controller seeds durable action schedule
 
 test "foreign key local action schedule controller reports incomplete when budget remains" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-fk-action-schedule-controller-budget";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-action-schedule-controller-budget/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
