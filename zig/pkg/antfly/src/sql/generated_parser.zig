@@ -2303,9 +2303,11 @@ pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token
         },
         else => return err,
     };
-    const actions = generated.actionsForState(info.state);
-    const expected = try alloc.alloc([]const u8, actions.len);
-    for (actions, 0..) |action, idx| expected[idx] = generated.symbolName(action.terminal);
+    const expected_count = generated.expectedTerminalCountForState(info.state);
+    const expected = try alloc.alloc([]const u8, expected_count);
+    for (expected, 0..) |*name, idx| {
+        name.* = generated.expectedTerminalNameForState(info.state, idx) orelse return error.UnsupportedSqlShape;
+    }
     const span: DiagnosticSpan = if (info.token_index < tokens.len)
         .{ .start = tokens[info.token_index].source_start, .end = tokens[info.token_index].source_end, .actual = tokens[info.token_index].text }
     else

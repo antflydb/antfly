@@ -180753,6 +180753,16 @@ pub fn actionsForState(state: u16) []const Action {
     return actions[start .. start + range.len];
 }
 
+pub fn expectedTerminalCountForState(state: u16) usize {
+    return actionsForState(state).len;
+}
+
+pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8 {
+    const state_actions = actionsForState(state);
+    if (index >= state_actions.len) return null;
+    return symbolName(state_actions[index].terminal);
+}
+
 pub fn symbolName(id: u16) []const u8 {
     if (id >= symbols.len) return "";
     return symbols[id].name;

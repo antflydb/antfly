@@ -1205,9 +1205,11 @@ Those variants should become the normal dispatch boundary for binder and lowerer
 code.
 
 Generated parser diagnostics expose the parser state, lookahead symbol, token
-index, source byte span, actual token text, and expected terminal names. That is
-the parse-phase shape the dashboard REPL, CLI, HTTP SQL endpoint, and corpus
-tests should use instead of string-only unsupported reasons.
+index, source byte span, actual token text, and expected terminal names through
+generated per-state diagnostic helpers rather than SQL-layer action-table
+inspection. That is the parse-phase shape the dashboard REPL, CLI, HTTP SQL
+endpoint, and corpus tests should use instead of string-only unsupported
+reasons.
 
 ## Testing And Evidence
 

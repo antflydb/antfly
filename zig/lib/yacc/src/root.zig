@@ -952,6 +952,16 @@ fn emitZigMetadata(
         \\    return actions[start .. start + range.len];
         \\}
         \\
+        \\pub fn expectedTerminalCountForState(state: u16) usize {
+        \\    return actionsForState(state).len;
+        \\}
+        \\
+        \\pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8 {
+        \\    const state_actions = actionsForState(state);
+        \\    if (index >= state_actions.len) return null;
+        \\    return symbolName(state_actions[index].terminal);
+        \\}
+        \\
         \\pub fn symbolName(id: u16) []const u8 {
         \\    if (id >= symbols.len) return "";
         \\    return symbols[id].name;
@@ -1266,6 +1276,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseErrorWithStackBuffer(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenId(token: Token) u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenIdByName(name: []const u8) ?u16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalCountForState(state: u16) usize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState(state: u16, index: usize) ?[]const u8") != null);
 }
 
 test "generateZigMetadata rejects unexpected conflict count drift" {
