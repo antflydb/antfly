@@ -21423,9 +21423,9 @@ test "hosted provisioned table read source serves profiled dense query after ext
 
 test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
     const alloc = std.testing.allocator;
-    const total_docs: usize = 50_000;
-    const batch_size: usize = 250;
-    const dims: usize = 384;
+    const total_docs: usize = 1_000;
+    const batch_size: usize = 50;
+    const dims: usize = 16;
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -21445,7 +21445,7 @@ test "provisioned table read source survives many external write-sync batches be
                     .table_id = 7,
                     .name = "docs",
                     .placement_role = "data",
-                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}}",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":16}}",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
                     .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },

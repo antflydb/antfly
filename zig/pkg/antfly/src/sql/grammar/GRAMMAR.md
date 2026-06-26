@@ -1096,7 +1096,10 @@ contract until storage and API row plans grow those outer-join semantics.
    projection starts against the retained generated expression kind, so
    malformed generated `CURRENT_DATE`/`CURRENT_TIMESTAMP`, cast, case, concat,
    unary/logical, parenthesized, and function-call projection metadata fails
-   closed before fallback projection parsing can accept it; select-list,
+   closed before fallback projection parsing can accept it; fixed select-list
+   function branches now also validate the retained function-name token against
+   the typed branch, including accepted aliases such as `jsonb_typeof`;
+   select-list,
    `GROUP BY`, and order-expression item handoffs now also require the
    retained generated expression payload to be internally valid at the lookup
    boundary before the broad start-kind check is accepted. Aggregate

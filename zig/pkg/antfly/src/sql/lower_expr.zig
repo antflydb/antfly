@@ -1884,6 +1884,94 @@ fn generatedSelectItemStartAllowsExpressionKind(
     };
 }
 
+fn validateGeneratedSelectItemStartFunctionName(
+    tokens: []const Token,
+    start: SelectItemStart,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    switch (start) {
+        .uuid_v4,
+        .json_extract_path,
+        .json_typeof,
+        .json_array_length,
+        .json_build_object,
+        .convert_from,
+        .to_jsonb,
+        .array_length,
+        .array_position,
+        .array_to_string,
+        .string_to_array,
+        .coalesce,
+        .replace,
+        .regexp_replace,
+        .regexp_substr,
+        .regexp_match,
+        .regexp_count,
+        .regexp_instr,
+        .translate,
+        .nullif,
+        .ascii,
+        .chr,
+        .overlay,
+        .repeat,
+        .reverse,
+        .md5,
+        .starts_with,
+        .ends_with,
+        .date_trunc,
+        .date_bin,
+        .abs,
+        .round,
+        .mod,
+        .power,
+        => {},
+        else => return,
+    }
+
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const token = tokens[name_tokens.start];
+    const valid = switch (start) {
+        .uuid_v4 => sqlTokenIsUuidV4Function(token),
+        .json_extract_path => sqlTokenIsJsonExtractPathFunction(token),
+        .json_typeof => sqlTokenIsJsonTypeofFunction(token),
+        .json_array_length => sqlTokenIsJsonArrayLengthFunction(token),
+        .json_build_object => sqlTokenIsJsonBuildObjectFunction(token),
+        .convert_from => token.matchesKeywordTag(.convert_from),
+        .to_jsonb => token.matchesKeywordTag(.to_jsonb),
+        .array_length => sqlTokenIsArrayLengthFunction(token),
+        .array_position => sqlTokenIsArrayPositionFunction(token),
+        .array_to_string => sqlTokenIsArrayToStringFunction(token),
+        .string_to_array => token.matchesKeywordTag(.string_to_array),
+        .coalesce => token.matchesKeywordTag(.coalesce),
+        .replace => token.matchesKeywordTag(.replace),
+        .regexp_replace => token.matchesKeywordTag(.regexp_replace),
+        .regexp_substr => sqlTokenIsRegexpSubstrFunction(token),
+        .regexp_match => sqlTokenIsRegexpMatchFunction(token),
+        .regexp_count => sqlTokenIsRegexpCountFunction(token),
+        .regexp_instr => sqlTokenIsRegexpInstrFunction(token),
+        .translate => sqlTokenIsTranslateFunction(token),
+        .nullif => token.matchesKeywordTag(.nullif),
+        .ascii => sqlTokenIsAsciiFunction(token),
+        .chr => sqlTokenIsChrFunction(token),
+        .overlay => sqlTokenIsOverlayFunction(token),
+        .repeat => sqlTokenIsRepeatFunction(token),
+        .reverse => sqlTokenIsReverseFunction(token),
+        .md5 => sqlTokenIsMd5Function(token),
+        .starts_with => sqlTokenIsStartsWithFunction(token),
+        .ends_with => sqlTokenIsEndsWithFunction(token),
+        .date_trunc => sqlTokenIsDateTruncFunction(token),
+        .date_bin => sqlTokenIsDateBinFunction(token),
+        .abs => token.matchesKeywordTag(.abs),
+        .round => token.matchesKeywordTag(.round),
+        .mod => token.matchesKeywordTag(.mod),
+        .power => token.matchesKeywordTag(.power),
+        else => unreachable,
+    };
+    if (!valid) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedSelectItemStartForExpression(
     tokens: []const Token,
     start: SelectItemStart,
@@ -1892,6 +1980,7 @@ fn validateGeneratedSelectItemStartForExpression(
     const expression = generated_expression orelse return;
     try validateGeneratedExpressionPayloads(tokens, expression.*);
     if (!generatedSelectItemStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
+    try validateGeneratedSelectItemStartFunctionName(tokens, start, expression.*);
 }
 
 fn validateGeneratedSimpleGroupExpression(
@@ -33111,6 +33200,24 @@ fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(parsed_sql
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len < 2) return error.TestUnexpectedResult;
+                    _ = read.projection_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
+                    const second_name_tokens = read.projection_items.expressions[1].function_name_tokens orelse return error.TestUnexpectedResult;
+                    read.projection_items.expressions[0].function_name_tokens = second_name_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedSubqueryTailLimitExpressionRange(
     expression: *generated_parser.GeneratedSqlExpressionAst,
     replacement: generated_parser.GeneratedSqlTokenRange,
@@ -34723,6 +34830,20 @@ test "sql adapter lower expr lowers jsonb containment existence and extraction p
     try std.testing.expectEqual(@as(usize, 1), to_jsonb_order.plan.query.order_by.len);
     try std.testing.expect(to_jsonb_order.plan.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.to_jsonb, to_jsonb_order.plan.query.order_by[0].expression.?.kind);
+
+    var malformed_generated_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT jsonb_typeof(metadata->'flags') AS flags_type, to_jsonb(id) AS id_json FROM usage_records WHERE id = $1",
+    );
+    defer malformed_generated_function_name.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(&malformed_generated_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_function_name,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
 
     var convert_from = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
