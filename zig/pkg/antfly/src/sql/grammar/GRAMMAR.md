@@ -992,10 +992,11 @@ Unsupported DDL remains on the existing parser until
    kinds or quantifier payloads cannot be accepted by the legacy expression
    lowering paths; generated scalar `OR`/`NOT` predicate groups now thread the
    same child metadata into scalar comparison, boolean-test, `IN`, and
-   quantified-list expansion branches; scalar atom and access predicate
-   lowering now consumes generated metadata for containment, overlap, JSON key
+   quantified-list expansion branches; scalar atom, access predicate, and
+   direct join `WHERE` predicate lowering now consume generated metadata for
+   containment, overlap, JSON key
    existence, JSON extract comparisons, pattern, range, membership, null-test,
-   boolean-test, and comparison operator families; generated logical `OR`/`AND`
+   boolean-test, quantified, and comparison operator families; generated logical `OR`/`AND`
    condition-list items are now
    threaded into expression alternative lowering, including inside generated
    logical `NOT` groups, so child predicate metadata is validated while

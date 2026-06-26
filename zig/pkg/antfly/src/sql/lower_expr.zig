@@ -25778,7 +25778,7 @@ pub fn parseJoinWhereAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
-        const generated_atom_expression = generatedSingleWhereAtomExpression(tokens, pos.*, generated_expression_ast);
+        const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
 
         if (try joinedMutationExpressionSideAt(tokens, pos.*, left_alias, right_alias, string_to_array_predicate_is_containment)) |expression_side| {
             try parseJoinedMutationExpressionWhereConditionWithContextAlloc(
@@ -25809,6 +25809,7 @@ pub fn parseJoinWhereAlloc(
         const target_expression_or_predicates = if (side == .left) targets.left_expression_or_predicates else targets.right_expression_or_predicates;
 
         if (parser.matchToken(tokens, pos, .at_contains) != null) {
+            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .contains);
             const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
@@ -25828,6 +25829,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
+            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .json_key_exists);
             if (column.field_type != .json) return error.InvalidSqlCatalog;
             const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
             var path_transferred = false;
@@ -25843,6 +25845,9 @@ pub fn parseJoinWhereAlloc(
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+            const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
+            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+            try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, generated_requires_quantifier);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -25850,11 +25855,15 @@ pub fn parseJoinWhereAlloc(
         if (parser.matchKeyword(tokens, pos, "not")) {
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+                const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
+                const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+                try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, generated_requires_quantifier);
                 try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
             try parser.expectKeyword(tokens, pos, "in");
+            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .not_in_list);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -25870,6 +25879,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
+            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .in_list);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -25889,6 +25899,7 @@ pub fn parseJoinWhereAlloc(
             .allow_boolean_literal = true,
             .allow_boolean_literal_negation = true,
         })) |is_tail| blk: {
+            try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedIsTailExpressionKind(is_tail));
             switch (is_tail.kind) {
                 .distinct_comparison, .null_test => {},
                 .boolean_unknown => {
@@ -25940,6 +25951,7 @@ pub fn parseJoinWhereAlloc(
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
+        try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedComparisonExpressionKindForOp(op));
         const value_json = if (op == .is_null or op == .is_not_null)
             null
         else if (column.field_type == .array and op == .eq)
@@ -39132,7 +39144,7 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
 test "sql adapter lower expr lowers equality join queries" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"enabled":{"type":"boolean"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"enabled":{"type":"boolean"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -39214,6 +39226,45 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
         alloc,
         &malformed_generated_join_predicate,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_join_where_child = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer'",
+    );
+    defer malformed_generated_join_where_child.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_join_where_child, .contains);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_where_child,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_join_where_contains = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.tags @> ARRAY['hot']",
+    );
+    defer malformed_generated_join_where_contains.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_join_where_contains, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_where_contains,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_join_where_json_key = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE c.metadata ? 'source'",
+    );
+    defer malformed_generated_join_where_json_key.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_join_where_json_key, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_where_json_key,
         schema,
         &.{},
     ));
