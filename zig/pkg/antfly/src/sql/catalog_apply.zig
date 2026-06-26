@@ -18,7 +18,6 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl.zig");
-const fingerprint = @import("fingerprint.zig");
 const lower_expr = @import("lower_expr.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -1765,6 +1764,31 @@ fn logicalDdlPlanForCatalogApplyTestAlloc(
     return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
 }
 
+fn ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc: std.mem.Allocator, plan: binder.LogicalSqlPlan) ![]u8 {
+    return switch (plan) {
+        .other_ddl => |other| switch (other) {
+            .adapter_noop => |noop| try std.fmt.allocPrint(alloc, "adapter_noop:ddl:reason={s}", .{@tagName(noop.reason)}),
+            .moved => error.TestUnexpectedResult,
+        },
+        .catalog_ddl => |catalog| switch (catalog) {
+            .comment_metadata => |comment| if (comment.parent_table_name) |parent_table|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:comment:kind={s}:object={s}:table={s}:comment={}",
+                    .{ @tagName(comment.target), comment.object_name, parent_table, comment.comment_json != null },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:comment:kind={s}:object={s}:comment={}",
+                    .{ @tagName(comment.target), comment.object_name, comment.comment_json != null },
+                ),
+            else => error.TestUnexpectedResult,
+        },
+        else => error.TestUnexpectedResult,
+    };
+}
+
 fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected: []const ddl_plan.AppliedDdlWorkAction) !void {
     try std.testing.expectEqual(expected.len, applied.work_items.len);
     for (expected, 0..) |action, i| {
@@ -1954,11 +1978,14 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     var create_public_schema = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
     defer create_public_schema.deinit(alloc);
     const create_public_schema_noop = switch (create_public_schema) {
-        .adapter_noop => |plan| plan,
+        .other_ddl => |other| switch (other) {
+            .adapter_noop => |plan| plan,
+            else => return error.TestUnexpectedResult,
+        },
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.schema_namespace, create_public_schema_noop.reason);
-    const create_public_schema_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_public_schema);
+    const create_public_schema_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_public_schema);
     defer alloc.free(create_public_schema_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=schema_namespace", create_public_schema_fingerprint);
     var public_schema_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_public_schema);
@@ -1968,11 +1995,14 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     var create_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;");
     defer create_extension.deinit(alloc);
     const create_extension_noop = switch (create_extension) {
-        .adapter_noop => |plan| plan,
+        .other_ddl => |other| switch (other) {
+            .adapter_noop => |plan| plan,
+            else => return error.TestUnexpectedResult,
+        },
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_extension_noop.reason);
-    const create_extension_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_extension);
+    const create_extension_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_extension);
     defer alloc.free(create_extension_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_extension_fingerprint);
     var extension_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension);
@@ -1982,17 +2012,20 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
     var create_public_extension = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
     defer create_public_extension.deinit(alloc);
     const create_public_extension_noop = switch (create_public_extension) {
-        .adapter_noop => |plan| plan,
+        .other_ddl => |other| switch (other) {
+            .adapter_noop => |plan| plan,
+            else => return error.TestUnexpectedResult,
+        },
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_public_extension_noop.reason);
-    const create_public_extension_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_public_extension);
+    const create_public_extension_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, create_public_extension);
     defer alloc.free(create_public_extension_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_public_extension_fingerprint);
 
     var table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS 'metered usage rows';");
     defer table_comment.deinit(alloc);
-    const table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, table_comment);
+    const table_comment_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, table_comment);
     defer alloc.free(table_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=true", table_comment_fingerprint);
     var table_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_comment);
@@ -2001,7 +2034,7 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
 
     var column_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN users.email IS 'contact address';");
     defer column_comment.deinit(alloc);
-    const column_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, column_comment);
+    const column_comment_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, column_comment);
     defer alloc.free(column_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=column:object=users.email:comment=true", column_comment_fingerprint);
     var column_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, table_commented.schema_json, column_comment);
@@ -2015,7 +2048,7 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
 
     var index_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX users_email_comment_idx IS 'email lookup';");
     defer index_comment.deinit(alloc);
-    const index_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, index_comment);
+    const index_comment_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, index_comment);
     defer alloc.free(index_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=index:object=users_email_comment_idx:comment=true", index_comment_fingerprint);
     var index_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, comment_indexed.schema_json, index_comment);
@@ -2024,7 +2057,7 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
 
     var constraint_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT users_updated_check ON users IS 'valid status';");
     defer constraint_comment.deinit(alloc);
-    const constraint_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, constraint_comment);
+    const constraint_comment_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, constraint_comment);
     defer alloc.free(constraint_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=constraint:object=users_updated_check:table=users:comment=true", constraint_comment_fingerprint);
     var constraint_commented = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, index_commented.schema_json, constraint_comment);
@@ -2033,7 +2066,7 @@ test "catalog apply applies adapter noops and comment ddl to public schema json"
 
     var clear_table_comment = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS NULL;");
     defer clear_table_comment.deinit(alloc);
-    const clear_table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, clear_table_comment);
+    const clear_table_comment_fingerprint = try ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc, clear_table_comment);
     defer alloc.free(clear_table_comment_fingerprint);
     try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=false", clear_table_comment_fingerprint);
     var table_comment_cleared = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, constraint_commented.schema_json, clear_table_comment);

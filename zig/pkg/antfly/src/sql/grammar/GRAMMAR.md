@@ -1103,6 +1103,9 @@ contract until storage and API row plans grow those outer-join semantics.
    typed aggregate op before accepting aggregate argument/filter metadata, and
    typed window specs validate the retained function-name token before
    accepting generated `OVER` metadata;
+   scalar expression predicate lowering now validates exact-range generated
+   function-call metadata against the typed row-expression function kind before
+   accepting retained predicate payloads;
    select-list,
    `GROUP BY`, and order-expression item handoffs now also require the
    retained generated expression payload to be internally valid at the lookup

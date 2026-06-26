@@ -2720,6 +2720,143 @@ pub const ExpressionWhereConditionRowParserOptions = struct {
 pub const ExpressionWhereConditionsParserOptions = ExpressionWhereConditionRowParserOptions;
 pub const ExpressionWhereConditionAlternativesParserOptions = ExpressionWhereConditionRowParserOptions;
 
+fn generatedExpressionForExactRange(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    if (expression.tokens) |tokens_range| {
+        if (generatedTokenRangeEqual(tokens_range, range)) return expression;
+    }
+    if (expression.inner_expression) |inner| {
+        if (generatedExpressionForExactRange(inner, range)) |found| return found;
+    }
+    if (expression.left_expression) |left| {
+        if (generatedExpressionForExactRange(left, range)) |found| return found;
+    }
+    if (expression.right_expression) |right| {
+        if (generatedExpressionForExactRange(right, range)) |found| return found;
+    }
+    for (expression.argument_items.expressions) |*argument| {
+        if (generatedExpressionForExactRange(argument, range)) |found| return found;
+    }
+    for (expression.array_items.expressions) |*item| {
+        if (generatedExpressionForExactRange(item, range)) |found| return found;
+    }
+    if (expression.filter_expression) |filter| {
+        if (generatedExpressionForExactRange(filter, range)) |found| return found;
+    }
+    if (expression.over_frame_start_expression) |frame_start| {
+        if (generatedExpressionForExactRange(frame_start, range)) |found| return found;
+    }
+    if (expression.over_frame_end_expression) |frame_end| {
+        if (generatedExpressionForExactRange(frame_end, range)) |found| return found;
+    }
+    if (expression.subquery_where_expression) |where_expression| {
+        if (generatedExpressionForExactRange(where_expression, range)) |found| return found;
+    }
+    if (expression.subquery_tail) |tail| {
+        if (tail.limit_expression) |limit_expression| {
+            if (generatedExpressionForExactRange(limit_expression, range)) |found| return found;
+        }
+        if (tail.offset_expression) |offset_expression| {
+            if (generatedExpressionForExactRange(offset_expression, range)) |found| return found;
+        }
+        if (tail.fetch_count_expression) |fetch_expression| {
+            if (generatedExpressionForExactRange(fetch_expression, range)) |found| return found;
+        }
+    }
+    return null;
+}
+
+fn generatedFunctionNameMatchesRowExpressionKind(
+    token: Token,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) ?bool {
+    return switch (kind) {
+        .uuid_v4 => sqlTokenIsUuidV4Function(token),
+        .coalesce => token.matchesKeywordTag(.coalesce),
+        .lower => token.matchesKeywordTag(.lower),
+        .upper => token.matchesKeywordTag(.upper),
+        .initcap => sqlTokenIsInitcapFunction(token),
+        .trim => token.matchesKeywordTag(.trim) or token.matchesKeywordTag(.btrim),
+        .ltrim => token.matchesKeywordTag(.ltrim),
+        .rtrim => token.matchesKeywordTag(.rtrim),
+        .replace => token.matchesKeywordTag(.replace),
+        .regexp_replace => token.matchesKeywordTag(.regexp_replace),
+        .regexp_substr => sqlTokenIsRegexpSubstrFunction(token),
+        .regexp_count => sqlTokenIsRegexpCountFunction(token),
+        .regexp_instr => sqlTokenIsRegexpInstrFunction(token),
+        .translate => sqlTokenIsTranslateFunction(token),
+        .concat => token.matchesKeywordTag(.concat),
+        .concat_ws => token.matchesKeywordTag(.concat_ws),
+        .nullif => token.matchesKeywordTag(.nullif),
+        .length => sqlTokenIsLengthFunction(token),
+        .octet_length => sqlTokenIsOctetLengthFunction(token),
+        .bit_length => sqlTokenIsBitLengthFunction(token),
+        .ascii => sqlTokenIsAsciiFunction(token),
+        .chr => sqlTokenIsChrFunction(token),
+        .substring => sqlTokenIsSubstringFunction(token),
+        .overlay => sqlTokenIsOverlayFunction(token),
+        .split_part => sqlTokenIsSplitPartFunction(token),
+        .strpos => sqlTokenIsStrposFunction(token),
+        .left => token.matchesKeywordTag(.left),
+        .right => token.matchesKeywordTag(.right),
+        .lpad => token.matchesKeywordTag(.lpad),
+        .rpad => token.matchesKeywordTag(.rpad),
+        .repeat => sqlTokenIsRepeatFunction(token),
+        .reverse => sqlTokenIsReverseFunction(token),
+        .md5 => sqlTokenIsMd5Function(token),
+        .starts_with => sqlTokenIsStartsWithFunction(token),
+        .ends_with => sqlTokenIsEndsWithFunction(token),
+        .regexp_match => sqlTokenIsRegexpMatchFunction(token),
+        .date_trunc => sqlTokenIsDateTruncFunction(token),
+        .date_bin => sqlTokenIsDateBinFunction(token),
+        .date_part => sqlTokenIsDatePartFunction(token),
+        .abs => token.matchesKeywordTag(.abs),
+        .round => token.matchesKeywordTag(.round),
+        .trunc => token.matchesKeywordTag(.trunc),
+        .floor => token.matchesKeywordTag(.floor),
+        .ceil => token.matchesKeywordTag(.ceil),
+        .sqrt => token.matchesKeywordTag(.sqrt),
+        .sign => token.matchesKeywordTag(.sign),
+        .power => token.matchesKeywordTag(.power),
+        .mod => token.matchesKeywordTag(.mod),
+        .greatest => token.matchesKeywordTag(.greatest),
+        .least => token.matchesKeywordTag(.least),
+        .json_extract => sqlTokenIsJsonExtractPathFunction(token),
+        .json_typeof => sqlTokenIsJsonTypeofFunction(token),
+        .json_array_length => sqlTokenIsJsonArrayLengthFunction(token),
+        .json_build_object => sqlTokenIsJsonBuildObjectFunction(token),
+        .to_jsonb => token.matchesKeywordTag(.to_jsonb),
+        .array_length => sqlTokenIsArrayLengthFunction(token),
+        .array_position => token.matchesKeywordTag(.array_position),
+        .array_positions => token.matchesKeywordTag(.array_positions),
+        .array_append => token.matchesKeywordTag(.array_append),
+        .array_prepend => token.matchesKeywordTag(.array_prepend),
+        .array_cat => token.matchesKeywordTag(.array_cat),
+        .array_remove => token.matchesKeywordTag(.array_remove),
+        .array_replace => token.matchesKeywordTag(.array_replace),
+        .array_to_string => sqlTokenIsArrayToStringFunction(token),
+        .string_to_array => token.matchesKeywordTag(.string_to_array),
+        else => null,
+    };
+}
+
+fn validateGeneratedRowExpressionFunctionIdentity(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const root = generated_expression_ast orelse return;
+    const generated_expression = generatedExpressionForExactRange(root, range) orelse return;
+    if (generated_expression.kind != .function_call) return;
+    const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
+    if (generatedFunctionNameMatchesRowExpressionKind(token, parsed_expression.kind)) |matches| {
+        if (!matches) return error.UnsupportedSqlShape;
+    }
+}
+
 fn parseExpressionWhereConditionRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2727,7 +2864,8 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     options: ExpressionWhereConditionRowParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    return try parseRowExpressionAlloc(
+    const start = pos.*;
+    const expression = try parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -2736,6 +2874,14 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
         options.arithmetic_hooks,
         options.variadic_hooks,
     );
+    errdefer freeExpression(alloc, expression);
+    try validateGeneratedRowExpressionFunctionIdentity(
+        tokens,
+        .{ .start = start, .end = pos.* },
+        expression,
+        options.generated_expression_ast,
+    );
+    return expression;
 }
 
 pub const JoinedExpressionParserContext = struct {
@@ -4906,14 +5052,12 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
 
-    const lhs = try parseRowExpressionAlloc(
+    const lhs = try parseExpressionWhereConditionRowExpressionAlloc(
         alloc,
         tokens,
         pos,
         type_context,
-        options.row_expression_hooks,
-        options.arithmetic_hooks,
-        options.variadic_hooks,
+        options,
     );
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
@@ -33287,6 +33431,25 @@ fn corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(parsed_sql:
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadWhereLeftFunctionNameToFirstProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    const projection_name_tokens = read.projection_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
+                    const left_expression = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
+                    _ = left_expression.function_name_tokens orelse return error.TestUnexpectedResult;
+                    left_expression.function_name_tokens = projection_name_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedSubqueryTailLimitExpressionRange(
     expression: *generated_parser.GeneratedSqlExpressionAst,
     replacement: generated_parser.GeneratedSqlTokenRange,
@@ -37204,6 +37367,20 @@ test "sql adapter lower expr lowers scalar function expressions" {
         &malformed_generated_function_argument,
         schema,
         &.{.{ .string = "u1" }},
+        .{},
+    ));
+
+    var malformed_generated_predicate_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT to_jsonb(id) AS id_json FROM usage_records WHERE lower(status) = $1",
+    );
+    defer malformed_generated_predicate_function_name.deinit(alloc);
+    try corruptGeneratedReadWhereLeftFunctionNameToFirstProjection(&malformed_generated_predicate_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_predicate_function_name,
+        schema,
+        &.{.{ .string = "open" }},
         .{},
     ));
 
