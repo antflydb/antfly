@@ -422,6 +422,35 @@ fn assertDBRootForwardersDoNotAccessSelfMembers(source: []const u8) void {
     }
 }
 
+fn enclosingPublicFunctionStart(source: []const u8, offset: usize) ?usize {
+    var search_end = @min(offset, source.len);
+    while (std.mem.lastIndexOf(u8, source[0..search_end], "\n    pub fn ")) |line_start| {
+        const fn_start = line_start + 1;
+        if (fn_start < offset) return fn_start;
+        search_end = line_start;
+    }
+    return null;
+}
+
+fn assertDBRootAfterGateForwardersHaveDurableGate(source: []const u8) void {
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, "AfterGate(")) |after_gate_start| {
+        const fn_start = enclosingPublicFunctionStart(source, after_gate_start) orelse {
+            std.debug.panic(
+                "storage/db/db.zig calls an AfterGate implementation helper at line {} outside a public DB forwarding method",
+                .{lineNumberForOffset(source, after_gate_start)},
+            );
+        };
+        if (std.mem.indexOf(u8, source[fn_start..after_gate_start], "enforceDurableMutationGate(self)") == null) {
+            std.debug.panic(
+                "storage/db/db.zig calls an AfterGate implementation helper at line {} without first enforcing the DB durable mutation gate in the same public method",
+                .{lineNumberForOffset(source, after_gate_start)},
+            );
+        }
+        search_index = after_gate_start + "AfterGate(".len;
+    }
+}
+
 fn assertDBSourceDoesNotUseMixins(path: []const u8, source: []const u8) void {
     if (std.mem.indexOf(u8, source, "usingnamespace")) |start| {
         std.debug.panic(
@@ -448,6 +477,35 @@ fn assertDBTestRootImportsPath(test_root_source: []const u8, import_path: []cons
         "{s} must explicitly import {s} because that DB implementation module owns inline tests",
         .{ db_test_root_path, import_path },
     );
+}
+
+fn assertDBStandaloneTestFilesReachable(b: *std.Build, test_root_source: []const u8) void {
+    var dir = b.build_root.handle.openDir(b.graph.io, db_source_root, .{ .iterate = true }) catch |err| {
+        std.debug.panic("failed to open {s} for DB standalone test reachability guardrail: {}", .{ db_source_root, err });
+    };
+    defer dir.close(b.graph.io);
+
+    var walker = dir.walk(b.allocator) catch |err| {
+        std.debug.panic("failed to walk {s} for DB standalone test reachability guardrail: {}", .{ db_source_root, err });
+    };
+    defer walker.deinit();
+
+    while (walker.next(b.graph.io) catch |err| {
+        std.debug.panic("failed to scan {s} for DB standalone test reachability guardrail: {}", .{ db_source_root, err });
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOfScalar(u8, entry.path, '/') != null) continue;
+        if (!std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
+
+        const import_path = std.fmt.allocPrint(b.allocator, "storage/db/{s}", .{entry.path}) catch |err| {
+            std.debug.panic("failed to build DB standalone test import path for {s}: {}", .{ entry.path, err });
+        };
+        if (std.mem.indexOf(u8, test_root_source, import_path) != null) continue;
+        std.debug.panic(
+            "{s} must explicitly import {s} so standalone DB test files stay reachable from lib-db-test/db-test",
+            .{ db_test_root_path, import_path },
+        );
+    }
 }
 
 fn importPathForAlias(source: []const u8, alias: []const u8) ?[]const u8 {
@@ -608,7 +666,9 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     assertDBRootDoesNotOwnInlineTests(source);
     assertDBRootDoesNotOwnPrivateHelpers(source);
     assertDBRootForwardersDoNotAccessSelfMembers(source);
+    assertDBRootAfterGateForwardersHaveDurableGate(source);
     assertDBTestRootImportsDBAggregateRoot(test_root_source);
+    assertDBStandaloneTestFilesReachable(b, test_root_source);
     assertDBInstantiatedImplContracts(b, source, test_root_source);
     assertDBImplementationModuleContract(b);
 }

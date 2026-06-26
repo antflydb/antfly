@@ -1190,12 +1190,14 @@ pub const DB = struct {
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
         try ha_replication_impl.enforceDurableMutationGate(self);
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.reloadAlgebraicSchemaConfigsAfterGate(self, schema_json);
     }
 
     pub fn schemaRuntimeStageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
         try ha_replication_impl.enforceDurableMutationGate(self);
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.stageAlgebraicSchemaConfigsPending(self, schema_json);
     }
 

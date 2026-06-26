@@ -2324,34 +2324,78 @@ pub fn isGeneratedGateTokens(tokens: []const token_mod.Token) bool {
 }
 
 pub fn diagnosticAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlDiagnostic {
-    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
-    const info = if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids|
-        try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null
-    else |err| switch (err) {
-        error.NoSpaceLeft => fallback: {
-            const token_ids = try tokenIdsAlloc(alloc, tokens);
-            defer alloc.free(token_ids);
-            break :fallback try parseGeneratedTokenIdsError(alloc, token_ids) orelse return null;
-        },
-        else => return err,
-    };
+    var diagnostic_tokens = try diagnosticTokenIdsAlloc(alloc, tokens);
+    defer diagnostic_tokens.deinit(alloc);
+
+    const info = try parseGeneratedTokenIdsError(alloc, diagnostic_tokens.token_ids) orelse return null;
+    const source_token_index = diagnostic_tokens.sourceTokenIndex(info.token_index);
     const expected_count = generated.expectedTerminalCountForState(info.state);
     const expected = try alloc.alloc([]const u8, expected_count);
     for (expected, 0..) |*name, idx| {
         name.* = generated.expectedTerminalNameForState(info.state, idx) orelse return error.UnsupportedSqlShape;
     }
-    const span: DiagnosticSpan = if (info.token_index < tokens.len)
-        .{ .start = tokens[info.token_index].source_start, .end = tokens[info.token_index].source_end, .actual = tokens[info.token_index].text }
+    const span: DiagnosticSpan = if (source_token_index < tokens.len)
+        .{ .start = tokens[source_token_index].source_start, .end = tokens[source_token_index].source_end, .actual = tokens[source_token_index].text }
     else
-        .{ .start = if (tokens.len == 0) 0 else tokens[tokens.len - 1].source_end, .end = if (tokens.len == 0) 0 else tokens[tokens.len - 1].source_end, .actual = "$end" };
+        .{ .start = diagnostic_tokens.endSourceOffset(tokens), .end = diagnostic_tokens.endSourceOffset(tokens), .actual = "$end" };
     return .{
         .state = info.state,
         .lookahead = info.lookahead,
-        .token_index = info.token_index,
+        .token_index = source_token_index,
         .source_start = span.start,
         .source_end = span.end,
         .expected = expected,
         .actual = span.actual,
+    };
+}
+
+const DiagnosticTokenIds = struct {
+    token_ids: []u16,
+    source_indexes: []usize,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.token_ids);
+        alloc.free(self.source_indexes);
+        self.* = .{ .token_ids = &.{}, .source_indexes = &.{} };
+    }
+
+    fn sourceTokenIndex(self: @This(), generated_token_index: usize) usize {
+        if (generated_token_index < self.source_indexes.len) return self.source_indexes[generated_token_index];
+        return if (self.source_indexes.len == 0) 0 else self.source_indexes[self.source_indexes.len - 1] + 1;
+    }
+
+    fn endSourceOffset(self: @This(), tokens: []const token_mod.Token) usize {
+        const end_token = self.sourceTokenIndex(self.source_indexes.len);
+        if (end_token == 0) return 0;
+        if (tokens.len == 0) return 0;
+        const previous = @min(end_token - 1, tokens.len - 1);
+        return tokens[previous].source_end;
+    }
+};
+
+fn diagnosticTokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !DiagnosticTokenIds {
+    var ids: std.ArrayListUnmanaged(u16) = .empty;
+    var source_indexes: std.ArrayListUnmanaged(usize) = .empty;
+    errdefer ids.deinit(alloc);
+    errdefer source_indexes.deinit(alloc);
+
+    var sink = TokenIdSink{ .list = .{ .items = &ids, .alloc = alloc } };
+    for (tokens, 0..) |tok, index| {
+        if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
+        const prev = if (index > 0) tokens[index - 1] else null;
+        const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
+        const before = ids.items.len;
+        try appendTokenIds(&sink, tokens, index, tok, prev, next);
+        const added = ids.items.len - before;
+        try source_indexes.ensureUnusedCapacity(alloc, added);
+        for (0..added) |_| source_indexes.appendAssumeCapacity(index);
+    }
+
+    const token_ids = try ids.toOwnedSlice(alloc);
+    errdefer alloc.free(token_ids);
+    return .{
+        .token_ids = token_ids,
+        .source_indexes = try source_indexes.toOwnedSlice(alloc),
     };
 }
 
@@ -12295,6 +12339,18 @@ test "generated SQL parser reports source-aware diagnostics" {
     try std.testing.expect(diagnostic.expected.len > 0);
     try std.testing.expectEqualStrings(")", diagnostic.actual);
     try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+}
+
+test "generated SQL parser diagnostics map generated token indexes to source tokens" {
+    const sql = "SELECT public.docs. FROM public.docs";
+    var tokens = try lexer.tokenizeAlloc(std.testing.allocator, sql);
+    defer lexer.freeTokens(std.testing.allocator, &tokens);
+    const diagnostic = try diagnosticAlloc(std.testing.allocator, tokens.items) orelse return error.ExpectedDiagnostic;
+    defer std.testing.allocator.free(diagnostic.expected);
+    try std.testing.expect(diagnostic.token_index <= tokens.items.len);
+    try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+    try std.testing.expect(diagnostic.source_end <= sql.len);
+    try std.testing.expect(diagnostic.expected.len > 0);
 }
 
 test "generated SQL parser reports bounded diagnostics for malformed corpus" {
