@@ -1532,8 +1532,12 @@ fn generatedGraphAstHasValidClassificationPayload(
     };
     if (graph_ast.kind != expected_kind) return false;
     const end = generatedGraphStatementEnd(tokens, graph_ast.statement_span) orelse return false;
-    _ = end;
-    return std.meta.eql(graph_ast.command_span, tokens[0].sourceSpan());
+    if (!std.meta.eql(graph_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.object_name_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.source_name_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.algorithm_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.option_tokens)) return false;
+    return generatedGraphRequiredPayloadIsValid(tokens, end, graph_ast);
 }
 
 fn generatedGraphStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
@@ -1546,6 +1550,58 @@ fn generatedGraphStatementEnd(tokens: []const Token, statement_span: SourceSpan)
     if (tokens[0].sourceSpan().start != statement_span.start) return null;
     if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
     return end;
+}
+
+fn generatedGraphOptionalTokenRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
+    return true;
+}
+
+fn generatedGraphRequiredPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    graph_ast: generated_parser.GeneratedSqlGraphAst,
+) bool {
+    return switch (graph_ast.kind) {
+        .create_index, .create_metric => {
+            if (end < 6) return false;
+            if (!tokens[0].matchesKeywordTag(.create) or !tokens[1].matchesKeywordTag(.graph)) return false;
+            if (graph_ast.kind == .create_index and !tokens[2].matchesKeywordTag(.index)) return false;
+            if (graph_ast.kind == .create_metric and !tokens[2].matchesKeywordTag(.metric)) return false;
+            if (!std.meta.eql(graph_ast.object_name_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 })) return false;
+            const source = graph_ast.source_name_tokens orelse return false;
+            if (source.start == 0 or source.end > end or !tokens[source.start - 1].matchesKeywordTag(.on)) return false;
+            if (!generatedGraphOptionsFollow(end, source.end, graph_ast.option_tokens)) return false;
+            return true;
+        },
+        .alter_metric => {
+            if (end < 8) return false;
+            if (!tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.graph) or !tokens[2].matchesKeywordTag(.index)) return false;
+            if (!std.meta.eql(graph_ast.source_name_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 })) return false;
+            const metric = graph_ast.object_name_tokens orelse return false;
+            if (metric.start < 2 or metric.end > end) return false;
+            if (!tokens[metric.start - 2].matchesKeywordTag(.add) or !tokens[metric.start - 1].matchesKeywordTag(.metric)) return false;
+            const algorithm = graph_ast.algorithm_tokens orelse return false;
+            if (algorithm.start == 0 or algorithm.end > end or !tokens[algorithm.start - 1].matchesKeywordTag(.using)) return false;
+            if (!generatedGraphOptionsFollow(end, algorithm.end, graph_ast.option_tokens)) return false;
+            return true;
+        },
+    };
+}
+
+fn generatedGraphOptionsFollow(
+    end: usize,
+    required_end: usize,
+    options: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (options) |range| {
+        return range.start == required_end and range.end == end and range.start < range.end;
+    }
+    return required_end == end;
 }
 
 fn generatedUnsupportedAstHasValidClassificationPayload(
@@ -6216,7 +6272,17 @@ test "sql adapter parsed sql retains generated graph nodes as DDL" {
             else => return error.TestUnexpectedResult,
         }
         switch (parsed.generated_statement.?.ast.?) {
-            .graph => |graph_ast| try std.testing.expectEqual(case.generated, graph_ast.kind),
+            .graph => |graph_ast| {
+                try std.testing.expectEqual(case.generated, graph_ast.kind);
+                try std.testing.expect(graph_ast.object_name_tokens != null);
+                switch (case.generated) {
+                    .create_index, .create_metric => try std.testing.expect(graph_ast.source_name_tokens != null),
+                    .alter_metric => {
+                        try std.testing.expect(graph_ast.source_name_tokens != null);
+                        try std.testing.expect(graph_ast.algorithm_tokens != null);
+                    },
+                }
+            },
             else => return error.TestUnexpectedResult,
         }
         switch (parsed.statement) {
@@ -6224,4 +6290,18 @@ test "sql adapter parsed sql retains generated graph nodes as DDL" {
             else => return error.TestUnexpectedResult,
         }
     }
+
+    var malformed = try ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank");
+    defer malformed.deinit(alloc);
+    var malformed_generated = malformed.generated_statement.?;
+    if (malformed_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph| graph.algorithm_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    malformed.statement = parseStatement(malformed.raw_statement, malformed_generated, &malformed.tokenized_sql);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(malformed.statement));
 }

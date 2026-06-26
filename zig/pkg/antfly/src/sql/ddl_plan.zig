@@ -4628,6 +4628,57 @@ fn validateGeneratedGraphAstSpans(
         return error.UnsupportedSqlShape;
     }
     if (end < 2 or !tokens[1].matchesKeywordTag(.graph)) return error.UnsupportedSqlShape;
+    try validateGeneratedGraphAstRanges(tokens, end, ast);
+}
+
+fn validateGeneratedGraphAstRanges(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !void {
+    switch (ast.kind) {
+        .create_index, .create_metric => {
+            if (end < 6) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
+            if (ast.kind == .create_index and !tokens[2].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
+            if (ast.kind == .create_metric and !tokens[2].matchesKeywordTag(.metric)) return error.UnsupportedSqlShape;
+            _ = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 3, end);
+            const source_range = ast.source_name_tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedRangeWithinStatement(source_range, end) or source_range.start == 0 or !tokens[source_range.start - 1].matchesKeywordTag(.on)) {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedGraphOptions(end, source_range.end, ast.option_tokens);
+        },
+        .alter_metric => {
+            if (end < 8) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeywordTag(.alter) or !tokens[2].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
+            _ = try requireGeneratedTokenRangeAt(ast.source_name_tokens, 3, end);
+            const metric_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedRangeWithinStatement(metric_range, end) or metric_range.start < 2 or
+                !tokens[metric_range.start - 2].matchesKeywordTag(.add) or
+                !tokens[metric_range.start - 1].matchesKeywordTag(.metric))
+            {
+                return error.UnsupportedSqlShape;
+            }
+            const algorithm_range = ast.algorithm_tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedRangeWithinStatement(algorithm_range, end) or algorithm_range.start == 0 or !tokens[algorithm_range.start - 1].matchesKeywordTag(.using)) {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedGraphOptions(end, algorithm_range.end, ast.option_tokens);
+        },
+    }
+}
+
+fn validateGeneratedGraphOptions(
+    end: usize,
+    required_end: usize,
+    options: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (options) |range| {
+        if (range.start != required_end or range.end != end or range.start >= range.end) return error.UnsupportedSqlShape;
+    } else if (required_end != end) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
@@ -16945,6 +16996,19 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_command.items(), malformed_graph_command_ast),
+    );
+
+    var malformed_graph_range = try tokenized.ParsedSql.initAlloc(alloc, graph_alter_metric_sql);
+    defer malformed_graph_range.deinit(alloc);
+    const malformed_graph_range_raw = malformed_graph_range.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_graph_range_ast = switch (malformed_graph_range_raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_graph_range_ast.algorithm_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_range.items(), malformed_graph_range_ast),
     );
 }
 

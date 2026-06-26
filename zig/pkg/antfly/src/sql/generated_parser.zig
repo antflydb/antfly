@@ -1766,6 +1766,10 @@ pub const GeneratedSqlGraphAst = struct {
     kind: GeneratedSqlGraphKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    object_name_tokens: ?GeneratedSqlTokenRange = null,
+    source_name_tokens: ?GeneratedSqlTokenRange = null,
+    algorithm_tokens: ?GeneratedSqlTokenRange = null,
+    option_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlUnsupportedAst = struct {
@@ -3363,11 +3367,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
             return .{ .read = read_ast };
         },
         .extension_index => |kind| .{ .extension_index = buildDdlAst(tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
-        .graph => |kind| .{ .graph = .{
-            .kind = kind,
-            .statement_span = statement_span,
-            .command_span = command_span,
-        } },
+        .graph => |kind| .{ .graph = buildGraphAst(tokens, end, kind, statement_span, command_span) },
         .cursor => |kind| .{ .cursor = buildCursorAst(end, kind, statement_span, command_span) },
         .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
         else => null,
@@ -3436,6 +3436,44 @@ fn buildCursorAst(
         .command_span = command_span,
         .tail_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
     };
+}
+
+fn buildGraphAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlGraphKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlGraphAst {
+    var ast = GeneratedSqlGraphAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    switch (kind) {
+        .create_index, .create_metric => {
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 3, end);
+            if (findKeyword(tokens, 4, end, .on)) |on_index| {
+                ast.source_name_tokens = generatedQualifiedNameRange(tokens, on_index + 1, end);
+                if (ast.source_name_tokens) |source| {
+                    if (source.end < end) ast.option_tokens = .{ .start = source.end, .end = end };
+                }
+            }
+        },
+        .alter_metric => {
+            ast.source_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 3, end);
+            if (findTopLevelKeywordSequence(tokens, 4, end, .add, .metric)) |add_metric_index| {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, add_metric_index + 2, end);
+                if (findKeyword(tokens, add_metric_index + 3, end, .using)) |using_index| {
+                    ast.algorithm_tokens = generatedSingleTokenRangeIfIdentifier(tokens, using_index + 1, end);
+                    if (ast.algorithm_tokens) |algorithm| {
+                        if (algorithm.end < end) ast.option_tokens = .{ .start = algorithm.end, .end = end };
+                    }
+                }
+            }
+        },
+    }
+    return ast;
 }
 
 fn generatedBeginHasModeTail(tokens: []const token_mod.Token, end: usize) bool {
@@ -11272,6 +11310,9 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlGraphKind.create_metric, graph.kind);
             try std.testing.expectEqualStrings("CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", spanText(graph_sql, graph.statement_span));
             try std.testing.expectEqualStrings("CREATE", spanText(graph_sql, graph.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, graph.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, graph.source_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 12 }, graph.option_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -11283,6 +11324,10 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlGraphKind.alter_metric, graph.kind);
             try std.testing.expectEqualStrings(alter_graph_sql, spanText(alter_graph_sql, graph.statement_span));
             try std.testing.expectEqualStrings("ALTER", spanText(alter_graph_sql, graph.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, graph.source_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, graph.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, graph.algorithm_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 19 }, graph.option_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
