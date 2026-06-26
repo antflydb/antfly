@@ -283,6 +283,9 @@ const rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate = table_write_manage
 const corruptEmbeddingArtifactInDb = table_write_managed_db.corruptEmbeddingArtifactInDb;
 const catchUpManagedIndexCreate = table_write_managed_db.catchUpManagedIndexCreate;
 const seedManagedIndexReplayFromStoredDocsIfNeeded = table_write_managed_db.seedManagedIndexReplayFromStoredDocsIfNeeded;
+const reconcileLocalTableIndexes = table_write_managed_db.reconcileLocalTableIndexes;
+const dropLocalTableIndex = table_write_managed_db.dropLocalTableIndex;
+const replayManagedIndexForTableIfNeeded = table_write_managed_db.replayManagedIndexForTableIfNeeded;
 const drainManagedDbBeforeClose = table_write_managed_db.drainManagedDbBeforeClose;
 const isTransientReplayVisibilityError = table_write_managed_db.isTransientReplayVisibilityError;
 const loadTableIndexesJson = table_write_managed_db.loadTableIndexesJson;
@@ -302,6 +305,7 @@ const validateTableBatchAgainstSchemaJson = table_write_managed_db.validateTable
 const validateTransactionAgainstCatalogSchema = table_write_managed_db.validateTransactionAgainstCatalogSchema;
 const openManagedDbForStatusWithCache = table_write_managed_db.openManagedDbForStatusWithCache;
 pub const openManagedDbForStatusWithIndexesJsonAndCache = table_write_managed_db.openManagedDbForStatusWithIndexesJsonAndCache;
+const openManagedDbWithIndexesJson = table_write_managed_db.openManagedDbWithIndexesJson;
 const openManagedDbWithIndexesJsonAndCache = table_write_managed_db.openManagedDbWithIndexesJsonAndCache;
 const openManagedDbWithIndexesJsonAndCacheMode = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheMode;
 const openManagedDbWithIndexesJsonAndCacheModeWithRuntime = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntime;
@@ -11426,32 +11430,6 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
-fn reconcileLocalTableIndexes(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    replica_root_dir: []const u8,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-) !void {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-        alloc,
-        catalog,
-        table_name,
-        "",
-        "",
-        5 * std.time.ns_per_s,
-        10,
-    );
-    defer alloc.free(group_ids);
-
-    for (group_ids) |group_id| {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-        defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
-        db.close();
-    }
-}
-
 fn reconcileCachedLocalTableIndexCreate(
     self: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -11528,87 +11506,6 @@ fn reconcileLocalTableIndexCreate(
         return try reconcileCachedLocalTableIndexCreate(self, alloc, cache, table_name, index_name);
     }
     return try reconcileUncachedLocalTableIndexCreate(self, alloc, table_name, index_name);
-}
-
-fn dropLocalTableIndex(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    replica_root_dir: []const u8,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    index_name: []const u8,
-) !void {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-        alloc,
-        catalog,
-        table_name,
-        "",
-        "",
-        5 * std.time.ns_per_s,
-        10,
-    );
-    defer alloc.free(group_ids);
-
-    for (group_ids) |group_id| {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-        defer alloc.free(path);
-
-        var db = try db_mod.DB.open(alloc, path, .{
-            .backend_runtime = backend_runtime,
-        });
-        defer db.close();
-        _ = db.deleteIndex(index_name) catch |err| switch (err) {
-            error.IndexNotFound => {},
-            else => return err,
-        };
-    }
-}
-
-fn replayManagedIndexForTableIfNeeded(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    replica_root_dir: []const u8,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    index_name: []const u8,
-) !bool {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-        alloc,
-        catalog,
-        table_name,
-        "",
-        "",
-        5 * std.time.ns_per_s,
-        10,
-    );
-    defer alloc.free(group_ids);
-
-    var managed_visibility_changed = false;
-    for (group_ids) |group_id| {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-        defer alloc.free(path);
-
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
-        defer db.close();
-        if (!try db.core.indexRequiresEnrichmentReplay(index_name)) continue;
-        managed_visibility_changed = true;
-
-        _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, &db, index_name);
-
-        if (try db.hasPendingDenseArtifactRebuild(alloc)) {
-            _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-            try db.runUntilIdle();
-        }
-    }
-    return managed_visibility_changed;
-}
-
-fn openManagedDbWithIndexesJson(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    indexes_json: []const u8,
-) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, backend_current_root_generation, null);
 }
 
 fn publishRuntimeStatusSnapshot(

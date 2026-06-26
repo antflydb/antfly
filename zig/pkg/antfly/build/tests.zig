@@ -36,6 +36,65 @@ pub const ModuleTestRun = struct {
     step: *std.Build.Step,
 };
 
+pub const StandaloneModuleTestStep = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
+pub const StandaloneModuleTestModules = struct {
+    regex: *std.Build.Module,
+    jsonschema: *std.Build.Module,
+    json: *std.Build.Module,
+    ml_tabular: *std.Build.Module,
+    fuzz_tabular_loader: *std.Build.Module,
+    toon: *std.Build.Module,
+    mcp: *std.Build.Module,
+    a2a: *std.Build.Module,
+    matcher: *std.Build.Module,
+    resolver: *std.Build.Module,
+    httpx_json: *std.Build.Module,
+    httpx: *std.Build.Module,
+    api_json_helpers: *std.Build.Module,
+    generating: *std.Build.Module,
+    embeddings: *std.Build.Module,
+    vectorindex: *std.Build.Module,
+    chunking: *std.Build.Module,
+    readers: *std.Build.Module,
+    extracting: *std.Build.Module,
+    image: *std.Build.Module,
+    reranking: *std.Build.Module,
+    casbin: *std.Build.Module,
+    usermgr: *std.Build.Module,
+    template: *std.Build.Module,
+};
+
+pub const StandaloneModuleTestRuns = struct {
+    regex: ModuleTestRun,
+    jsonschema: ModuleTestRun,
+    json: ModuleTestRun,
+    ml_tabular: ModuleTestRun,
+    fuzz_tabular_loader: ModuleTestRun,
+    toon: ModuleTestRun,
+    mcp: ModuleTestRun,
+    a2a: ModuleTestRun,
+    matcher: ModuleTestRun,
+    resolver: ModuleTestRun,
+    httpx_json: ModuleTestRun,
+    httpx: ModuleTestRun,
+    api_json_helpers: ModuleTestRun,
+    generating: ModuleTestRun,
+    embeddings: ModuleTestRun,
+    vectorindex: ModuleTestRun,
+    chunking: ModuleTestRun,
+    readers: ModuleTestRun,
+    extracting: ModuleTestRun,
+    image: ModuleTestRun,
+    reranking: ModuleTestRun,
+    casbin: ModuleTestRun,
+    usermgr: ModuleTestRun,
+    template: ModuleTestRun,
+};
+
 pub const ModuleTestOptions = struct {
     filters: ?[]const []const u8 = null,
     select_filters: bool = true,
@@ -220,6 +279,13 @@ fn isDBFocusedTestStepName(name: []const u8) bool {
         std.mem.startsWith(u8, name, "lib-db-");
 }
 
+fn isStandaloneModuleTestStepName(name: []const u8) bool {
+    for (standalone_module_test_steps) |step| {
+        if (std.mem.eql(u8, name, step.name)) return true;
+    }
+    return false;
+}
+
 fn assertBuildZigDoesNotDeclareDBFocusedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
@@ -228,9 +294,9 @@ fn assertBuildZigDoesNotDeclareDBFocusedTestSteps(source: []const u8) void {
         const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
             std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
         const name = source[name_start..name_end];
-        if (isDBFocusedTestStepName(name)) {
+        if (isDBFocusedTestStepName(name) or isStandaloneModuleTestStepName(name)) {
             std.debug.panic(
-                "build.zig declares DB focused test step '{s}' at line {}; move DB test inventories to pkg/antfly/build/tests.zig",
+                "build.zig declares test inventory step '{s}' at line {}; move test inventories to pkg/antfly/build/tests.zig",
                 .{ name, lineNumberForOffset(source, start) },
             );
         }

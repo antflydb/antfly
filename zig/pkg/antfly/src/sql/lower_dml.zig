@@ -13788,12 +13788,12 @@ fn updatePointFromGeneratedDmlAstAlloc(
         .primary_key_assignment = .{ .mark_rewrite = &rewrite_identity },
     };
     const assignment_tokens = tokens[0..assignments_range.end];
-    var assignment_pos = assignments_range.start;
-    while (assignment_pos < assignments_range.end) {
+    parser_state.pos = assignments_range.start;
+    while (parser_state.pos < assignments_range.end) {
         try parseConflictUpdateSetAssignmentAlloc(
             alloc,
             assignment_tokens,
-            &assignment_pos,
+            &parser_state.pos,
             schema,
             params,
             parser_options.conflict_existing_qualifiers,
@@ -13807,10 +13807,10 @@ fn updatePointFromGeneratedDmlAstAlloc(
             &array_update,
             assignment_hooks,
         );
-        if (assignment_pos == assignments_range.end) break;
-        if (assignment_tokens[assignment_pos].kind != .comma) return error.UnsupportedSqlShape;
-        assignment_pos += 1;
-        if (assignment_pos == assignments_range.end) return error.UnsupportedSqlShape;
+        if (parser_state.pos == assignments_range.end) break;
+        if (assignment_tokens[parser_state.pos].kind != .comma) return error.UnsupportedSqlShape;
+        parser_state.pos += 1;
+        if (parser_state.pos == assignments_range.end) return error.UnsupportedSqlShape;
     }
     if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlUpdateTargetPaths(schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);

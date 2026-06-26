@@ -16,6 +16,7 @@ const std = @import("std");
 const scraping = @import("antfly_scraping");
 
 const common_secrets = @import("../../common/secrets.zig");
+const metadata_mod = @import("../../metadata/mod.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const asset_producer_mod = @import("../../storage/db/enrichment/asset_producer.zig");
 const asset_producer_runtime = @import("../../asset_producer_runtime.zig");
@@ -240,6 +241,105 @@ pub fn seedManagedIndexReplayFromStoredDocsIfNeeded(
     if (!try managedIndexCoverageIncomplete(alloc, db, index_name)) return false;
     _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
     return true;
+}
+
+pub fn reconcileLocalTableIndexes(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+) !void {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
+        db.close();
+    }
+}
+
+pub fn dropLocalTableIndex(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    index_name: []const u8,
+) !void {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var db = try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = backend_runtime,
+        });
+        defer db.close();
+        _ = db.deleteIndex(index_name) catch |err| switch (err) {
+            error.IndexNotFound => {},
+            else => return err,
+        };
+    }
+}
+
+pub fn replayManagedIndexForTableIfNeeded(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    index_name: []const u8,
+) !bool {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+
+    var managed_visibility_changed = false;
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog, table_name, group_id, backend_runtime);
+        defer db.close();
+        if (!try db.core.indexRequiresEnrichmentReplay(index_name)) continue;
+        managed_visibility_changed = true;
+
+        _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, &db, index_name);
+
+        if (try db.hasPendingDenseArtifactRebuild(alloc)) {
+            _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            try db.runUntilIdle();
+        }
+    }
+    return managed_visibility_changed;
 }
 
 pub fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
@@ -948,6 +1048,14 @@ pub fn openManagedDbWithIndexesJsonAndCache(
         resource_manager,
         .default,
     );
+}
+
+pub fn openManagedDbWithIndexesJson(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    indexes_json: []const u8,
+) !db_mod.DB {
+    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, backend_current_root_generation, null);
 }
 
 pub fn openManagedDbWithIndexesJsonAndCacheMode(
