@@ -371,9 +371,7 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
             tokenMatchesKeyword(tokens[start + 3], .as) and
             tokenMatchesText(tokens[start + 4], "transaction");
     }
-    if (tokenMatchesText(first, "start")) {
-        return start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction");
-    }
+    if (tokenMatchesText(first, "start")) return true;
     if (tokenMatchesKeyword(first, .begin)) return true;
     if (tokenMatchesKeyword(first, .savepoint)) return true;
     if (tokenMatchesText(first, "release")) {
@@ -390,10 +388,7 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
             tokenMatchesKeyword(tokens[start + 2], .savepoint) and
             tokens[start + 3].kind == .identifier;
     }
-    if (!tokenMatchesKeyword(first, .commit) and !tokenMatchesKeyword(first, .rollback)) return false;
-    if (end == start + 1) return true;
-    return end == start + 2 and
-        (tokenMatchesText(tokens[start + 1], "work") or tokenMatchesText(tokens[start + 1], "transaction"));
+    return tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .rollback);
 }
 
 fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -2569,6 +2564,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt(text AS SELECT id FROM usage_records"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "EXECUTE read_stmt("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DEALLOCATE read_stmt extra"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "START WORK"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT NOW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT WORK NOW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ROLLBACK LATER"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));

@@ -68,8 +68,10 @@ adapter.
 Transaction boundary commands now dispatch through generated AST-to-plan
 lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
 adapter-noop boundaries, including retained statement/command source-span and
-command-kind validation. Transaction mode and savepoint controls are also
-lowered from generated transaction ASTs: `SET TRANSACTION`,
+command-kind validation. `START`, `COMMIT`, and `ROLLBACK` command heads now
+require generated parser success at SQL ingress, so malformed transaction
+tails cannot fall back to the legacy transaction adapter. Transaction mode and
+savepoint controls are also lowered from generated transaction ASTs: `SET TRANSACTION`,
 `START TRANSACTION`, `BEGIN ...` mode tails, `SAVEPOINT`, `RELEASE [SAVEPOINT]`,
 and `ROLLBACK TO [SAVEPOINT]` retain validated mode/name token ranges before
 lowering to the typed transaction-control or savepoint plans.
