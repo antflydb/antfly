@@ -270,7 +270,7 @@ pub const IdentityAllocatorSpec = struct {
     }
 };
 
-const LoweredDdlPlan = union(enum) {
+const LegacyDdlParserPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
     session_catalog: SessionCatalogPlan,
     create_table: CreateTablePlan,
@@ -364,12 +364,12 @@ pub const DdlPlanParserOptions = struct {
     row_security_policy_options: RowSecurityPolicyOptions,
 };
 
-fn parseDdlPlanAlloc(
+fn parseLegacyDdlParserPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeyword("call")) {
         return .{ .procedure_call = try parseProcedureCallPlanTailAlloc(alloc, tokens, pos) };
@@ -3421,7 +3421,7 @@ pub fn cursorPortalPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlCursorAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     const cursor = try cursorPortalLogicalPlanFromGeneratedAstAlloc(alloc, tokens, ast);
     return .{ .cursor_portal = cursor };
 }
@@ -3513,7 +3513,7 @@ pub fn transactionControlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     const logical = transactionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, ast) catch |err| switch (err) {
         error.UnsupportedSqlShape => {
             try validateGeneratedTransactionAstSpans(tokens, ast);
@@ -3574,7 +3574,7 @@ pub fn transactionBoundaryPlanFromGeneratedAst(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     const plan = try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, ast);
     switch (plan) {
         .adapter_noop => return plan,
@@ -3651,7 +3651,7 @@ pub fn sessionDdlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlSessionAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     _ = try validateGeneratedSessionAstRanges(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
@@ -3766,7 +3766,7 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedDdlAstSpans(tokens, ast);
     return switch (ast.kind) {
         .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
@@ -3787,7 +3787,7 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedDdlAstSpans(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
@@ -4164,10 +4164,10 @@ fn routineCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedRoutineDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (plan) {
@@ -4231,10 +4231,10 @@ fn authorizationCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedRoleDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (plan) {
@@ -4295,10 +4295,10 @@ fn typeSystemCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedTypeSystemDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (plan) {
@@ -4406,10 +4406,10 @@ fn viewCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedViewDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4484,10 +4484,10 @@ fn materializedViewCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedMaterializedViewDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4586,10 +4586,10 @@ fn domainCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedDomainDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4656,10 +4656,10 @@ fn sequenceCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedSequenceDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4734,10 +4734,10 @@ fn enumTypeCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedEnumTypeDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4804,10 +4804,10 @@ fn tablespaceCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedTablespaceDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4872,10 +4872,10 @@ fn logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedLogicalReplicationDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -4993,10 +4993,10 @@ fn rowSecurityPolicyCatalogPlanFromGeneratedDdlAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedRowSecurityPolicyDdlAst(tokens, ast);
     var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
     errdefer plan.deinit(alloc);
     if (pos != tokens.len) return error.UnsupportedSqlShape;
     switch (ast.kind) {
@@ -5232,11 +5232,11 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlGraphAst,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedGraphAstSpans(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
-    var plan: LoweredDdlPlan = switch (ast.kind) {
+    var plan: LegacyDdlParserPlan = switch (ast.kind) {
         .create_index => .{ .create_index = if (ast.edge_tokens != null or ast.extraction_enrichment_tokens != null)
             try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
         else
@@ -5713,7 +5713,7 @@ fn validateGeneratedGraphPlanMatchesAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlGraphAst,
-    plan: LoweredDdlPlan,
+    plan: LegacyDdlParserPlan,
 ) !void {
     const create_index = switch (plan) {
         .create_index => |create_index| create_index,
@@ -12091,10 +12091,10 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
     boundary: GeneratedUnsupportedCatalogBoundary,
     options: DdlPlanParserOptions,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     try validateGeneratedUnsupportedCatalogAst(tokens, ast, boundary);
     const start_pos = pos.*;
-    var plan = parseDdlPlanAlloc(alloc, tokens, pos, options) catch |err| {
+    var plan = parseLegacyDdlParserPlanAlloc(alloc, tokens, pos, options) catch |err| {
         pos.* = start_pos;
         return err;
     };
@@ -12468,29 +12468,29 @@ fn validateLogicalReplicationPlanKind(
     }
 }
 
-fn lowerDdlPlanAlloc(
+fn legacyDdlParserPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
-) !LoweredDdlPlan {
-    return try lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, .{});
+) !LegacyDdlParserPlan {
+    return try legacyDdlParserPlanWithFunctionBindingsAlloc(alloc, sql, .{});
 }
 
-fn lowerDdlPlanWithFunctionBindingsAlloc(
+fn legacyDdlParserPlanWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
     function_bindings: lower_expr.SqlFunctionBindings,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
 
-    return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
+    return try legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
 }
 
-fn lowerDdlPlanParsedSqlAlloc(
+fn legacyDdlParserPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-) !LoweredDdlPlan {
-    return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+) !LegacyDdlParserPlan {
+    return try legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
 pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
@@ -12746,11 +12746,11 @@ pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
     return try routine_trigger_parser.parse();
 }
 
-fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
+fn legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
-) !LoweredDdlPlan {
+) !LegacyDdlParserPlan {
     switch (parsed_sql.statement) {
         .unsupported => return error.UnsupportedSqlShape,
         else => {},
@@ -12803,15 +12803,15 @@ fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             }
         }
     }
-    return try parseDdlPlanAlloc(alloc, tokens, &state.pos, options);
+    return try parseLegacyDdlParserPlanAlloc(alloc, tokens, &state.pos, options);
 }
 
-const lowerDdlPlanForTestAlloc = lowerDdlPlanAlloc;
-const lowerDdlPlanWithFunctionBindingsForTestAlloc = lowerDdlPlanWithFunctionBindingsAlloc;
+const legacyDdlParserPlanForTestAlloc = legacyDdlParserPlanAlloc;
+const legacyDdlParserPlanWithFunctionBindingsForTestAlloc = legacyDdlParserPlanWithFunctionBindingsAlloc;
 
 test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE IF NOT EXISTS usage_records (
         \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -12877,7 +12877,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var casted_defaults = try lowerDdlPlanForTestAlloc(
+    var casted_defaults = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE casted_defaults (
         \\  id uuid PRIMARY KEY,
@@ -12911,7 +12911,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var no_primary_key = try lowerDdlPlanForTestAlloc(
+    var no_primary_key = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);",
     );
@@ -12930,7 +12930,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var primary_key_timing = try lowerDdlPlanForTestAlloc(
+    var primary_key_timing = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE primary_key_timing (
         \\  id uuid CONSTRAINT primary_key_timing_id_pk PRIMARY KEY NOT DEFERRABLE INITIALLY IMMEDIATE,
@@ -12950,7 +12950,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var table_primary_key_timing = try lowerDdlPlanForTestAlloc(
+    var table_primary_key_timing = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE table_primary_key_timing (
         \\  tenant_id text NOT NULL,
@@ -12975,7 +12975,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var primary_key_not_null = try lowerDdlPlanForTestAlloc(
+    var primary_key_not_null = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE primary_key_not_null (id uuid PRIMARY KEY NOT NULL);",
     );
@@ -12989,7 +12989,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var unique_nulls_distinct = try lowerDdlPlanForTestAlloc(
+    var unique_nulls_distinct = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE unique_nulls_distinct (
         \\  id uuid PRIMARY KEY,
@@ -13016,7 +13016,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var covering_unique_constraints = try lowerDdlPlanForTestAlloc(
+    var covering_unique_constraints = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE covering_unique_constraints (
         \\  id uuid PRIMARY KEY INCLUDE (tenant_id),
@@ -13059,11 +13059,11 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE ONLY usage_records (id uuid PRIMARY KEY);",
     ));
-    var inline_nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+    var inline_nulls_not_distinct_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_unique_nulls (id uuid PRIMARY KEY, email text UNIQUE NULLS NOT DISTINCT);",
     );
@@ -13077,7 +13077,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var table_nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+    var table_nulls_not_distinct_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_table_unique_nulls (id uuid PRIMARY KEY, email text, CONSTRAINT bad_table_unique_nulls_email_key UNIQUE NULLS NOT DISTINCT (email));",
     );
@@ -13092,7 +13092,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var deferrable_unique = try lowerDdlPlanForTestAlloc(
+    var deferrable_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_deferred_unique (id uuid PRIMARY KEY, email text UNIQUE DEFERRABLE);",
     );
@@ -13106,11 +13106,11 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_deferred_table_unique (id uuid PRIMARY KEY, email text, CONSTRAINT bad_deferred_table_unique_email_key UNIQUE (email) NOT DEFERRABLE INITIALLY DEFERRED);",
     ));
-    var deferrable_primary = try lowerDdlPlanForTestAlloc(
+    var deferrable_primary = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_deferred_primary (id uuid PRIMARY KEY DEFERRABLE);",
     );
@@ -13124,27 +13124,27 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_deferred_table_primary (tenant_id text NOT NULL, id uuid NOT NULL, CONSTRAINT bad_deferred_table_primary_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY DEFERRED);",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_primary_include_overlap (id uuid PRIMARY KEY INCLUDE (id));",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE bad_unique_include_overlap (id uuid PRIMARY KEY, email text UNIQUE INCLUDE (email));",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE duplicate_pk (tenant_id text, id text, PRIMARY KEY (tenant_id, tenant_id));",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE duplicate_unique (id text PRIMARY KEY, tenant_id text, CONSTRAINT duplicate_unique_tenant_key UNIQUE (tenant_id, tenant_id));",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE duplicate_fk (id text PRIMARY KEY, tenant_id text, FOREIGN KEY (tenant_id, tenant_id) REFERENCES tenants (id, id));",
     ));
@@ -13153,7 +13153,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
 test "sql adapter ddl plan lowers create index ddl" {
     const alloc = std.testing.allocator;
 
-    var ordinary = try lowerDdlPlanForTestAlloc(
+    var ordinary = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_status_idx ON usage_records (tenant_id, status);",
     );
@@ -13179,7 +13179,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var covering = try lowerDdlPlanForTestAlloc(
+    var covering = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount);",
     );
@@ -13203,7 +13203,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var derived_full_text = try lowerDdlPlanForTestAlloc(
+    var derived_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');",
     );
@@ -13223,7 +13223,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var derived_json_arrow_full_text = try lowerDdlPlanForTestAlloc(
+    var derived_json_arrow_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text ((attrs->>'title')) WITH (analyzer = 'standard');",
     );
@@ -13239,7 +13239,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var derived_json_function_full_text = try lowerDdlPlanForTestAlloc(
+    var derived_json_function_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_plan_fts ON docs USING antfly_full_text ((jsonb_extract_path_text(attrs, 'billing', 'plan')));",
     );
@@ -13255,7 +13255,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var embedded_json_dotted_full_text = try lowerDdlPlanForTestAlloc(
+    var embedded_json_dotted_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text (attrs.title) WITH (analyzer = 'standard');",
     );
@@ -13271,7 +13271,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var embedded_json_operator_full_text = try lowerDdlPlanForTestAlloc(
+    var embedded_json_operator_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text ((attrs->>'title'));",
     );
@@ -13286,7 +13286,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var embedded_json_path_function_full_text = try lowerDdlPlanForTestAlloc(
+    var embedded_json_path_function_full_text = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_plan_fts ON docs USING antfly_full_text ((jsonb_extract_path_text(attrs, 'billing', 'plan')));",
     );
@@ -13301,7 +13301,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var external_vector = try lowerDdlPlanForTestAlloc(
+    var external_vector = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
     );
@@ -13320,7 +13320,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var embedded_json_external_vector = try lowerDdlPlanForTestAlloc(
+    var embedded_json_external_vector = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_embedding_hnsw ON docs USING hnsw (attrs.embedding vector_cosine_ops) WITH (dimension = 1536);",
     );
@@ -13336,7 +13336,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var managed_aknn = try lowerDdlPlanForTestAlloc(
+    var managed_aknn = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', metric = 'cosine', dimension = 384, chunk_size = 512);",
     );
@@ -13356,7 +13356,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var algebraic = try lowerDdlPlanForTestAlloc(
+    var algebraic = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_algebraic ON docs USING antfly_algebraic () WITH (derive_from_schema = true);",
     );
@@ -13372,7 +13372,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var graph = try lowerDdlPlanForTestAlloc(
+    var graph = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_edge_graph ON doc_edges USING antfly_graph (source_doc, target_doc) WITH (type_field = 'edge_type', weight_field = 'confidence', edge_policy = 'all');",
     );
@@ -13395,7 +13395,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var embedded_json_graph = try lowerDdlPlanForTestAlloc(
+    var embedded_json_graph = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_attrs_edge_graph ON doc_edges USING antfly_graph (attrs.source_doc, attrs.target_doc) WITH (type_field = 'attrs.edge_type', weight_field = 'attrs.confidence', edge_policy = 'all');",
     );
@@ -13415,7 +13415,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var graph_syntax = try lowerDdlPlanForTestAlloc(
+    var graph_syntax = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');",
     );
@@ -13439,7 +13439,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var graph_json_syntax = try lowerDdlPlanForTestAlloc(
+    var graph_json_syntax = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE GRAPH INDEX docs_attrs_graph_syntax ON doc_edges EDGE ((attrs->>'source') -> (attrs->>'target')) TYPE attrs.edge_type WEIGHT attrs.confidence;",
     );
@@ -13459,7 +13459,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var graph_extraction_syntax = try lowerDdlPlanForTestAlloc(
+    var graph_extraction_syntax = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');",
     );
@@ -13487,12 +13487,12 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE source.document_id TARGET target.document_id;",
     ));
 
-    var graph_metric = try lowerDdlPlanForTestAlloc(
+    var graph_metric = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_edge_graph_pagerank ON doc_edges USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', damping = 0.85, max_iterations = 40);",
     );
@@ -13512,7 +13512,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var graph_metric_syntax = try lowerDdlPlanForTestAlloc(
+    var graph_metric_syntax = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40);",
     );
@@ -13536,7 +13536,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var hybrid = try lowerDdlPlanForTestAlloc(
+    var hybrid = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_hybrid_search ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_body_semantic,docs_edge_graph_pagerank', fusion = 'rrf', reranker = 'cross_encoder');",
     );
@@ -13554,7 +13554,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var public_qualified = try lowerDdlPlanForTestAlloc(
+    var public_qualified = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status);",
     );
@@ -13574,7 +13574,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var only_qualified = try lowerDdlPlanForTestAlloc(
+    var only_qualified = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX public.usage_records_status_idx ON ONLY public.usage_records (status);",
     );
@@ -13594,7 +13594,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var archive_qualified = try lowerDdlPlanForTestAlloc(
+    var archive_qualified = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX archive.usage_records_status_idx ON archive.usage_records (status);",
     );
@@ -13614,7 +13614,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var idempotent = try lowerDdlPlanForTestAlloc(
+    var idempotent = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status);",
     );
@@ -13634,7 +13634,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var concurrent = try lowerDdlPlanForTestAlloc(
+    var concurrent = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX CONCURRENTLY usage_records_created_at_idx ON usage_records (created_at DESC NULLS LAST);",
     );
@@ -13656,7 +13656,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var unique_concurrent = try lowerDdlPlanForTestAlloc(
+    var unique_concurrent = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_records_email_key ON usage_records (lower(email));",
     );
@@ -13680,7 +13680,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var md5_unique = try lowerDdlPlanForTestAlloc(
+    var md5_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_digest_key ON usage_records (md5(email));",
     );
@@ -13703,7 +13703,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+    var nulls_not_distinct_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
     );
@@ -13725,12 +13725,12 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_external_id_idx ON usage_records (external_id) NULLS DISTINCT;",
     ));
 
-    var temporal_unique = try lowerDdlPlanForTestAlloc(
+    var temporal_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
     );
@@ -13752,12 +13752,12 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX prices_sku_valid_time_idx ON prices (sku, valid_time WITHOUT OVERLAPS);",
     ));
 
-    var wrapped_expression = try lowerDdlPlanForTestAlloc(
+    var wrapped_expression = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));",
     );
@@ -13779,7 +13779,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var concat_ws_expression = try lowerDdlPlanForTestAlloc(
+    var concat_ws_expression = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_status_label_idx ON usage_records (concat_ws(':', status, id));",
     );
@@ -13804,7 +13804,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var rich_expression_index = try lowerDdlPlanForTestAlloc(
+    var rich_expression_index = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_status_replace_idx ON usage_records (replace(status, 'old', 'new'));",
     );
@@ -13829,7 +13829,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var wrapped_unique_expression = try lowerDdlPlanForTestAlloc(
+    var wrapped_unique_expression = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (tenant_id, (lower(email)));",
     );
@@ -13852,7 +13852,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var ordered = try lowerDdlPlanForTestAlloc(
+    var ordered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX idx_import_jobs_instance ON import_jobs USING btree (organization_id, cloud_instance_id, created_at DESC NULLS LAST);",
     );
@@ -13876,7 +13876,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var partial_expression = try lowerDdlPlanForTestAlloc(
+    var partial_expression = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_lower_email_active_key ON users (tenant_id, lower(email)) WHERE (deleted_at IS NULL) AND ((status)::text = 'active'::text);",
     );
@@ -13906,7 +13906,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var expression_where_partial = try lowerDdlPlanForTestAlloc(
+    var expression_where_partial = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX users_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
     );
@@ -13937,7 +13937,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var boolean_partial = try lowerDdlPlanForTestAlloc(
+    var boolean_partial = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX idx_project_tables_default ON project_tables(project_id, is_default) WHERE (is_default = TRUE);",
     );
@@ -13963,7 +13963,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var signed_partial = try lowerDdlPlanForTestAlloc(
+    var signed_partial = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_negative_amount_idx ON usage_records (status) WHERE amount = -1;",
     );
@@ -13988,15 +13988,15 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_duplicate_idx ON usage_records (status, status);",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_duplicate_expr_key ON usage_records (lower(email), lower(email));",
     ));
-    var unique_covering = try lowerDdlPlanForTestAlloc(
+    var unique_covering = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (tenant_id);",
     );
@@ -14017,7 +14017,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
-    var explicit_nulls_distinct = try lowerDdlPlanForTestAlloc(
+    var explicit_nulls_distinct = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_nulls_distinct_key ON usage_records (email) NULLS DISTINCT INCLUDE (tenant_id);",
     );
@@ -14038,15 +14038,15 @@ test "sql adapter ddl plan lowers create index ddl" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_email_nulls_distinct_idx ON usage_records (email) NULLS DISTINCT;",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (email);",
     ));
-    var covering_gin = try lowerDdlPlanForTestAlloc(
+    var covering_gin = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_metadata_gin_cover ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
     );
@@ -14063,7 +14063,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var covering_lower = try lowerDdlPlanForTestAlloc(
+    var covering_lower = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_lower_email_cover ON usage_records (lower(email)) INCLUDE (tenant_id);",
     );
@@ -14082,7 +14082,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var casted_not_null = try lowerDdlPlanForTestAlloc(
+    var casted_not_null = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX cloud_groups_external_key ON cloud_groups (organization_id, external_id) WHERE ((external_id)::text IS NOT NULL);",
     );
@@ -14104,7 +14104,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var json_gin = try lowerDdlPlanForTestAlloc(
+    var json_gin = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata jsonb_path_ops)",
     );
@@ -14128,7 +14128,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var array_gin = try lowerDdlPlanForTestAlloc(
+    var array_gin = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_tags_gin ON usage_records USING gin (tags array_ops)",
     );
@@ -14152,7 +14152,7 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_index = try lowerDdlPlanForTestAlloc(
+    var drop_index = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "DROP INDEX IF EXISTS usage_records_status_idx;",
     );
@@ -14173,7 +14173,7 @@ test "sql adapter ddl plan lowers create index ddl" {
 
 test "sql adapter ddl plan lowers alter table ddl" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD COLUMN metadata jsonb DEFAULT '{"source":"migration"}',
@@ -14253,7 +14253,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var if_exists = try lowerDdlPlanForTestAlloc(
+    var if_exists = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE IF EXISTS usage_records ADD COLUMN optional_status text;",
     );
@@ -14272,7 +14272,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var explicit_nulls_distinct_unique = try lowerDdlPlanForTestAlloc(
+    var explicit_nulls_distinct_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;",
     );
@@ -14293,7 +14293,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var not_valid_unique = try lowerDdlPlanForTestAlloc(
+    var not_valid_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) NOT VALID;",
     );
@@ -14313,7 +14313,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+    var nulls_not_distinct_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS NOT DISTINCT (email);",
     );
@@ -14333,7 +14333,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var deferrable_unique = try lowerDdlPlanForTestAlloc(
+    var deferrable_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;",
     );
@@ -14356,7 +14356,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var explicit_covering_unique = try lowerDdlPlanForTestAlloc(
+    var explicit_covering_unique = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
     );
@@ -14380,12 +14380,12 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (email);",
     ));
 
-    var explicit_primary_key_timing = try lowerDdlPlanForTestAlloc(
+    var explicit_primary_key_timing = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY IMMEDIATE;",
     );
@@ -14406,7 +14406,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var deferrable_primary_key = try lowerDdlPlanForTestAlloc(
+    var deferrable_primary_key = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED;",
     );
@@ -14430,7 +14430,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var explicit_covering_primary_key = try lowerDdlPlanForTestAlloc(
+    var explicit_covering_primary_key = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
     );
@@ -14453,12 +14453,12 @@ test "sql adapter ddl plan lowers alter table ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (id);",
     ));
 
-    var drop_column = try lowerDdlPlanForTestAlloc(
+    var drop_column = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records DROP COLUMN IF EXISTS metadata RESTRICT",
     );
@@ -14484,7 +14484,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_constraint = try lowerDdlPlanForTestAlloc(
+    var drop_constraint = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS usage_records_amount_check CASCADE",
     );
@@ -14510,7 +14510,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_default = try lowerDdlPlanForTestAlloc(
+    var set_default = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending'",
     );
@@ -14537,7 +14537,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_default = try lowerDdlPlanForTestAlloc(
+    var drop_default = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER status DROP DEFAULT",
     );
@@ -14558,7 +14558,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_not_null = try lowerDdlPlanForTestAlloc(
+    var set_not_null = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL",
     );
@@ -14579,7 +14579,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_not_null = try lowerDdlPlanForTestAlloc(
+    var drop_not_null = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER status DROP NOT NULL",
     );
@@ -14600,7 +14600,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_type = try lowerDdlPlanForTestAlloc(
+    var alter_type = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER COLUMN status TYPE varchar(64)",
     );
@@ -14623,7 +14623,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_type_collated = try lowerDdlPlanForTestAlloc(
+    var alter_type_collated = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER COLUMN status TYPE text COLLATE \"C\"",
     );
@@ -14646,7 +14646,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_set_data_type = try lowerDdlPlanForTestAlloc(
+    var alter_set_data_type = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER status SET DATA TYPE text[]",
     );
@@ -14669,7 +14669,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_set_data_type_collated = try lowerDdlPlanForTestAlloc(
+    var alter_set_data_type_collated = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER status SET DATA TYPE text COLLATE \"C\"",
     );
@@ -14692,7 +14692,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var rename_column = try lowerDdlPlanForTestAlloc(
+    var rename_column = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records RENAME COLUMN status TO state",
     );
@@ -14713,7 +14713,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var rename_constraint = try lowerDdlPlanForTestAlloc(
+    var rename_constraint = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_amount_check TO usage_records_quantity_check",
     );
@@ -14733,7 +14733,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
-    var upper_generated = try lowerDdlPlanForTestAlloc(
+    var upper_generated = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(tenant_id)) STORED",
     );
@@ -14760,7 +14760,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
 test "sql adapter ddl plan lowers alter table constraint validation ddl" {
     const alloc = std.testing.allocator;
 
-    var add_check = try lowerDdlPlanForTestAlloc(
+    var add_check = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0) NOT VALID;",
     );
@@ -14788,7 +14788,7 @@ test "sql adapter ddl plan lowers alter table constraint validation ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var validate = try lowerDdlPlanForTestAlloc(
+    var validate = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_amount_check;",
     );
@@ -14813,7 +14813,7 @@ test "sql adapter ddl plan lowers alter table constraint validation ddl" {
 
 test "sql adapter ddl plan lowers additive inline foreign key column ddl" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS cloud_instance_id UUID REFERENCES cloud_instances(id) ON DELETE CASCADE;",
     );
@@ -14848,7 +14848,7 @@ test "sql adapter ddl plan lowers additive inline foreign key column ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var named = try lowerDdlPlanForTestAlloc(
+    var named = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE import_jobs ADD COLUMN cloud_instance_table_id uuid CONSTRAINT import_jobs_instance_table_fkey REFERENCES cloud_instance_tables(id) ON DELETE CASCADE;",
     );
@@ -14881,7 +14881,7 @@ test "sql adapter ddl plan lowers additive inline foreign key column ddl" {
 
 test "sql adapter ddl plan lowers updated-at trigger ddl into typed update policy" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at('updated_at_ns');",
     );
@@ -14903,7 +14903,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    var default_column = try lowerDdlPlanForTestAlloc(
+    var default_column = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE PROCEDURE set_updated_at();",
     );
@@ -14920,7 +14920,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    var replace_trigger = try lowerDdlPlanForTestAlloc(
+    var replace_trigger = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns')",
     );
@@ -14940,7 +14940,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_trigger = try lowerDdlPlanForTestAlloc(
+    var drop_trigger = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "DROP TRIGGER IF EXISTS update_timestamp ON ONLY public.usage_records RESTRICT;",
     );
@@ -14963,7 +14963,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    var insert_trigger = try lowerDdlPlanForTestAlloc(
+    var insert_trigger = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE INSERT ON usage_records EXECUTE FUNCTION touch_updated_at()",
     );
@@ -14981,7 +14981,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    var arbitrary_trigger = try lowerDdlPlanForTestAlloc(
+    var arbitrary_trigger = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
     );
@@ -15003,7 +15003,7 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
 test "sql adapter ddl plan lowers catalog-only ddl plans" {
     const alloc = std.testing.allocator;
 
-    var table_clone = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    var table_clone = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
     defer table_clone.deinit(alloc);
     switch (table_clone) {
         .table_clone => |plan| {
@@ -15022,7 +15022,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id, contact_email) AS SELECT id, email FROM users;");
+    var create_view = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id, contact_email) AS SELECT id, email FROM users;");
     defer create_view.deinit(alloc);
     switch (create_view) {
         .view_catalog => |plan| switch (plan) {
@@ -15041,7 +15041,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_or_replace_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id, email FROM users;");
+    var create_or_replace_view = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id, email FROM users;");
     defer create_or_replace_view.deinit(alloc);
     switch (create_or_replace_view) {
         .view_catalog => |plan| switch (plan) {
@@ -15054,9 +15054,9 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id) AS SELECT id, email FROM users;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id) AS SELECT id, email FROM users;"));
 
-    var materialized_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users WITH NO DATA;");
+    var materialized_view = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users WITH NO DATA;");
     defer materialized_view.deinit(alloc);
     switch (materialized_view) {
         .materialized_view_catalog => |plan| switch (plan) {
@@ -15072,7 +15072,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_enum_type = try lowerDdlPlanForTestAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
+    var create_enum_type = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
     defer create_enum_type.deinit(alloc);
     switch (create_enum_type) {
         .enum_type_catalog => |plan| switch (plan) {
@@ -15087,7 +15087,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var add_enum_value = try lowerDdlPlanForTestAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';");
+    var add_enum_value = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';");
     defer add_enum_value.deinit(alloc);
     switch (add_enum_value) {
         .enum_type_catalog => |plan| switch (plan) {
@@ -15103,7 +15103,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_enum_type = try lowerDdlPlanForTestAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE;");
+    var drop_enum_type = try legacyDdlParserPlanForTestAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE;");
     defer drop_enum_type.deinit(alloc);
     switch (drop_enum_type) {
         .enum_type_catalog => |plan| switch (plan) {
@@ -15127,7 +15127,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_enum));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_create_enum));
 
     var malformed_generated_alter_enum = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE 'archived';");
     defer malformed_generated_alter_enum.deinit(alloc);
@@ -15139,9 +15139,9 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum));
 
-    var serial_identity = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
+    var serial_identity = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
     defer serial_identity.deinit(alloc);
     switch (serial_identity) {
         .identity_allocator_catalog => |plan| {
@@ -15155,7 +15155,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var generated_identity = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text);");
+    var generated_identity = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text);");
     defer generated_identity.deinit(alloc);
     switch (generated_identity) {
         .identity_allocator_catalog => |plan| {
@@ -15168,7 +15168,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var generated_identity_options = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
+    var generated_identity_options = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
     defer generated_identity_options.deinit(alloc);
     switch (generated_identity_options) {
         .identity_allocator_catalog => |plan| {
@@ -15187,9 +15187,9 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (NO MINVALUE MINVALUE 1) PRIMARY KEY, status text);"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (NO MINVALUE MINVALUE 1) PRIMARY KEY, status text);"));
 
-    var create_extension = try lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
+    var create_extension = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
     defer create_extension.deinit(alloc);
     switch (create_extension) {
         .extension_catalog => |plan| switch (plan) {
@@ -15203,7 +15203,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var update_extension = try lowerDdlPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
+    var update_extension = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
     defer update_extension.deinit(alloc);
     switch (update_extension) {
         .extension_catalog => |plan| switch (plan) {
@@ -15216,7 +15216,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_extension = try lowerDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
+    var drop_extension = try legacyDdlParserPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
     defer drop_extension.deinit(alloc);
     switch (drop_extension) {
         .extension_catalog => |plan| switch (plan) {
@@ -15230,10 +15230,10 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION pgcrypto WITH SCHEMA public;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA private;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE EXTENSION pgcrypto WITH SCHEMA public;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA private;"));
 
-    var create_domain = try lowerDdlPlanForTestAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);");
+    var create_domain = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);");
     defer create_domain.deinit(alloc);
     switch (create_domain) {
         .domain_catalog => |plan| switch (plan) {
@@ -15252,7 +15252,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_domain = try lowerDdlPlanForTestAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL;");
+    var alter_domain = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL;");
     defer alter_domain.deinit(alloc);
     switch (alter_domain) {
         .domain_catalog => |plan| switch (plan) {
@@ -15280,7 +15280,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_name));
 
     var malformed_generated_create_domain_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
     defer malformed_generated_create_domain_tail.deinit(alloc);
@@ -15296,9 +15296,9 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_tail));
 
-    var create_sequence = try lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
+    var create_sequence = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
     defer create_sequence.deinit(alloc);
     switch (create_sequence) {
         .sequence_catalog => |plan| switch (plan) {
@@ -15315,7 +15315,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_sequence = try lowerDdlPlanForTestAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
+    var alter_sequence = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
     defer alter_sequence.deinit(alloc);
     switch (alter_sequence) {
         .sequence_catalog => |plan| switch (plan) {
@@ -15340,7 +15340,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_sequence = try lowerDdlPlanForTestAlloc(alloc, "DROP SEQUENCE IF EXISTS users_owned_id_seq CASCADE;");
+    var drop_sequence = try legacyDdlParserPlanForTestAlloc(alloc, "DROP SEQUENCE IF EXISTS users_owned_id_seq CASCADE;");
     defer drop_sequence.deinit(alloc);
     switch (drop_sequence) {
         .sequence_catalog => |plan| switch (plan) {
@@ -15364,7 +15364,7 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_sequence));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_create_sequence));
 
     var malformed_generated_alter_sequence = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE users_owned_id_seq RESTART WITH 1000;");
     defer malformed_generated_alter_sequence.deinit(alloc);
@@ -15376,16 +15376,16 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_sequence));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_sequence));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
 }
 
 test "sql adapter ddl plan lowers routine catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var create_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql;");
+    var create_function = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql;");
     defer create_function.deinit(alloc);
     switch (create_function) {
         .function_catalog => |plan| switch (plan) {
@@ -15402,7 +15402,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var replace_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql;");
+    var replace_function = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql;");
     defer replace_function.deinit(alloc);
     switch (replace_function) {
         .function_catalog => |plan| switch (plan) {
@@ -15412,7 +15412,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var option_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;");
+    var option_function = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;");
     defer option_function.deinit(alloc);
     switch (option_function) {
         .function_catalog => |plan| switch (plan) {
@@ -15440,7 +15440,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var trigger_body = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;");
+    var trigger_body = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;");
     defer trigger_body.deinit(alloc);
     switch (trigger_body) {
         .function_catalog => |plan| switch (plan) {
@@ -15458,7 +15458,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_function = try lowerDdlPlanForTestAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE;");
+    var drop_function = try legacyDdlParserPlanForTestAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE;");
     defer drop_function.deinit(alloc);
     switch (drop_function) {
         .function_catalog => |plan| switch (plan) {
@@ -15474,7 +15474,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_procedure = try lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;");
+    var create_procedure = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;");
     defer create_procedure.deinit(alloc);
     switch (create_procedure) {
         .function_catalog => |plan| switch (plan) {
@@ -15494,7 +15494,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var call_procedure = try lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage();");
+    var call_procedure = try legacyDdlParserPlanForTestAlloc(alloc, "CALL rotate_usage();");
     defer call_procedure.deinit(alloc);
     switch (call_procedure) {
         .procedure_call => |call| {
@@ -15504,7 +15504,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_procedure = try lowerDdlPlanForTestAlloc(alloc, "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE;");
+    var drop_procedure = try legacyDdlParserPlanForTestAlloc(alloc, "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE;");
     defer drop_procedure.deinit(alloc);
     switch (drop_procedure) {
         .function_catalog => |plan| switch (plan) {
@@ -15537,7 +15537,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_create_routine_name));
 
     var malformed_create_routine_tail = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15555,7 +15555,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_create_routine_tail));
 
     var malformed_drop_routine_signature = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15573,7 +15573,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_signature));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_drop_routine_signature));
 
     var malformed_drop_routine_cascade = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15592,10 +15592,10 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_cascade));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_drop_routine_cascade));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
-    var create_procedure_arg = try lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
+    var create_procedure_arg = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
     defer create_procedure_arg.deinit(alloc);
     switch (create_procedure_arg) {
         .function_catalog => |plan| switch (plan) {
@@ -15610,13 +15610,13 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
 }
 
 test "sql adapter ddl plan lowers authorization catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var grant_privilege = try lowerDdlPlanForTestAlloc(alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;");
+    var grant_privilege = try legacyDdlParserPlanForTestAlloc(alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;");
     defer grant_privilege.deinit(alloc);
     switch (grant_privilege) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15633,7 +15633,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var grant_all_tables = try lowerDdlPlanForTestAlloc(alloc, "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;");
+    var grant_all_tables = try legacyDdlParserPlanForTestAlloc(alloc, "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;");
     defer grant_all_tables.deinit(alloc);
     switch (grant_all_tables) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15649,7 +15649,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var revoke_privilege = try lowerDdlPlanForTestAlloc(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
+    var revoke_privilege = try legacyDdlParserPlanForTestAlloc(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
     defer revoke_privilege.deinit(alloc);
     switch (revoke_privilege) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15665,7 +15665,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_role = try lowerDdlPlanForTestAlloc(alloc, "CREATE ROLE app_writer;");
+    var create_role = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE ROLE app_writer;");
     defer create_role.deinit(alloc);
     switch (create_role) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15675,7 +15675,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_user = try lowerDdlPlanForTestAlloc(alloc, "CREATE USER app_writer;");
+    var create_user = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE USER app_writer;");
     defer create_user.deinit(alloc);
     switch (create_user) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15685,7 +15685,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_group = try lowerDdlPlanForTestAlloc(alloc, "CREATE GROUP app_readers;");
+    var create_group = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE GROUP app_readers;");
     defer create_group.deinit(alloc);
     switch (create_group) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15695,7 +15695,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_role = try lowerDdlPlanForTestAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
+    var alter_role = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
     defer alter_role.deinit(alloc);
     switch (alter_role) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15715,7 +15715,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var reset_role = try lowerDdlPlanForTestAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout;");
+    var reset_role = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout;");
     defer reset_role.deinit(alloc);
     switch (reset_role) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15731,7 +15731,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var reset_user = try lowerDdlPlanForTestAlloc(alloc, "ALTER USER app_writer RESET statement_timeout;");
+    var reset_user = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER USER app_writer RESET statement_timeout;");
     defer reset_user.deinit(alloc);
     switch (reset_user) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15745,7 +15745,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var reset_group = try lowerDdlPlanForTestAlloc(alloc, "ALTER GROUP app_readers RESET statement_timeout;");
+    var reset_group = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER GROUP app_readers RESET statement_timeout;");
     defer reset_group.deinit(alloc);
     switch (reset_group) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15759,7 +15759,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_role = try lowerDdlPlanForTestAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
+    var drop_role = try legacyDdlParserPlanForTestAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
     defer drop_role.deinit(alloc);
     switch (drop_role) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15772,7 +15772,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_user = try lowerDdlPlanForTestAlloc(alloc, "DROP USER IF EXISTS app_writer;");
+    var drop_user = try legacyDdlParserPlanForTestAlloc(alloc, "DROP USER IF EXISTS app_writer;");
     defer drop_user.deinit(alloc);
     switch (drop_user) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15785,7 +15785,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_group = try lowerDdlPlanForTestAlloc(alloc, "DROP GROUP IF EXISTS app_readers;");
+    var drop_group = try legacyDdlParserPlanForTestAlloc(alloc, "DROP GROUP IF EXISTS app_readers;");
     defer drop_group.deinit(alloc);
     switch (drop_group) {
         .authorization_catalog => |plan| switch (plan) {
@@ -15815,7 +15815,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_role_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_create_role_name));
 
     var malformed_alter_role_tail = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15833,7 +15833,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter_role_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_alter_role_tail));
 
     var malformed_drop_role_if_exists = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15852,7 +15852,7 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_if_exists));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_drop_role_if_exists));
 
     var malformed_drop_role_tail = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15871,13 +15871,13 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_drop_role_tail));
 }
 
 test "sql adapter ddl plan lowers partition and row security catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var create_partitioned_table = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
+    var create_partitioned_table = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
     defer create_partitioned_table.deinit(alloc);
     switch (create_partitioned_table) {
         .table_partition_catalog => |plan| switch (plan) {
@@ -15892,7 +15892,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var create_table_partition = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    var create_table_partition = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
     defer create_table_partition.deinit(alloc);
     switch (create_table_partition) {
         .table_partition_catalog => |plan| switch (plan) {
@@ -15907,7 +15907,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var attach_partition = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    var attach_partition = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
     defer attach_partition.deinit(alloc);
     switch (attach_partition) {
         .table_partition_catalog => |plan| switch (plan) {
@@ -15922,7 +15922,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var detach_partition = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;");
+    var detach_partition = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;");
     defer detach_partition.deinit(alloc);
     switch (detach_partition) {
         .table_partition_catalog => |plan| switch (plan) {
@@ -15935,7 +15935,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var enable_row_security = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
+    var enable_row_security = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
     defer enable_row_security.deinit(alloc);
     switch (enable_row_security) {
         .row_security_catalog => |plan| switch (plan) {
@@ -15948,7 +15948,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var create_row_policy = try lowerDdlPlanForTestAlloc(alloc, "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));");
+    var create_row_policy = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));");
     defer create_row_policy.deinit(alloc);
     switch (create_row_policy) {
         .row_security_catalog => |plan| switch (plan) {
@@ -15970,7 +15970,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var expression_row_policy = try lowerDdlPlanForTestAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
+    var expression_row_policy = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
     defer expression_row_policy.deinit(alloc);
     switch (expression_row_policy) {
         .row_security_catalog => |plan| switch (plan) {
@@ -15987,7 +15987,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_row_policy = try lowerDdlPlanForTestAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');");
+    var alter_row_policy = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');");
     defer alter_row_policy.deinit(alloc);
     switch (alter_row_policy) {
         .row_security_catalog => |plan| switch (plan) {
@@ -16008,7 +16008,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_row_policy = try lowerDdlPlanForTestAlloc(alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;");
+    var drop_row_policy = try legacyDdlParserPlanForTestAlloc(alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;");
     defer drop_row_policy.deinit(alloc);
     switch (drop_row_policy) {
         .row_security_catalog => |plan| switch (plan) {
@@ -16026,7 +16026,7 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
 test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var create_schema = try lowerDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS tenant_ops;");
+    var create_schema = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS tenant_ops;");
     defer create_schema.deinit(alloc);
     switch (create_schema) {
         .schema_namespace_catalog => |plan| switch (plan) {
@@ -16039,7 +16039,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var rename_schema = try lowerDdlPlanForTestAlloc(alloc, "ALTER SCHEMA tenant_ops RENAME TO tenant_ops_archive;");
+    var rename_schema = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER SCHEMA tenant_ops RENAME TO tenant_ops_archive;");
     defer rename_schema.deinit(alloc);
     switch (rename_schema) {
         .schema_namespace_catalog => |plan| switch (plan) {
@@ -16052,7 +16052,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_schema = try lowerDdlPlanForTestAlloc(alloc, "DROP SCHEMA IF EXISTS tenant_ops CASCADE;");
+    var drop_schema = try legacyDdlParserPlanForTestAlloc(alloc, "DROP SCHEMA IF EXISTS tenant_ops CASCADE;");
     defer drop_schema.deinit(alloc);
     switch (drop_schema) {
         .schema_namespace_catalog => |plan| switch (plan) {
@@ -16066,7 +16066,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var create_database = try lowerDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops;");
+    var create_database = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops;");
     defer create_database.deinit(alloc);
     switch (create_database) {
         .database_catalog => |plan| switch (plan) {
@@ -16076,7 +16076,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_database = try lowerDdlPlanForTestAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
+    var alter_database = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
     defer alter_database.deinit(alloc);
     switch (alter_database) {
         .database_catalog => |plan| switch (plan) {
@@ -16094,7 +16094,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_database = try lowerDdlPlanForTestAlloc(alloc, "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE);");
+    var drop_database = try legacyDdlParserPlanForTestAlloc(alloc, "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE);");
     defer drop_database.deinit(alloc);
     switch (drop_database) {
         .database_catalog => |plan| switch (plan) {
@@ -16108,7 +16108,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var create_tablespace = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
+    var create_tablespace = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
     defer create_tablespace.deinit(alloc);
     switch (create_tablespace) {
         .tablespace_catalog => |plan| switch (plan) {
@@ -16121,7 +16121,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var rename_tablespace = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
+    var rename_tablespace = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
     defer rename_tablespace.deinit(alloc);
     switch (rename_tablespace) {
         .tablespace_catalog => |plan| switch (plan) {
@@ -16134,7 +16134,7 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_tablespace = try lowerDdlPlanForTestAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive;");
+    var drop_tablespace = try legacyDdlParserPlanForTestAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive;");
     defer drop_tablespace.deinit(alloc);
     switch (drop_tablespace) {
         .tablespace_catalog => |plan| switch (plan) {
@@ -16157,13 +16157,13 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_tablespace));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_tablespace));
 }
 
 test "sql adapter ddl plan lowers notification and logical replication catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var listen_notification = try lowerDdlPlanForTestAlloc(alloc, "LISTEN usage_events;");
+    var listen_notification = try legacyDdlParserPlanForTestAlloc(alloc, "LISTEN usage_events;");
     defer listen_notification.deinit(alloc);
     switch (listen_notification) {
         .notification_channel => |plan| switch (plan) {
@@ -16173,7 +16173,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var notify_notification = try lowerDdlPlanForTestAlloc(alloc, "NOTIFY usage_events, 'updated';");
+    var notify_notification = try legacyDdlParserPlanForTestAlloc(alloc, "NOTIFY usage_events, 'updated';");
     defer notify_notification.deinit(alloc);
     switch (notify_notification) {
         .notification_channel => |plan| switch (plan) {
@@ -16186,7 +16186,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var unlisten_all_notification = try lowerDdlPlanForTestAlloc(alloc, "UNLISTEN *;");
+    var unlisten_all_notification = try legacyDdlParserPlanForTestAlloc(alloc, "UNLISTEN *;");
     defer unlisten_all_notification.deinit(alloc);
     switch (unlisten_all_notification) {
         .notification_channel => |plan| switch (plan) {
@@ -16199,7 +16199,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var create_publication = try lowerDdlPlanForTestAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records;");
+    var create_publication = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records;");
     defer create_publication.deinit(alloc);
     switch (create_publication) {
         .logical_replication => |plan| switch (plan) {
@@ -16217,7 +16217,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_publication = try lowerDdlPlanForTestAlloc(alloc, "ALTER PUBLICATION usage_pub ADD TABLE usage_events;");
+    var alter_publication = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER PUBLICATION usage_pub ADD TABLE usage_events;");
     defer alter_publication.deinit(alloc);
     switch (alter_publication) {
         .logical_replication => |plan| switch (plan) {
@@ -16237,7 +16237,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_publication = try lowerDdlPlanForTestAlloc(alloc, "DROP PUBLICATION IF EXISTS usage_pub;");
+    var drop_publication = try legacyDdlParserPlanForTestAlloc(alloc, "DROP PUBLICATION IF EXISTS usage_pub;");
     defer drop_publication.deinit(alloc);
     switch (drop_publication) {
         .logical_replication => |plan| switch (plan) {
@@ -16253,7 +16253,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var create_subscription = try lowerDdlPlanForTestAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;");
+    var create_subscription = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;");
     defer create_subscription.deinit(alloc);
     switch (create_subscription) {
         .logical_replication => |plan| switch (plan) {
@@ -16271,7 +16271,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var alter_subscription = try lowerDdlPlanForTestAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE;");
+    var alter_subscription = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE;");
     defer alter_subscription.deinit(alloc);
     switch (alter_subscription) {
         .logical_replication => |plan| switch (plan) {
@@ -16287,7 +16287,7 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_subscription = try lowerDdlPlanForTestAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub;");
+    var drop_subscription = try legacyDdlParserPlanForTestAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub;");
     defer drop_subscription.deinit(alloc);
     switch (drop_subscription) {
         .logical_replication => |plan| switch (plan) {
@@ -16316,13 +16316,13 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_publication));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_publication));
 }
 
 test "sql adapter ddl plan lowers type system catalog ddl plans" {
     const alloc = std.testing.allocator;
 
-    var create_collation = try lowerDdlPlanForTestAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');");
+    var create_collation = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');");
     defer create_collation.deinit(alloc);
     switch (create_collation) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16338,7 +16338,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var rename_collation = try lowerDdlPlanForTestAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
+    var rename_collation = try legacyDdlParserPlanForTestAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
     defer rename_collation.deinit(alloc);
     switch (rename_collation) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16354,7 +16354,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_collation = try lowerDdlPlanForTestAlloc(alloc, "DROP COLLATION IF EXISTS ci_text;");
+    var drop_collation = try legacyDdlParserPlanForTestAlloc(alloc, "DROP COLLATION IF EXISTS ci_text;");
     defer drop_collation.deinit(alloc);
     switch (drop_collation) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16370,7 +16370,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_operator = try lowerDdlPlanForTestAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
+    var create_operator = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
     defer create_operator.deinit(alloc);
     switch (create_operator) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16386,7 +16386,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_operator = try lowerDdlPlanForTestAlloc(alloc, "DROP OPERATOR === (text, text);");
+    var drop_operator = try legacyDdlParserPlanForTestAlloc(alloc, "DROP OPERATOR === (text, text);");
     defer drop_operator.deinit(alloc);
     switch (drop_operator) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16403,7 +16403,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_operator_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP OPERATOR IF EXISTS === (text, text);");
+    var drop_operator_if_exists = try legacyDdlParserPlanForTestAlloc(alloc, "DROP OPERATOR IF EXISTS === (text, text);");
     defer drop_operator_if_exists.deinit(alloc);
     switch (drop_operator_if_exists) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16420,7 +16420,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_aggregate = try lowerDdlPlanForTestAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
+    var create_aggregate = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
     defer create_aggregate.deinit(alloc);
     switch (create_aggregate) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16437,7 +16437,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_aggregate = try lowerDdlPlanForTestAlloc(alloc, "DROP AGGREGATE first_value_text(text);");
+    var drop_aggregate = try legacyDdlParserPlanForTestAlloc(alloc, "DROP AGGREGATE first_value_text(text);");
     defer drop_aggregate.deinit(alloc);
     switch (drop_aggregate) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16454,7 +16454,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_aggregate_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP AGGREGATE IF EXISTS first_value_text(text);");
+    var drop_aggregate_if_exists = try legacyDdlParserPlanForTestAlloc(alloc, "DROP AGGREGATE IF EXISTS first_value_text(text);");
     defer drop_aggregate_if_exists.deinit(alloc);
     switch (drop_aggregate_if_exists) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16471,7 +16471,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_cast = try lowerDdlPlanForTestAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
+    var create_cast = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
     defer create_cast.deinit(alloc);
     switch (create_cast) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16489,7 +16489,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_cast = try lowerDdlPlanForTestAlloc(alloc, "DROP CAST (jsonb AS text);");
+    var drop_cast = try legacyDdlParserPlanForTestAlloc(alloc, "DROP CAST (jsonb AS text);");
     defer drop_cast.deinit(alloc);
     switch (drop_cast) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16506,7 +16506,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var drop_cast_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP CAST IF EXISTS (jsonb AS text);");
+    var drop_cast_if_exists = try legacyDdlParserPlanForTestAlloc(alloc, "DROP CAST IF EXISTS (jsonb AS text);");
     defer drop_cast_if_exists.deinit(alloc);
     switch (drop_cast_if_exists) {
         .type_system_catalog => |plan| switch (plan) {
@@ -16533,13 +16533,13 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_collation));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_collation));
 }
 
 test "sql adapter ddl plan lowers maintenance job ddl plans" {
     const alloc = std.testing.allocator;
 
-    var vacuum = try lowerDdlPlanForTestAlloc(alloc, "VACUUM usage_records;");
+    var vacuum = try legacyDdlParserPlanForTestAlloc(alloc, "VACUUM usage_records;");
     defer vacuum.deinit(alloc);
     switch (vacuum) {
         .maintenance_job => |plan| switch (plan) {
@@ -16555,7 +16555,7 @@ test "sql adapter ddl plan lowers maintenance job ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var analyze = try lowerDdlPlanForTestAlloc(alloc, "ANALYZE usage_records;");
+    var analyze = try legacyDdlParserPlanForTestAlloc(alloc, "ANALYZE usage_records;");
     defer analyze.deinit(alloc);
     switch (analyze) {
         .maintenance_job => |plan| switch (plan) {
@@ -16569,7 +16569,7 @@ test "sql adapter ddl plan lowers maintenance job ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var reindex = try lowerDdlPlanForTestAlloc(alloc, "REINDEX TABLE usage_records;");
+    var reindex = try legacyDdlParserPlanForTestAlloc(alloc, "REINDEX TABLE usage_records;");
     defer reindex.deinit(alloc);
     switch (reindex) {
         .maintenance_job => |plan| switch (plan) {
@@ -16583,7 +16583,7 @@ test "sql adapter ddl plan lowers maintenance job ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var cluster = try lowerDdlPlanForTestAlloc(alloc, "CLUSTER usage_records USING usage_records_status_idx;");
+    var cluster = try legacyDdlParserPlanForTestAlloc(alloc, "CLUSTER usage_records USING usage_records_status_idx;");
     defer cluster.deinit(alloc);
     switch (cluster) {
         .maintenance_job => |plan| switch (plan) {
@@ -16601,7 +16601,7 @@ test "sql adapter ddl plan lowers maintenance job ddl plans" {
 test "sql adapter ddl plan lowers bulk io ddl plans" {
     const alloc = std.testing.allocator;
 
-    var copy_from = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);");
+    var copy_from = try legacyDdlParserPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);");
     defer copy_from.deinit(alloc);
     switch (copy_from) {
         .bulk_io => |plan| {
@@ -16625,7 +16625,7 @@ test "sql adapter ddl plan lowers bulk io ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var copy_header = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
+    var copy_header = try legacyDdlParserPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
     defer copy_header.deinit(alloc);
     switch (copy_header) {
         .bulk_io => |plan| {
@@ -16649,7 +16649,7 @@ test "sql adapter ddl plan lowers bulk io ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var copy_where = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
+    var copy_where = try legacyDdlParserPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
     defer copy_where.deinit(alloc);
     switch (copy_where) {
         .bulk_io => |plan| {
@@ -16674,7 +16674,7 @@ test "sql adapter ddl plan lowers bulk io ddl plans" {
         .{ .sql = "COPY usage_records (id, status) TO PROGRAM 'cat > /tmp/usage.csv' WITH (FORMAT csv);", .direction = .to, .endpoint_kind = .program, .endpoint = "cat > /tmp/usage.csv" },
     };
     for (endpoint_cases) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .bulk_io => |plan| {
@@ -16686,7 +16686,7 @@ test "sql adapter ddl plan lowers bulk io ddl plans" {
         }
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (OIDS true);"));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (OIDS true);"));
 }
 
 test "sql adapter ddl plan lowers session catalog ddl plans" {
@@ -16698,7 +16698,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         "RESET client_min_messages;",
     };
     for (noops) |sql| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .adapter_noop => |plan| try std.testing.expectEqual(AdapterNoopDdlReason.session_setting, plan.reason),
@@ -16706,7 +16706,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         }
     }
 
-    var set_public_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET search_path TO public;");
+    var set_public_search_path = try legacyDdlParserPlanForTestAlloc(alloc, "SET search_path TO public;");
     defer set_public_search_path.deinit(alloc);
     switch (set_public_search_path) {
         .session_catalog => |plan| switch (plan) {
@@ -16720,7 +16720,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_tenant_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
+    var set_tenant_search_path = try legacyDdlParserPlanForTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
     defer set_tenant_search_path.deinit(alloc);
     switch (set_tenant_search_path) {
         .session_catalog => |plan| switch (plan) {
@@ -16735,7 +16735,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_app_setting = try lowerDdlPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    var set_app_setting = try legacyDdlParserPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer set_app_setting.deinit(alloc);
     switch (set_app_setting) {
         .session_catalog => |plan| switch (plan) {
@@ -16750,7 +16750,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_sync_level = try lowerDdlPlanForTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
+    var set_sync_level = try legacyDdlParserPlanForTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
     defer set_sync_level.deinit(alloc);
     switch (set_sync_level) {
         .session_catalog => |plan| switch (plan) {
@@ -16765,7 +16765,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_runtime_setting = try lowerDdlPlanForTestAlloc(alloc, "SET statement_timeout = '1ms';");
+    var set_runtime_setting = try legacyDdlParserPlanForTestAlloc(alloc, "SET statement_timeout = '1ms';");
     defer set_runtime_setting.deinit(alloc);
     switch (set_runtime_setting) {
         .session_catalog => |plan| switch (plan) {
@@ -16779,7 +16779,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_transaction_read_only = try lowerDdlPlanForTestAlloc(alloc, "SET default_transaction_read_only = on;");
+    var set_transaction_read_only = try legacyDdlParserPlanForTestAlloc(alloc, "SET default_transaction_read_only = on;");
     defer set_transaction_read_only.deinit(alloc);
     switch (set_transaction_read_only) {
         .session_catalog => |plan| switch (plan) {
@@ -16793,7 +16793,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_session_transaction_read_only = try lowerDdlPlanForTestAlloc(alloc, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
+    var set_session_transaction_read_only = try legacyDdlParserPlanForTestAlloc(alloc, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
     defer set_session_transaction_read_only.deinit(alloc);
     switch (set_session_transaction_read_only) {
         .session_catalog => |plan| switch (plan) {
@@ -16807,7 +16807,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var reset_app_setting = try lowerDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
+    var reset_app_setting = try legacyDdlParserPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer reset_app_setting.deinit(alloc);
     switch (reset_app_setting) {
         .session_catalog => |plan| switch (plan) {
@@ -16830,7 +16830,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         .{ .sql = "DISCARD ALL;", .tag = .discard_all },
     };
     for (session_commands) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .session_catalog => |plan| try std.testing.expectEqual(case.tag, std.meta.activeTag(plan)),
@@ -16852,7 +16852,7 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         "DISCARD TEMP;",
     };
     for (unsupported) |sql| {
-        try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, sql));
+        try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc, sql));
     }
 }
 
@@ -16861,7 +16861,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 
     var generated_search_path = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET search_path TO public;");
     defer generated_search_path.deinit(alloc);
-    var legacy_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET search_path TO public;");
+    var legacy_search_path = try legacyDdlParserPlanForTestAlloc(alloc, "SET search_path TO public;");
     defer legacy_search_path.deinit(alloc);
     switch (generated_search_path) {
         .set_search_path => |generated| switch (legacy_search_path) {
@@ -16880,7 +16880,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 
     var generated_setting = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer generated_setting.deinit(alloc);
-    var legacy_setting = try lowerDdlPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    var legacy_setting = try legacyDdlParserPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer legacy_setting.deinit(alloc);
     switch (generated_setting) {
         .set_setting => |generated| switch (legacy_setting) {
@@ -16900,7 +16900,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 
     var generated_reset = try generatedSessionCatalogPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer generated_reset.deinit(alloc);
-    var legacy_reset = try lowerDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
+    var legacy_reset = try legacyDdlParserPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer legacy_reset.deinit(alloc);
     switch (generated_reset) {
         .reset_setting => |generated| switch (legacy_reset) {
@@ -16927,7 +16927,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
     for (tag_cases) |case| {
         var generated = try generatedSessionCatalogPlanForTestAlloc(alloc, case.sql);
         defer generated.deinit(alloc);
-        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer legacy.deinit(alloc);
         try std.testing.expectEqual(case.tag, std.meta.activeTag(generated));
         switch (legacy) {
@@ -16940,7 +16940,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
     const alloc = std.testing.allocator;
 
-    var table_lock = try lowerDdlPlanForTestAlloc(alloc, "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE;");
+    var table_lock = try legacyDdlParserPlanForTestAlloc(alloc, "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE;");
     defer table_lock.deinit(alloc);
     switch (table_lock) {
         .transaction_control => |plan| switch (plan) {
@@ -16954,7 +16954,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var constraint_mode = try lowerDdlPlanForTestAlloc(alloc, "SET CONSTRAINTS ALL DEFERRED;");
+    var constraint_mode = try legacyDdlParserPlanForTestAlloc(alloc, "SET CONSTRAINTS ALL DEFERRED;");
     defer constraint_mode.deinit(alloc);
     switch (constraint_mode) {
         .transaction_control => |plan| switch (plan) {
@@ -16968,7 +16968,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var set_transaction = try lowerDdlPlanForTestAlloc(alloc, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;");
+    var set_transaction = try legacyDdlParserPlanForTestAlloc(alloc, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;");
     defer set_transaction.deinit(alloc);
     switch (set_transaction) {
         .transaction_control => |plan| switch (plan) {
@@ -16983,7 +16983,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var start_transaction = try lowerDdlPlanForTestAlloc(alloc, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;");
+    var start_transaction = try legacyDdlParserPlanForTestAlloc(alloc, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;");
     defer start_transaction.deinit(alloc);
     switch (start_transaction) {
         .transaction_control => |plan| switch (plan) {
@@ -16997,7 +16997,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var begin_transaction = try lowerDdlPlanForTestAlloc(alloc, "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;");
+    var begin_transaction = try legacyDdlParserPlanForTestAlloc(alloc, "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;");
     defer begin_transaction.deinit(alloc);
     switch (begin_transaction) {
         .transaction_control => |plan| switch (plan) {
@@ -17024,7 +17024,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         "ROLLBACK WORK;",
     };
     for (noops) |sql| {
-        var noop = try lowerDdlPlanForTestAlloc(alloc, sql);
+        var noop = try legacyDdlParserPlanForTestAlloc(alloc, sql);
         defer noop.deinit(alloc);
         switch (noop) {
             .adapter_noop => |plan| try std.testing.expectEqual(AdapterNoopDdlReason.transaction_control, plan.reason),
@@ -17032,7 +17032,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         }
     }
 
-    var advisory_lock = try lowerDdlPlanForTestAlloc(alloc, "SELECT pg_advisory_lock(42);");
+    var advisory_lock = try legacyDdlParserPlanForTestAlloc(alloc, "SELECT pg_advisory_lock(42);");
     defer advisory_lock.deinit(alloc);
     switch (advisory_lock) {
         .transaction_control => |plan| switch (plan) {
@@ -17046,7 +17046,7 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var advisory_unlock = try lowerDdlPlanForTestAlloc(alloc, "SELECT pg_advisory_unlock(42);");
+    var advisory_unlock = try legacyDdlParserPlanForTestAlloc(alloc, "SELECT pg_advisory_unlock(42);");
     defer advisory_unlock.deinit(alloc);
     switch (advisory_unlock) {
         .transaction_control => |plan| switch (plan) {
@@ -17080,7 +17080,7 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     };
     for (cases) |sql| {
         const generated = try generatedTransactionBoundaryPlanForTestAlloc(alloc, sql);
-        var legacy = try lowerDdlPlanForTestAlloc(alloc, sql);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, sql);
         defer legacy.deinit(alloc);
         switch (generated) {
             .adapter_noop => |generated_noop| switch (legacy) {
@@ -17188,7 +17188,7 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
 
     for (cases) |case| {
         const generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
-        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer legacy.deinit(alloc);
         switch (generated) {
             .transaction_control => |generated_control| switch (generated_control) {
@@ -17258,7 +17258,7 @@ test "sql adapter generated savepoint transaction AST lowers to savepoint plans"
     for (cases) |case| {
         var generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
         defer generated.deinit(alloc);
-        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer legacy.deinit(alloc);
         switch (generated) {
             .savepoint_transaction => |generated_savepoint| switch (legacy) {
@@ -17327,7 +17327,7 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
     for (cases) |sql| {
         var generated = try generatedSimpleDdlPlanForTestAlloc(alloc, sql);
         defer generated.deinit(alloc);
-        var legacy = try lowerDdlPlanForTestAlloc(alloc, sql);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, sql);
         defer legacy.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
         switch (generated) {
@@ -17400,7 +17400,7 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter_database));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_alter_database));
 
     var generated_create_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public.analytics;");
     defer generated_create_schema.deinit(alloc);
@@ -17452,7 +17452,7 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_rename_schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_rename_schema));
 
     var generated_create_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
     defer generated_create_extension.deinit(alloc);
@@ -17504,7 +17504,7 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_update_extension));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_update_extension));
 
     var generated_drop_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
     defer generated_drop_extension.deinit(alloc);
@@ -17548,7 +17548,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
     defer session.deinit(alloc);
-    var session_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session);
+    var session_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &session);
     defer session_plan.deinit(alloc);
     switch (session_plan) {
         .session_catalog => |plan| switch (plan) {
@@ -17563,7 +17563,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var session_setting = try tokenized.ParsedSql.initAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer session_setting.deinit(alloc);
-    var session_setting_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session_setting);
+    var session_setting_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &session_setting);
     defer session_setting_plan.deinit(alloc);
     switch (session_setting_plan) {
         .session_catalog => |plan| switch (plan) {
@@ -17579,7 +17579,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var session_noop = try tokenized.ParsedSql.initAlloc(alloc, "SET client_encoding = 'UTF8';");
     defer session_noop.deinit(alloc);
-    var session_noop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session_noop);
+    var session_noop_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &session_noop);
     defer session_noop_plan.deinit(alloc);
     switch (session_noop_plan) {
         .adapter_noop => |noop| try std.testing.expectEqual(AdapterNoopDdlReason.session_setting, noop.reason),
@@ -17588,7 +17588,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var prepared = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_by_status(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer prepared.deinit(alloc);
-    var prepared_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &prepared);
+    var prepared_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &prepared);
     defer prepared_plan.deinit(alloc);
     switch (prepared_plan) {
         .prepared_statement => |plan| switch (plan) {
@@ -17604,7 +17604,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var graph = try tokenized.ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc);");
     defer graph.deinit(alloc);
-    var graph_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &graph);
+    var graph_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &graph);
     defer graph_plan.deinit(alloc);
     switch (graph_plan) {
         .create_index => |plan| {
@@ -17617,7 +17617,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_create_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
     defer runtime_create_table.deinit(alloc);
-    var runtime_create_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_table);
+    var runtime_create_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_table);
     defer runtime_create_table_plan.deinit(alloc);
     switch (runtime_create_table_plan) {
         .create_table => |plan| {
@@ -17630,7 +17630,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_create_function = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_generated_usage() RETURNS trigger LANGUAGE plpgsql;");
     defer runtime_create_function.deinit(alloc);
-    var runtime_create_function_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_function);
+    var runtime_create_function_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_function);
     defer runtime_create_function_plan.deinit(alloc);
     switch (runtime_create_function_plan) {
         .function_catalog => |plan| switch (plan) {
@@ -17646,7 +17646,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_drop_function = try tokenized.ParsedSql.initAlloc(alloc, "DROP FUNCTION IF EXISTS touch_generated_usage(text) CASCADE;");
     defer runtime_drop_function.deinit(alloc);
-    var runtime_drop_function_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_function);
+    var runtime_drop_function_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_drop_function);
     defer runtime_drop_function_plan.deinit(alloc);
     switch (runtime_drop_function_plan) {
         .function_catalog => |plan| switch (plan) {
@@ -17664,7 +17664,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_create_procedure = try tokenized.ParsedSql.initAlloc(alloc, "CREATE PROCEDURE rotate_generated_usage() LANGUAGE plpgsql;");
     defer runtime_create_procedure.deinit(alloc);
-    var runtime_create_procedure_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_procedure);
+    var runtime_create_procedure_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_procedure);
     defer runtime_create_procedure_plan.deinit(alloc);
     switch (runtime_create_procedure_plan) {
         .function_catalog => |plan| switch (plan) {
@@ -17679,7 +17679,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_create_role = try tokenized.ParsedSql.initAlloc(alloc, "CREATE ROLE generated_app_writer;");
     defer runtime_create_role.deinit(alloc);
-    var runtime_create_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_role);
+    var runtime_create_role_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_role);
     defer runtime_create_role_plan.deinit(alloc);
     switch (runtime_create_role_plan) {
         .authorization_catalog => |plan| switch (plan) {
@@ -17691,7 +17691,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_alter_role = try tokenized.ParsedSql.initAlloc(alloc, "ALTER ROLE generated_app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
     defer runtime_alter_role.deinit(alloc);
-    var runtime_alter_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_alter_role);
+    var runtime_alter_role_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_alter_role);
     defer runtime_alter_role_plan.deinit(alloc);
     switch (runtime_alter_role_plan) {
         .authorization_catalog => |plan| switch (plan) {
@@ -17708,7 +17708,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_drop_role = try tokenized.ParsedSql.initAlloc(alloc, "DROP ROLE IF EXISTS generated_app_writer;");
     defer runtime_drop_role.deinit(alloc);
-    var runtime_drop_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_role);
+    var runtime_drop_role_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_drop_role);
     defer runtime_drop_role_plan.deinit(alloc);
     switch (runtime_drop_role_plan) {
         .authorization_catalog => |plan| switch (plan) {
@@ -17723,7 +17723,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_serial_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
     defer runtime_serial_table.deinit(alloc);
-    var runtime_serial_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_serial_table);
+    var runtime_serial_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_serial_table);
     defer runtime_serial_table_plan.deinit(alloc);
     switch (runtime_serial_table_plan) {
         .identity_allocator_catalog => |plan| {
@@ -17739,7 +17739,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_serial_named_column = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_named_column (\"serial\" text, status text);");
     defer runtime_serial_named_column.deinit(alloc);
-    var runtime_serial_named_column_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_serial_named_column);
+    var runtime_serial_named_column_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_serial_named_column);
     defer runtime_serial_named_column_plan.deinit(alloc);
     switch (runtime_serial_named_column_plan) {
         .create_table => |plan| {
@@ -17752,7 +17752,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_drop_table = try tokenized.ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS generated_usage_records CASCADE;");
     defer runtime_drop_table.deinit(alloc);
-    var runtime_drop_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_table);
+    var runtime_drop_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_drop_table);
     defer runtime_drop_table_plan.deinit(alloc);
     switch (runtime_drop_table_plan) {
         .drop_table => |plan| {
@@ -17765,7 +17765,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_create_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);");
     defer runtime_create_index.deinit(alloc);
-    var runtime_create_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_index);
+    var runtime_create_index_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_index);
     defer runtime_create_index_plan.deinit(alloc);
     switch (runtime_create_index_plan) {
         .create_index => |plan| {
@@ -17781,7 +17781,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_active_status_idx ON generated_usage_records (status) WHERE status = 'active';");
     defer runtime_partial_index.deinit(alloc);
-    var runtime_partial_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_partial_index);
+    var runtime_partial_index_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_partial_index);
     defer runtime_partial_index_plan.deinit(alloc);
     switch (runtime_partial_index_plan) {
         .create_index => |plan| {
@@ -17799,7 +17799,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_expression_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_active_tenant_email_key ON generated_usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';");
     defer runtime_expression_partial_index.deinit(alloc);
-    var runtime_expression_partial_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_expression_partial_index);
+    var runtime_expression_partial_index_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_expression_partial_index);
     defer runtime_expression_partial_index_plan.deinit(alloc);
     switch (runtime_expression_partial_index_plan) {
         .create_index => |plan| {
@@ -17816,7 +17816,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_drop_index = try tokenized.ParsedSql.initAlloc(alloc, "DROP INDEX IF EXISTS generated_usage_status_idx RESTRICT;");
     defer runtime_drop_index.deinit(alloc);
-    var runtime_drop_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_index);
+    var runtime_drop_index_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_drop_index);
     defer runtime_drop_index_plan.deinit(alloc);
     switch (runtime_drop_index_plan) {
         .drop_index => |plan| {
@@ -17828,7 +17828,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE IF EXISTS ONLY generated_usage_records DROP COLUMN IF EXISTS status RESTRICT;");
     defer runtime_alter_table.deinit(alloc);
-    var runtime_alter_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_alter_table);
+    var runtime_alter_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_alter_table);
     defer runtime_alter_table_plan.deinit(alloc);
     switch (runtime_alter_table_plan) {
         .alter_table => |plan| {
@@ -17849,7 +17849,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_multi_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
     defer runtime_multi_alter_table.deinit(alloc);
-    var runtime_multi_alter_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_multi_alter_table);
+    var runtime_multi_alter_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_multi_alter_table);
     defer runtime_multi_alter_table_plan.deinit(alloc);
     switch (runtime_multi_alter_table_plan) {
         .alter_table => |plan| {
@@ -17873,7 +17873,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
     defer runtime_row_security.deinit(alloc);
-    var runtime_row_security_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_row_security);
+    var runtime_row_security_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_row_security);
     defer runtime_row_security_plan.deinit(alloc);
     switch (runtime_row_security_plan) {
         .row_security_catalog => |plan| switch (plan) {
@@ -17896,7 +17896,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
 
     var malformed_generated_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records DISABLE ROW LEVEL SECURITY;");
     defer malformed_generated_row_security.deinit(alloc);
@@ -17908,7 +17908,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_row_security));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_row_security));
 
     var malformed_generated_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
     defer malformed_generated_session.deinit(alloc);
@@ -17920,7 +17920,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_session));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_session));
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {
@@ -17928,7 +17928,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
 
     var generated_table = try generatedDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
     defer generated_table.deinit(alloc);
-    var legacy_table = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    var legacy_table = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
     defer legacy_table.deinit(alloc);
     switch (generated_table) {
         .create_table => |generated| switch (legacy_table) {
@@ -17997,7 +17997,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const drop_table_sql = "DROP TABLE IF EXISTS usage_records CASCADE;";
     var generated_drop_table = try generatedDdlPlanForTestAlloc(alloc, drop_table_sql);
     defer generated_drop_table.deinit(alloc);
-    var legacy_drop_table = try lowerDdlPlanForTestAlloc(alloc, drop_table_sql);
+    var legacy_drop_table = try legacyDdlParserPlanForTestAlloc(alloc, drop_table_sql);
     defer legacy_drop_table.deinit(alloc);
     switch (generated_drop_table) {
         .drop_table => |generated| switch (legacy_drop_table) {
@@ -18013,7 +18013,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
 
     var generated_index = try generatedDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
     defer generated_index.deinit(alloc);
-    var legacy_index = try lowerDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
+    var legacy_index = try legacyDdlParserPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
     defer legacy_index.deinit(alloc);
     switch (generated_index) {
         .create_index => |generated| switch (legacy_index) {
@@ -18034,7 +18034,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const drop_index_sql = "DROP INDEX IF EXISTS usage_records_status_idx RESTRICT;";
     var generated_drop_index = try generatedDdlPlanForTestAlloc(alloc, drop_index_sql);
     defer generated_drop_index.deinit(alloc);
-    var legacy_drop_index = try lowerDdlPlanForTestAlloc(alloc, drop_index_sql);
+    var legacy_drop_index = try legacyDdlParserPlanForTestAlloc(alloc, drop_index_sql);
     defer legacy_drop_index.deinit(alloc);
     switch (generated_drop_index) {
         .drop_index => |generated| switch (legacy_drop_index) {
@@ -18050,7 +18050,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_add_sql = "ALTER TABLE usage_records ADD COLUMN status text;";
     var generated_alter_add = try generatedDdlPlanForTestAlloc(alloc, alter_add_sql);
     defer generated_alter_add.deinit(alloc);
-    var legacy_alter_add = try lowerDdlPlanForTestAlloc(alloc, alter_add_sql);
+    var legacy_alter_add = try legacyDdlParserPlanForTestAlloc(alloc, alter_add_sql);
     defer legacy_alter_add.deinit(alloc);
     switch (generated_alter_add) {
         .alter_table => |generated| switch (legacy_alter_add) {
@@ -18071,7 +18071,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_drop_sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT;";
     var generated_alter_drop = try generatedDdlPlanForTestAlloc(alloc, alter_drop_sql);
     defer generated_alter_drop.deinit(alloc);
-    var legacy_alter_drop = try lowerDdlPlanForTestAlloc(alloc, alter_drop_sql);
+    var legacy_alter_drop = try legacyDdlParserPlanForTestAlloc(alloc, alter_drop_sql);
     defer legacy_alter_drop.deinit(alloc);
     switch (generated_alter_drop) {
         .alter_table => |generated| switch (legacy_alter_drop) {
@@ -18096,7 +18096,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_rename_sql = "ALTER TABLE usage_records RENAME COLUMN status TO state;";
     var generated_alter_rename = try generatedDdlPlanForTestAlloc(alloc, alter_rename_sql);
     defer generated_alter_rename.deinit(alloc);
-    var legacy_alter_rename = try lowerDdlPlanForTestAlloc(alloc, alter_rename_sql);
+    var legacy_alter_rename = try legacyDdlParserPlanForTestAlloc(alloc, alter_rename_sql);
     defer legacy_alter_rename.deinit(alloc);
     switch (generated_alter_rename) {
         .alter_table => |generated| switch (legacy_alter_rename) {
@@ -18119,7 +18119,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_validate_sql = "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_amount_check;";
     var generated_alter_validate = try generatedDdlPlanForTestAlloc(alloc, alter_validate_sql);
     defer generated_alter_validate.deinit(alloc);
-    var legacy_alter_validate = try lowerDdlPlanForTestAlloc(alloc, alter_validate_sql);
+    var legacy_alter_validate = try legacyDdlParserPlanForTestAlloc(alloc, alter_validate_sql);
     defer legacy_alter_validate.deinit(alloc);
     switch (generated_alter_validate) {
         .alter_table => |generated| switch (legacy_alter_validate) {
@@ -18145,7 +18145,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     ;
     var generated_alter_constraint = try generatedDdlPlanForTestAlloc(alloc, alter_constraint_sql);
     defer generated_alter_constraint.deinit(alloc);
-    var legacy_alter_constraint = try lowerDdlPlanForTestAlloc(alloc, alter_constraint_sql);
+    var legacy_alter_constraint = try legacyDdlParserPlanForTestAlloc(alloc, alter_constraint_sql);
     defer legacy_alter_constraint.deinit(alloc);
     switch (generated_alter_constraint) {
         .alter_table => |generated| switch (legacy_alter_constraint) {
@@ -18191,7 +18191,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const covering_partial_sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL;";
     var generated_covering_partial = try generatedDdlPlanForTestAlloc(alloc, covering_partial_sql);
     defer generated_covering_partial.deinit(alloc);
-    var legacy_covering_partial = try lowerDdlPlanForTestAlloc(alloc, covering_partial_sql);
+    var legacy_covering_partial = try legacyDdlParserPlanForTestAlloc(alloc, covering_partial_sql);
     defer legacy_covering_partial.deinit(alloc);
     switch (generated_covering_partial) {
         .create_index => |generated| switch (legacy_covering_partial) {
@@ -18219,7 +18219,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const expression_partial_sql = "CREATE UNIQUE INDEX users_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';";
     var generated_expression_partial = try generatedDdlPlanForTestAlloc(alloc, expression_partial_sql);
     defer generated_expression_partial.deinit(alloc);
-    var legacy_expression_partial = try lowerDdlPlanForTestAlloc(alloc, expression_partial_sql);
+    var legacy_expression_partial = try legacyDdlParserPlanForTestAlloc(alloc, expression_partial_sql);
     defer legacy_expression_partial.deinit(alloc);
     switch (generated_expression_partial) {
         .create_index => |generated| switch (legacy_expression_partial) {
@@ -18246,7 +18246,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
 test "sql adapter ddl plan lowers prepared transaction ddl plans" {
     const alloc = std.testing.allocator;
 
-    var prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    var prepare = try legacyDdlParserPlanForTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
     defer prepare.deinit(alloc);
     switch (prepare) {
         .prepared_transaction => |plan| {
@@ -18256,7 +18256,7 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var commit = try lowerDdlPlanForTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    var commit = try legacyDdlParserPlanForTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
     defer commit.deinit(alloc);
     switch (commit) {
         .prepared_transaction => |plan| {
@@ -18266,7 +18266,7 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var rollback = try lowerDdlPlanForTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    var rollback = try legacyDdlParserPlanForTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
     defer rollback.deinit(alloc);
     switch (rollback) {
         .prepared_transaction => |plan| {
@@ -18278,7 +18278,7 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
 
     var generated_prepare = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
     defer generated_prepare.deinit(alloc);
-    var generated_prepare_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &generated_prepare);
+    var generated_prepare_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &generated_prepare);
     defer generated_prepare_plan.deinit(alloc);
     switch (generated_prepare_plan) {
         .prepared_transaction => |plan| {
@@ -18290,7 +18290,7 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
 
     var generated_commit = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
     defer generated_commit.deinit(alloc);
-    var generated_commit_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &generated_commit);
+    var generated_commit_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &generated_commit);
     defer generated_commit_plan.deinit(alloc);
     switch (generated_commit_plan) {
         .prepared_transaction => |plan| {
@@ -18310,7 +18310,7 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_gid));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_gid));
 
     var malformed_kind = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
     defer malformed_kind.deinit(alloc);
@@ -18322,13 +18322,13 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 }
 
 test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl plans" {
     const alloc = std.testing.allocator;
 
-    var prepare_statement = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    var prepare_statement = try legacyDdlParserPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer prepare_statement.deinit(alloc);
     switch (prepare_statement) {
         .prepared_statement => |plan| switch (plan) {
@@ -18352,7 +18352,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         .{ .sql = "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);", .family = .update },
     };
     for (prepared_cases) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .prepared_statement => |plan| switch (plan) {
@@ -18366,7 +18366,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         }
     }
 
-    var execute_statement = try lowerDdlPlanForTestAlloc(alloc, "EXECUTE usage_plan('open');");
+    var execute_statement = try legacyDdlParserPlanForTestAlloc(alloc, "EXECUTE usage_plan('open');");
     defer execute_statement.deinit(alloc);
     switch (execute_statement) {
         .prepared_statement => |plan| switch (plan) {
@@ -18379,7 +18379,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var deallocate_statement = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
+    var deallocate_statement = try legacyDdlParserPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
     defer deallocate_statement.deinit(alloc);
     switch (deallocate_statement) {
         .prepared_statement => |plan| switch (plan) {
@@ -18389,7 +18389,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var deallocate_all = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE ALL;");
+    var deallocate_all = try legacyDdlParserPlanForTestAlloc(alloc, "DEALLOCATE ALL;");
     defer deallocate_all.deinit(alloc);
     switch (deallocate_all) {
         .prepared_statement => |plan| switch (plan) {
@@ -18399,7 +18399,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var declare_cursor = try lowerDdlPlanForTestAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;");
+    var declare_cursor = try legacyDdlParserPlanForTestAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;");
     defer declare_cursor.deinit(alloc);
     switch (declare_cursor) {
         .cursor_portal => |plan| switch (plan) {
@@ -18415,7 +18415,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var declare_scroll_hold = try lowerDdlPlanForTestAlloc(alloc, "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id;");
+    var declare_scroll_hold = try legacyDdlParserPlanForTestAlloc(alloc, "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id;");
     defer declare_scroll_hold.deinit(alloc);
     switch (declare_scroll_hold) {
         .cursor_portal => |plan| switch (plan) {
@@ -18430,7 +18430,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var declare_merge = try lowerDdlPlanForTestAlloc(alloc, "DECLARE merge_cursor CURSOR FOR MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
+    var declare_merge = try legacyDdlParserPlanForTestAlloc(alloc, "DECLARE merge_cursor CURSOR FOR MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
     defer declare_merge.deinit(alloc);
     switch (declare_merge) {
         .cursor_portal => |plan| switch (plan) {
@@ -18455,7 +18455,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         .{ .sql = "FETCH FORWARD usage_cursor;", .direction = .forward },
     };
     for (fetch_cases) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .cursor_portal => |plan| switch (plan) {
@@ -18480,7 +18480,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         .{ .sql = "MOVE usage_cursor;", .direction = .next },
     };
     for (move_cases) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .cursor_portal => |plan| switch (plan) {
@@ -18495,7 +18495,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         }
     }
 
-    var close_cursor = try lowerDdlPlanForTestAlloc(alloc, "CLOSE usage_cursor;");
+    var close_cursor = try legacyDdlParserPlanForTestAlloc(alloc, "CLOSE usage_cursor;");
     defer close_cursor.deinit(alloc);
     switch (close_cursor) {
         .cursor_portal => |plan| switch (plan) {
@@ -18505,7 +18505,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         else => return error.TestUnexpectedResult,
     }
 
-    var close_all = try lowerDdlPlanForTestAlloc(alloc, "CLOSE ALL;");
+    var close_all = try legacyDdlParserPlanForTestAlloc(alloc, "CLOSE ALL;");
     defer close_all.deinit(alloc);
     switch (close_all) {
         .cursor_portal => |plan| switch (plan) {
@@ -18526,7 +18526,7 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         .{ .sql = "ROLLBACK TO before_retry;", .tag = .rollback_to },
     };
     for (savepoint_cases) |case| {
-        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        var lowered = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
         defer lowered.deinit(alloc);
         switch (lowered) {
             .savepoint_transaction => |plan| {
@@ -18548,7 +18548,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
 
     var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer generated_prepare.deinit(alloc);
-    var legacy_prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    var legacy_prepare = try legacyDdlParserPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer legacy_prepare.deinit(alloc);
     switch (generated_prepare) {
         .prepare => |generated| switch (legacy_prepare) {
@@ -18568,7 +18568,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
 
     var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
     defer generated_execute.deinit(alloc);
-    var legacy_execute = try lowerDdlPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
+    var legacy_execute = try legacyDdlParserPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
     defer legacy_execute.deinit(alloc);
     switch (generated_execute) {
         .execute => |generated| switch (legacy_execute) {
@@ -18586,7 +18586,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
 
     var generated_deallocate = try generatedPreparedStatementPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
     defer generated_deallocate.deinit(alloc);
-    var legacy_deallocate = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
+    var legacy_deallocate = try legacyDdlParserPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
     defer legacy_deallocate.deinit(alloc);
     switch (generated_deallocate) {
         .deallocate => |generated| switch (legacy_deallocate) {
@@ -18684,7 +18684,7 @@ fn generatedSessionCatalogPlanForTestAlloc(alloc: std.mem.Allocator, sql: []cons
     return try sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed.items(), session_ast);
 }
 
-fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LegacyDdlParserPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
@@ -18695,7 +18695,7 @@ fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: [
     return try transactionBoundaryPlanFromGeneratedAst(alloc, parsed.items(), transaction_ast);
 }
 
-fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LegacyDdlParserPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
@@ -18706,7 +18706,7 @@ fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []
     return try transactionControlPlanFromGeneratedAstAlloc(alloc, parsed.items(), transaction_ast);
 }
 
-fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LegacyDdlParserPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
@@ -18714,7 +18714,7 @@ fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8)
     return try simpleDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ddl_ast);
 }
 
-fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LegacyDdlParserPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
@@ -18743,7 +18743,7 @@ fn generatedDdlCompatibleAst(ast: generated_parser.GeneratedSqlAst) !generated_p
     };
 }
 
-fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LegacyDdlParserPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
@@ -18758,7 +18758,7 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     const alloc = std.testing.allocator;
 
     const graph_index_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');";
-    var legacy_graph_index = try lowerDdlPlanForTestAlloc(alloc, graph_index_sql);
+    var legacy_graph_index = try legacyDdlParserPlanForTestAlloc(alloc, graph_index_sql);
     defer legacy_graph_index.deinit(alloc);
     var generated_graph_index = try generatedGraphDdlPlanForTestAlloc(alloc, graph_index_sql);
     defer generated_graph_index.deinit(alloc);
@@ -18811,7 +18811,7 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     }
 
     const graph_extraction_sql = "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');";
-    var legacy_graph_extraction = try lowerDdlPlanForTestAlloc(alloc, graph_extraction_sql);
+    var legacy_graph_extraction = try legacyDdlParserPlanForTestAlloc(alloc, graph_extraction_sql);
     defer legacy_graph_extraction.deinit(alloc);
     var generated_graph_extraction = try generatedGraphDdlPlanForTestAlloc(alloc, graph_extraction_sql);
     defer generated_graph_extraction.deinit(alloc);
@@ -18929,7 +18929,7 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
         .expression = normalize_expression,
     }};
 
-    var generated_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+    var generated_table = try legacyDdlParserPlanWithFunctionBindingsForTestAlloc(
         alloc,
         "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
         .{ .routine_expressions = &bindings },
@@ -18947,7 +18947,7 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqual(@as(usize, 1), generated_expression.operands.len);
     try std.testing.expectEqualStrings("status", generated_expression.operands[0].field);
 
-    var rewrite_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+    var rewrite_table = try legacyDdlParserPlanWithFunctionBindingsForTestAlloc(
         alloc,
         "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING normalize_status(status);",
         .{ .routine_expressions = &bindings },
@@ -18966,7 +18966,7 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqual(@as(usize, 1), rewrite_expression.operands.len);
     try std.testing.expectEqualStrings("status", rewrite_expression.operands[0].field);
 
-    var checked_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+    var checked_table = try legacyDdlParserPlanWithFunctionBindingsForTestAlloc(
         alloc,
         "CREATE TABLE usage_records (id text PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (normalize_status(status) != 'deleted'));",
         .{ .routine_expressions = &bindings },
@@ -18984,7 +18984,7 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqualStrings("status", checked_expression.lhs.operands[0].field);
     try std.testing.expectEqualStrings("\"deleted\"", checked_expression.rhs[0].value_json);
 
-    var routine_policy = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+    var routine_policy = try legacyDdlParserPlanWithFunctionBindingsForTestAlloc(
         alloc,
         "CREATE POLICY usage_records_normalized_policy ON usage_records USING (normalize_status(status) = 'active');",
         .{ .routine_expressions = &bindings },
@@ -19013,7 +19013,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users WITH NO DATA;",
     );
     defer create_sql.deinit(alloc);
-    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    var create_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &create_sql);
     defer create_plan.deinit(alloc);
     switch (create_plan) {
         .materialized_view_catalog => |catalog| switch (catalog) {
@@ -19033,7 +19033,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         "DROP MATERIALIZED VIEW IF EXISTS users_mv CASCADE;",
     );
     defer drop_sql.deinit(alloc);
-    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    var drop_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &drop_sql);
     defer drop_plan.deinit(alloc);
     switch (drop_plan) {
         .materialized_view_catalog => |catalog| switch (catalog) {
@@ -19052,7 +19052,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;",
     );
     defer refresh_sql.deinit(alloc);
-    var refresh_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &refresh_sql);
+    var refresh_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &refresh_sql);
     defer refresh_plan.deinit(alloc);
     switch (refresh_plan) {
         .materialized_view_catalog => |catalog| switch (catalog) {
@@ -19079,7 +19079,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19094,7 +19094,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 
     var unsupported_alter_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19105,7 +19105,7 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         .unsupported => {},
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &unsupported_alter_sql));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &unsupported_alter_sql));
 }
 
 test "sql adapter generated view DDL AST lowers to catalog plans" {
@@ -19116,7 +19116,7 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id AS user_id FROM users;",
     );
     defer create_sql.deinit(alloc);
-    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    var create_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &create_sql);
     defer create_plan.deinit(alloc);
     switch (create_plan) {
         .view_catalog => |catalog| switch (catalog) {
@@ -19137,7 +19137,7 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         "ALTER VIEW users_v RENAME TO users_active_v;",
     );
     defer rename_sql.deinit(alloc);
-    var rename_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &rename_sql);
+    var rename_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &rename_sql);
     defer rename_plan.deinit(alloc);
     switch (rename_plan) {
         .view_catalog => |catalog| switch (catalog) {
@@ -19155,7 +19155,7 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         "DROP VIEW IF EXISTS users_v CASCADE;",
     );
     defer drop_sql.deinit(alloc);
-    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    var drop_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &drop_sql);
     defer drop_plan.deinit(alloc);
     switch (drop_plan) {
         .view_catalog => |catalog| switch (catalog) {
@@ -19182,7 +19182,7 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_replace));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_replace));
 
     var malformed_operation = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19197,7 +19197,7 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_operation));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_operation));
 }
 
 test "sql adapter generated domain DDL AST lowers to catalog plans" {
@@ -19208,7 +19208,7 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);",
     );
     defer create_sql.deinit(alloc);
-    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    var create_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &create_sql);
     defer create_plan.deinit(alloc);
     switch (create_plan) {
         .domain_catalog => |catalog| switch (catalog) {
@@ -19227,7 +19227,7 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         "ALTER DOMAIN positive_amount SET NOT NULL, SET DEFAULT 42, DROP DEFAULT;",
     );
     defer alter_sql.deinit(alloc);
-    var alter_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &alter_sql);
+    var alter_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &alter_sql);
     defer alter_plan.deinit(alloc);
     switch (alter_plan) {
         .domain_catalog => |catalog| switch (catalog) {
@@ -19245,7 +19245,7 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         "DROP DOMAIN IF EXISTS positive_amount CASCADE;",
     );
     defer drop_sql.deinit(alloc);
-    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    var drop_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &drop_sql);
     defer drop_plan.deinit(alloc);
     switch (drop_plan) {
         .domain_catalog => |catalog| switch (catalog) {
@@ -19272,7 +19272,7 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_create));
 
     var malformed_alter = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19287,7 +19287,7 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_alter));
 }
 
 test "sql adapter generated row policy DDL AST lowers to catalog plans" {
@@ -19298,7 +19298,7 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
         "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
     );
     defer create_sql.deinit(alloc);
-    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    var create_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &create_sql);
     defer create_plan.deinit(alloc);
     switch (create_plan) {
         .row_security_catalog => |catalog| switch (catalog) {
@@ -19326,7 +19326,7 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
         "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');",
     );
     defer alter_sql.deinit(alloc);
-    var alter_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &alter_sql);
+    var alter_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &alter_sql);
     defer alter_plan.deinit(alloc);
     switch (alter_plan) {
         .row_security_catalog => |catalog| switch (catalog) {
@@ -19353,7 +19353,7 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
         "DROP POLICY usage_records_tenant_policy ON usage_records;",
     );
     defer drop_sql.deinit(alloc);
-    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    var drop_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &drop_sql);
     defer drop_plan.deinit(alloc);
     switch (drop_plan) {
         .row_security_catalog => |catalog| switch (catalog) {
@@ -19380,7 +19380,7 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_table = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19395,7 +19395,7 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_table));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_table));
 }
 
 test "sql adapter generated utility unsupported AST lowers to typed catalog plans" {
@@ -19417,7 +19417,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
     for (cases) |case| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
-        var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+        var lowered = try legacyDdlParserPlanParsedSqlAlloc(alloc, &parsed_sql);
         defer lowered.deinit(alloc);
         switch (case.kind) {
             .call => switch (lowered) {
@@ -19480,7 +19480,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19495,7 +19495,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 
     var malformed_trigger_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19514,7 +19514,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_trigger_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_trigger_subject));
 }
 
 test "sql adapter generated notification unsupported AST lowers to catalog plans" {
@@ -19525,7 +19525,7 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
         "LISTEN usage_events;",
     );
     defer listen_sql.deinit(alloc);
-    var listen_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &listen_sql);
+    var listen_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &listen_sql);
     defer listen_plan.deinit(alloc);
     switch (listen_plan) {
         .notification_channel => |catalog| switch (catalog) {
@@ -19540,7 +19540,7 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
         "NOTIFY usage_events, 'updated';",
     );
     defer notify_sql.deinit(alloc);
-    var notify_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &notify_sql);
+    var notify_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &notify_sql);
     defer notify_plan.deinit(alloc);
     switch (notify_plan) {
         .notification_channel => |catalog| switch (catalog) {
@@ -19558,7 +19558,7 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
         "UNLISTEN *;",
     );
     defer unlisten_sql.deinit(alloc);
-    var unlisten_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &unlisten_sql);
+    var unlisten_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &unlisten_sql);
     defer unlisten_plan.deinit(alloc);
     switch (unlisten_plan) {
         .notification_channel => |catalog| switch (catalog) {
@@ -19584,7 +19584,7 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19599,7 +19599,7 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
 test "sql adapter generated maintenance unsupported AST lowers to catalog plans" {
@@ -19610,7 +19610,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         "VACUUM usage_records;",
     );
     defer vacuum_sql.deinit(alloc);
-    var vacuum_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &vacuum_sql);
+    var vacuum_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &vacuum_sql);
     defer vacuum_plan.deinit(alloc);
     switch (vacuum_plan) {
         .maintenance_job => |maintenance| switch (maintenance) {
@@ -19631,7 +19631,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         "ANALYZE usage_records;",
     );
     defer analyze_sql.deinit(alloc);
-    var analyze_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &analyze_sql);
+    var analyze_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &analyze_sql);
     defer analyze_plan.deinit(alloc);
     switch (analyze_plan) {
         .maintenance_job => |maintenance| switch (maintenance) {
@@ -19650,7 +19650,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         "REINDEX TABLE usage_records;",
     );
     defer reindex_sql.deinit(alloc);
-    var reindex_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &reindex_sql);
+    var reindex_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &reindex_sql);
     defer reindex_plan.deinit(alloc);
     switch (reindex_plan) {
         .maintenance_job => |maintenance| switch (maintenance) {
@@ -19669,7 +19669,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         "CLUSTER usage_records USING usage_records_status_idx;",
     );
     defer cluster_sql.deinit(alloc);
-    var cluster_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &cluster_sql);
+    var cluster_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &cluster_sql);
     defer cluster_plan.deinit(alloc);
     switch (cluster_plan) {
         .maintenance_job => |maintenance| switch (maintenance) {
@@ -19696,7 +19696,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19711,7 +19711,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
 test "sql adapter generated cursor and savepoint transaction AST lowers to catalog plans" {
@@ -19722,7 +19722,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
     );
     defer declare_sql.deinit(alloc);
-    var declare_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &declare_sql);
+    var declare_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &declare_sql);
     defer declare_plan.deinit(alloc);
     switch (declare_plan) {
         .cursor_portal => |cursor| switch (cursor) {
@@ -19743,7 +19743,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "FETCH FORWARD 10 IN usage_cursor;",
     );
     defer fetch_sql.deinit(alloc);
-    var fetch_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &fetch_sql);
+    var fetch_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &fetch_sql);
     defer fetch_plan.deinit(alloc);
     switch (fetch_plan) {
         .cursor_portal => |cursor| switch (cursor) {
@@ -19762,7 +19762,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "MOVE FORWARD 10 IN usage_cursor;",
     );
     defer move_sql.deinit(alloc);
-    var move_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &move_sql);
+    var move_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &move_sql);
     defer move_plan.deinit(alloc);
     switch (move_plan) {
         .cursor_portal => |cursor| switch (cursor) {
@@ -19781,7 +19781,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "CLOSE ALL;",
     );
     defer close_sql.deinit(alloc);
-    var close_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &close_sql);
+    var close_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &close_sql);
     defer close_plan.deinit(alloc);
     switch (close_plan) {
         .cursor_portal => |cursor| switch (cursor) {
@@ -19799,7 +19799,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "SAVEPOINT before_retry;",
     );
     defer savepoint_sql.deinit(alloc);
-    var savepoint_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &savepoint_sql);
+    var savepoint_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &savepoint_sql);
     defer savepoint_plan.deinit(alloc);
     switch (savepoint_plan) {
         .savepoint_transaction => |savepoint| switch (savepoint) {
@@ -19814,7 +19814,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         "RELEASE SAVEPOINT before_retry;",
     );
     defer release_sql.deinit(alloc);
-    var release_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &release_sql);
+    var release_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &release_sql);
     defer release_plan.deinit(alloc);
     switch (release_plan) {
         .savepoint_transaction => |savepoint| switch (savepoint) {
@@ -19837,7 +19837,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_cursor_tail = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19852,7 +19852,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_cursor_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_cursor_tail));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19867,7 +19867,7 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
 test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
@@ -19878,7 +19878,7 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
         "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);",
     );
     defer copy_from_sql.deinit(alloc);
-    var copy_from_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &copy_from_sql);
+    var copy_from_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &copy_from_sql);
     defer copy_from_plan.deinit(alloc);
     switch (copy_from_plan) {
         .bulk_io => |plan| {
@@ -19899,7 +19899,7 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
         "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';",
     );
     defer copy_where_sql.deinit(alloc);
-    var copy_where_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &copy_where_sql);
+    var copy_where_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &copy_where_sql);
     defer copy_where_plan.deinit(alloc);
     switch (copy_where_plan) {
         .bulk_io => |plan| {
@@ -19926,7 +19926,7 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_kind));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -19941,7 +19941,7 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
 test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
@@ -19955,9 +19955,9 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         .unsupported => |statement| try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_rule, statement.kind),
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &generated_unsupported));
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &generated_unsupported));
 
-    var replace_if_not_exists = try lowerDdlPlanForTestAlloc(
+    var replace_if_not_exists = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE OR REPLACE TABLE IF NOT EXISTS audit_log (id uuid PRIMARY KEY)",
     );
@@ -19973,7 +19973,7 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
     try std.testing.expect(replace_if_not_exists_plan.primary_key != null);
     try std.testing.expectEqualStrings("id", replace_if_not_exists_plan.primary_key.?.columns[0]);
 
-    var no_primary_key = try lowerDdlPlanForTestAlloc(
+    var no_primary_key = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE audit_log (id uuid, payload jsonb)",
     );
@@ -19983,11 +19983,11 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(no_primary_key_plan.primary_key == null);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric DEFAULT 0::text)",
     ));
-    var text_cast_numeric_default = try lowerDdlPlanForTestAlloc(
+    var text_cast_numeric_default = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric DEFAULT '0'::text)",
     );
@@ -19996,11 +19996,11 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         .create_table => |plan| try std.testing.expectError(error.UnsupportedSqlShape, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric COLLATE \"C\")",
     ));
-    var alter_type_rewrite = try lowerDdlPlanForTestAlloc(
+    var alter_type_rewrite = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1",
     );
@@ -20021,7 +20021,7 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         },
         else => return error.TestUnexpectedResult,
     }
-    var nulls_not_distinct_unique_index = try lowerDdlPlanForTestAlloc(
+    var nulls_not_distinct_unique_index = try legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE UNIQUE INDEX audit_log_external_id_key ON audit_log (external_id) NULLS NOT DISTINCT",
     );
@@ -20032,11 +20032,11 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
     };
     try std.testing.expect(nulls_not_distinct_unique_index_plan.unique);
     try std.testing.expect(nulls_not_distinct_unique_index_plan.nulls_not_distinct);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER audit_row AFTER UPDATE ON usage_records EXECUTE FUNCTION audit_changes()",
     ));
-    var drop_cascade = try lowerDdlPlanForTestAlloc(alloc, "DROP TABLE usage_records CASCADE");
+    var drop_cascade = try legacyDdlParserPlanForTestAlloc(alloc, "DROP TABLE usage_records CASCADE");
     defer drop_cascade.deinit(alloc);
     const drop_cascade_plan = switch (drop_cascade) {
         .drop_table => |drop_table| drop_table,
@@ -20046,7 +20046,7 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
     try std.testing.expect(!drop_cascade_plan.if_exists);
     try std.testing.expectEqualStrings("usage_records", drop_cascade_plan.table_name);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "DROP TABLE usage_records, archived_usage_records",
     ));
@@ -20062,7 +20062,7 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
 
 test "sql adapter ddl plan rejects mistyped expression checks during catalog validation" {
     const alloc = std.testing.allocator;
-    var text_mismatch = try lowerDdlPlanForTestAlloc(
+    var text_mismatch = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE bad_expression_checks (
         \\  id text PRIMARY KEY,
@@ -20077,7 +20077,7 @@ test "sql adapter ddl plan rejects mistyped expression checks during catalog val
         else => return error.TestUnexpectedResult,
     }
 
-    var function_mismatch = try lowerDdlPlanForTestAlloc(
+    var function_mismatch = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE bad_function_checks (
         \\  id text PRIMARY KEY,
@@ -20092,7 +20092,7 @@ test "sql adapter ddl plan rejects mistyped expression checks during catalog val
         else => return error.TestUnexpectedResult,
     }
 
-    var range_mismatch = try lowerDdlPlanForTestAlloc(
+    var range_mismatch = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE bad_range_checks (
         \\  id text PRIMARY KEY,
@@ -20159,7 +20159,7 @@ test "sql adapter ddl plan rejects mistyped expression checks during catalog val
 
 test "sql adapter ddl plan lowers application inline foreign key ddl" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE cloud_groups (
         \\  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -20216,7 +20216,7 @@ test "sql adapter ddl plan lowers application inline foreign key ddl" {
 
 test "sql adapter ddl plan preserves named inline create table constraints" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE inline_named_constraints (
         \\  id uuid CONSTRAINT inline_named_constraints_pkey PRIMARY KEY,
@@ -20261,7 +20261,7 @@ test "sql adapter ddl plan preserves named inline create table constraints" {
 
 test "sql adapter ddl plan lowers application-time temporal table constraints" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE account_prices (
         \\  tenant_id text NOT NULL,
@@ -20299,7 +20299,7 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", runtime.periods[0].name);
     try std.testing.expectEqualStrings("valid_time", runtime.primary_key.?.without_overlaps_period.?);
 
-    var child = try lowerDdlPlanForTestAlloc(
+    var child = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE price_adjustments (
         \\  tenant_id text NOT NULL,
@@ -20328,7 +20328,7 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", child_create.foreign_keys[0].child_period.?);
     try std.testing.expectEqualStrings("valid_time", child_create.foreign_keys[0].parent_period.?);
 
-    var system_versioned = try lowerDdlPlanForTestAlloc(
+    var system_versioned = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE account_prices_history (
         \\  tenant_id text NOT NULL,
@@ -20350,7 +20350,7 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
     defer runtime_schema.freeSchema(alloc, system_versioned_runtime);
     try std.testing.expect(system_versioned_runtime.system_versioned);
 
-    var alter = try lowerDdlPlanForTestAlloc(
+    var alter = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\ALTER TABLE account_prices
         \\  ADD PERIOD FOR sell_time (valid_from, valid_to),
@@ -20384,7 +20384,7 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
 
 test "sql adapter ddl plan lowers computed check constraints into native expression checks" {
     const alloc = std.testing.allocator;
-    var lowered = try lowerDdlPlanForTestAlloc(
+    var lowered = try legacyDdlParserPlanForTestAlloc(
         alloc,
         \\CREATE TABLE expression_checks (
         \\  id text PRIMARY KEY,
