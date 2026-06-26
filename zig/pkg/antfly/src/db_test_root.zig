@@ -17,6 +17,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = @import("storage/db/mod.zig");
+    _ = @import("storage/db/derived_async.zig");
     _ = @import("storage/db/schema_runtime.zig");
     _ = @import("storage/db/relational_integrity.zig");
     _ = @import("storage/db/relational_rows.zig");

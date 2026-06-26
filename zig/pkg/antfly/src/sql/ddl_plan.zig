@@ -3048,6 +3048,43 @@ pub fn deallocatePreparedStatementPlanFromGeneratedAstAlloc(
     return .{ .statement_name = try alloc.dupe(u8, statement_name) };
 }
 
+pub fn cursorPortalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlCursorAst,
+) !LoweredDdlPlan {
+    try validateGeneratedCursorAstSpans(tokens, ast);
+    const tail = ast.tail_tokens orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    var plan: LoweredDdlPlan = switch (ast.kind) {
+        .declare => .{ .cursor_portal = .{ .declare = try parseDeclareCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
+        .fetch => .{ .cursor_portal = .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
+        .close => .{ .cursor_portal = .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
+    };
+    errdefer plan.deinit(alloc);
+    if (pos != tail.end - tail.start) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn validateGeneratedCursorAstSpans(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlCursorAst,
+) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end == 0 or tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    switch (ast.kind) {
+        .declare => if (!tokens[0].matchesKeywordTag(.declare)) return error.UnsupportedSqlShape,
+        .fetch => if (!tokens[0].matchesKeywordTag(.fetch)) return error.UnsupportedSqlShape,
+        .close => if (!tokens[0].matchesKeywordTag(.close)) return error.UnsupportedSqlShape,
+    }
+    const tail = ast.tail_tokens orelse return error.UnsupportedSqlShape;
+    if (tail.start != 1 or tail.end != end or tail.start >= tail.end or tail.end > tokens.len) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn generatedSingleIdentifierText(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) ![]const u8 {
     if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
@@ -10360,7 +10397,6 @@ const GeneratedUnsupportedCatalogBoundaryFamily = enum {
     authorization,
     bulk_io,
     comment,
-    cursor_savepoint,
     logical_replication,
     maintenance,
     notification,
@@ -10382,7 +10418,6 @@ fn generatedUnsupportedCatalogBoundary(
             .grant, .revoke => .{ .family = .authorization, .kind = kind },
             .copy => .{ .family = .bulk_io, .kind = kind },
             .comment => .{ .family = .comment, .kind = kind },
-            .close, .declare, .fetch, .release, .savepoint => .{ .family = .cursor_savepoint, .kind = kind },
             .alter_publication, .alter_subscription, .create_publication, .create_subscription, .drop_publication, .drop_subscription => .{ .family = .logical_replication, .kind = kind },
             .analyze, .cluster, .reindex, .vacuum => .{ .family = .maintenance, .kind = kind },
             .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
@@ -10546,34 +10581,6 @@ fn validateGeneratedUnsupportedCatalogAst(
         .comment => switch (boundary.kind) {
             .comment => {
                 if (end < 1 or !tokens[0].matchesKeyword("comment")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .cursor_savepoint => switch (boundary.kind) {
-            .close => {
-                if (end < 1 or !tokens[0].matchesKeyword("close")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .declare => {
-                if (end < 1 or !tokens[0].matchesKeyword("declare")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .fetch => {
-                if (end < 1 or !tokens[0].matchesKeyword("fetch")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .release => {
-                if (end < 1 or !tokens[0].matchesKeyword("release")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .savepoint => {
-                if (end < 1 or !tokens[0].matchesKeyword("savepoint")) {
                     return error.UnsupportedSqlShape;
                 }
             },
@@ -10748,44 +10755,6 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
         .comment => switch (boundary.kind) {
             .comment => switch (plan) {
                 .comment_metadata => {},
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .cursor_savepoint => switch (boundary.kind) {
-            .close => switch (plan) {
-                .cursor_portal => |cursor| switch (cursor) {
-                    .close => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .declare => switch (plan) {
-                .cursor_portal => |cursor| switch (cursor) {
-                    .declare => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .fetch => switch (plan) {
-                .cursor_portal => |cursor| switch (cursor) {
-                    .fetch => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .release => switch (plan) {
-                .savepoint_transaction => |savepoint| switch (savepoint) {
-                    .release => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .savepoint => switch (plan) {
-                .savepoint_transaction => |savepoint| switch (savepoint) {
-                    .savepoint => {},
-                    else => return error.UnsupportedSqlShape,
-                },
                 else => return error.UnsupportedSqlShape,
             },
             else => return error.UnsupportedSqlShape,
@@ -11002,6 +10971,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
                 .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
+                .cursor => |cursor_ast| return try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast),
                 .ddl, .extension_index => |ddl_ast| {
                     if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
                         return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
@@ -17748,7 +17718,7 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
-test "sql adapter generated cursor unsupported and savepoint transaction AST lowers to catalog plans" {
+test "sql adapter generated cursor and savepoint transaction AST lowers to catalog plans" {
     const alloc = std.testing.allocator;
 
     var declare_sql = try tokenized.ParsedSql.initAlloc(
@@ -17847,12 +17817,27 @@ test "sql adapter generated cursor unsupported and savepoint transaction AST low
     if (malformed_kind.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .close,
+                .cursor => |*cursor| cursor.kind = .close,
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_cursor_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CLOSE usage_cursor;",
+    );
+    defer malformed_cursor_tail.deinit(alloc);
+    if (malformed_cursor_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .cursor => |*cursor| cursor.tail_tokens = .{ .start = 0, .end = malformed_cursor_tail.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_cursor_tail));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,

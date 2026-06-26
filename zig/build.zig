@@ -51,7 +51,6 @@ const snowball_languages = [_][]const u8{
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
 const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
 const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
-const max_build_zig_bytes = 2 * 1024 * 1024;
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -76,39 +75,6 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     const io = b.graph.io;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
-}
-
-fn readBuildSourceAlloc(b: *std.Build) []const u8 {
-    return b.build_root.handle.readFileAlloc(b.graph.io, "build.zig", b.allocator, .limited(max_build_zig_bytes)) catch |err| {
-        std.debug.panic("failed to read build.zig for test filter guardrail: {}", .{err});
-    };
-}
-
-fn lineNumberForOffset(source: []const u8, offset: usize) usize {
-    var line: usize = 1;
-    for (source[0..@min(offset, source.len)]) |byte| {
-        if (byte == '\n') line += 1;
-    }
-    return line;
-}
-
-fn assertBuildZigDoesNotInlineTestFilters(b: *std.Build) void {
-    const source = readBuildSourceAlloc(b);
-    const needle = ".filters = &." ++ "{";
-    var search_index: usize = 0;
-    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
-        const list_start = start + needle.len;
-        const list_end = std.mem.indexOfScalarPos(u8, source, list_start, '}') orelse
-            std.debug.panic("unterminated inline test filter list in build.zig at line {}", .{lineNumberForOffset(source, start)});
-        const string_count = std.mem.count(u8, source[list_start..list_end], "\"") / 2;
-        if (string_count > 0) {
-            std.debug.panic(
-                "build.zig has inline test filters at line {}; move exact test-title lists to pkg/antfly/build/tests.zig",
-                .{lineNumberForOffset(source, start)},
-            );
-        }
-        search_index = list_end + 1;
-    }
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
@@ -1258,7 +1224,7 @@ fn addOpenApiGeneratedCheckStep(
 }
 
 pub fn build(b: *std.Build) void {
-    assertBuildZigDoesNotInlineTestFilters(b);
+    antfly_tests_build.assertBuildZigDoesNotOwnTestInventory(b);
 
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils

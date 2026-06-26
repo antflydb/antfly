@@ -17,8 +17,10 @@ const std = @import("std");
 const backend_types = @import("../../storage/backend_types.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const table_write_core = @import("core.zig");
+const table_write_managed_db = @import("managed_db.zig");
 
 pub const GroupBatch = table_write_core.GroupBatch;
+const drainManagedDbBeforeClose = table_write_managed_db.drainManagedDbBeforeClose;
 
 pub const min_batch_ops: usize = 100;
 pub const max_window_ops: usize = 25_000;
@@ -65,6 +67,39 @@ pub fn autoBulkIngestGroupBatchOps(group: anytype, sync_level: db_mod.types.Sync
     _ = group;
     _ = sync_level;
     return 0;
+}
+
+pub fn ensureGroupBatch(
+    alloc: std.mem.Allocator,
+    grouped: *std.ArrayListUnmanaged(GroupBatch),
+    group_id: u64,
+) !*GroupBatch {
+    for (grouped.items) |*group| {
+        if (group.group_id == group_id) return group;
+    }
+    try grouped.append(alloc, .{ .group_id = group_id });
+    return &grouped.items[grouped.items.len - 1];
+}
+
+pub fn applyGroupBatchUnchecked(
+    db: *db_mod.DB,
+    group: GroupBatch,
+    req: db_mod.types.BatchRequest,
+    before_batch: ?*const fn () void,
+) !void {
+    if (before_batch) |hook| hook();
+    try db.batch(.{
+        .writes = group.writes.items,
+        .deletes = group.deletes.items,
+        .relational_identity_rewrites = group.relational_identity_rewrites.items,
+        .transforms = group.transforms.items,
+        .graph_writes = req.graph_writes,
+        .graph_deletes = req.graph_deletes,
+        .predicates = req.predicates,
+        .timestamp_ns = req.timestamp_ns,
+        .sync_level = req.sync_level,
+    });
+    if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
 }
 
 pub const WriteCoalesceQueue = struct {

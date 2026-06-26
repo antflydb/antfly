@@ -52,6 +52,7 @@ statement:
   | dml_statement
   | read_statement
   | graph_statement
+  | cursor_statement
   | unsupported_statement
   ;
 
@@ -593,6 +594,12 @@ graph_statement:
   | ALTER GRAPH INDEX identifier_name diagnostic_tail_opt
   ;
 
+cursor_statement:
+    CLOSE diagnostic_tail
+  | DECLARE diagnostic_tail
+  | FETCH diagnostic_tail
+  ;
+
 unsupported_statement:
     ANALYZE unsupported_tail_opt
   | EXPLAIN explain_options_opt explain_subject_opt
@@ -629,12 +636,9 @@ unsupported_statement:
   | DROP TRIGGER diagnostic_tail_opt
   | CALL diagnostic_tail_opt
   | CHECKPOINT diagnostic_tail_opt
-  | CLOSE diagnostic_tail_opt
   | COPY diagnostic_tail_opt
   | CLUSTER diagnostic_tail_opt
   | COMMENT diagnostic_tail_opt
-  | DECLARE diagnostic_tail_opt
-  | FETCH diagnostic_tail_opt
   | GRANT diagnostic_tail_opt
   | LISTEN diagnostic_tail_opt
   | LOAD diagnostic_tail_opt

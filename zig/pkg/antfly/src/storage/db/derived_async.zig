@@ -39,7 +39,6 @@ const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
-const ha_replication = @import("ha_replication.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -1439,12 +1438,12 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
-            try ha_replication.enforceWriteGateOptional(ctx.ha_write_gate);
+            try DB.DerivedAsyncCallbacks.enforce_ha_write_gate_optional(ctx.ha_write_gate);
             const sequence = ctx.store.reserveNextReplaySequence(1);
             const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
             defer ctx.alloc.free(payload);
             try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
-            ha_replication.mirrorReplayPayloadBestEffort(ctx.log_mutex, ctx.ha_async_effect_mirror, payload);
+            DB.DerivedAsyncCallbacks.mirror_ha_replay_payload_best_effort_context(ctx.log_mutex, ctx.ha_async_effect_mirror, payload);
             ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
             return sequence;
         }

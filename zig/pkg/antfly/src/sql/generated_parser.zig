@@ -27,6 +27,7 @@ pub const GeneratedSqlStatementKind = enum {
     read,
     extension_index,
     graph,
+    cursor,
     unsupported,
     other,
 };
@@ -53,6 +54,12 @@ pub const GeneratedSqlPreparedKind = enum {
     prepare,
     execute,
     deallocate,
+};
+
+pub const GeneratedSqlCursorKind = enum {
+    declare,
+    fetch,
+    close,
 };
 
 pub const GeneratedSqlDdlKind = enum {
@@ -381,6 +388,7 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     read: GeneratedSqlReadKind,
     extension_index: GeneratedSqlExtensionIndexKind,
     graph: GeneratedSqlGraphKind,
+    cursor: GeneratedSqlCursorKind,
     unsupported: GeneratedSqlUnsupportedKind,
     other: void,
 };
@@ -988,6 +996,13 @@ pub const GeneratedSqlPreparedAst = struct {
     parameter_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     inner_statement_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+pub const GeneratedSqlCursorAst = struct {
+    kind: GeneratedSqlCursorKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+    tail_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlDdlAst = struct {
@@ -1737,6 +1752,7 @@ pub const GeneratedSqlAst = union(enum) {
     read: *GeneratedSqlReadAst,
     extension_index: GeneratedSqlDdlAst,
     graph: GeneratedSqlGraphAst,
+    cursor: GeneratedSqlCursorAst,
     unsupported: GeneratedSqlUnsupportedAst,
 
     pub fn deinit(self: *GeneratedSqlAst, alloc: std.mem.Allocator) void {
@@ -1820,6 +1836,10 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1", .kind = .prepared },
     .{ .sql = "EXECUTE read_stmt()", .kind = .prepared },
     .{ .sql = "DEALLOCATE read_stmt", .kind = .prepared },
+    .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records", .kind = .cursor },
+    .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
+    .{ .sql = "CLOSE usage_cursor", .kind = .cursor },
+    .{ .sql = "CLOSE ALL", .kind = .cursor },
 };
 
 pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
@@ -2053,7 +2073,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
     .{ .sql = "CHECKPOINT", .kind = .unsupported },
-    .{ .sql = "CLOSE usage_cursor", .kind = .unsupported },
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
@@ -2075,7 +2094,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)", .kind = .unsupported },
     .{ .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)", .kind = .unsupported },
     .{ .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')", .kind = .unsupported },
-    .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE", .kind = .unsupported },
@@ -2097,7 +2115,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
-    .{ .sql = "FETCH FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "GRANT SELECT ON TABLE usage_records TO readonly", .kind = .unsupported },
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
     .{ .sql = "LOAD 'auto_explain'", .kind = .unsupported },
@@ -2449,6 +2466,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.prepare)) return .{ .prepared = .prepare };
     if (first.matchesKeywordTag(.execute)) return .{ .prepared = .execute };
     if (first.matchesKeywordTag(.deallocate)) return .{ .prepared = .deallocate };
+    if (first.matchesKeywordTag(.close)) return .{ .cursor = .close };
+    if (first.matchesKeywordTag(.declare)) return .{ .cursor = .declare };
+    if (first.matchesKeywordTag(.fetch)) return .{ .cursor = .fetch };
     if (first.matchesKeywordTag(.create) and tokens.len > 1) {
         if (generatedCreateTableAsTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .relation_population };
         if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
@@ -2643,14 +2663,11 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
     if (first.matchesKeywordTag(.call)) return .{ .unsupported = .call };
     if (first.matchesKeywordTag(.checkpoint)) return .{ .unsupported = .checkpoint };
-    if (first.matchesKeywordTag(.close)) return .{ .unsupported = .close };
     if (first.matchesKeywordTag(.cluster)) return .{ .unsupported = .cluster };
     if (first.matchesKeywordTag(.comment)) return .{ .unsupported = .comment };
     if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
-    if (first.matchesKeywordTag(.declare)) return .{ .unsupported = .declare };
     if (first.matchesKeywordTag(.do)) return .{ .unsupported = .do_block };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
-    if (first.matchesKeywordTag(.fetch)) return .{ .unsupported = .fetch };
     if (first.matchesKeywordTag(.grant)) return .{ .unsupported = .grant };
     if (first.matchesKeywordTag(.listen)) return .{ .unsupported = .listen };
     if (first.matchesKeywordTag(.load)) return .{ .unsupported = .load };
@@ -3058,6 +3075,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
             .statement_span = statement_span,
             .command_span = command_span,
         } },
+        .cursor => |kind| .{ .cursor = buildCursorAst(end, kind, statement_span, command_span) },
         .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
         else => null,
     };
@@ -3111,6 +3129,20 @@ fn generatedSavepointNameRange(tokens: []const token_mod.Token, end: usize, star
     if (start >= end or end > tokens.len) return null;
     const name_start = if (tokens[start].matchesKeywordTag(.savepoint)) start + 1 else start;
     return if (name_start < end) .{ .start = name_start, .end = end } else null;
+}
+
+fn buildCursorAst(
+    end: usize,
+    kind: GeneratedSqlCursorKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlCursorAst {
+    return .{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+        .tail_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
+    };
 }
 
 fn generatedBeginHasModeTail(tokens: []const token_mod.Token, end: usize) bool {
@@ -7178,14 +7210,14 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_trigger }, (try parseSqlAlloc(alloc, "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .close }, (try parseSqlAlloc(alloc, "CLOSE usage_cursor")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .close }, (try parseSqlAlloc(alloc, "CLOSE usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_access_method }, (try parseSqlAlloc(alloc, "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_conversion }, (try parseSqlAlloc(alloc, "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_event_trigger }, (try parseSqlAlloc(alloc, "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_conversion }, (try parseSqlAlloc(alloc, "DROP CONVERSION IF EXISTS usage_conv")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
@@ -7193,7 +7225,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_statistics }, (try parseSqlAlloc(alloc, "DROP STATISTICS IF EXISTS usage_stats")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_configuration }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .listen }, (try parseSqlAlloc(alloc, "LISTEN usage_events")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .load }, (try parseSqlAlloc(alloc, "LOAD 'auto_explain'")).statement);
@@ -7323,6 +7355,18 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, prepared.parameter_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, prepared.inner_statement_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cursor_sql = "FETCH FORWARD 10 IN usage_cursor;";
+    const cursor_result = try parseSqlAlloc(alloc, cursor_sql);
+    switch (cursor_result.ast.?) {
+        .cursor => |cursor| {
+            try std.testing.expectEqual(GeneratedSqlCursorKind.fetch, cursor.kind);
+            try std.testing.expectEqualStrings("FETCH FORWARD 10 IN usage_cursor", spanText(cursor_sql, cursor.statement_span));
+            try std.testing.expectEqualStrings("FETCH", spanText(cursor_sql, cursor.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 5 }, cursor.tail_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -11073,12 +11117,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .create_user_mapping,
             .reason = .create_user_mapping_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 12 },
-        },
-        .{
-            .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
-            .kind = .declare,
-            .reason = .declare_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
             .sql = "DO 'BEGIN NULL; END'",

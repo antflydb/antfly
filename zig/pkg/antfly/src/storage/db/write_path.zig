@@ -39,7 +39,7 @@ const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
-const ha_replication = @import("ha_replication.zig");
+const ha_types = @import("ha_types.zig");
 const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
     @import("scraping_stub.zig")
 else
@@ -6404,7 +6404,7 @@ pub fn Impl(comptime DB: type) type {
 
         fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
             if (keys.len == 0) return;
-            try ha_replication.enforceWriteGateOptional(ctx.ha_write_gate);
+            try DB.WritePathCallbacks.enforce_ha_write_gate_optional(ctx.ha_write_gate);
 
             var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             defer store_writes.deinit(ctx.alloc);
@@ -6504,7 +6504,7 @@ pub fn Impl(comptime DB: type) type {
                 .sequence = sequence,
                 .payload = replay_payload,
             });
-            ha_replication.mirrorReplayPayloadBestEffort(ctx.log_mutex, ctx.ha_async_effect_mirror, replay_payload);
+            DB.WritePathCallbacks.mirror_ha_replay_payload_best_effort_context(ctx.log_mutex, ctx.ha_async_effect_mirror, replay_payload);
             var sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets(ctx.alloc, ctx.index_manager, derived_batch);
             defer sync_targets.deinit(ctx.alloc);
             ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
@@ -8253,10 +8253,10 @@ pub fn Impl(comptime DB: type) type {
                 };
                 relational_participant_closed = true;
             }
-            var ha_applied_lsn_value_buf: [ha_replication.applied_lsn_value_len]u8 = undefined;
+            var ha_applied_lsn_value_buf: [ha_types.applied_lsn_value_len]u8 = undefined;
             if (opts.ha_applied_lsn_marker) |lsn| {
                 if (lsn != 0) {
-                    try store_writes.append(self.alloc, ha_replication.appliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
+                    try store_writes.append(self.alloc, ha_types.appliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
                 }
             }
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)

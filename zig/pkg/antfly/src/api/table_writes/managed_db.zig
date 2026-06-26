@@ -30,8 +30,13 @@ const managed_embedder = @import("../../inference/managed_embedder.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const table_catalog = @import("../table_catalog.zig");
 const tables_api = @import("../tables.zig");
+const table_write_core = @import("core.zig");
+const table_write_index_config = @import("index_config.zig");
 
+const backend_current_root_generation = table_write_core.backend_current_root_generation;
 const local_schema_json_key = db_mod.local_schema_json_key;
+const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
+const parseIndexKind = table_write_index_config.parseIndexKind;
 
 pub const ManagedDbOpenMode = enum {
     default,
@@ -81,6 +86,160 @@ pub fn applyLocalTableSchemaJson(
     schema_json: []const u8,
 ) !void {
     try db.applyTableSchemaJson(alloc, schema_json, .{});
+}
+
+pub fn rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len == 0) "{}" else indexes_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        const index_name = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, index_name, "full_text_index_v")) continue;
+        if ((try parseIndexKind(entry.value_ptr.*)) != .full_text) continue;
+        const current = findDbIndexStats(stats.indexes, index_name) orelse continue;
+        if (current.doc_count != 0) continue;
+
+        _ = try db.deleteIndex(index_name);
+        const config_json = try extractIndexConfigJson(alloc, index_name, entry.value_ptr.*);
+        defer alloc.free(config_json);
+        try db.addIndex(.{
+            .name = index_name,
+            .kind = .full_text,
+            .config_json = config_json,
+        });
+    }
+}
+
+fn findDbIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []const u8) ?db_mod.types.DBIndexStats {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, index_name)) return index;
+    }
+    return null;
+}
+
+pub fn corruptEmbeddingArtifactInDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    doc_key: []const u8,
+    index_name: []const u8,
+) !bool {
+    const dense_name = db.core.index_manager.denseEmbeddingName(index_name);
+    const sparse_name = db.core.index_manager.sparseEmbeddingName(index_name);
+    const candidate_names = [_]?[]const u8{
+        index_name,
+        dense_name,
+        sparse_name,
+    };
+    const prefix = try db_mod.internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "embedding");
+    defer alloc.free(prefix);
+    const artifacts = try db.core.scanStorePrefix(alloc, prefix);
+    defer db_mod.docstore.DocStore.freeResults(alloc, artifacts);
+
+    var fallback_key: ?[]const u8 = null;
+    for (artifacts) |entry| {
+        if (!db_mod.internal_keys.isEmbeddingArtifactKey(entry.key)) continue;
+        if (fallback_key == null) fallback_key = entry.key;
+        for (candidate_names) |candidate_opt| {
+            const candidate = candidate_opt orelse continue;
+            if (!db_mod.internal_keys.matchesEmbeddingArtifactName(entry.key, candidate)) continue;
+            try db.core.store.put(entry.key, "bad-artifact");
+            return true;
+        }
+    }
+
+    if (fallback_key) |artifact_key| {
+        try db.core.store.put(artifact_key, "bad-artifact");
+        return true;
+    }
+
+    const injection_names = [_]?[]const u8{
+        dense_name,
+        sparse_name,
+        index_name,
+    };
+    for (injection_names) |candidate_opt| {
+        const candidate = candidate_opt orelse continue;
+        const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, candidate);
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+        return true;
+    }
+
+    return false;
+}
+
+pub fn catchUpManagedIndexCreate(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    if (try db.core.indexRequiresEnrichmentReplay(index_name)) {
+        if (db.enrichment_runtime != null) {
+            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        } else {
+            _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
+        }
+    }
+
+    try db.runUntilIdle();
+    try db.catchUpPendingDerivedReplay();
+    try db.runUntilIdle();
+
+    if (try db.hasPendingDenseArtifactRebuild(alloc)) {
+        _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+        try db.runUntilIdle();
+        try db.catchUpPendingDerivedReplay();
+        try db.runUntilIdle();
+    }
+    try db.core.index_manager.syncAll(false);
+}
+
+fn managedIndexReplayDebtRequired(replay_debt: anytype, index_name: []const u8) bool {
+    for (replay_debt) |status| {
+        if (!std.mem.eql(u8, status.index_name, index_name)) continue;
+        return status.catch_up_required;
+    }
+    return false;
+}
+
+fn managedIndexCoverageIncomplete(alloc: std.mem.Allocator, db: *db_mod.DB, index_name: []const u8) !bool {
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    const primary_doc_count = try db.primaryDocCount(alloc);
+    if (primary_doc_count == 0) return false;
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, index_name)) continue;
+        return item.doc_count < primary_doc_count;
+    }
+    return false;
+}
+
+pub fn seedManagedIndexReplayFromStoredDocsIfNeeded(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !bool {
+    const replay_debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+    if (managedIndexReplayDebtRequired(replay_debt, index_name)) return false;
+    if (!try managedIndexCoverageIncomplete(alloc, db, index_name)) return false;
+    _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+    return true;
 }
 
 pub fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
@@ -490,6 +649,70 @@ pub fn validateTransactionAgainstCatalogSchema(
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
+}
+
+pub fn openManagedDbForTable(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !db_mod.DB {
+    return try openManagedDbForTableWithRuntime(alloc, path, catalog, table_name, null);
+}
+
+pub fn openManagedDbForTableWithRuntime(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !db_mod.DB {
+    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, backend_current_root_generation, null, backend_runtime);
+}
+
+pub fn openManagedDbForTableGroupWithRuntime(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !db_mod.DB {
+    return try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null);
+}
+
+pub fn openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
+}
+
+pub fn openManagedDbForTableWithCache(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+) !db_mod.DB {
+    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, null);
+}
+
+pub fn openManagedDbForTableWithIndexesJson(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    indexes_json: ?[]const u8,
+) !db_mod.DB {
+    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, backend_current_root_generation, null, null);
 }
 
 pub fn openManagedDbForTableWithCacheAndRuntime(

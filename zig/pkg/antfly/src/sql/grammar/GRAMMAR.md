@@ -406,8 +406,7 @@ such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `DROP OWNED`, and `REASSIGN OWNED`, utility/control statements such as
 `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
-simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
-`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus common PostgreSQL extension
+the remaining unsupported cursor movement command `MOVE`, plus common PostgreSQL extension
 catalog families for conversions, event triggers, extended statistics,
 operator/aggregate ALTER forms, operator class/family objects, and text-search
 configuration/dictionary/parser/template objects, plus simple `EXPLAIN` forms
@@ -471,18 +470,21 @@ Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
 `CREATE TRIGGER` and `DROP TRIGGER`. Maintenance commands use the same
 validated generated unsupported boundary for `VACUUM`, `ANALYZE`, `REINDEX`,
 and `CLUSTER` before delegating to typed maintenance planning.
-Legacy-supported cursor and savepoint commands use the validated unsupported
-boundary for `DECLARE`, `FETCH`, `CLOSE`, `SAVEPOINT`, and `RELEASE` before
-delegating to typed cursor/savepoint planning; `MOVE` remains an unsupported
-generated diagnostic because there is no typed cursor plan for it yet. Bulk
-I/O commands use the validated unsupported boundary for `COPY` before
+Legacy-supported cursor commands use generated cursor AST nodes for `DECLARE`,
+`FETCH`, and `CLOSE`, including validated statement/command source spans and
+typed tail token ranges before delegating to typed cursor portal planning.
+Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
+`RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
+savepoint planning. `MOVE` remains an unsupported generated diagnostic because
+there is no typed cursor plan for it yet. Bulk I/O commands use the validated
+unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
 generated option payloads and subject-range validation before the inner
 read/write statement is reparsed.
 Generated unsupported utility command heads that require a subject, such as
 `CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `NOTIFY`, `REINDEX`, `REVOKE`,
-`SAVEPOINT`, and `UNLISTEN`, now fail closed through the generated parser when
+and `UNLISTEN`, now fail closed through the generated parser when
 the statement stops at the command head instead of falling through to legacy
 DDL probing.
 Generated unsupported nodes now also participate in the parsed statement
@@ -1105,11 +1107,14 @@ variants for:
   ASTs as source-level Antfly function item metadata, with graph function items
   retained as a subset carrying graph-specific semantic argument payloads rather
   than as standalone graph statements
+- cursor statement, including generated AST payloads for command spans and
+  typed tail token ranges for `DECLARE`, `FETCH`, and `CLOSE`, plus
+  generated-first AST-to-plan lowering into typed cursor portal plans
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
-  `SECURITY LABEL`, `UNLISTEN`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
-  `SAVEPOINT`, `RELEASE`, `ALTER MATERIALIZED VIEW`, foreign table,
+  `SECURITY LABEL`, `UNLISTEN`, `MOVE`,
+  `ALTER MATERIALIZED VIEW`, foreign table,
   foreign data wrapper, user mapping, language, rule, server, and trigger DDL
   forms, plus bare, simple, optioned, and `EXPLAIN ANALYZE` forms
   with command spans, subject ranges where present, and stable unsupported
@@ -1155,8 +1160,7 @@ Generated grammar work needs evidence at multiple levels:
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
   `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
-  `SECURITY LABEL`, `UNLISTEN`, cursor commands `CLOSE`/`DECLARE`/`FETCH`/`MOVE`,
-  transaction-control commands `SAVEPOINT`/`RELEASE`, PostgreSQL foreign-data
+  `SECURITY LABEL`, `UNLISTEN`, cursor command `MOVE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, servers, and user
   mappings, plus language, rule, trigger, conversion, event-trigger, extended
   statistics, operator/aggregate ALTER forms, operator class/family, and text-search
@@ -1166,8 +1170,8 @@ Generated grammar work needs evidence at multiple levels:
   available.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
-  tests cover generated session, transaction, prepared, DDL, DML, read, and
-  graph statement payloads, including top-level generated read-list metadata.
+  tests cover generated session, transaction, prepared, cursor, DDL, DML, read,
+  and graph statement payloads, including top-level generated read-list metadata.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, simple DDL database/schema

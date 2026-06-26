@@ -6972,13 +6972,13 @@ pub const WritePlanLoweringContext = struct {
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
         if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-            std.log.err("write lowering using generated dml kind={}", .{dml_ast.kind});
+            std.log.debug("write lowering using generated dml kind={}", .{dml_ast.kind});
             return self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options, self.function_bindings) catch |err| {
                 std.log.err("write lowering generated dml failed kind={} err={}", .{ dml_ast.kind, err });
                 return err;
             };
         }
-        std.log.err("write lowering using handwritten dml", .{});
+        std.log.debug("write lowering using handwritten dml", .{});
         return try plan.lowerWritePlanWithParsedSqlAlloc(parsed_sql, self.schema, options, self.hooks());
     }
 

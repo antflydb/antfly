@@ -23,7 +23,6 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
-const relational_integrity = @import("relational_integrity.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
@@ -49,7 +48,7 @@ const TestHelpers = if (builtin.is_test) struct {
 
 pub fn Impl(comptime DB: type) type {
     return struct {
-        const ForeignKeyActionScheduleRecord = relational_integrity.ForeignKeyActionScheduleRecord;
+        const ForeignKeyActionScheduleRecord = DB.ForeignKeyActionScheduleRecord;
 
         pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
             const txn_id = makeTxnId(self);
@@ -639,7 +638,7 @@ pub fn Impl(comptime DB: type) type {
                     if (metadata_mutations.len > 0) self.alloc.free(metadata_mutations);
                 }
                 for (metadata_mutations) |mutation| {
-                    if (!isRowClaimIntentMetadataKey(mutation.key) and !isForeignKeyActionScheduleMetadataKey(mutation.key)) continue;
+                    if (!isRowClaimIntentMetadataKey(mutation.key) and !DB.isForeignKeyActionScheduleMetadataKey(mutation.key)) continue;
                     const skip_key = try self.alloc.dupe(u8, mutation.key);
                     var skip_key_owned = true;
                     errdefer if (skip_key_owned) self.alloc.free(skip_key);
@@ -1070,7 +1069,6 @@ const encodeRelationalIdentityRewriteIntentValueAlloc = relational_store_mod.enc
 const collectTransactionRelationalIdentityRewritesAlloc = relational_store_mod.collectTransactionRelationalIdentityRewritesAlloc;
 const freeRelationalIdentityRewrites = relational_store_mod.freeRelationalIdentityRewrites;
 const isRelationalIdentityRewriteEndpoint = relational_store_mod.isRelationalIdentityRewriteEndpoint;
-const isForeignKeyActionScheduleMetadataKey = relational_integrity.isForeignKeyActionScheduleMetadataKey;
 const collectTransactionExternalizedForeignKeyParentChecksAlloc = relational_store_mod.collectTransactionExternalizedForeignKeyParentChecksAlloc;
 const collectTransactionForeignKeyConstraintTimingOverridesAlloc = relational_store_mod.collectTransactionForeignKeyConstraintTimingOverridesAlloc;
 const freeExternalizedForeignKeyParentChecks = relational_store_mod.freeExternalizedForeignKeyParentChecks;

@@ -223,6 +223,8 @@ pub const DB = struct {
     };
     pub const DerivedAsyncCallbacks = struct {
         pub const dense_catch_up_finish_options = denseCatchUpFinishOptions;
+        pub const enforce_ha_write_gate_optional = ha_replication.enforceWriteGateOptional;
+        pub const mirror_ha_replay_payload_best_effort_context = ha_replication.mirrorReplayPayloadBestEffort;
         pub const apply_derived_batch_to_index_context = derived_async_impl.applyDerivedBatchToIndexContext;
         pub const apply_derived_batch_to_index_context_profiled = derived_async_impl.applyDerivedBatchToIndexContextProfiled;
         pub const save_index_status_snapshots = db_internal.saveIndexStatusSnapshots;
@@ -238,6 +240,7 @@ pub const DB = struct {
         pub const batch_internal = write_path_impl.batchInternal;
         pub const open_mode_requires_read_only_backends = db_config.openModeRequiresReadOnlyBackends;
         pub const enforce_ha_write_gate = ha_replication_impl.enforceDBWriteGate;
+        pub const enforce_ha_write_gate_optional = ha_replication.enforceWriteGateOptional;
         pub const preflight_ha_batch_sync_commit = ha_replication_impl.preflightDBBatchSyncCommit;
         pub const bench_metrics_enabled = db_internal.benchMetricsEnabled;
         pub const log_batch_profile = logBatchProfile;
@@ -273,6 +276,7 @@ pub const DB = struct {
         pub const mirror_ha_batch_mutation_commit = ha_replication_impl.mirrorDBBatchMutationCommit;
         pub const mirror_ha_replay_payload_commit = ha_replication_impl.mirrorDBReplayPayloadCommit;
         pub const mirror_ha_replay_payload_best_effort = ha_replication_impl.mirrorDBReplayPayloadBestEffort;
+        pub const mirror_ha_replay_payload_best_effort_context = ha_replication.mirrorReplayPayloadBestEffort;
         pub const should_append_split_delta = split_restore_impl.shouldAppendSplitDelta;
         pub const current_time_ns = db_internal.currentTimeNs;
         pub const mark_precomputed_enrichment_applied_for_sync = lifecycle_impl.markPrecomputedEnrichmentAppliedForSync;
@@ -2168,6 +2172,10 @@ pub const DB = struct {
         return try relational_integrity_impl.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
     }
 
+    pub fn isForeignKeyActionScheduleMetadataKey(key: []const u8) bool {
+        return relational_integrity.isForeignKeyActionScheduleMetadataKey(key);
+    }
+
     pub const ForeignKeyIntegrityProgressRecord = relational_integrity.ForeignKeyIntegrityProgressRecord;
     pub const ForeignKeyIntegrityClaimRecord = relational_integrity.ForeignKeyIntegrityClaimRecord;
     pub const ForeignKeyIntegrityJobRecord = relational_integrity.ForeignKeyIntegrityJobRecord;
@@ -3229,6 +3237,55 @@ pub const DB = struct {
     pub const RelationalRowsJoinedMutationSourcePlan = relational_rows.JoinedMutationSourcePlan;
 
     pub const RelationalRowsQueryOrderKey = relational_rows.QueryOrderKey;
+
+    pub fn validateRelationalRowsExpressionAgainstSchema(
+        self: *DB,
+        runtime_schema: schema_mod.TableSchema,
+        expression: schema_mod.RelationalRowsExpression,
+    ) !void {
+        _ = self;
+        return try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
+    }
+
+    pub fn relationalRowsExpressionValueJsonAlloc(
+        self: *DB,
+        alloc: Allocator,
+        row: std.json.Value,
+        expression: types.RelationalRowsExpression,
+    ) anyerror![]u8 {
+        _ = self;
+        return try relational_rows_impl.relationalRowsExpressionValueJsonAlloc(alloc, row, expression);
+    }
+
+    pub fn relationalRowsGeneratedColumnValueJsonAlloc(
+        self: *DB,
+        alloc: Allocator,
+        row: std.json.Value,
+        generated: schema_mod.RelationalGeneratedValue,
+    ) ![]u8 {
+        _ = self;
+        return try relational_rows_impl.schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(alloc, row, generated);
+    }
+
+    pub fn relationalRowsExpressionConditionMatches(
+        self: *DB,
+        alloc: Allocator,
+        row: std.json.Value,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!bool {
+        _ = self;
+        return try relational_rows_impl.relationalRowsExpressionConditionMatches(alloc, row, condition);
+    }
+
+    pub fn relationalRowsQueryPredicatePasses(
+        self: *DB,
+        alloc: Allocator,
+        row: std.json.Value,
+        predicate: schema_mod.RelationalCheck,
+    ) !bool {
+        _ = self;
+        return try relational_rows.queryPredicatePasses(alloc, row, predicate);
+    }
 
     pub fn relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
         alloc: Allocator,

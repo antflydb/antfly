@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+const max_build_zig_bytes = 2 * 1024 * 1024;
+
 pub const no_default_filters = [_][]const u8{};
 
 pub const DBTestStep = struct {
@@ -161,6 +163,87 @@ pub const db_root_step_name = "lib-db-test";
 pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
 pub const db_sim_step_name = "db-sim-test";
+
+fn readBuildSourceAlloc(b: *std.Build) []const u8 {
+    return b.build_root.handle.readFileAlloc(b.graph.io, "build.zig", b.allocator, .limited(max_build_zig_bytes)) catch |err| {
+        std.debug.panic("failed to read build.zig for test inventory guardrail: {}", .{err});
+    };
+}
+
+fn lineNumberForOffset(source: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    for (source[0..@min(offset, source.len)]) |byte| {
+        if (byte == '\n') line += 1;
+    }
+    return line;
+}
+
+fn assertBuildZigDoesNotInlineTestFilters(source: []const u8) void {
+    const needle = ".filters = &." ++ "{";
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
+        const list_start = start + needle.len;
+        const list_end = std.mem.indexOfScalarPos(u8, source, list_start, '}') orelse
+            std.debug.panic("unterminated inline test filter list in build.zig at line {}", .{lineNumberForOffset(source, start)});
+        const string_count = std.mem.count(u8, source[list_start..list_end], "\"") / 2;
+        if (string_count > 0) {
+            std.debug.panic(
+                "build.zig has inline test filters at line {}; move exact test-title lists to pkg/antfly/build/tests.zig",
+                .{lineNumberForOffset(source, start)},
+            );
+        }
+        search_index = list_end + 1;
+    }
+}
+
+fn assertBuildZigTestFiltersReferenceManifest(source: []const u8) void {
+    const needle = ".filters =";
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
+        const assignment_end = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse
+            std.debug.panic("unterminated test filter assignment in build.zig at line {}", .{lineNumberForOffset(source, start)});
+        if (std.mem.indexOf(u8, source[start..assignment_end], "antfly_tests_build.") == null) {
+            std.debug.panic(
+                "build.zig test filters at line {} must reference pkg/antfly/build/tests.zig",
+                .{lineNumberForOffset(source, start)},
+            );
+        }
+        search_index = assignment_end + 1;
+    }
+}
+
+fn isDBFocusedTestStepName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, db_root_step_name)) return true;
+    if (std.mem.eql(u8, name, db_storage_step_name)) return true;
+    if (std.mem.eql(u8, name, db_sim_step_name)) return true;
+    return (std.mem.startsWith(u8, name, "db-") and std.mem.endsWith(u8, name, "-test")) or
+        std.mem.startsWith(u8, name, "lib-db-");
+}
+
+fn assertBuildZigDoesNotDeclareDBFocusedTestSteps(source: []const u8) void {
+    const needle = "b.step(" ++ "\"";
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
+        const name_start = start + needle.len;
+        const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
+            std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
+        const name = source[name_start..name_end];
+        if (isDBFocusedTestStepName(name)) {
+            std.debug.panic(
+                "build.zig declares DB focused test step '{s}' at line {}; move DB test inventories to pkg/antfly/build/tests.zig",
+                .{ name, lineNumberForOffset(source, start) },
+            );
+        }
+        search_index = name_end + 1;
+    }
+}
+
+pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
+    const source = readBuildSourceAlloc(b);
+    assertBuildZigDoesNotInlineTestFilters(source);
+    assertBuildZigTestFiltersReferenceManifest(source);
+    assertBuildZigDoesNotDeclareDBFocusedTestSteps(source);
+}
 
 pub const capi_default_filters = [_][]const u8{
     "capi lite opens exports imports checks and vacuums aflite",

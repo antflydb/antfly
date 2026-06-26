@@ -13185,14 +13185,19 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
             .params = params,
             .function_bindings = function_bindings,
         };
-        returning = try generatedReturningProjectionAlloc(
+        parser_state.pos = returning_range.start;
+        returning = generatedReturningProjectionAlloc(
             alloc,
             tokens,
             returning_range,
             schema,
             table_name,
+            &parser_state.pos,
             parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
-        );
+        ) catch |err| {
+            std.log.err("generated insert values returning parse failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -13820,7 +13825,8 @@ fn updatePointFromGeneratedDmlAstAlloc(
     var returning: plan_mod.ReturningProjection = .{};
     errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
+        parser_state.pos = returning_range.start;
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, &parser_state.pos, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -13910,7 +13916,8 @@ fn deletePointFromGeneratedDmlAstAlloc(
     var returning: plan_mod.ReturningProjection = .{};
     errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
+        parser_state.pos = returning_range.start;
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, &parser_state.pos, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -13944,15 +13951,16 @@ fn generatedReturningProjectionAlloc(
     range: generated_parser.GeneratedSqlTokenRange,
     schema: runtime_schema.TableSchema,
     table_name: []const u8,
+    pos: *usize,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
 ) !plan_mod.ReturningProjection {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     const scoped_tokens = tokens[0..range.end];
     const returning_qualifiers = [_][]const u8{table_name};
-    var index = range.start;
-    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, &index, schema, &returning_qualifiers, returning_hooks);
+    pos.* = range.start;
+    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, pos, schema, &returning_qualifiers, returning_hooks);
     errdefer returning.deinit(alloc);
-    if (index != range.end) return error.UnsupportedSqlShape;
+    if (pos.* != range.end) return error.UnsupportedSqlShape;
     return returning;
 }
 

@@ -8171,10 +8171,18 @@ pub fn parseCaseFoldRowExpressionAlloc(
         defer_row_expression_field_validation or
         effective_type_context.joined_source_schema != null;
 
-    const operand = try parseRowExpressionAlloc(alloc, tokens, pos, effective_type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+    const operand = parseRowExpressionAlloc(alloc, tokens, pos, effective_type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks) catch |err| {
+        const token_text = if (pos.* < tokens.len) tokens[pos.*].text else "<eof>";
+        std.log.err("case fold operand parse failed token={s} pos={} err={}", .{ token_text, pos.*, err });
+        return err;
+    };
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    try effective_type_context.validateTextRowExpression(operand);
+    effective_type_context.validateTextRowExpression(operand) catch |err| {
+        const field = if (operand.kind == .field) operand.field else "";
+        std.log.err("case fold operand text validation failed kind={} field={s} err={}", .{ operand.kind, field, err });
+        return err;
+    };
     try operands.append(alloc, operand);
     operand_transferred = true;
 
@@ -10220,7 +10228,10 @@ pub fn parseReturningProjectionAlloc(
                 context.defer_row_expression_field_validation,
             );
             defer alloc.free(parsed_field);
-            const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+            const field = binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers) catch |err| {
+                std.log.err("returning simple field normalize failed field={s} err={}", .{ parsed_field, err });
+                return err;
+            };
             var field_owned = true;
             errdefer if (field_owned) alloc.free(field);
             const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
@@ -10252,19 +10263,26 @@ pub fn parseReturningProjectionAlloc(
             if (parser.matchToken(tokens, pos, .comma) == null) break;
             continue;
         }
-        const item = try parseReturningSelectItemWithQualifiersAlloc(alloc, tokens, pos, returning_qualifiers, .{
+        const item = parseReturningSelectItemWithQualifiersAlloc(alloc, tokens, pos, returning_qualifiers, .{
             .params = options.params,
             .function_bindings = options.function_bindings,
             .field_source = options.field_source,
             .context_hooks = options.context_hooks,
             .select_item_options = options.select_item_options,
-        });
+        }) catch |err| {
+            const token_text = if (pos.* < tokens.len) tokens[pos.*].text else "<eof>";
+            std.log.err("returning select item parse failed token={s} pos={} err={}", .{ token_text, pos.*, err });
+            return err;
+        };
         var item_owned = true;
         errdefer if (item_owned) plan_mod.freeSelectItem(alloc, item);
         switch (item) {
             .field => |parsed_field| {
                 if (saw_all) return error.UnsupportedSqlShape;
-                const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+                const field = binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers) catch |err| {
+                    std.log.err("returning select field normalize failed field={s} err={}", .{ parsed_field, err });
+                    return err;
+                };
                 var field_owned = true;
                 errdefer if (field_owned) alloc.free(field);
                 alloc.free(parsed_field);

@@ -24,7 +24,6 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
-const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
@@ -85,29 +84,6 @@ pub fn Impl(comptime DB: type) type {
 
         fn currentTimeNs() u64 {
             return db_internal.currentTimeNs();
-        }
-
-        fn validateRelationalRowsExpressionAgainstSchema(
-            runtime_schema: schema_mod.TableSchema,
-            expression: schema_mod.RelationalRowsExpression,
-        ) !void {
-            try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
-        }
-
-        fn relationalRowsExpressionValueJsonAlloc(
-            alloc: Allocator,
-            row: std.json.Value,
-            expression: schema_mod.RelationalRowsExpression,
-        ) ![]u8 {
-            return try relational_rows.expressionValueJsonAlloc(alloc, row, expression, currentTimeNs());
-        }
-
-        fn relationalRowsGeneratedColumnValueJsonAlloc(
-            alloc: Allocator,
-            row: std.json.Value,
-            generated: schema_mod.RelationalGeneratedValue,
-        ) ![]u8 {
-            return try relational_rows.generatedColumnValueJsonAlloc(alloc, row, generated, currentTimeNs());
         }
 
         fn recordForeignKeyIntegrityProgressLocked(
@@ -752,7 +728,7 @@ pub fn Impl(comptime DB: type) type {
 
                 for (generated_columns) |column| {
                     const generated = column.generated orelse continue;
-                    const value_json = Self.relationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
+                    const value_json = self.relationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
                     defer alloc.free(value_json);
                     const generated_row = try relationalDefaultColumnRowValueAlloc(alloc, column, value_json);
                     errdefer alloc.free(generated_row);
@@ -902,14 +878,13 @@ pub fn Impl(comptime DB: type) type {
             target_column: schema_mod.RelationalColumn,
             expression: schema_mod.RelationalRowsExpression,
         ) !?[]u8 {
-            _ = self;
             const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row_value) catch return error.InvalidRowsRequest;
             defer alloc.free(row_json);
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidRowsRequest;
 
-            const value_json = Self.relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
+            const value_json = self.relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
             defer alloc.free(value_json);
             var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
             defer parsed_value.deinit();
@@ -1063,7 +1038,7 @@ pub fn Impl(comptime DB: type) type {
             if (has_expression_rewrite) {
                 const expression = job.expression.?;
                 const target_column = relationalRowsFindColumn(runtime_schema.relational_columns, job.target_column) orelse return error.InvalidSchemaRewriteExpression;
-                try Self.validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+                try self.validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
 
                 const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, local_range.start, local_range.end);
                 defer relational_store_mod.freeRows(alloc, rows);
@@ -1259,10 +1234,8 @@ pub fn Impl(comptime DB: type) type {
             row: std.json.Value,
             check: schema_mod.RelationalCheck,
         ) !bool {
-            _ = self;
-            const now_ns = Self.currentTimeNs();
-            if (check.expression) |condition| return try relational_rows.expressionConditionMatches(alloc, row, condition, now_ns);
-            return try relational_rows.queryPredicatePasses(alloc, row, check);
+            if (check.expression) |condition| return try self.relationalRowsExpressionConditionMatches(alloc, row, condition);
+            return try self.relationalRowsQueryPredicatePasses(alloc, row, check);
         }
 
         pub fn validateRuntimeSchemaFeatureLevel(table_schema: schema_mod.TableSchema) !void {

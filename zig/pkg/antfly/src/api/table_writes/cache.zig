@@ -18,6 +18,7 @@ const scraping = @import("antfly_scraping");
 
 const common_secrets = @import("../../common/secrets.zig");
 const metadata_api = @import("../../metadata/api.zig");
+const metadata_mod = @import("../../metadata/mod.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -33,11 +34,12 @@ const runtime_status = @import("../runtime_status.zig");
 const table_catalog = @import("../table_catalog.zig");
 const tables_api = @import("../tables.zig");
 const table_write_bulk_ingest = @import("bulk_ingest.zig");
+const table_write_core = @import("core.zig");
 const table_write_index_config = @import("index_config.zig");
 const table_write_managed_db = @import("managed_db.zig");
 
 const max_cached_write_tables = 64;
-const backend_current_root_generation: u64 = 0;
+const backend_current_root_generation = table_write_core.backend_current_root_generation;
 const auto_bulk_ingest_max_window_ops = table_write_bulk_ingest.max_window_ops;
 const auto_bulk_ingest_max_idle_ns = table_write_bulk_ingest.max_idle_ns;
 const auto_bulk_ingest_finish_options = table_write_bulk_ingest.finish_options;
@@ -45,6 +47,7 @@ const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
 const loadTableIdentityNamespaceForGroup = table_write_managed_db.loadTableIdentityNamespaceForGroup;
+const openManagedDbForStatusWithCache = table_write_managed_db.openManagedDbForStatusWithCache;
 const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions;
 const validateProvisionedDbIdentityNamespaceExpected = table_write_managed_db.validateProvisionedDbIdentityNamespaceExpected;
 
@@ -301,6 +304,49 @@ pub fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
             .async_indexing = .{ .startup = startup },
         },
     };
+}
+
+pub fn snapshotLocalTableRuntimeStatusesUncached(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+) !?runtime_status.LocalTableRuntimeStatuses {
+    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        5 * std.time.ns_per_s,
+        10,
+    );
+    defer alloc.free(group_ids);
+    if (group_ids.len == 0) return null;
+
+    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, group_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(alloc);
+        alloc.free(items);
+    }
+
+    for (group_ids) |group_id| {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, backend_current_root_generation, null, backend_runtime);
+        errdefer db.close();
+        items[initialized] = .{
+            .group_id = group_id,
+            .stats = try db.runtimeStatusStatsConsistent(alloc),
+        };
+        initialized += 1;
+        db.close();
+    }
+
+    return .{ .items = items };
 }
 
 fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {

@@ -931,6 +931,7 @@ fn parseStatement(
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
             } else return .{ .unknown = raw_statement },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
+            .cursor => |kind| return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } },
             .unsupported => |kind| {
                 if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
                 if (kind == .explain) return .{ .explain = parseGeneratedExplainStatement(raw_statement, tokenized_sql.items(), generated_raw) };
@@ -951,6 +952,14 @@ fn parseStatement(
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
+    };
+}
+
+fn generatedCursorUnsupportedKind(kind: generated_parser.GeneratedSqlCursorKind) generated_parser.GeneratedSqlUnsupportedKind {
+    return switch (kind) {
+        .declare => .declare,
+        .fetch => .fetch,
+        .close => .close,
     };
 }
 
@@ -2691,11 +2700,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .checkpoint_not_planned_by_generated_parser,
         },
         .{
-            .sql = "CLOSE usage_cursor",
-            .kind = .close,
-            .reason = .close_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "CLUSTER usage_records USING usage_status_idx",
             .kind = .cluster,
             .reason = .cluster_not_planned_by_generated_parser,
@@ -2801,11 +2805,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_user_mapping_not_planned_by_generated_parser,
         },
         .{
-            .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
-            .kind = .declare,
-            .reason = .declare_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "DO 'BEGIN NULL; END'",
             .kind = .do_block,
             .reason = .do_block_not_planned_by_generated_parser,
@@ -2884,11 +2883,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql",
             .kind = .drop_transform,
             .reason = .drop_transform_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "FETCH FROM usage_cursor",
-            .kind = .fetch,
-            .reason = .fetch_not_planned_by_generated_parser,
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
@@ -3091,6 +3085,21 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.rollback_to_savepoint, generated_transaction.kind);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, generated_transaction.name_tokens.?);
         },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cursor = try ParsedSql.initAlloc(alloc, "FETCH FROM usage_cursor");
+    defer cursor.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.cursor, cursor.generatedStatementKind().?);
+    switch (cursor.generated_statement.?.ast.?) {
+        .cursor => |generated_cursor| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlCursorKind.fetch, generated_cursor.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 3 }, generated_cursor.tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (cursor.statement) {
+        .ddl => {},
         else => return error.TestUnexpectedResult,
     }
 
