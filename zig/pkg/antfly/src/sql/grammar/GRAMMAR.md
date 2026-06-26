@@ -43,7 +43,10 @@ regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records both
 actual and expected conflict counts. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
-with tracked conflict reporting. The
+with tracked conflict reporting. Conflict drift now has a structured generator
+report path that prints the expected and actual conflict counts plus
+representative state/terminal/action conflicts, so broad grammar edits fail
+with actionable evidence instead of an opaque count mismatch. The
 first runtime integration observes the generated parser on the `ParsedSql` path
 but does not require grammar parity
 before the existing parser can handle a statement. When the generated parser

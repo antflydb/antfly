@@ -39,6 +39,10 @@ pub fn main(init: std.process.Init) !void {
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, input_path, arena, .limited(4 * 1024 * 1024));
     const generated = yacc.generateZigMetadata(arena, source_label, source) catch |err| {
+        if (err == error.ConflictCountMismatch) {
+            const report = yacc.conflictReportAlloc(arena, source_label, source, 20) catch null;
+            if (report) |text| std.debug.print("{s}", .{text});
+        }
         std.debug.print("yacc-zig: invalid grammar {s}: {}\n", .{ input_path, err });
         std.process.exit(1);
     };

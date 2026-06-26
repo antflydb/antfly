@@ -100,6 +100,15 @@ pub const Tables = struct {
     augmented_start_symbol: u16,
 };
 
+pub const ConflictExpectation = struct {
+    expected: ?usize,
+    actual: usize,
+
+    pub fn matches(self: @This()) bool {
+        return self.expected == null or self.expected.? == self.actual;
+    }
+};
+
 pub fn generateZigMetadata(
     allocator: std.mem.Allocator,
     input_path: []const u8,
@@ -112,6 +121,63 @@ pub fn generateZigMetadata(
         if (tables.conflicts.len != expected_conflicts) return error.ConflictCountMismatch;
     }
     return try emitZigMetadata(allocator, input_path, source, grammar, tables);
+}
+
+pub fn conflictExpectation(allocator: std.mem.Allocator, source: []const u8) !ConflictExpectation {
+    const grammar = try parseGrammar(allocator, source);
+    try validateGrammar(grammar);
+    const tables = try buildSlrTables(allocator, grammar);
+    return .{
+        .expected = grammar.expected_conflicts,
+        .actual = tables.conflicts.len,
+    };
+}
+
+pub fn conflictReportAlloc(
+    allocator: std.mem.Allocator,
+    input_path: []const u8,
+    source: []const u8,
+    max_conflicts: usize,
+) ![]u8 {
+    const grammar = try parseGrammar(allocator, source);
+    try validateGrammar(grammar);
+    const tables = try buildSlrTables(allocator, grammar);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try appendFmt(allocator, &out,
+        \\grammar conflict report: {s}
+        \\expected: {s}
+        \\actual: {d}
+        \\
+    , .{
+        input_path,
+        if (grammar.expected_conflicts) |expected|
+            try std.fmt.allocPrint(allocator, "{d}", .{expected})
+        else
+            "unset",
+        tables.conflicts.len,
+    });
+    if (tables.conflicts.len == 0) return try out.toOwnedSlice(allocator);
+
+    const limit = @min(max_conflicts, tables.conflicts.len);
+    try appendFmt(allocator, &out, "first {d} conflicts:\n", .{limit});
+    for (tables.conflicts[0..limit]) |conflict| {
+        try appendFmt(
+            allocator,
+            &out,
+            "  state={d} terminal={s} existing={s} candidate={s}\n",
+            .{
+                conflict.state,
+                tables.symbols[conflict.terminal].name,
+                @tagName(conflict.existing),
+                @tagName(conflict.candidate),
+            },
+        );
+    }
+    if (limit < tables.conflicts.len) {
+        try appendFmt(allocator, &out, "  ... {d} more conflicts\n", .{tables.conflicts.len - limit});
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
@@ -1144,6 +1210,47 @@ test "generateZigMetadata rejects unexpected conflict count drift" {
         \\  ;
     ;
     try std.testing.expectError(error.ConflictCountMismatch, generateZigMetadata(arena, "ambiguous.y", source));
+}
+
+test "conflictExpectation reports expected and actual counts" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID PLUS
+        \\expr:
+        \\    expr PLUS expr
+        \\  | ID
+        \\  ;
+    ;
+    const expectation = try conflictExpectation(arena, source);
+    try std.testing.expectEqual(@as(?usize, 0), expectation.expected);
+    try std.testing.expect(expectation.actual > 0);
+    try std.testing.expect(!expectation.matches());
+}
+
+test "conflictReportAlloc names representative conflicts" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID PLUS
+        \\expr:
+        \\    expr PLUS expr
+        \\  | ID
+        \\  ;
+    ;
+    const report = try conflictReportAlloc(arena, "ambiguous.y", source, 1);
+    try std.testing.expect(std.mem.indexOf(u8, report, "grammar conflict report: ambiguous.y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "expected: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "actual: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "terminal=PLUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "existing=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "candidate=") != null);
 }
 
 test "validateGrammar rejects unknown symbols" {
