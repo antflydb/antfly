@@ -329,6 +329,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedExtendedCatalogDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedCursorStatementHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -561,6 +562,16 @@ fn isGeneratedExtendedCatalogObject(tokens: []const Token, object_index: usize, 
         .create, .drop => tokenMatchesKeyword(object, .function) or tokenMatchesKeyword(object, .procedure),
         .alter => false,
     };
+}
+
+fn isGeneratedCursorStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    return tokenMatchesText(first, "declare") or
+        tokenMatchesKeyword(first, .fetch) or
+        tokenMatchesKeyword(first, .close);
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -2625,6 +2636,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PROCEDURE rotate_usage"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP FUNCTION IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP PROCEDURE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DECLARE usage_cursor CURSOR FOR"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "FETCH FROM"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CLOSE ALL EXTRA"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));

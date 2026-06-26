@@ -493,6 +493,9 @@ and `CLUSTER` before delegating to typed maintenance planning.
 Legacy-supported cursor commands use generated cursor AST nodes for `DECLARE`,
 `FETCH`, and `CLOSE`, including validated statement/command source spans and
 typed tail token ranges before delegating to typed cursor portal planning.
+Those cursor heads now require generated parser success at SQL ingress so
+incomplete cursor commands fail closed instead of falling back to the legacy
+DDL-like command adapter.
 Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
 `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
 savepoint planning. `MOVE` remains an unsupported generated diagnostic because
