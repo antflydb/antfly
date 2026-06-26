@@ -4297,13 +4297,15 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         switch (logical_plan.*) {
-            .table_ddl, .catalog_ddl, .other_ddl, .cursor, .extension, .maintenance, .bulk_io => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .table_ddl, .catalog_ddl, .extension => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .other_ddl => |plan| return try self.applyOtherDdlLogicalPlanWithSession(plan, session, context),
             .session => |plan| return try self.applySessionLogicalPlanWithSession(plan, session, context),
-            .transaction => |plan| return try self.applyTransactionLogicalPlanWithSession(plan, logical_plan, session, context),
+            .transaction => |plan| return try self.applyTransactionLogicalPlanWithSession(plan, session, context),
             .prepared_statement => |plan| return try self.applyPreparedStatementLogicalPlanWithSession(plan, session, context),
             .notification => |plan| return try self.applyNotificationLogicalPlanWithSession(plan, session, context),
             .routine => |*plan| return try self.applyRoutineLogicalPlanWithSession(plan, session, context),
             .auth => return try self.applyAuthLogicalPlanWithSession(logical_plan, session, context),
+            .cursor, .maintenance, .bulk_io => return error.UnsupportedSqlShape,
             .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
         }
     }
@@ -4328,6 +4330,47 @@ pub const ApiHttpServer = struct {
         errdefer applied.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         return applied;
+    }
+
+    fn applyOtherDdlLogicalPlanWithSession(
+        self: *ApiHttpServer,
+        plan: sql_adapter.OtherDdlLogicalPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const timing = try self.sqlStatementExecutionTimingForContext(session, context);
+        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+        if (try self.publicSqlReadOnlyActive(session)) {
+            switch (plan) {
+                .adapter_noop => {},
+                .moved => return error.SqlReadOnlyTransaction,
+            }
+        }
+        switch (plan) {
+            .adapter_noop => |noop| switch (noop.reason) {
+                .transaction_control => {
+                    if (context.parsed_sql) |parsed_sql| {
+                        if (parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
+                            try session.clearTransactionLocalState(self.alloc);
+                            var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+                            applied.noop = true;
+                            return applied;
+                        }
+                        if (parsedSqlTransactionBoundaryStartsSession(parsed_sql)) {
+                            session.in_sql_transaction = true;
+                            session.sql_transaction_failed = false;
+                            var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+                            applied.noop = true;
+                            return applied;
+                        }
+                    }
+                    return error.UnsupportedSqlShape;
+                },
+                .extension => return try extension_domain.sql_adapter.executeRelationalSqlExtensionNoopAlloc(self.alloc),
+                else => return error.UnsupportedSqlShape,
+            },
+            .moved => return error.UnsupportedSqlShape,
+        }
     }
 
     fn applySessionLogicalPlanWithSession(
@@ -4364,7 +4407,6 @@ pub const ApiHttpServer = struct {
     fn applyTransactionLogicalPlanWithSession(
         self: *ApiHttpServer,
         plan: sql_adapter.TransactionLogicalPlan,
-        logical_plan: *sql_adapter.LogicalSqlPlan,
         session: *sql_adapter.OwnedSqlCatalogSession,
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -4383,7 +4425,7 @@ pub const ApiHttpServer = struct {
                         applied.noop = applied_mode;
                         return applied;
                     },
-                    else => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+                    else => return error.UnsupportedSqlShape,
                 }
             },
             .prepared => |prepared| {
@@ -4394,7 +4436,7 @@ pub const ApiHttpServer = struct {
                 }
                 return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
             },
-            .savepoint => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .savepoint => return error.UnsupportedSqlShape,
         }
     }
 
@@ -4507,54 +4549,7 @@ pub const ApiHttpServer = struct {
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-        if (try self.publicSqlReadOnlyActive(session)) {
-            const allowed = switch (logical_plan.*) {
-                .other_ddl => |other| switch (other) {
-                    .adapter_noop => true,
-                    .moved => false,
-                },
-                .cursor => |cursor| switch (cursor) {
-                    .declare => |declare| declare.statement_kind == .read,
-                    .fetch,
-                    .move,
-                    .close,
-                    => true,
-                },
-                .transaction => |transaction| switch (transaction) {
-                    .control => |control| try self.transactionControlPlanAllowedInReadOnly(control),
-                    .savepoint => true,
-                    .prepared => false,
-                },
-                else => false,
-            };
-            if (!allowed) return error.SqlReadOnlyTransaction;
-        }
-
-        switch (logical_plan.*) {
-            .other_ddl => |other| switch (other) {
-                .adapter_noop => |noop| {
-                    if (noop.reason == .transaction_control) {
-                        if (context.parsed_sql) |parsed_sql| {
-                            if (parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
-                                try session.clearTransactionLocalState(self.alloc);
-                                var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
-                                applied.noop = true;
-                                return applied;
-                            }
-                            if (parsedSqlTransactionBoundaryStartsSession(parsed_sql)) {
-                                session.in_sql_transaction = true;
-                                session.sql_transaction_failed = false;
-                                var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
-                                applied.noop = true;
-                                return applied;
-                            }
-                        }
-                    }
-                },
-                .moved => {},
-            },
-            else => {},
-        }
+        if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
 
         var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
         defer durable_plan.deinit(self.alloc);

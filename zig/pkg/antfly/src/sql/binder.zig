@@ -1064,29 +1064,7 @@ pub const TableDdlLogicalPlan = union(enum) {
         }
         self.* = undefined;
     }
-
-    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
-        return switch (self.*) {
-            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
-            .create_table => |payload| moveTableDdl(self, .{ .create_table = payload }),
-            .table_clone => |payload| moveTableDdl(self, .{ .table_clone = payload }),
-            .view_catalog => |payload| moveTableDdl(self, .{ .view_catalog = payload }),
-            .materialized_view_catalog => |payload| moveTableDdl(self, .{ .materialized_view_catalog = payload }),
-            .relation_lifetime => |payload| moveTableDdl(self, .{ .relation_lifetime = payload }),
-            .table_partition_catalog => |payload| moveTableDdl(self, .{ .table_partition_catalog = payload }),
-            .create_index => |payload| moveTableDdl(self, .{ .create_index = payload }),
-            .drop_index => |payload| moveTableDdl(self, .{ .drop_index = payload }),
-            .drop_table => |payload| moveTableDdl(self, .{ .drop_table = payload }),
-            .alter_table => |payload| moveTableDdl(self, .{ .alter_table = payload }),
-            .create_update_policy => |payload| moveTableDdl(self, .{ .create_update_policy = payload }),
-        };
-    }
 };
-
-fn moveTableDdl(plan: *TableDdlLogicalPlan, lowered: ddl_plan.LoweredDdlPlan) ddl_plan.LoweredDdlPlan {
-    plan.* = .{ .moved = {} };
-    return lowered;
-}
 
 pub const CatalogDdlLogicalPlan = union(enum) {
     moved: void,
@@ -1117,28 +1095,7 @@ pub const CatalogDdlLogicalPlan = union(enum) {
         }
         self.* = undefined;
     }
-
-    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
-        return switch (self.*) {
-            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
-            .enum_type_catalog => |payload| moveCatalogDdl(self, .{ .enum_type_catalog = payload }),
-            .domain_catalog => |payload| moveCatalogDdl(self, .{ .domain_catalog = payload }),
-            .sequence_catalog => |payload| moveCatalogDdl(self, .{ .sequence_catalog = payload }),
-            .identity_allocator_catalog => |payload| moveCatalogDdl(self, .{ .identity_allocator_catalog = payload }),
-            .schema_namespace_catalog => |payload| moveCatalogDdl(self, .{ .schema_namespace_catalog = payload }),
-            .database_catalog => |payload| moveCatalogDdl(self, .{ .database_catalog = payload }),
-            .tablespace_catalog => |payload| moveCatalogDdl(self, .{ .tablespace_catalog = payload }),
-            .logical_replication => |payload| moveCatalogDdl(self, .{ .logical_replication = payload }),
-            .type_system_catalog => |payload| moveCatalogDdl(self, .{ .type_system_catalog = payload }),
-            .comment_metadata => |payload| moveCatalogDdl(self, .{ .comment_metadata = payload }),
-        };
-    }
 };
-
-fn moveCatalogDdl(plan: *CatalogDdlLogicalPlan, lowered: ddl_plan.LoweredDdlPlan) ddl_plan.LoweredDdlPlan {
-    plan.* = .{ .moved = {} };
-    return lowered;
-}
 
 pub const OtherDdlLogicalPlan = union(enum) {
     moved: void,
@@ -1146,16 +1103,6 @@ pub const OtherDdlLogicalPlan = union(enum) {
 
     pub fn deinit(self: *@This(), _: std.mem.Allocator) void {
         self.* = undefined;
-    }
-
-    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
-        return switch (self.*) {
-            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
-            .adapter_noop => |payload| blk: {
-                self.* = .{ .moved = {} };
-                break :blk .{ .adapter_noop = payload };
-            },
-        };
     }
 };
 

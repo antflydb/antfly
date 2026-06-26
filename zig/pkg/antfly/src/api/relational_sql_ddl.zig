@@ -30,22 +30,9 @@ pub fn applyDurablePlanOnServiceWithSessionAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     switch (plan.*) {
-        .moved => return error.UnsupportedSqlShape,
         .table_ddl => |*table_plan| return try applyTableDdlPlanOnServiceWithSessionAlloc(alloc, svc, table_plan, session),
         .catalog_ddl => |catalog_plan| return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, catalog_plan, session),
-        .other_ddl => |*other_plan| return try applyOtherDdlPlanOnServiceWithSessionAlloc(alloc, svc, other_plan, session),
-        .session => |session_plan| return try applySessionLogicalPlanWithSessionAlloc(alloc, svc, session_plan, session),
-        .transaction => |transaction| switch (transaction) {
-            .control, .prepared, .savepoint => return try applyTransactionLogicalPlanWithSessionAlloc(alloc, svc, transaction, session),
-        },
-        .prepared_statement => |prepared_statement| return try applyPreparedStatementLogicalPlanWithSessionAlloc(alloc, svc, prepared_statement, session),
-        .cursor => |cursor| return try applyCursorLogicalPlanWithSessionAlloc(alloc, svc, cursor, session),
-        .notification => |notification| return try applyNotificationLogicalPlanWithSessionAlloc(alloc, svc, notification, session),
-        .routine => |routine| return try applyRoutineLogicalPlanWithSessionAlloc(alloc, svc, routine, session),
-        .auth => |auth| return try applyAuthLogicalPlanWithSessionAlloc(alloc, svc, auth, session),
         .extension => |extension| return try applyExtensionLogicalPlanWithSessionAlloc(alloc, svc, extension, session),
-        .maintenance => |maintenance| return try applyMaintenanceLogicalPlanWithSessionAlloc(alloc, svc, maintenance, session),
-        .bulk_io => |bulk_io| return try applyBulkIoLogicalPlanWithSessionAlloc(alloc, svc, bulk_io, session),
     }
 }
 
@@ -142,114 +129,6 @@ fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn applyOtherDdlPlanOnServiceWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: *sql_adapter.OtherDdlLogicalPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = svc;
-    _ = session;
-    return switch (plan.*) {
-        .adapter_noop => |noop| switch (noop.reason) {
-            .extension => try extension_domain.sql_adapter.executeRelationalSqlExtensionNoopAlloc(alloc),
-            else => error.UnsupportedSqlShape,
-        },
-        .moved => error.UnsupportedSqlShape,
-    };
-}
-
-fn applySessionLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.SessionCatalogPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyTransactionLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.TransactionLogicalPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyPreparedStatementLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.PreparedStatementPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyCursorLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.CursorPortalPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyNotificationLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.NotificationChannelPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyRoutineLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.RoutineLogicalPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyAuthLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.AuthorizationLogicalPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
 fn applyExtensionLogicalPlanWithSessionAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
@@ -258,32 +137,6 @@ fn applyExtensionLogicalPlanWithSessionAlloc(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     _ = session;
     return try extension_domain.sql_adapter.executeRelationalSqlExtensionPlanOnService(svc, alloc, plan);
-}
-
-fn applyMaintenanceLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.MaintenanceJobPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
-}
-
-fn applyBulkIoLogicalPlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    plan: sql_adapter.BulkIoPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
-    _ = alloc;
-    _ = svc;
-    _ = plan;
-    _ = session;
-    return error.UnsupportedSqlShape;
 }
 
 fn applyDropTableCascadeReferences(

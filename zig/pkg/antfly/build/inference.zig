@@ -14,18 +14,22 @@
 
 const std = @import("std");
 
-const delegated_steps = [_][]const u8{
-    "run",
-    "finetune",
-    "bench-paged-attention",
-    "bench-training",
-    "bench-linalg",
-    "bench-audio",
-    "bench-gliner2-native",
-    "gliner2-production-readiness",
-    "test-finetune",
-    "test",
-    "wasm",
+const DelegatedStep = struct {
+    public_name: []const u8,
+    package_step: []const u8,
+};
+
+const delegated_steps = [_]DelegatedStep{
+    .{ .public_name = "run", .package_step = "run" },
+    .{ .public_name = "finetune", .package_step = "finetune" },
+    .{ .public_name = "bench-paged-attention", .package_step = "bench-paged-attention" },
+    .{ .public_name = "bench-training", .package_step = "bench-training" },
+    .{ .public_name = "bench-linalg", .package_step = "bench-linalg" },
+    .{ .public_name = "bench-audio", .package_step = "bench-audio" },
+    .{ .public_name = "bench-gliner2-native", .package_step = "bench-gliner2-native" },
+    .{ .public_name = "finetune-test", .package_step = "test-finetune" },
+    .{ .public_name = "test", .package_step = "test" },
+    .{ .public_name = "wasm", .package_step = "wasm" },
 };
 
 const DelegatedPackageStep = struct {
@@ -50,14 +54,14 @@ pub fn addDelegatedBuildSteps(ctx: anytype) DelegatedBuildSteps {
 
     var test_step: ?*std.Build.Step = null;
     var finetune_test_step: ?*std.Build.Step = null;
-    for (delegated_steps) |step_name| {
-        const delegated = addDelegatedPackageStep(b, step_name);
+    for (delegated_steps) |step| {
+        const delegated = addDelegatedPackageStep(b, step);
         const run = delegated.run;
         addDelegatedOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
-        if (std.mem.eql(u8, step_name, "test")) {
+        if (std.mem.eql(u8, step.public_name, "test")) {
             test_step = delegated.step;
-        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
+        } else if (std.mem.eql(u8, step.public_name, "finetune-test")) {
             finetune_test_step = delegated.step;
         }
     }
@@ -67,16 +71,16 @@ pub fn addDelegatedBuildSteps(ctx: anytype) DelegatedBuildSteps {
     };
 }
 
-fn addDelegatedPackageStep(b: *std.Build, step_name: []const u8) DelegatedPackageStep {
+fn addDelegatedPackageStep(b: *std.Build, delegated_step: DelegatedStep) DelegatedPackageStep {
     const run = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
-        step_name,
+        delegated_step.package_step,
     });
     run.setCwd(b.path("pkg/inference"));
     const delegated = b.step(
-        b.fmt("inference-{s}", .{step_name}),
-        b.fmt("Delegate to pkg/inference zig build {s}", .{step_name}),
+        b.fmt("inference-{s}", .{delegated_step.public_name}),
+        b.fmt("Delegate to pkg/inference zig build {s}", .{delegated_step.package_step}),
     );
     delegated.dependOn(&run.step);
     return .{
