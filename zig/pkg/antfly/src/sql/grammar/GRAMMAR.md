@@ -1074,7 +1074,8 @@ Important performance requirements:
   exposes typed token-id helpers, and the SQL facade maps fixed token kinds
   through those helpers instead of runtime string symbol-table probes. Dynamic
   keyword normalization uses a token-only generated lookup instead of scanning
-  all grammar symbols.
+  all grammar symbols, and generated runtime metadata no longer exposes a
+  catch-all symbol-name lookup for parser ingress.
 - **Indexed parse tables**: generated action/goto tables carry per-state row
   ranges and use binary search inside the active row instead of scanning the
   full table. Future compression can move from row ranges to row displacement,

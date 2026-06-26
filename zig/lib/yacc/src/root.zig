@@ -945,13 +945,6 @@ fn emitZigMetadata(
         \\    }
         \\}
         \\
-        \\pub fn symbolId(name: []const u8) ?u16 {
-        \\    for (symbols, 0..) |symbol, idx| {
-        \\        if (std.mem.eql(u8, symbol.name, name)) return @intCast(idx);
-        \\    }
-        \\    return null;
-        \\}
-        \\
         \\pub fn actionsForState(state: u16) []const Action {
         \\    if (state >= action_ranges.len) return &.{};
         \\    const range = action_ranges[state];
