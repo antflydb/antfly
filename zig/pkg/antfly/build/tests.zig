@@ -2769,6 +2769,96 @@ pub fn addStandaloneModuleTestSteps(
     };
 }
 
+fn addStorageBackendTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    test_step: StorageBackendTestStep,
+) ModuleTestRun {
+    return addModuleTestStep(b, root_module, test_step.name, test_step.description, .{
+        .filters = test_step.filters,
+        .select_filters = test_step.select_filters,
+        .simple_runner = test_step.simple_runner,
+    });
+}
+
+pub fn addStorageBackendTestSteps(
+    b: *std.Build,
+    modules: StorageBackendTestModules,
+    deps: StorageBackendTestDependencies,
+) StorageBackendTestRuns {
+    const lmdb = addStorageBackendTestStep(b, modules.lmdb_engine, storage_backend_test_steps.lmdb);
+    const storage_lmdb = addStorageBackendTestStep(b, modules.storage_lmdb, storage_backend_test_steps.storage_lmdb);
+    const storage_lmdb_replay = addStorageBackendTestStep(b, modules.storage_lmdb, storage_backend_test_steps.storage_lmdb_replay);
+    const storage_sim_runtime = addStorageBackendTestStep(b, modules.storage_sim_runtime, storage_backend_test_steps.storage_sim_runtime);
+    const storage_lmdb_soak = addStorageBackendTestStep(b, modules.storage_lmdb_soak, storage_backend_test_steps.storage_lmdb_soak);
+    const docstore = addStorageBackendTestStep(b, modules.docstore, storage_backend_test_steps.docstore);
+    const shard = addStorageBackendTestStep(b, modules.shard, storage_backend_test_steps.shard);
+    const wal = addStorageBackendTestStep(b, modules.wal, storage_backend_test_steps.wal);
+    const wal_sim = addStorageBackendTestStep(b, modules.wal, storage_backend_test_steps.wal_sim);
+    const wal_vopr = addStorageBackendTestStep(b, modules.wal, storage_backend_test_steps.wal_vopr);
+    const wal_replay = addStorageBackendTestStep(b, modules.wal, storage_backend_test_steps.wal_replay);
+    const wal_soak = addStorageBackendTestStep(b, modules.wal_soak, storage_backend_test_steps.wal_soak);
+    const persistent = addStorageBackendTestStep(b, modules.persistent, storage_backend_test_steps.persistent);
+    const persistent_sim = addStorageBackendTestStep(b, modules.persistent, storage_backend_test_steps.persistent_sim);
+    const persistent_replay = addStorageBackendTestStep(b, modules.persistent, storage_backend_test_steps.persistent_replay);
+    const persistent_vopr = addStorageBackendTestStep(b, modules.persistent, storage_backend_test_steps.persistent_vopr);
+    const persistent_soak = addStorageBackendTestStep(b, modules.persistent_soak, storage_backend_test_steps.persistent_soak);
+    const index_manager = addStorageBackendTestStep(b, modules.index_manager, storage_backend_test_steps.index_manager);
+    const index_manager_resource = addStorageBackendTestStep(b, modules.index_manager, storage_backend_test_steps.index_manager_resource);
+    const index_manager_sim = addStorageBackendTestStep(b, modules.index_manager, storage_backend_test_steps.index_manager_sim);
+    const index_manager_replay = addStorageBackendTestStep(b, modules.index_manager, storage_backend_test_steps.index_manager_replay);
+    const index_manager_vopr = addStorageBackendTestStep(b, modules.index_manager, storage_backend_test_steps.index_manager_vopr);
+    const sparse = addStorageBackendTestStep(b, modules.sparse, storage_backend_test_steps.sparse);
+    const derived_log = addStorageBackendTestStep(b, modules.derived_log, storage_backend_test_steps.derived_log);
+
+    const storage_sim_soak = b.step(storage_backend_test_steps.storage_sim_soak.name, storage_backend_test_steps.storage_sim_soak.description);
+    storage_sim_soak.dependOn(&storage_lmdb_soak.run.step);
+    storage_sim_soak.dependOn(&wal_soak.run.step);
+    storage_sim_soak.dependOn(&persistent_soak.run.step);
+
+    const storage_sim = b.step(storage_backend_test_steps.storage_sim.name, storage_backend_test_steps.storage_sim.description);
+    storage_sim.dependOn(&wal_sim.run.step);
+    storage_sim.dependOn(&persistent_sim.run.step);
+    storage_sim.dependOn(&index_manager_sim.run.step);
+
+    const storage_vopr = b.step(storage_backend_test_steps.storage_vopr.name, storage_backend_test_steps.storage_vopr.description);
+    storage_vopr.dependOn(&storage_sim_runtime.run.step);
+    storage_vopr.dependOn(&deps.lsm_backend_sim.step);
+    storage_vopr.dependOn(&wal_vopr.run.step);
+    storage_vopr.dependOn(&persistent_vopr.run.step);
+    storage_vopr.dependOn(&index_manager_vopr.run.step);
+
+    return .{
+        .lmdb = lmdb,
+        .storage_lmdb = storage_lmdb,
+        .storage_lmdb_replay = storage_lmdb_replay,
+        .storage_sim_runtime = storage_sim_runtime,
+        .storage_lmdb_soak = storage_lmdb_soak,
+        .docstore = docstore,
+        .shard = shard,
+        .wal = wal,
+        .wal_sim = wal_sim,
+        .wal_vopr = wal_vopr,
+        .wal_replay = wal_replay,
+        .wal_soak = wal_soak,
+        .persistent = persistent,
+        .persistent_sim = persistent_sim,
+        .persistent_replay = persistent_replay,
+        .persistent_vopr = persistent_vopr,
+        .persistent_soak = persistent_soak,
+        .index_manager = index_manager,
+        .index_manager_resource = index_manager_resource,
+        .index_manager_sim = index_manager_sim,
+        .index_manager_replay = index_manager_replay,
+        .index_manager_vopr = index_manager_vopr,
+        .sparse = sparse,
+        .derived_log = derived_log,
+        .storage_sim = storage_sim,
+        .storage_vopr = storage_vopr,
+        .storage_sim_soak = storage_sim_soak,
+    };
+}
+
 fn addSimpleAPITestRun(
     b: *std.Build,
     root_module: *std.Build.Module,

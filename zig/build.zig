@@ -3372,118 +3372,33 @@ pub fn build(b: *std.Build) void {
     unit_progress_tail = chainLabeledRun(b, standalone_module_tests.template.tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
-    const lmdb_unit_tests = b.addTest(.{
-        .root_module = lmdb_engine_mod,
-    });
-    const run_lmdb_unit_tests = b.addRunArtifact(lmdb_unit_tests);
-
-    const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
-    lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
-
     const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
-    const storage_lmdb_unit_tests = b.addTest(.{
-        .root_module = storage_lmdb_test_mod,
-    });
-    const run_storage_lmdb_unit_tests = b.addRunArtifact(storage_lmdb_unit_tests);
-
-    const storage_lmdb_test_step = b.step("storage-lmdb-test", "Run storage/lmdb wrapper unit tests");
-    storage_lmdb_test_step.dependOn(&run_storage_lmdb_unit_tests.step);
-
-    const storage_lmdb_replay_tests = b.addTest(.{
-        .root_module = storage_lmdb_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.lmdb_replay,
-    });
-    const run_storage_lmdb_replay_tests = b.addRunArtifact(storage_lmdb_replay_tests);
-    const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
-    storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
     const storage_sim_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_sim_runtime_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const storage_sim_runtime_tests = b.addTest(.{
-        .root_module = storage_sim_runtime_test_mod,
-    });
-    const run_storage_sim_runtime_tests = b.addRunArtifact(storage_sim_runtime_tests);
-    const storage_sim_runtime_test_step = b.step("storage-sim-runtime-test", "Run storage simulation runtime and modeled device tests");
-    storage_sim_runtime_test_step.dependOn(&run_storage_sim_runtime_tests.step);
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
     const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
-    const storage_lmdb_soak_tests = b.addTest(.{
-        .root_module = storage_lmdb_soak_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.lmdb_soak,
-    });
-    const run_storage_lmdb_soak_tests = b.addRunArtifact(storage_lmdb_soak_tests);
-    const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
-    storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
     docstore_test_mod.addImport("antfly_vellum", vellum_mod);
     docstore_test_mod.addImport("antfly_regex", regex_mod);
-    const docstore_unit_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
-    });
-    const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
-
-    const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
-    docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     shard_test_mod.addImport("antfly_vellum", vellum_mod);
     shard_test_mod.addImport("antfly_regex", regex_mod);
-    const shard_unit_tests = b.addTest(.{
-        .root_module = shard_test_mod,
-    });
-    const run_shard_unit_tests = b.addRunArtifact(shard_unit_tests);
-
-    const shard_test_step = b.step("shard-test", "Run storage/shard unit tests");
-    shard_test_step.dependOn(&run_shard_unit_tests.step);
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("antfly_vellum", vellum_mod);
     wal_test_mod.addImport("antfly_regex", regex_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
-    const wal_unit_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
-
-    const wal_test_step = b.step("wal-test", "Run storage/wal unit tests");
-    wal_test_step.dependOn(&run_wal_unit_tests.step);
-
-    const wal_sim_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_sim,
-    });
-    const run_wal_sim_tests = b.addRunArtifact(wal_sim_tests);
-    const wal_sim_test_step = b.step("wal-sim-test", "Run only the WAL simulation workload tests");
-    wal_sim_test_step.dependOn(&run_wal_sim_tests.step);
-
-    const wal_vopr_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_vopr,
-    });
-    const run_wal_vopr_tests = b.addRunArtifact(wal_vopr_tests);
-    const wal_vopr_test_step = b.step("wal-vopr-test", "Run WAL modeled-time VOPR smoke tests");
-    wal_vopr_test_step.dependOn(&run_wal_vopr_tests.step);
-
-    const wal_replay_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_replay,
-    });
-    const run_wal_replay_tests = b.addRunArtifact(wal_replay_tests);
-    const wal_replay_step = b.step("wal-replay-fixtures", "Run only the WAL replay fixture tests");
-    wal_replay_step.dependOn(&run_wal_replay_tests.step);
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
@@ -3491,18 +3406,6 @@ pub fn build(b: *std.Build) void {
     wal_soak_test_mod.addImport("bloom", bloom_mod);
     wal_soak_test_mod.addImport("antfly_vellum", vellum_mod);
     wal_soak_test_mod.addImport("antfly_regex", regex_mod);
-    const wal_soak_tests = b.addTest(.{
-        .root_module = wal_soak_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.wal_soak,
-    });
-    const run_wal_soak_tests = b.addRunArtifact(wal_soak_tests);
-    const wal_soak_step = b.step("wal-sim-soak", "Run only the WAL simulation soak test");
-    wal_soak_step.dependOn(&run_wal_soak_tests.step);
-
-    const storage_sim_soak_step = b.step("storage-sim-soak", "Run the LMDB and WAL simulation soak tests");
-    storage_sim_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
-    storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
-    soak_test_step.dependOn(storage_sim_soak_step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
@@ -3512,41 +3415,6 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
-    const persistent_unit_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
-
-    const persistent_test_step = b.step("persistent-test", "Run storage/persistent unit tests");
-    persistent_test_step.dependOn(&run_persistent_unit_tests.step);
-
-    const persistent_sim_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_sim,
-    });
-    const run_persistent_sim_tests = b.addRunArtifact(persistent_sim_tests);
-    const persistent_sim_step = b.step("persistent-sim-test", "Run only the persistent simulation workload tests");
-    persistent_sim_step.dependOn(&run_persistent_sim_tests.step);
-
-    const persistent_replay_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_replay,
-    });
-    const run_persistent_replay_tests = b.addRunArtifact(persistent_replay_tests);
-    const persistent_replay_step = b.step("persistent-replay-fixtures", "Run only the persistent replay fixture tests");
-    persistent_replay_step.dependOn(&run_persistent_replay_tests.step);
-
-    const persistent_vopr_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_vopr,
-    });
-    const run_persistent_vopr_tests = b.addRunArtifact(persistent_vopr_tests);
-    const persistent_vopr_step = b.step("persistent-vopr-test", "Run persistent modeled-storage VOPR smoke tests");
-    persistent_vopr_step.dependOn(&run_persistent_vopr_tests.step);
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
@@ -3557,15 +3425,6 @@ pub fn build(b: *std.Build) void {
     persistent_soak_test_mod.addImport("antfly_vector", vector_mod);
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_soak_test_mod.addImport("antfly_reranking", reranking_mod);
-    const persistent_soak_tests = b.addTest(.{
-        .root_module = persistent_soak_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.persistent_soak,
-    });
-    const run_persistent_soak_tests = b.addRunArtifact(persistent_soak_tests);
-    const persistent_soak_step = b.step("persistent-sim-soak", "Run only the persistent simulation soak test");
-    persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
-
-    storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
 
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     addSnowballModule(b, index_manager_test_mod);
@@ -3578,50 +3437,6 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
-    const index_manager_unit_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.no_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
-
-    const index_manager_test_step = b.step("index-manager-test", "Run storage/db/catalog/index_manager unit tests");
-    index_manager_test_step.dependOn(&run_index_manager_unit_tests.step);
-
-    const index_manager_resource_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_resource,
-    });
-    const run_index_manager_resource_tests = b.addRunArtifact(index_manager_resource_tests);
-    const index_manager_resource_step = b.step("index-manager-resource-test", "Run index manager resource-manager accounting tests");
-    index_manager_resource_step.dependOn(&run_index_manager_resource_tests.step);
-
-    const index_manager_sim_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_sim,
-    });
-    const run_index_manager_sim_tests = b.addRunArtifact(index_manager_sim_tests);
-    const index_manager_sim_step = b.step("index-manager-sim-test", "Run only the index manager simulation workload tests");
-    index_manager_sim_step.dependOn(&run_index_manager_sim_tests.step);
-
-    const index_manager_replay_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_replay,
-    });
-    const run_index_manager_replay_tests = b.addRunArtifact(index_manager_replay_tests);
-    const index_manager_replay_step = b.step("index-manager-replay-fixtures", "Run only the index manager replay fixture tests");
-    index_manager_replay_step.dependOn(&run_index_manager_replay_tests.step);
-
-    const index_manager_vopr_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &antfly_tests_build.StorageBackendTestFilters.index_manager_vopr,
-    });
-    const run_index_manager_vopr_tests = b.addRunArtifact(index_manager_vopr_tests);
-    const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
-    index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{
@@ -3641,19 +3456,6 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_db_test_mod.addImport("antfly_platform", platform_mod);
     db_test_mod.addImport("usermgr_storage", usermgr_storage_db_test_mod);
 
-    const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
-    storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_persistent_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_index_manager_sim_tests.step);
-
-    const storage_vopr_step = b.step("storage-vopr-test", "Run storage modeled-time/model-I/O VOPR smoke and simulation checks");
-    storage_vopr_step.dependOn(&run_storage_sim_runtime_tests.step);
-    storage_vopr_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
-    storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
-    sim_test_step.dependOn(storage_vopr_step);
-
     const db_storage_tests = antfly_tests_build.addDBStorageTestSteps(b, db_test_mod);
     sim_test_step.dependOn(&db_storage_tests.sim.step);
 
@@ -3661,23 +3463,30 @@ pub fn build(b: *std.Build) void {
     sparse_test_mod.addImport("bloom", bloom_mod);
     sparse_test_mod.addImport("antfly_vellum", vellum_mod);
     sparse_test_mod.addImport("antfly_regex", regex_mod);
-    const sparse_unit_tests = b.addTest(.{
-        .root_module = sparse_test_mod,
-    });
-    const run_sparse_unit_tests = b.addRunArtifact(sparse_unit_tests);
-
-    const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
-    sparse_test_step.dependOn(&run_sparse_unit_tests.step);
 
     const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     derived_log_test_mod.addImport("bloom", bloom_mod);
-    const derived_log_unit_tests = b.addTest(.{
-        .root_module = derived_log_test_mod,
+    derived_log_test_mod.addImport("antfly_vellum", vellum_mod);
+    derived_log_test_mod.addImport("antfly_regex", regex_mod);
+    const storage_backend_tests = antfly_tests_build.addStorageBackendTestSteps(b, .{
+        .lmdb_engine = lmdb_engine_mod,
+        .storage_lmdb = storage_lmdb_test_mod,
+        .storage_lmdb_soak = storage_lmdb_soak_test_mod,
+        .storage_sim_runtime = storage_sim_runtime_test_mod,
+        .docstore = docstore_test_mod,
+        .shard = shard_test_mod,
+        .wal = wal_test_mod,
+        .wal_soak = wal_soak_test_mod,
+        .persistent = persistent_test_mod,
+        .persistent_soak = persistent_soak_test_mod,
+        .index_manager = index_manager_test_mod,
+        .sparse = sparse_test_mod,
+        .derived_log = derived_log_test_mod,
+    }, .{
+        .lsm_backend_sim = run_lib_lsm_backend_sim_tests,
     });
-    const run_derived_log_unit_tests = b.addRunArtifact(derived_log_unit_tests);
-
-    const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
-    derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
+    sim_test_step.dependOn(storage_backend_tests.storage_vopr);
+    soak_test_step.dependOn(storage_backend_tests.storage_sim_soak);
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
@@ -3694,16 +3503,16 @@ pub fn build(b: *std.Build) void {
         &run_lib_storage_tests.step,
         &run_lsm_backend_tests.step,
         &run_resource_budget_tests.step,
-        &run_lmdb_unit_tests.step,
-        &run_storage_lmdb_unit_tests.step,
-        &run_docstore_unit_tests.step,
-        &run_shard_unit_tests.step,
-        &run_wal_unit_tests.step,
-        &run_persistent_unit_tests.step,
-        &run_index_manager_unit_tests.step,
+        &storage_backend_tests.lmdb.run.step,
+        &storage_backend_tests.storage_lmdb.run.step,
+        &storage_backend_tests.docstore.run.step,
+        &storage_backend_tests.shard.run.step,
+        &storage_backend_tests.wal.run.step,
+        &storage_backend_tests.persistent.run.step,
+        &storage_backend_tests.index_manager.run.step,
         &db_storage_tests.all.step,
-        &run_sparse_unit_tests.step,
-        &run_derived_log_unit_tests.step,
+        &storage_backend_tests.sparse.run.step,
+        &storage_backend_tests.derived_log.run.step,
         &graph_metric_tests.lifecycle.step,
         &graph_metric_tests.query_fan_in.step,
         &graph_metric_tests.cleanup.step,

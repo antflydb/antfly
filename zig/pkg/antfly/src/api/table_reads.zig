@@ -58,7 +58,6 @@ const serverless_query = @import("../serverless/query/mod.zig");
 const schema_api = @import("../schema/mod.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
-const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("../platform/time.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
@@ -100,6 +99,9 @@ const joinJobStateRemote = table_read_remote_wire.joinJobStateRemote;
 const graphExpandRemote = table_read_remote_wire.graphExpandRemote;
 const graphHydrateRemote = table_read_remote_wire.graphHydrateRemote;
 const graphEdgesRemote = table_read_remote_wire.graphEdgesRemote;
+const lookupRelationalUniqueOwnerRemote = table_read_remote_wire.lookupRelationalUniqueOwnerRemote;
+const lookupRelationalTemporalUniqueOwnerRemote = table_read_remote_wire.lookupRelationalTemporalUniqueOwnerRemote;
+const lookupRelationalTemporalUniqueOverlapOwnerRemote = table_read_remote_wire.lookupRelationalTemporalUniqueOverlapOwnerRemote;
 const GraphMetricFanInShardRequest = table_read_graph.GraphMetricFanInShardRequest;
 const prepareGraphMetricFanInShardRequest = table_read_graph.prepareGraphMetricFanInShardRequest;
 const validateGraphHydrateResolvedDocFilterForDb = table_read_graph.validateGraphHydrateResolvedDocFilterForDb;
@@ -446,34 +448,6 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
         tensor_program.access_paths,
         tensor_program.asProgram(),
     );
-}
-
-fn lookupRelationalTemporalUniqueOverlapOwnerRemote(
-    executor: http_common.RequestExecutor,
-    alloc: std.mem.Allocator,
-    base_uri: []const u8,
-    group_id: u64,
-    table_name: []const u8,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-    encoded_start: []const u8,
-    encoded_end: []const u8,
-) !?[]u8 {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    const body = try std.fmt.allocPrint(
-        alloc,
-        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_start\":{f},\"encoded_end\":{f}}}",
-        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_start, .{}), std.json.fmt(encoded_end, .{}) },
-    );
-    defer alloc.free(body);
-    var result = client.fetchGroupTemporalUniqueOverlapOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    defer result.deinit(alloc);
-    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
-    defer parsed.deinit();
-    return try alloc.dupe(u8, parsed.value.owner_key);
 }
 
 pub const BoundTableReadSource = struct {
@@ -3448,7 +3422,6 @@ const routedRowsPlanRangesForJoinAlloc = table_read_relational_rows.routedRowsPl
 const routedRowsPlanRangesForJoinCtesAlloc = table_read_relational_rows.routedRowsPlanRangesForJoinCtesAlloc;
 const relationalRowsScanPayloadCanStripSyntheticKey = table_read_relational_rows.scanPayloadCanStripSyntheticKey;
 const resolveSingleUniqueOwnerGroup = table_read_relational_rows.resolveSingleUniqueOwnerGroup;
-const relationalUniqueOwnerKeyAlloc = table_read_relational_rows.relationalUniqueOwnerKeyAlloc;
 const lookupRelationalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalUniqueOwnerInDb;
 const lookupRelationalTemporalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalTemporalUniqueOwnerInDb;
 const lookupRelationalTemporalUniqueOverlapOwnerInDb = table_read_relational_rows.lookupRelationalTemporalUniqueOverlapOwnerInDb;
@@ -4629,49 +4602,6 @@ fn lookupRelationalUniqueOwnerProvisionedHostedLocal(
         error.NotLeader => if (consistency == .stale) err else try lookupRelationalUniqueOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, .stale),
         else => err,
     };
-}
-
-fn lookupRelationalUniqueOwnerRemote(
-    executor: http_common.RequestExecutor,
-    alloc: std.mem.Allocator,
-    base_uri: []const u8,
-    group_id: u64,
-    table_name: []const u8,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-) !?[]u8 {
-    const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
-    defer alloc.free(key);
-    var lookup = (try lookupRemote(executor, alloc, base_uri, group_id, table_name, key, .{})) orelse return null;
-    defer lookup.deinit(alloc);
-    return try alloc.dupe(u8, lookup.json);
-}
-
-fn lookupRelationalTemporalUniqueOwnerRemote(
-    executor: http_common.RequestExecutor,
-    alloc: std.mem.Allocator,
-    base_uri: []const u8,
-    group_id: u64,
-    table_name: []const u8,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-    encoded_point: []const u8,
-) !?[]u8 {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    const body = try std.fmt.allocPrint(
-        alloc,
-        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_point\":{f}}}",
-        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_point, .{}) },
-    );
-    defer alloc.free(body);
-    var result = client.fetchGroupTemporalUniqueOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    defer result.deinit(alloc);
-    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
-    defer parsed.deinit();
-    return try alloc.dupe(u8, parsed.value.owner_key);
 }
 
 fn lookupProvisionedLocal(

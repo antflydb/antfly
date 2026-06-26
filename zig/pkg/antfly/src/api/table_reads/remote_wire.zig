@@ -28,10 +28,12 @@ const http_common = @import("../../raft/transport/http_common.zig");
 const query_api = @import("../query.zig");
 const query_contract = @import("../query_contract.zig");
 const table_read_core = @import("core.zig");
+const table_read_relational_rows = @import("relational_rows.zig");
 
 const LookupResponse = table_read_core.LookupResponse;
 const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
 const ScanResponse = table_read_core.ScanResponse;
+const relationalUniqueOwnerKeyAlloc = table_read_relational_rows.relationalUniqueOwnerKeyAlloc;
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
@@ -259,6 +261,77 @@ pub fn lookupRemote(
         .json = try alloc.dupe(u8, result.body),
         .version = if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
     };
+}
+
+pub fn lookupRelationalUniqueOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !?[]u8 {
+    const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(key);
+    var lookup = (try lookupRemote(executor, alloc, base_uri, group_id, table_name, key, .{})) orelse return null;
+    defer lookup.deinit(alloc);
+    return try alloc.dupe(u8, lookup.json);
+}
+
+pub fn lookupRelationalTemporalUniqueOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+) !?[]u8 {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_point\":{f}}}",
+        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_point, .{}) },
+    );
+    defer alloc.free(body);
+    var result = client.fetchGroupTemporalUniqueOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
+    defer parsed.deinit();
+    return try alloc.dupe(u8, parsed.value.owner_key);
+}
+
+pub fn lookupRelationalTemporalUniqueOverlapOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+) !?[]u8 {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_start\":{f},\"encoded_end\":{f}}}",
+        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_start, .{}), std.json.fmt(encoded_end, .{}) },
+    );
+    defer alloc.free(body);
+    var result = client.fetchGroupTemporalUniqueOverlapOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
+    defer parsed.deinit();
+    return try alloc.dupe(u8, parsed.value.owner_key);
 }
 
 pub fn scanRemote(
