@@ -5887,11 +5887,11 @@ pub const ApiHttpServer = struct {
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
-        const source_table_name: ?[]const u8 = if (read_catalog.source_binding) |binding|
+        const source_table_name: []const u8 = if (read_catalog.source_binding) |binding|
             try self.alloc.dupe(u8, binding.target().table_name)
         else
-            null;
-        defer if (source_table_name) |name| self.alloc.free(name);
+            try self.alloc.dupe(u8, target.table_name);
+        defer self.alloc.free(source_table_name);
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
@@ -6003,11 +6003,11 @@ pub const ApiHttpServer = struct {
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
-        const source_table_name: ?[]const u8 = if (read_catalog.source_binding) |binding|
+        const source_table_name: []const u8 = if (read_catalog.source_binding) |binding|
             try self.alloc.dupe(u8, binding.target().table_name)
         else
-            null;
-        defer if (source_table_name) |name| self.alloc.free(name);
+            try self.alloc.dupe(u8, target.table_name);
+        defer self.alloc.free(source_table_name);
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
