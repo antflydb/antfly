@@ -213,8 +213,9 @@ The facade files should contain:
 - temporary compile-time imports of migrated test modules if needed
 
 They should not retain business logic after a chunk has been migrated.
-They also should not preserve local-only build target names through aliases;
-renamed focused targets can move directly to their durable suite names.
+They also should not preserve old local-only build target names as aliases.
+Renamed focused targets should move directly to their durable suite names,
+because these targets are local ergonomics rather than CI contracts.
 
 During the migration, the facades may still contain unmigrated code. The end
 state should make the facades boring and small.

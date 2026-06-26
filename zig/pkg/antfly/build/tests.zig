@@ -395,6 +395,21 @@ fn assertBuildZigDoesNotOwnAPISplitImplementationInventory(source: []const u8) v
     }
 }
 
+fn assertBuildZigDoesNotPreserveLocalAPITestAliases(source: []const u8) void {
+    const local_alias_targets = .{
+        "api-table-reads-docid-test",
+        "api-table-writes-docid-test",
+    };
+    inline for (local_alias_targets) |target_name| {
+        if (std.mem.indexOf(u8, source, target_name)) |start| {
+            std.debug.panic(
+                "build.zig registers old local API test target '{s}' at line {}; use the durable api-table-reads-test/api-table-writes-test targets directly",
+                .{ target_name, lineNumberForOffset(source, start) },
+            );
+        }
+    }
+}
+
 pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
@@ -402,6 +417,7 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotOwnManifestTestRoots(source);
     assertBuildZigDoesNotOwnAPISplitImplementationInventory(source);
+    assertBuildZigDoesNotPreserveLocalAPITestAliases(source);
 }
 
 fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {

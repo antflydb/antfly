@@ -4768,9 +4768,12 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
-        try validateGeneratedExpressionPredicateKind(
+        try validateGeneratedRegexPredicateExpression(
             options.generated_expression_ast,
-            generatedRegexPredicateKind(regex_operator.case_insensitive, regex_operator.negated),
+            tokens,
+            pos.* - 1,
+            regex_operator.case_insensitive,
+            regex_operator.negated,
         );
         const condition = try parseExpressionRegexpMatchConditionAlloc(
             alloc,
@@ -5053,9 +5056,12 @@ pub fn parseExpressionWhereConditionsAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
-        try validateGeneratedExpressionPredicateKind(
+        try validateGeneratedRegexPredicateExpression(
             options.generated_expression_ast,
-            generatedRegexPredicateKind(regex_operator.case_insensitive, regex_operator.negated),
+            tokens,
+            pos.* - 1,
+            regex_operator.case_insensitive,
+            regex_operator.negated,
         );
         const condition = try parseExpressionRegexpMatchConditionAlloc(
             alloc,
@@ -25444,6 +25450,33 @@ fn validateGeneratedExpressionPredicateKind(
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedRegexPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    case_insensitive: bool,
+    negated: bool,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    const expected_kind = generatedRegexPredicateKind(case_insensitive, negated);
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const expected_token_kind: TokenKind = switch (expected_kind) {
+        .regex_match => .regex_match,
+        .regex_imatch => .regex_imatch,
+        .regex_not_match => .regex_not_match,
+        .regex_not_imatch => .regex_not_imatch,
+        else => return error.UnsupportedSqlShape,
+    };
+    if (tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
+}
+
 fn generatedRegexPredicateKind(
     case_insensitive: bool,
     negated: bool,
@@ -38790,6 +38823,20 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expect(regex_operator.case_insensitive);
     try std.testing.expect(regex_operator.negated);
     try std.testing.expectEqual(@as(usize, 1), regex_pos);
+    const regex_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .regex_not_imatch,
+        .operator_tokens = .{ .start = 0, .end = 1 },
+    };
+    try validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, true, true);
+    const stale_regex_tokens = [_]Token{.{ .kind = .regex_match, .text = "~" }};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRegexPredicateExpression(&regex_expression, &stale_regex_tokens, 0, true, true),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, false, false),
+    );
     const json_key_set_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },
         .{ .kind = .question_any, .text = "?|" },
