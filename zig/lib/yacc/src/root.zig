@@ -667,9 +667,9 @@ fn emitZigMetadata(
         \\pub const conflict_count = {d};
         \\pub const expected_conflict_count: ?usize = {s};
         \\
-        \\pub const SymbolKind = enum {{ terminal, nonterminal }};
-        \\pub const Symbol = struct {{ name: []const u8, kind: SymbolKind }};
-        \\pub const symbols = [_]Symbol{{
+        \\const SymbolKind = enum {{ terminal, nonterminal }};
+        \\const Symbol = struct {{ name: []const u8, kind: SymbolKind }};
+        \\const symbols = [_]Symbol{{
         \\
     , .{
         input_path,
@@ -1285,6 +1285,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbol_name_bytes = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_static_bytes =") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbols") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Symbol") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".scan_l = \"https://example.test/postgres/scan.l\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);

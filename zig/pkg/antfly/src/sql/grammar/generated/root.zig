@@ -27,9 +27,9 @@ pub const goto_count = 2630;
 pub const conflict_count = 11466;
 pub const expected_conflict_count: ?usize = 11466;
 
-pub const SymbolKind = enum { terminal, nonterminal };
-pub const Symbol = struct { name: []const u8, kind: SymbolKind };
-pub const symbols = [_]Symbol{
+const SymbolKind = enum { terminal, nonterminal };
+const Symbol = struct { name: []const u8, kind: SymbolKind };
+const symbols = [_]Symbol{
     .{ .name = "$end", .kind = .terminal },
     .{ .name = "IDENT", .kind = .terminal },
     .{ .name = "STRING", .kind = .terminal },
