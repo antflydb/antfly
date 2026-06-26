@@ -1200,6 +1200,9 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_name_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_argument_tokens)) return false;
+    if (!generatedReadAntflySourceItemsAreValid(tokens, end, read_ast.source_tokens, read_ast.source_antfly_function_items, read_ast.source_antfly_function_count)) return false;
+    if (!generatedReadGraphSourceItemsAreValid(tokens, end, read_ast.source_tokens, read_ast.source_antfly_function_items, read_ast.source_graph_function_items, read_ast.source_graph_function_count)) return false;
+    if (!generatedReadGraphSourceCompatibilityFieldsAreValid(read_ast)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_operator_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_left_tokens)) return false;
@@ -1343,9 +1346,236 @@ fn generatedReadCtePayloadIsValid(
             if (row_lock_tokens.start >= row_lock_tokens.end or !tokenMatchesKeyword(tokens[row_lock_tokens.start], .@"for")) return false;
         }
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_set_operation_tokens)) return false;
+        if (!generatedReadAntflySourceItemsAreValid(tokens, end, cte.body_source_tokens, cte.body_source_antfly_function_items, cte.body_source_antfly_function_count)) return false;
+        if (!generatedReadGraphSourceItemsAreValid(tokens, end, cte.body_source_tokens, cte.body_source_antfly_function_items, cte.body_source_graph_function_items, cte.body_source_graph_function_count)) return false;
         if (cte.body_projection_tokens == null) return false;
     }
     return true;
+}
+
+fn generatedReadAntflySourceItemsAreValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    count: usize,
+) bool {
+    if (items.len != count) return false;
+    const source_tokens = maybe_source_tokens orelse return items.len == 0 and count == 0;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, source_tokens)) return false;
+    var previous_end = source_tokens.start;
+    for (items) |item| {
+        if (item.tokens.start < previous_end) return false;
+        if (!generatedReadAntflySourceItemIsValid(tokens, end, source_tokens, item)) return false;
+        previous_end = item.tokens.end;
+    }
+    return true;
+}
+
+fn generatedReadAntflySourceItemIsValid(
+    tokens: []const Token,
+    end: usize,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) bool {
+    if (!generatedReadNestedRangeIsValid(tokens, end, source_tokens, item.tokens)) return false;
+    if (item.tokens.end < item.tokens.start + 3) return false;
+    if (!std.meta.eql(item.name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = item.tokens.start, .end = item.tokens.start + 1 })) return false;
+    if (!std.meta.eql(item.argument_tokens, generated_parser.GeneratedSqlTokenRange{ .start = item.tokens.start + 2, .end = item.tokens.end - 1 })) return false;
+    if (tokens[item.tokens.start + 1].kind != .lparen or tokens[item.tokens.end - 1].kind != .rparen) return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, item.name_tokens)) return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, item.argument_tokens)) return false;
+    if (generatedReadAntflyTableFunctionKindForToken(tokens[item.name_tokens.start]) != item.kind) return false;
+    if (item.argument_items.len != item.argument_count) return false;
+    var previous_end = item.argument_tokens.start;
+    for (item.argument_items) |argument| {
+        if (argument.tokens.start < previous_end) return false;
+        if (!generatedReadNamedArgumentIsValid(tokens, end, item.argument_tokens, argument)) return false;
+        previous_end = argument.tokens.end;
+    }
+    return true;
+}
+
+fn generatedReadNamedArgumentIsValid(
+    tokens: []const Token,
+    end: usize,
+    argument_tokens: generated_parser.GeneratedSqlTokenRange,
+    argument: generated_parser.GeneratedSqlNamedArgumentAst,
+) bool {
+    if (!generatedReadNestedRangeIsValid(tokens, end, argument_tokens, argument.tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, argument.tokens, argument.name_tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, argument.tokens, argument.operator_tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, argument.tokens, argument.value_tokens)) return false;
+    if (argument.name_tokens.start != argument.tokens.start) return false;
+    if (argument.value_tokens.end != argument.tokens.end) return false;
+    if (argument.operator_tokens.start < argument.name_tokens.end or argument.operator_tokens.end > argument.value_tokens.start) return false;
+    if (argument.operator_tokens.end != argument.value_tokens.start) return false;
+    return true;
+}
+
+fn generatedReadGraphSourceItemsAreValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    antfly_items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    graph_items: []const generated_parser.GeneratedSqlGraphTableFunctionAst,
+    count: usize,
+) bool {
+    if (graph_items.len != count) return false;
+    const source_tokens = maybe_source_tokens orelse return graph_items.len == 0 and count == 0;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, source_tokens)) return false;
+    var previous_end = source_tokens.start;
+    for (graph_items) |item| {
+        if (item.tokens.start < previous_end) return false;
+        if (!generatedReadGraphSourceItemIsValid(tokens, end, source_tokens, item)) return false;
+        const matching_antfly_item = generatedReadMatchingAntflySourceItem(item, antfly_items) orelse return false;
+        if (!generatedReadGraphSourceSemanticPayloadIsValid(tokens, end, item, matching_antfly_item)) return false;
+        previous_end = item.tokens.end;
+    }
+    return true;
+}
+
+fn generatedReadGraphSourceItemIsValid(
+    tokens: []const Token,
+    end: usize,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+) bool {
+    if (!generatedReadNestedRangeIsValid(tokens, end, source_tokens, item.tokens)) return false;
+    if (item.tokens.end < item.tokens.start + 3) return false;
+    if (!std.meta.eql(item.name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = item.tokens.start, .end = item.tokens.start + 1 })) return false;
+    if (!std.meta.eql(item.argument_tokens, generated_parser.GeneratedSqlTokenRange{ .start = item.tokens.start + 2, .end = item.tokens.end - 1 })) return false;
+    if (tokens[item.tokens.start + 1].kind != .lparen or tokens[item.tokens.end - 1].kind != .rparen) return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, item.name_tokens)) return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, item.argument_tokens)) return false;
+    if (generatedReadGraphTableFunctionKindForToken(tokens[item.name_tokens.start]) != item.kind) return false;
+    return true;
+}
+
+fn generatedReadMatchingAntflySourceItem(
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+    antfly_items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) ?generated_parser.GeneratedSqlAntflyTableFunctionAst {
+    for (antfly_items) |antfly_item| {
+        if (!std.meta.eql(graph_item.tokens, antfly_item.tokens)) continue;
+        if (!std.meta.eql(graph_item.name_tokens, antfly_item.name_tokens)) continue;
+        if (!std.meta.eql(graph_item.argument_tokens, antfly_item.argument_tokens)) continue;
+        if (generatedReadGraphTableFunctionKindFromAntfly(antfly_item.kind) != graph_item.kind) continue;
+        return antfly_item;
+    }
+    return null;
+}
+
+fn generatedReadGraphSourceSemanticPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) bool {
+    if (graph_item.argument_count != antfly_item.argument_count) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.table_name_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "table_name", "table" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.index_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "index", "graph_index" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.start_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "start", "start_node" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.start_result_ref_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "start_result_ref", "result_ref" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.target_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "target", "target_node" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.target_result_ref_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{"target_result_ref"}))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.pattern_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{"pattern"}))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.return_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "return", "return_aliases" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.metric_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "metric", "graph_metric" }))) return false;
+    if (!generatedReadGraphSemanticValueMatches(tokens, end, graph_item.argument_tokens, graph_item.query_value_tokens, generatedReadAntflyArgumentValueByNames(tokens, antfly_item, &.{ "query", "text" }))) return false;
+
+    return switch (graph_item.kind) {
+        .traverse, .neighbors => graph_item.index_value_tokens != null and (graph_item.start_value_tokens != null or graph_item.start_result_ref_value_tokens != null),
+        .shortest_path, .k_shortest_paths => graph_item.index_value_tokens != null and
+            (graph_item.start_value_tokens != null or graph_item.start_result_ref_value_tokens != null) and
+            (graph_item.target_value_tokens != null or graph_item.target_result_ref_value_tokens != null),
+        .match => graph_item.index_value_tokens != null and
+            (graph_item.start_value_tokens != null or graph_item.start_result_ref_value_tokens != null) and
+            graph_item.pattern_value_tokens != null,
+        .metric, .metric_rerank => graph_item.index_value_tokens != null and graph_item.metric_value_tokens != null,
+    };
+}
+
+fn generatedReadGraphSemanticValueMatches(
+    tokens: []const Token,
+    end: usize,
+    argument_tokens: generated_parser.GeneratedSqlTokenRange,
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (actual == null and expected == null) return true;
+    const actual_value = actual orelse return false;
+    const expected_value = expected orelse return false;
+    if (!std.meta.eql(actual_value, expected_value)) return false;
+    return generatedReadNestedRangeIsValid(tokens, end, argument_tokens, actual_value);
+}
+
+fn generatedReadAntflyArgumentValueByNames(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    names: []const []const u8,
+) ?generated_parser.GeneratedSqlTokenRange {
+    for (item.argument_items) |argument| {
+        if (argument.name_tokens.start >= argument.name_tokens.end or argument.name_tokens.start >= tokens.len) continue;
+        for (names) |name| {
+            if (tokenMatchesText(tokens[argument.name_tokens.start], name)) return argument.value_tokens;
+        }
+    }
+    return null;
+}
+
+fn generatedReadGraphSourceCompatibilityFieldsAreValid(read_ast: *const generated_parser.GeneratedSqlReadAst) bool {
+    if (read_ast.source_graph_function_items.len == 0) {
+        return read_ast.source_graph_function_count == 0 and
+            read_ast.source_graph_function_tokens == null and
+            read_ast.source_graph_function_name_tokens == null and
+            read_ast.source_graph_function_argument_tokens == null and
+            read_ast.source_graph_function_kind == null;
+    }
+    const first = read_ast.source_graph_function_items[0];
+    return std.meta.eql(read_ast.source_graph_function_tokens orelse return false, first.tokens) and
+        std.meta.eql(read_ast.source_graph_function_name_tokens orelse return false, first.name_tokens) and
+        std.meta.eql(read_ast.source_graph_function_argument_tokens orelse return false, first.argument_tokens) and
+        (read_ast.source_graph_function_kind orelse return false) == first.kind;
+}
+
+fn generatedReadAntflyTableFunctionKindForToken(token: Token) ?generated_parser.GeneratedSqlAntflyTableFunctionKind {
+    if (token.matchesQualifiedKeywordTag("antfly", .full_text_search)) return .full_text_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .semantic_search)) return .semantic_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .vector_search)) return .vector_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .graph_traverse;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .graph_neighbors;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .graph_shortest_path;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .graph_k_shortest_paths;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .graph_match;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .graph_metric;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .graph_metric_rerank;
+    if (token.matchesQualifiedKeywordTag("antfly", .hybrid_search)) return .hybrid_search;
+    return null;
+}
+
+fn generatedReadGraphTableFunctionKindForToken(token: Token) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .traverse;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .neighbors;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .shortest_path;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .k_shortest_paths;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .match;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .metric;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .metric_rerank;
+    return null;
+}
+
+fn generatedReadGraphTableFunctionKindFromAntfly(kind: generated_parser.GeneratedSqlAntflyTableFunctionKind) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
+    return switch (kind) {
+        .graph_traverse => .traverse,
+        .graph_neighbors => .neighbors,
+        .graph_shortest_path => .shortest_path,
+        .graph_k_shortest_paths => .k_shortest_paths,
+        .graph_match => .match,
+        .graph_metric => .metric,
+        .graph_metric_rerank => .metric_rerank,
+        else => null,
+    };
 }
 
 fn generatedReadOptionalNestedRangeIsValid(
@@ -1359,6 +1589,16 @@ fn generatedReadOptionalNestedRangeIsValid(
         return inner.start >= outer.start and inner.end <= outer.end;
     }
     return true;
+}
+
+fn generatedReadNestedRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    outer: generated_parser.GeneratedSqlTokenRange,
+    inner: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, inner)) return false;
+    return inner.start >= outer.start and inner.end <= outer.end;
 }
 
 fn generatedReadOptionalTokenRangeIsValidThrough(
@@ -4616,6 +4856,53 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_row_lock_query.statement = parseStatement(generated_cte_row_lock_query.raw_statement, malformed_cte_row_lock_generated, &generated_cte_row_lock_query.tokenized_sql);
     try std.testing.expect(generated_cte_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_row_lock_query.statement));
+
+    var generated_graph_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm");
+    defer generated_graph_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_source_query.generatedStatementKind().?);
+
+    var malformed_antfly_source_count = generated_graph_source_query.generated_statement.?;
+    if (malformed_antfly_source_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.source_antfly_function_count += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_source_query.statement = parseStatement(generated_graph_source_query.raw_statement, malformed_antfly_source_count, &generated_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_source_query.statement));
+
+    var malformed_graph_source_metric = generated_graph_source_query.generated_statement.?;
+    if (malformed_graph_source_metric.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.source_graph_function_items[0].pattern_value_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_source_query.statement = parseStatement(generated_graph_source_query.raw_statement, malformed_graph_source_metric, &generated_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_source_query.statement));
+
+    var generated_cte_graph_source_query = try ParsedSql.initAlloc(alloc, "WITH ranked AS (SELECT * FROM antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm) SELECT id FROM ranked");
+    defer generated_cte_graph_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_graph_source_query.generatedStatementKind().?);
+
+    var malformed_cte_graph_source = generated_cte_graph_source_query.generated_statement.?;
+    if (malformed_cte_graph_source.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_source_graph_function_items[0].metric_value_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_graph_source_query.statement = parseStatement(generated_cte_graph_source_query.raw_statement, malformed_cte_graph_source, &generated_cte_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_cte_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_graph_source_query.statement));
 
     var malformed_command_span = generated_query.generated_statement.?;
     if (malformed_command_span.ast) |*generated_ast| {

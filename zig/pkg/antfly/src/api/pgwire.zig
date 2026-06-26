@@ -863,23 +863,27 @@ const Connection = struct {
                 try self.sendJsonRows(rows, columns, tag, result_formats, include_row_description);
             },
             .rows_batch => |rows_batch| {
-                if (rows_batch.returning_rows.len > 0) {
-                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, rows_batch.returning_rows.len);
+                if (rows_batch.result.returning_rows.len > 0) {
+                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, rows_batch.result.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(rows_batch.returning_rows, null, tag, result_formats, include_row_description);
+                    const columns = if (rows_batch.columns.len == 0) null else try pgwire_module.pgwireColumnsForRelationalColumnsAlloc(self.alloc, rows_batch.columns);
+                    defer if (columns) |owned| self.alloc.free(owned);
+                    try self.sendJsonRows(rows_batch.result.returning_rows, columns, tag, result_formats, include_row_description);
                 } else {
-                    const tag = try pgwire_module.commandTagForRowsBatch(self.alloc, result.statement_kind, rows_batch);
+                    const tag = try pgwire_module.commandTagForRowsBatch(self.alloc, result.statement_kind, rows_batch.result);
                     defer self.alloc.free(tag);
                     try self.sendCommandComplete(tag);
                 }
             },
             .mutation_source => |mutation_source| {
-                if (mutation_source.returning_rows.len > 0) {
-                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, mutation_source.returning_rows.len);
+                if (mutation_source.result.returning_rows.len > 0) {
+                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, mutation_source.result.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(mutation_source.returning_rows, null, tag, result_formats, include_row_description);
+                    const columns = if (mutation_source.columns.len == 0) null else try pgwire_module.pgwireColumnsForRelationalColumnsAlloc(self.alloc, mutation_source.columns);
+                    defer if (columns) |owned| self.alloc.free(owned);
+                    try self.sendJsonRows(mutation_source.result.returning_rows, columns, tag, result_formats, include_row_description);
                 } else {
-                    const tag = try pgwire_module.commandTagForMutationSource(self.alloc, result.statement_kind, mutation_source);
+                    const tag = try pgwire_module.commandTagForMutationSource(self.alloc, result.statement_kind, mutation_source.result);
                     defer self.alloc.free(tag);
                     try self.sendCommandComplete(tag);
                 }

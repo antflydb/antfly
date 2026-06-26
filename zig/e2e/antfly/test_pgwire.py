@@ -608,6 +608,40 @@ def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
     assert json.loads(rows[0][4]) == {"tier": "gold"}
 
 
+def test_pgwire_returning_row_description_uses_relational_type_oids(pgwire_server):
+    table = _table_name("pgwire_returning_types")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, amount numeric, active boolean, attrs jsonb);")
+        insert_messages = _pgwire_simple_query(
+            sock,
+            f"INSERT INTO {table} (id, amount, active, attrs) "
+            "VALUES ('row:returning', 42, true, '{\"kind\":\"returning\"}'::jsonb) "
+            "RETURNING id, amount, active, attrs, lower(id) AS id_key;",
+        )
+        update_messages = _pgwire_simple_query(
+            sock,
+            f"UPDATE {table} SET amount = amount + 1 WHERE id = 'row:returning' "
+            "RETURNING id, amount + 1 AS next_amount;",
+        )
+
+    assert [message for message in insert_messages if message["type"] == "columns"] == [
+        {
+            "type": "columns",
+            "columns": ["id", "amount", "active", "attrs", "id_key"],
+            "oids": [PG_TEXT_OID, PG_NUMERIC_OID, PG_BOOL_OID, PG_JSONB_OID, PG_TEXT_OID],
+        }
+    ]
+    insert_rows = [message["values"] for message in insert_messages if message["type"] == "row"]
+    assert insert_rows == [["row:returning", "42", "true", '{"kind":"returning"}', "row:returning"]]
+
+    assert [message for message in update_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["id", "next_amount"], "oids": [PG_TEXT_OID, PG_NUMERIC_OID]}
+    ]
+    assert [message["values"] for message in update_messages if message["type"] == "row"] == [["row:returning", "44"]]
+
+
 def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server):
     table = _table_name("metadata_pgwire")
 

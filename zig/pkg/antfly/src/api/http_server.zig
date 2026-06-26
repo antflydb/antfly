@@ -4728,14 +4728,36 @@ pub const ApiHttpServer = struct {
             }
         };
 
+        pub const RowsBatch = struct {
+            result: relational_rows_api.OwnedRowsBatchRequest,
+            columns: []const runtime_schema_mod.RelationalColumn = &.{},
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.result.deinit(alloc);
+                relational_rows_api.freeRowsOutputColumns(alloc, self.columns);
+                self.* = undefined;
+            }
+        };
+
+        pub const MutationSource = struct {
+            result: db_mod.types.RelationalRowsMutationSourceResult,
+            columns: []const runtime_schema_mod.RelationalColumn = &.{},
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.result.deinit(alloc);
+                relational_rows_api.freeRowsOutputColumns(alloc, self.columns);
+                self.* = undefined;
+            }
+        };
+
         session_id: u64,
         statement_kind: []const u8,
         transaction_status: PublicSqlTransactionStatus = .idle,
         result: union(enum) {
             ddl: Ddl,
             read: Read,
-            rows_batch: relational_rows_api.OwnedRowsBatchRequest,
-            mutation_source: db_mod.types.RelationalRowsMutationSourceResult,
+            rows_batch: RowsBatch,
+            mutation_source: MutationSource,
         },
 
         pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -4853,9 +4875,9 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         session_id: u64,
         statement_kind: []const u8,
-        rows_batch: relational_rows_api.OwnedRowsBatchRequest,
+        rows_batch: PublicSqlResult.RowsBatch,
     ) ![]u8 {
-        const result_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_batch);
+        const result_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_batch.result);
         defer self.alloc.free(result_body);
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -4874,9 +4896,9 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         session_id: u64,
         statement_kind: []const u8,
-        result: db_mod.types.RelationalRowsMutationSourceResult,
+        result: PublicSqlResult.MutationSource,
     ) ![]u8 {
-        const result_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
+        const result_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result.result);
         defer self.alloc.free(result_body);
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -5726,16 +5748,26 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         if (lowered == .insert_source) {
+            const returning_columns = self.publicSqlInsertSourceRequestReturningColumnsAlloc(schema, lowered.insert_source.insert_source.req) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(target_table, schema, &lowered.insert_source, authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = insert_source_result },
+                .result = .{ .mutation_source = .{
+                    .result = insert_source_result,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
@@ -5745,16 +5777,26 @@ pub const ApiHttpServer = struct {
                 .delete_source => |*delete_source| delete_source,
                 else => unreachable,
             };
+            const returning_columns = self.publicSqlMutationRequestReturningColumnsAlloc(schema, mutation_source.mutation.req) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const mutation_source_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, mutation_source, authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = mutation_source_result },
+                .result = .{ .mutation_source = .{
+                    .result = mutation_source_result,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
@@ -5771,7 +5813,7 @@ pub const ApiHttpServer = struct {
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = truncate_result },
+                .result = .{ .mutation_source = .{ .result = truncate_result } },
             } };
         }
 
@@ -5781,16 +5823,32 @@ pub const ApiHttpServer = struct {
                 .delete_joined_source => |*delete_joined_source| delete_joined_source,
                 else => unreachable,
             };
+            const owned_source_schema = self.publicSqlSourceSchemaForWriteAlloc(target_table, joined_mutation_source.source_table_name, session.session()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                else => return err,
+            };
+            defer if (owned_source_schema) |source_schema| runtime_schema_mod.freeSchema(self.alloc, source_schema);
+            const joined_source_schema = owned_source_schema orelse schema;
+            const returning_columns = self.publicSqlJoinedMutationRequestReturningColumnsAlloc(schema, joined_source_schema, joined_mutation_source.mutation.req) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const joined_mutation_result = switch (try self.applyLoweredPublicSqlJoinedMutationSource(target_table, schema, joined_mutation_source, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = joined_mutation_result },
+                .result = .{ .mutation_source = .{
+                    .result = joined_mutation_result,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
@@ -5800,47 +5858,99 @@ pub const ApiHttpServer = struct {
                 .recursive_delete_joined_source => |recursive_delete_joined_source| recursive_delete_joined_source,
                 else => unreachable,
             };
+            var recursive_source_schema = schema;
+            recursive_source_schema.relational_columns = recursive_joined_mutation_source.recursive.output_columns;
+            const returning_columns = self.publicSqlJoinedMutationRequestReturningColumnsAlloc(schema, recursive_source_schema, recursive_joined_mutation_source.mutation.mutation.req) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const recursive_joined_mutation_result = switch (try self.applyLoweredPublicSqlRecursiveJoinedMutationSource(target_table, schema, recursive_joined_mutation_source, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = recursive_joined_mutation_result },
+                .result = .{ .mutation_source = .{
+                    .result = recursive_joined_mutation_result,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
         if (lowered == .merge_mutation) {
+            const owned_source_schema = self.publicSqlSourceSchemaForWriteAlloc(target_table, lowered.merge_mutation.source_table_name, session.session()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                else => return err,
+            };
+            defer if (owned_source_schema) |source_schema| runtime_schema_mod.freeSchema(self.alloc, source_schema);
+            const merge_source_schema = owned_source_schema orelse schema;
+            const returning_columns = self.publicSqlReturningColumnsAlloc(schema, merge_source_schema, lowered.merge_mutation.returning) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const merge_batch = switch (try self.applyLoweredPublicSqlMergeMutation(target_table, schema, &lowered.merge_mutation, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .batch => |batch| batch,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .rows_batch = merge_batch },
+                .result = .{ .rows_batch = .{
+                    .result = merge_batch,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
         if (lowered == .recursive_merge_mutation) {
+            var recursive_source_schema = schema;
+            recursive_source_schema.relational_columns = lowered.recursive_merge_mutation.recursive.output_columns;
+            const returning_columns = self.publicSqlReturningColumnsAlloc(schema, recursive_source_schema, lowered.recursive_merge_mutation.merge.returning) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                else => return err,
+            };
+            var returning_columns_owned = true;
+            defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
             const merge_batch = switch (try self.applyLoweredPublicSqlRecursiveMergeMutation(target_table, schema, lowered.recursive_merge_mutation, session.session(), authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
                 .batch => |batch| batch,
             };
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
+            returning_columns_owned = false;
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .rows_batch = merge_batch },
+                .result = .{ .rows_batch = .{
+                    .result = merge_batch,
+                    .columns = returning_columns,
+                } },
             } };
         }
 
+        const returning_projection = switch (lowered) {
+            .insert => |*insert| insert.returning,
+            .update => |*update| update.returning,
+            .delete => |*delete| delete.returning,
+            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        };
+        const returning_columns = self.publicSqlReturningColumnsAlloc(schema, null, returning_projection) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+            else => return err,
+        };
+        var returning_columns_owned = true;
+        defer if (returning_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, returning_columns);
         const rows_batch = switch (lowered) {
             .insert => |*insert| &insert.batch,
             .update => |*update| &update.batch,
@@ -5852,16 +5962,32 @@ pub const ApiHttpServer = struct {
 
         const owned_rows_batch = rows_batch.*;
         switch (lowered) {
-            .insert => |*insert| self.alloc.free(insert.table_name),
-            .update => |*update| self.alloc.free(update.table_name),
-            .delete => |*delete| self.alloc.free(delete.table_name),
+            .insert => |*insert| {
+                self.alloc.free(insert.table_name);
+                insert.returning.deinit(self.alloc);
+                insert.returning = .{};
+            },
+            .update => |*update| {
+                self.alloc.free(update.table_name);
+                update.returning.deinit(self.alloc);
+                update.returning = .{};
+            },
+            .delete => |*delete| {
+                self.alloc.free(delete.table_name);
+                delete.returning.deinit(self.alloc);
+                delete.returning = .{};
+            },
             else => unreachable,
         }
         lowered_owned = false;
+        returning_columns_owned = false;
         return .{ .result = .{
             .session_id = self.ensureSqlProtocolSessionId(session),
             .statement_kind = @tagName(statement_kind),
-            .result = .{ .rows_batch = owned_rows_batch },
+            .result = .{ .rows_batch = .{
+                .result = owned_rows_batch,
+                .columns = returning_columns,
+            } },
         } };
     }
 
@@ -6152,6 +6278,69 @@ pub const ApiHttpServer = struct {
                 return try relational_rows_api.rowsReadPlanOutputColumnsWithSchemasAlloc(self.alloc, default_schema, default_schema, source_schema, .{ .lateral = lateral.plan });
             },
         }
+    }
+
+    fn publicSqlReturningColumnsAlloc(
+        self: *ApiHttpServer,
+        target_schema: runtime_schema_mod.TableSchema,
+        source_schema: ?runtime_schema_mod.TableSchema,
+        returning: sql_adapter.ReturningProjection,
+    ) ![]const runtime_schema_mod.RelationalColumn {
+        return try sql_adapter.returningOutputColumnsAlloc(self.alloc, target_schema, .{
+            .alloc = self.alloc,
+            .schema = target_schema,
+            .joined_source_schema = source_schema,
+        }, returning);
+    }
+
+    fn publicSqlMutationRequestReturningColumnsAlloc(
+        self: *ApiHttpServer,
+        target_schema: runtime_schema_mod.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) ![]const runtime_schema_mod.RelationalColumn {
+        return try self.publicSqlReturningColumnsAlloc(target_schema, null, .{
+            .fields = req.returning,
+            .expressions = req.returning_expressions,
+        });
+    }
+
+    fn publicSqlInsertSourceRequestReturningColumnsAlloc(
+        self: *ApiHttpServer,
+        target_schema: runtime_schema_mod.TableSchema,
+        req: db_mod.types.RelationalRowsInsertSourceRequest,
+    ) ![]const runtime_schema_mod.RelationalColumn {
+        return try self.publicSqlReturningColumnsAlloc(target_schema, null, .{
+            .fields = req.returning,
+            .expressions = req.returning_expressions,
+        });
+    }
+
+    fn publicSqlJoinedMutationRequestReturningColumnsAlloc(
+        self: *ApiHttpServer,
+        target_schema: runtime_schema_mod.TableSchema,
+        source_schema: runtime_schema_mod.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) ![]const runtime_schema_mod.RelationalColumn {
+        return try self.publicSqlReturningColumnsAlloc(target_schema, source_schema, .{
+            .fields = req.returning,
+            .expressions = req.returning_expressions,
+        });
+    }
+
+    fn publicSqlSourceSchemaForWriteAlloc(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        source_table_name: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+    ) !?runtime_schema_mod.TableSchema {
+        const effective_source_table = rowsPlanEffectiveSideTable(target_table_name, source_table_name);
+        if (std.mem.eql(u8, effective_source_table, target_table_name)) return null;
+        return try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+            self.alloc,
+            self.catalogSource(),
+            effective_source_table,
+            session,
+        );
     }
 
     fn publicSqlCatalogSchemaUnlessDefaultAlloc(
@@ -6568,10 +6757,11 @@ pub const ApiHttpServer = struct {
         switch (outcome) {
             .response => |response| return response,
             .result => |*result| {
-                defer result.deinit(self.alloc);
                 const body = try self.encodePublicSqlResultAlloc(result.*);
                 defer self.alloc.free(body);
-                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
+                const response = try jsonBodyResponseWithStatus(self.alloc, 200, body);
+                result.deinit(self.alloc);
+                return response;
             },
         }
     }

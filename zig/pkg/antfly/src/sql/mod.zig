@@ -974,6 +974,7 @@ pub const selectListOutputCount = lower_expr.selectListOutputCount;
 pub const validateWindowSelectListOutputs = lower_expr.validateWindowSelectListOutputs;
 pub const validateAggregateSelectListOutputs = lower_expr.validateAggregateSelectListOutputs;
 pub const validateReturningProjectionOutputs = lower_expr.validateReturningProjectionOutputs;
+pub const returningOutputColumnsAlloc = lower_expr.returningOutputColumnsAlloc;
 pub const returningFieldOutputCount = lower_expr.returningFieldOutputCount;
 pub const returningExpressionOutputCount = lower_expr.returningExpressionOutputCount;
 pub const jsonValueProjectedType = lower_expr.jsonValueProjectedType;

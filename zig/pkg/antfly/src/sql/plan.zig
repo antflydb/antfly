@@ -481,6 +481,7 @@ pub const LoweredInsert = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
     sync_level: db_mod.types.SyncLevel = .write,
+    returning: ReturningProjection = .{},
     returning_expression_count: usize = 0,
     returning_all: bool = false,
     conflict_where: bool = false,
@@ -488,6 +489,7 @@ pub const LoweredInsert = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.batch.deinit(alloc);
+        self.returning.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -539,12 +541,14 @@ pub const LoweredMutation = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
     sync_level: db_mod.types.SyncLevel = .write,
+    returning: ReturningProjection = .{},
     returning_expression_count: usize = 0,
     returning_all: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.batch.deinit(alloc);
+        self.returning.deinit(alloc);
         self.* = undefined;
     }
 };

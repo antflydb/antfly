@@ -260,6 +260,14 @@ Keep the existing focused test roots stable:
 - `api-table-reads-docid-test`
 - `api-table-writes-docid-test`
 
+Keep `zig/build.zig` at suite granularity. The API read/write refactor should
+not add one `b.addTest` block or one top-level build step per extracted leaf
+module or per regression. New read/write leaf tests should be imported by the
+stable focused test roots and registered through the grouped API test helper in
+`pkg/antfly/build/tests.zig`. `zig/build.zig` should know about durable suites
+such as API table reads, API table writes, rows, DOCID lifecycle, and graph
+metric coverage, not individual implementation test names.
+
 Yes: tests should generally move with the production behavior they prove. The
 important caveat is that this is an ownership move, not a mechanical file move.
 Leaf implementation tests should travel with the extracted leaf module; boundary

@@ -9531,12 +9531,14 @@ pub fn parseInsertAlloc(
     row_values_rows.deinit(alloc);
     freeConflictClauses(alloc, conflicts.items);
     conflicts.deinit(alloc);
-    returning.deinit(alloc);
 
     alloc.free(target_table.alias);
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = target_table.name,
         .batch = batch,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
         .conflict_where = conflict_where,
@@ -9921,12 +9923,14 @@ pub fn parseUpdateAlloc(
     json_set.deinit(alloc);
     freeArrayTransformValues(alloc, array_update.items);
     array_update.deinit(alloc);
-    returning.deinit(alloc);
 
     alloc.free(target_table.alias);
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = target_table.name,
         .batch = batch,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
     };
@@ -9978,12 +9982,13 @@ pub fn parseDeleteAlloc(
     var batch = try relational_rows.parseRowsBatchRequestWithResolver(alloc, target_table.name, body_json, options.schema, options.unique_resolver orelse return error.UnsupportedRowsSelector);
     errdefer batch.deinit(alloc);
 
-    returning.deinit(alloc);
-
     alloc.free(target_table.alias);
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = target_table.name,
         .batch = batch,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
     };
@@ -12959,7 +12964,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         try rejectDuplicateConflictUpdateTargets(alloc, schema, columns, rows, conflicts.items);
     }
     var returning: plan_mod.ReturningProjection = .{};
-    defer returning.deinit(alloc);
+    errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
         const parser_context = @import("parser_context.zig");
         var parser_state = parser_context.ParserState{
@@ -13003,10 +13008,13 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     conflicts.deinit(alloc);
 
     table_transferred = true;
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = table_name,
         .batch = batch,
         .sync_level = options.sync_level,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
         .conflict_where = conflict_where,
@@ -13592,7 +13600,7 @@ fn updatePointFromGeneratedDmlAstAlloc(
     if (where_pos != where_range.end) return error.UnsupportedSqlShape;
 
     var returning: plan_mod.ReturningProjection = .{};
-    defer returning.deinit(alloc);
+    errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
         returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
     }
@@ -13623,10 +13631,13 @@ fn updatePointFromGeneratedDmlAstAlloc(
     array_update.deinit(alloc);
 
     table_transferred = true;
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = table_name,
         .batch = batch,
         .sync_level = options.sync_level,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
     };
@@ -13679,7 +13690,7 @@ fn deletePointFromGeneratedDmlAstAlloc(
     if (where_pos != where_range.end) return error.UnsupportedSqlShape;
 
     var returning: plan_mod.ReturningProjection = .{};
-    defer returning.deinit(alloc);
+    errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
         returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
     }
@@ -13697,10 +13708,13 @@ fn deletePointFromGeneratedDmlAstAlloc(
     batch.req.sync_level = options.sync_level;
 
     table_transferred = true;
+    const owned_returning = returning;
+    returning = .{};
     return .{
         .table_name = table_name,
         .batch = batch,
         .sync_level = options.sync_level,
+        .returning = owned_returning,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
     };

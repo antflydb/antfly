@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
 const db_internal = @import("internal.zig");
@@ -32,6 +33,20 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const row_claim_intent_key_prefix = relational_rows.row_claim_intent_key_prefix;
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const TxnResolverRecorder = support.TxnResolverRecorder;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
 
 pub fn Impl(comptime DB: type) type {
     return struct {
@@ -1147,14 +1162,11 @@ fn encodeTimestampValue(alloc: Allocator, timestamp_ns: u64) ![]u8 {
 
 test "db transactions local lifecycle exposes committed and deleted documents" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1206,15 +1218,12 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
 
 test "db transactions relational commit writes relational base rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1265,14 +1274,11 @@ test "db transactions relational commit writes relational base rows" {
 
 test "db transactions durable foreign key action schedules are atomic" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1378,14 +1384,11 @@ test "db transactions durable foreign key action schedules are atomic" {
 
 test "db transactions unique constraint mutations enforce owner handoff" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -1473,14 +1476,11 @@ test "db transactions unique constraint mutations enforce owner handoff" {
 
 test "db transactions doc identity intent writes reject new documents at ordinal exhaustion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -1523,14 +1523,11 @@ test "db transactions doc identity intent writes reject new documents at ordinal
 
 test "db transactions created identity rows remain visible after reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -1567,14 +1564,11 @@ test "db transactions created identity rows remain visible after reopen" {
 
 test "db transactions abort leaves no visible document" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1591,14 +1585,11 @@ test "db transactions abort leaves no visible document" {
 
 test "db transactions resolve transforms against pending same-transaction writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1634,15 +1625,12 @@ test "db transactions resolve transforms against pending same-transaction writes
 
 test "db transactions relational transforms read base rows and honor abort" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1696,14 +1684,11 @@ test "db transactions relational transforms read base rows and honor abort" {
 
 test "db transactions write request enforces version predicates" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1732,14 +1717,11 @@ test "db transactions write request enforces version predicates" {
 
 test "db transactions write request detects concurrent intent conflicts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1758,14 +1740,11 @@ test "db transactions write request detects concurrent intent conflicts" {
 
 test "db transactions row claims block transactional and direct mutations until resolution" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1814,14 +1793,11 @@ test "db transactions row claims block transactional and direct mutations until 
 
 test "db transactions row claim lease expiry aborts stale owner and lets next claimer proceed" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1870,14 +1846,11 @@ test "db transactions row claim lease expiry aborts stale owner and lets next cl
 
 test "db transactions row claim lease expiry lets direct mutation reclaim stale owner" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1913,14 +1886,11 @@ test "db transactions row claim lease expiry lets direct mutation reclaim stale 
 
 test "db transactions row claim search skip locked returns claimed subset" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -1963,14 +1933,11 @@ test "db transactions row claim search skip locked returns claimed subset" {
 
 test "db transactions committed transaction exposes commit timestamp for later predicates" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2009,14 +1976,11 @@ test "db transactions committed transaction exposes commit timestamp for later p
 
 test "db transactions aborted transaction preserves prior committed state and version" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2052,14 +2016,11 @@ test "db transactions aborted transaction preserves prior committed state and ve
 
 test "db transactions explicit resolveTransactionIntents applies participant-style commit version" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2082,14 +2043,11 @@ test "db transactions explicit resolveTransactionIntents applies participant-sty
 
 test "db transactions recoverTransactions auto-aborts stale pending intents" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2110,14 +2068,11 @@ test "db transactions recoverTransactions auto-aborts stale pending intents" {
 
 test "db transactions participant recovery preserves finalized transaction until all participants resolve" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2150,16 +2105,13 @@ test "db transactions participant recovery preserves finalized transaction until
 
 test "db transactions recovery runtime resolves participants and unblocks cleanup" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     const txn_id = blk: {
         var setup_db = try DB.open(alloc, std.mem.span(path), .{});
@@ -2234,14 +2186,11 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
 
 test "db transactions recovery runtime appends identity rows for committed orphaned intents" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const txn_id = blk: {
         var setup_db = try DB.open(alloc, std.mem.span(path), .{});
@@ -2269,7 +2218,7 @@ test "db transactions recovery runtime appends identity rows for committed orpha
         break :blk txn_id;
     };
 
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .transaction_recovery = .{
@@ -2311,15 +2260,12 @@ test "db transactions recovery runtime appends identity rows for committed orpha
 
 test "db transactions relational recovery resolves orphaned intents into base rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const commit_ts: u64 = 2_000;
     const txn_id = blk: {
@@ -2357,7 +2303,7 @@ test "db transactions relational recovery resolves orphaned intents into base ro
         break :blk txn_id;
     };
 
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .transaction_recovery = .{
@@ -2411,15 +2357,12 @@ test "db transactions relational recovery resolves orphaned intents into base ro
 
 test "db transactions one-shot relational recovery resolves orphaned intents into base rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2454,7 +2397,7 @@ test "db transactions one-shot relational recovery resolves orphaned intents int
     std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
     try db.core.store.put(record_key[0..], record_value[0..]);
 
-    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     const stats = try db.runTransactionRecoveryOnce(.{
         .enabled = true,
@@ -2483,14 +2426,11 @@ test "db transactions one-shot relational recovery resolves orphaned intents int
 
 test "db transactions batch enforces optimistic version predicates" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();

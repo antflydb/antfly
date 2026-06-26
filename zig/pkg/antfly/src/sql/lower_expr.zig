@@ -10072,6 +10072,69 @@ pub fn validateReturningProjectionOutputs(
     }
 }
 
+fn cloneReturningOutputColumnAlloc(
+    alloc: std.mem.Allocator,
+    output_name: []const u8,
+    source: runtime_schema.RelationalColumn,
+) !runtime_schema.RelationalColumn {
+    const name = try alloc.dupe(u8, output_name);
+    errdefer alloc.free(name);
+    const path = try alloc.dupe(u8, output_name);
+    errdefer alloc.free(path);
+    const collation = if (source.collation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (collation) |value| alloc.free(value);
+    return .{
+        .name = name,
+        .path = path,
+        .field_type = source.field_type,
+        .array_item_type = source.array_item_type,
+        .nullable = source.nullable,
+        .collation = collation,
+    };
+}
+
+pub fn returningOutputColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    returning: plan_mod.ReturningProjection,
+) ![]const runtime_schema.RelationalColumn {
+    if (!returning.hasProjection()) return &.{};
+    const returning_all = returning.returnsAll();
+    const field_count = if (returning_all) schema.relational_columns.len else returning.fields.len;
+    const columns = try alloc.alloc(runtime_schema.RelationalColumn, field_count + returning.expressions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+            if (column.collation) |collation| alloc.free(collation);
+        }
+        alloc.free(columns);
+    }
+
+    if (returning_all) {
+        for (schema.relational_columns) |source| {
+            columns[initialized] = try cloneReturningOutputColumnAlloc(alloc, source.name, source);
+            initialized += 1;
+        }
+    } else {
+        for (returning.fields) |field| {
+            const source = binder.relationalColumnForReturningField(schema, field) orelse return error.InvalidSqlCatalog;
+            columns[initialized] = try cloneReturningOutputColumnAlloc(alloc, field, source);
+            initialized += 1;
+        }
+    }
+
+    for (returning.expressions) |projection| {
+        const field_type = try type_context.rowExpressionOutputType(projection.expression);
+        const array_item_type = try type_context.rowExpressionOutputArrayItemType(projection.expression);
+        columns[initialized] = try projectedColumnAlloc(alloc, projection.output, field_type, array_item_type, true);
+        initialized += 1;
+    }
+    return columns;
+}
+
 pub fn parseReturningProjectionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,

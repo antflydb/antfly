@@ -907,7 +907,11 @@ Unsupported DDL remains on the existing parser until
    metadata into direct generated read ASTs. CTE read bodies also retain,
    validate, and clone body-level Antfly and graph table-function metadata so
    generated child-read planning sees the same table-function source semantics
-   as direct top-level reads. Incomplete generated read
+   as direct top-level reads. Parsed-statement classification now also
+   validates generated Antfly and graph table-function source counts, source
+   item ranges, named-argument ranges, graph compatibility fields, and
+   required graph semantic payloads for both top-level read sources and CTE
+   body sources before publishing a generated read family. Incomplete generated read
    clause-boundary shapes for
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
    incomplete boolean and comparison operator tails, ordering,
@@ -1268,7 +1272,9 @@ Generated grammar work needs evidence at multiple levels:
   the generated parser instead of legacy DDL fallback, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
   including duplicate argument rejection and joined graph sources, plus
-  fail-closed malformed Antfly and graph-source validation. Plan/lowering tests
+  fail-closed malformed Antfly and graph-source validation at both the
+  parsed-statement classification boundary and the executable lowering
+  boundary. Plan/lowering tests
   now cover `antfly.graph_metric(...)` as a direct relational table-function
   source and joined with graph match sources, and query-function tests cover
   transfer of parsed graph metric queries into owned table-function CTEs.

@@ -3931,14 +3931,6 @@ pub fn build(b: *std.Build) void {
     const lib_api_logic_test_step = b.step("lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests");
     lib_api_logic_test_step.dependOn(&run_lib_api_logic_tests.step);
 
-    const lib_api_docid_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
     const api_transactions_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_transactions_test_root.zig"),
         .target = target,
@@ -3981,157 +3973,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
-    const api_transactions_docid_tests = b.addTest(.{
-        .root_module = api_transactions_docid_test_mod,
-        .filters = &APITestFilters.transactions_docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
+    const api_docid_tests = antfly_tests_build.addAPIDocIdTestSteps(b, .{
+        .root = lib_test_mod,
+        .transactions_docid = api_transactions_docid_test_mod,
+        .table_writes_docid = api_table_writes_docid_test_mod,
+        .table_reads_docid = api_table_reads_docid_test_mod,
+        .public_table_http_docid = api_public_table_http_docid_test_mod,
+        .rows = api_rows_test_mod,
+        .internal_group_write_routes = api_internal_group_write_routes_test_mod,
+        .raft_transition_runtime_docid = raft_transition_runtime_docid_test_mod,
     });
-    const api_table_writes_docid_tests = b.addTest(.{
-        .root_module = api_table_writes_docid_test_mod,
-        .filters = selectTestFilters(b, &APITestFilters.table_writes_docid),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const provisioned_query_visibility_tests = b.addTest(.{
-        .root_module = api_table_writes_docid_test_mod,
-        .filters = selectTestFilters(b, &APITestFilters.provisioned_query_visibility),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_table_reads_docid_tests = b.addTest(.{
-        .root_module = api_table_reads_docid_test_mod,
-        .filters = &APITestFilters.table_reads_docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_table_reads_graph_metric_tests = b.addTest(.{
-        .root_module = api_table_reads_docid_test_mod,
-        .filters = &APITestFilters.table_reads_graph_metric,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_public_table_http_docid_tests = b.addTest(.{
-        .root_module = api_public_table_http_docid_test_mod,
-        .filters = &APITestFilters.public_table_http_docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_rows_tests = b.addTest(.{
-        .root_module = api_rows_test_mod,
-        .filters = selectTestFilters(b, &APITestFilters.rows),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const sql_api_parity_tests = b.addTest(.{
-        .root_module = api_rows_test_mod,
-        .filters = &APITestFilters.sql_api_parity,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const sql_api_parity_fixture_promote_tests = b.addTest(.{
-        .root_module = api_rows_test_mod,
-        .filters = &APITestFilters.sql_api_parity_fixture,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const sql_api_parity_fixture_check_tests = b.addTest(.{
-        .root_module = api_rows_test_mod,
-        .filters = &APITestFilters.sql_api_parity_fixture,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_internal_group_write_routes_tests = b.addTest(.{
-        .root_module = api_internal_group_write_routes_test_mod,
-        .filters = &APITestFilters.internal_group_write_routes,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const raft_transition_runtime_docid_tests = b.addTest(.{
-        .root_module = raft_transition_runtime_docid_test_mod,
-        .filters = &APITestFilters.raft_transition_runtime_docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const lib_serverless_docid_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.serverless_docid,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_api_docid_tests = b.addRunArtifact(lib_api_docid_tests);
-    const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
-    const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
-    const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
-    const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
-    const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
-    const run_api_table_reads_graph_metric_tests = b.addRunArtifact(api_table_reads_graph_metric_tests);
-    const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
-    const run_api_rows_tests = b.addRunArtifact(api_rows_tests);
-    const run_sql_api_parity_tests = b.addRunArtifact(sql_api_parity_tests);
-    const run_sql_api_parity_fixture_promote_tests = b.addRunArtifact(sql_api_parity_fixture_promote_tests);
-    run_sql_api_parity_fixture_promote_tests.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
-    const run_sql_api_parity_fixture_check_tests = b.addRunArtifact(sql_api_parity_fixture_check_tests);
-    run_sql_api_parity_fixture_check_tests.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
-    const run_api_internal_group_write_routes_tests = b.addRunArtifact(api_internal_group_write_routes_tests);
-    const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
-
-    const api_transactions_test_step = b.step("api-transactions-test", "Run focused API transaction coordinator tests");
-    api_transactions_test_step.dependOn(&run_api_transactions_docid_tests.step);
-
-    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write DOCID tests");
-    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-
-    const provisioned_query_visibility_step = b.step("provisioned-query-visibility-test", "Run focused provisioned query visibility tests");
-    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
-    unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
-
-    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read DOCID tests");
-    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-
-    const api_internal_group_write_routes_test_step = b.step("api-internal-group-write-routes-test", "Run focused internal group write route tests");
-    api_internal_group_write_routes_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
-
-    const api_rows_test_step = b.step("api-rows-test", "Run focused relational row API tests");
-    api_rows_test_step.dependOn(&run_api_rows_tests.step);
-
-    const sql_api_parity_test_step = b.step("sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests");
-    sql_api_parity_test_step.dependOn(&run_sql_api_parity_tests.step);
-
-    const sql_api_parity_fixture_promote_step = b.step("sql-api-parity-fixture-promote", "Regenerate the SQL/API typed-plan parity fixture from the source corpus");
-    sql_api_parity_fixture_promote_step.dependOn(&run_sql_api_parity_fixture_promote_tests.step);
-
-    const sql_api_parity_fixture_check_step = b.step("sql-api-parity-fixture-check", "Check that the SQL/API typed-plan parity fixture matches the source corpus");
-    sql_api_parity_fixture_check_step.dependOn(&run_sql_api_parity_fixture_check_tests.step);
-
-    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
-    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    unit_test_step.dependOn(&api_docid_tests.provisioned_query_visibility.step);
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &APITestFilters.docid_lifecycle,
@@ -4143,11 +3995,11 @@ pub fn build(b: *std.Build) void {
     const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
     const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
     docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&api_docid_tests.transactions_docid.step);
+    docid_lifecycle_test_step.dependOn(&api_docid_tests.table_reads_docid.step);
+    docid_lifecycle_test_step.dependOn(&api_docid_tests.table_writes_docid.step);
+    docid_lifecycle_test_step.dependOn(&api_docid_tests.public_table_http_docid.step);
+    docid_lifecycle_test_step.dependOn(&api_docid_tests.raft_transition_runtime_docid.step);
     docid_lifecycle_test_step.dependOn(&lib_db_module_tests.result_shape.step);
 
     const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
@@ -4157,15 +4009,15 @@ pub fn build(b: *std.Build) void {
     docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
 
     const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
-    lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_rows_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
-    lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.serverless_docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.transactions_docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.table_reads_docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.table_writes_docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.public_table_http_docid.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.rows.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.internal_group_write_routes.step);
+    lib_api_docid_test_step.dependOn(&api_docid_tests.raft_transition_runtime_docid.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -4197,7 +4049,7 @@ pub fn build(b: *std.Build) void {
     if (snowball_sources_available) {
         generated_check_step.dependOn(snowball_check_step);
     }
-    generated_check_step.dependOn(sql_api_parity_fixture_check_step);
+    generated_check_step.dependOn(&api_docid_tests.sql_api_parity_fixture_check.step);
 
     const lib_metadata_sim_forward_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4580,10 +4432,10 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
-    unit_test_step.dependOn(&run_lib_api_docid_tests.step);
-    unit_test_step.dependOn(&run_api_rows_tests.step);
-    unit_test_step.dependOn(&run_sql_api_parity_tests.step);
-    unit_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
+    unit_test_step.dependOn(&api_docid_tests.docid.step);
+    unit_test_step.dependOn(&api_docid_tests.rows.step);
+    unit_test_step.dependOn(&api_docid_tests.sql_api_parity.step);
+    unit_test_step.dependOn(&api_docid_tests.internal_group_write_routes.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -4956,7 +4808,7 @@ pub fn build(b: *std.Build) void {
         &run_graph_metric_cleanup_tests.step,
         &run_graph_metric_degree_canary_tests.step,
         &run_graph_metric_default_gate_tests.step,
-        &run_api_table_reads_graph_metric_tests.step,
+        &api_docid_tests.table_reads_graph_metric.step,
         &run_public_api_graph_metric_e2e_tests.step,
     });
 
