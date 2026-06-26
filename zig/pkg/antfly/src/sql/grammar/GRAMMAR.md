@@ -623,6 +623,10 @@ Suggested migration order:
 
 1. Session and control statements: `SET`, `RESET`, `SHOW`, `DISCARD ALL`,
    `BEGIN`, `COMMIT`, `ROLLBACK`, `PREPARE`, `EXECUTE`, `DEALLOCATE`.
+   The generated prepared-statement grammar accepts PostgreSQL-compatible
+   `DEALLOCATE PREPARE name` in addition to `DEALLOCATE name` and
+   `DEALLOCATE ALL`, and the generated AST records the actual prepared
+   statement name span after the optional `PREPARE` keyword.
 2. DDL: `CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `ALTER TABLE`,
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,

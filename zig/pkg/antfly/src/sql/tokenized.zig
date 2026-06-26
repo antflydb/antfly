@@ -2895,6 +2895,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt(text AS SELECT id FROM usage_records"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "EXECUTE read_stmt("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DEALLOCATE read_stmt extra"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DEALLOCATE PREPARE read_stmt extra"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "START WORK"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT NOW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT WORK NOW"));
@@ -3952,6 +3953,14 @@ test "sql adapter parsed sql owns typed statement variants" {
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared, prepared.generatedStatementKind().?);
     switch (prepared.statement) {
         .prepared => |statement| try std.testing.expectEqualStrings("PREPARE read_stmt AS SELECT id FROM usage_records", statement.raw.sql(prepared.sql())),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var deallocate_prepare = try ParsedSql.initAlloc(alloc, "DEALLOCATE PREPARE read_stmt");
+    defer deallocate_prepare.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared, deallocate_prepare.generatedStatementKind().?);
+    switch (deallocate_prepare.statement) {
+        .prepared => |statement| try std.testing.expectEqualStrings("DEALLOCATE PREPARE read_stmt", statement.raw.sql(deallocate_prepare.sql())),
         else => return error.TestUnexpectedResult,
     }
 

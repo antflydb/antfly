@@ -127,6 +127,7 @@ prepared_statement:
     PREPARE identifier_name prepare_parameter_types_opt AS statement
   | EXECUTE identifier_name execute_argument_list_opt
   | DEALLOCATE identifier_name
+  | DEALLOCATE PREPARE identifier_name
   | DEALLOCATE ALL
   ;
 
