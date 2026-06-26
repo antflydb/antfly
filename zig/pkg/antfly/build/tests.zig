@@ -1556,6 +1556,7 @@ pub const APITestFilters = struct {
         "api.table_writes.relational_mutation.test.",
         "api.table_writes.remote_wire.test.",
         "api.table_writes.schema_jobs.test.",
+        "api.table_writes.sources.test.",
         "api auto bulk ingest does not open sessions for normal online writes",
         "provisioned table write source rejects stale doc identity namespace before write",
         "bound table write source backs up and restores a local table",

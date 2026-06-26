@@ -24,6 +24,7 @@ const table_writes_schema_jobs = @import("api/table_writes/schema_jobs.zig");
 const table_writes_backup_restore = @import("api/table_writes/backup_restore.zig");
 const table_writes_relational_mutation = @import("api/table_writes/relational_mutation.zig");
 const table_writes_remote_wire = @import("api/table_writes/remote_wire.zig");
+const table_writes_sources = @import("api/table_writes/sources.zig");
 
 test {
     _ = table_writes;
@@ -38,4 +39,5 @@ test {
     _ = table_writes_backup_restore;
     _ = table_writes_relational_mutation;
     _ = table_writes_remote_wire;
+    _ = table_writes_sources;
 }
