@@ -267,8 +267,10 @@ multiple matched/not-matched arms, conditional arms, matched
 `UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
 write prefixes; recursive CTE insert-source, update, delete, and `MERGE`
 forms now retain generated per-CTE body metadata and validate generated CTE and
-command ranges plus full generated child-read parses for each recorded CTE body
-before dispatching to the typed recursive write-plan variants;
+command ranges, CTE item name/alias/`AS`/materialization/body delimiter
+layout, comma-separated item boundaries, and full generated child-read parses
+for each recorded CTE body before dispatching to the typed recursive write-plan
+variants;
 and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Generated
 direct `UPDATE` and `DELETE` point-vs-source selection now uses generated
