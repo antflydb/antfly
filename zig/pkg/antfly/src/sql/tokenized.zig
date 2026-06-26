@@ -2504,6 +2504,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .checkpoint,
         .create_access_method,
         .create_conversion,
+        .create_database_options,
         .create_event_trigger,
         .create_foreign_data_wrapper,
         .create_foreign_table,
@@ -2513,6 +2514,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_operator_family,
         .create_policy,
         .create_rule,
+        .create_schema_options,
         .create_server,
         .create_statistics,
         .create_text_search_configuration,
@@ -2535,6 +2537,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_policy,
         .drop_routine,
         .drop_rule,
+        .drop_schema_multi,
         .drop_server,
         .drop_statistics,
         .drop_text_search_configuration,
@@ -2891,8 +2894,6 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SCHEMA analytics AUTHORIZATION app_user"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER EXTENSION vector UPDATE TO"));
@@ -2900,7 +2901,6 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER USER"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP GROUP IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SCHEMA analytics, reporting"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
@@ -3438,6 +3438,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_conversion_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE DATABASE tenant_ops WITH OWNER app",
+            .kind = .create_database_options,
+            .reason = .create_database_options_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()",
             .kind = .create_event_trigger,
             .reason = .create_event_trigger_not_planned_by_generated_parser,
@@ -3471,6 +3476,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE SCHEMA analytics AUTHORIZATION app_user",
+            .kind = .create_schema_options,
+            .reason = .create_schema_options_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
@@ -3576,6 +3586,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE",
             .kind = .drop_routine,
             .reason = .drop_routine_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP SCHEMA analytics, reporting",
+            .kind = .drop_schema_multi,
+            .reason = .drop_schema_multi_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",

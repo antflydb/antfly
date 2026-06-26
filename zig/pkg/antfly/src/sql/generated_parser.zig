@@ -224,6 +224,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_user_mapping,
     create_access_method,
     create_conversion,
+    create_database_options,
     create_event_trigger,
     create_foreign_table,
     create_foreign_data_wrapper,
@@ -234,6 +235,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_policy,
     create_publication,
     create_rule,
+    create_schema_options,
     create_server,
     create_subscription,
     create_statistics,
@@ -256,6 +258,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_operator_class,
     drop_operator_family,
     drop_routine,
+    drop_schema_multi,
     drop_statistics,
     drop_text_search_configuration,
     drop_text_search_dictionary,
@@ -331,6 +334,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_user_mapping_not_planned_by_generated_parser,
     create_access_method_not_planned_by_generated_parser,
     create_conversion_not_planned_by_generated_parser,
+    create_database_options_not_planned_by_generated_parser,
     create_event_trigger_not_planned_by_generated_parser,
     create_foreign_table_not_planned_by_generated_parser,
     create_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -341,6 +345,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_policy_not_planned_by_generated_parser,
     create_publication_not_planned_by_generated_parser,
     create_rule_not_planned_by_generated_parser,
+    create_schema_options_not_planned_by_generated_parser,
     create_server_not_planned_by_generated_parser,
     create_subscription_not_planned_by_generated_parser,
     create_statistics_not_planned_by_generated_parser,
@@ -363,6 +368,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_operator_class_not_planned_by_generated_parser,
     drop_operator_family_not_planned_by_generated_parser,
     drop_routine_not_planned_by_generated_parser,
+    drop_schema_multi_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
     drop_text_search_dictionary_not_planned_by_generated_parser,
@@ -2109,6 +2115,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler", .kind = .unsupported },
     .{ .sql = "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1", .kind = .unsupported },
+    .{ .sql = "CREATE DATABASE tenant_ops WITH OWNER app", .kind = .unsupported },
     .{ .sql = "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler", .kind = .unsupported },
@@ -2116,6 +2123,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)", .kind = .unsupported },
     .{ .sql = "CREATE OPERATOR FAMILY usage_family USING btree", .kind = .unsupported },
     .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
+    .{ .sql = "CREATE SCHEMA analytics AUTHORIZATION app_user", .kind = .unsupported },
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
     .{ .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
@@ -2137,6 +2145,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree", .kind = .unsupported },
     .{ .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree", .kind = .unsupported },
     .{ .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP SCHEMA analytics, reporting", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict", .kind = .unsupported },
@@ -2555,8 +2564,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.view)) return .{ .ddl = .create_view };
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.function)) return .{ .ddl = .create_function };
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
-        if (second.matchesKeywordTag(.database)) return .{ .ddl = .create_database };
-        if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
+        if (second.matchesKeywordTag(.database)) {
+            if (generatedCreateCatalogHeadHasUnsupportedTail(tokens, 2)) return .{ .unsupported = .create_database_options };
+            return .{ .ddl = .create_database };
+        }
+        if (second.matchesKeywordTag(.schema)) {
+            if (generatedCreateCatalogHeadHasUnsupportedTail(tokens, 2)) return .{ .unsupported = .create_schema_options };
+            return .{ .ddl = .create_schema };
+        }
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .create_view };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .create_materialized_view };
@@ -2692,7 +2707,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .drop_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .drop_procedure };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
-        if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
+        if (second.matchesKeywordTag(.schema)) {
+            if (generatedDropSchemaHasMultipleTargets(tokens)) return .{ .unsupported = .drop_schema_multi };
+            return .{ .ddl = .drop_schema };
+        }
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
         if (second.matchesKeywordTag(.access) and tokens.len > 2 and tokens[2].matchesKeywordTag(.method)) return .{ .unsupported = .drop_access_method };
@@ -2866,6 +2884,22 @@ fn generatedCreateTableTargetRange(tokens: []const token_mod.Token, start: usize
     return generatedQualifiedNameRange(tokens, index, end);
 }
 
+fn generatedCreateCatalogHeadHasUnsupportedTail(tokens: []const token_mod.Token, name_start: usize) bool {
+    const end = statementTokenEnd(tokens);
+    var index = name_start;
+    _ = consumeGeneratedIfNotExists(tokens, &index, end);
+    const name = generatedQualifiedNameRange(tokens, index, end) orelse return false;
+    return name.end < end;
+}
+
+fn generatedDropSchemaHasMultipleTargets(tokens: []const token_mod.Token) bool {
+    const end = statementTokenEnd(tokens);
+    var index: usize = 2;
+    _ = consumeGeneratedIfExists(tokens, &index, end);
+    const first = generatedQualifiedNameRange(tokens, index, end) orelse return false;
+    return first.end < end and tokens[first.end].kind == .comma;
+}
+
 fn consumeGeneratedRelationLifetime(tokens: []const token_mod.Token, index: *usize, end: usize) void {
     if (index.* >= end) return;
     if (tokens[index.*].matchesKeywordTag(.temp) or
@@ -2947,6 +2981,7 @@ fn buildUnsupportedAst(
             .alter_user_mapping => .alter_user_mapping_not_planned_by_generated_parser,
             .create_access_method => .create_access_method_not_planned_by_generated_parser,
             .create_conversion => .create_conversion_not_planned_by_generated_parser,
+            .create_database_options => .create_database_options_not_planned_by_generated_parser,
             .create_event_trigger => .create_event_trigger_not_planned_by_generated_parser,
             .create_foreign_table => .create_foreign_table_not_planned_by_generated_parser,
             .create_foreign_data_wrapper => .create_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -2957,6 +2992,7 @@ fn buildUnsupportedAst(
             .create_policy => .create_policy_not_planned_by_generated_parser,
             .create_publication => .create_publication_not_planned_by_generated_parser,
             .create_rule => .create_rule_not_planned_by_generated_parser,
+            .create_schema_options => .create_schema_options_not_planned_by_generated_parser,
             .create_server => .create_server_not_planned_by_generated_parser,
             .create_subscription => .create_subscription_not_planned_by_generated_parser,
             .create_statistics => .create_statistics_not_planned_by_generated_parser,
@@ -2979,6 +3015,7 @@ fn buildUnsupportedAst(
             .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
             .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
             .drop_routine => .drop_routine_not_planned_by_generated_parser,
+            .drop_schema_multi => .drop_schema_multi_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
             .drop_text_search_dictionary => .drop_text_search_dictionary_not_planned_by_generated_parser,
@@ -7314,6 +7351,8 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_access_method }, (try parseSqlAlloc(alloc, "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_conversion }, (try parseSqlAlloc(alloc, "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_database_options }, (try parseSqlAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_schema_options }, (try parseSqlAlloc(alloc, "CREATE SCHEMA analytics AUTHORIZATION app_user")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_event_trigger }, (try parseSqlAlloc(alloc, "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
@@ -7321,6 +7360,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_routine }, (try parseSqlAlloc(alloc, "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_schema_multi }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics, reporting")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_statistics }, (try parseSqlAlloc(alloc, "DROP STATISTICS IF EXISTS usage_stats")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_configuration }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
@@ -11212,6 +11252,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
+            .sql = "CREATE DATABASE tenant_ops WITH OWNER app",
+            .kind = .create_database_options,
+            .reason = .create_database_options_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()",
             .kind = .create_event_trigger,
             .reason = .create_event_trigger_not_planned_by_generated_parser,
@@ -11252,6 +11298,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 12 },
+        },
+        .{
+            .sql = "CREATE SCHEMA analytics AUTHORIZATION app_user",
+            .kind = .create_schema_options,
+            .reason = .create_schema_options_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
             .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
@@ -11378,6 +11430,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_routine,
             .reason = .drop_routine_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
+            .sql = "DROP SCHEMA analytics, reporting",
+            .kind = .drop_schema_multi,
+            .reason = .drop_schema_multi_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",

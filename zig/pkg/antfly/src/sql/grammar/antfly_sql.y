@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 9770
+%expect 9775
 
 %start statement
 
@@ -607,6 +607,8 @@ unsupported_statement:
     ANALYZE unsupported_tail_opt
   | EXPLAIN explain_options_opt explain_subject_opt
   | DO diagnostic_tail_opt
+  | CREATE DATABASE if_not_exists_opt qualified_name diagnostic_tail
+  | CREATE SCHEMA if_not_exists_opt qualified_name diagnostic_tail
   | CREATE ACCESS METHOD diagnostic_tail_opt
   | CREATE FOREIGN DATA identifier_name diagnostic_tail_opt
   | CREATE FOREIGN TABLE diagnostic_tail_opt
@@ -635,6 +637,7 @@ unsupported_statement:
   | DROP identifier_name diagnostic_tail_opt
   | DROP identifier_name identifier_name diagnostic_tail_opt
   | DROP OWNED diagnostic_tail_opt
+  | DROP SCHEMA if_exists_opt qualified_name COMMA diagnostic_tail
   | DROP RULE diagnostic_tail_opt
   | DROP SERVER diagnostic_tail_opt
   | DROP TRIGGER diagnostic_tail_opt

@@ -545,6 +545,11 @@ Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
+diagnostics also cover rich PostgreSQL catalog shapes under otherwise supported
+heads, including `CREATE DATABASE ...` option tails, `CREATE SCHEMA ...`
+authorization/definition tails, and multi-target `DROP SCHEMA`, so those
+valid-but-unplanned forms become explicit unsupported statements rather than
+generic syntax failures. Generated unsupported
 heads that already have typed catalog/runtime support now enter the parsed DDL
 family directly and are accepted only through the validated generated
 unsupported boundary. Recognized generated-owned unsupported heads now require
@@ -1242,7 +1247,8 @@ Generated grammar work needs evidence at multiple levels:
   mappings, plus language, unsupported routine/language/transform DDL,
   large-object administration, rule, trigger, conversion, event-trigger, extended
   statistics, operator/aggregate ALTER forms, operator class/family, and text-search
-  configuration/dictionary/parser/template DDL, and bare, simple, optioned,
+  configuration/dictionary/parser/template DDL, rich catalog option shapes for
+  `CREATE DATABASE`, `CREATE SCHEMA`, and multi-target `DROP SCHEMA`, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata, explain-option payloads, and subject ranges where
   available.
