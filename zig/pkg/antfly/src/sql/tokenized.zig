@@ -1903,6 +1903,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_text_search_template,
         .drop_transform,
         .drop_user_mapping,
+        .import_foreign_schema,
         .load,
         .move,
         .read_row_lock,
@@ -2818,6 +2819,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE",
             .kind = .drop_foreign_data_wrapper,
             .reason = .drop_foreign_data_wrapper_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "IMPORT FOREIGN SCHEMA public FROM SERVER usage_server INTO local_schema",
+            .kind = .import_foreign_schema,
+            .reason = .import_foreign_schema_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP ACCESS METHOD IF EXISTS usage_am",

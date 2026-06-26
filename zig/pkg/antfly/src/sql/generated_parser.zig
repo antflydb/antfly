@@ -256,6 +256,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     explain,
     fetch,
     grant,
+    import_foreign_schema,
     listen,
     load,
     lock,
@@ -355,6 +356,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
+    import_foreign_schema_not_planned_by_generated_parser,
     listen_not_planned_by_generated_parser,
     load_not_planned_by_generated_parser,
     lock_not_planned_by_generated_parser,
@@ -2097,6 +2099,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE", .kind = .unsupported },
+    .{ .sql = "IMPORT FOREIGN SCHEMA public FROM SERVER usage_server INTO local_schema", .kind = .unsupported },
     .{ .sql = "DROP ACCESS METHOD IF EXISTS usage_am", .kind = .unsupported },
     .{ .sql = "DROP CONVERSION IF EXISTS usage_conv", .kind = .unsupported },
     .{ .sql = "DROP EVENT TRIGGER IF EXISTS usage_ddl_start", .kind = .unsupported },
@@ -2652,6 +2655,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.delete)) return .{ .dml = .delete };
     if (first.matchesKeywordTag(.truncate)) return .{ .dml = .truncate };
     if (first.matchesKeywordTag(.merge)) return .{ .dml = .merge };
+    if (first.matchesKeywordTag(.import) and tokens.len > 2 and tokens[1].matchesKeywordTag(.foreign) and tokens[2].matchesKeywordTag(.schema)) return .{ .unsupported = .import_foreign_schema };
     if (first.matchesKeywordTag(.with)) {
         if (generatedWriteKindForWithStatement(tokens)) |kind| return .{ .dml = kind };
         return .{ .read = classifyReadKind(tokens) };
@@ -2895,6 +2899,7 @@ fn buildUnsupportedAst(
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
+            .import_foreign_schema => .import_foreign_schema_not_planned_by_generated_parser,
             .listen => .listen_not_planned_by_generated_parser,
             .load => .load_not_planned_by_generated_parser,
             .lock => .lock_not_planned_by_generated_parser,
@@ -11135,6 +11140,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_foreign_data_wrapper,
             .reason = .drop_foreign_data_wrapper_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "IMPORT FOREIGN SCHEMA public FROM SERVER usage_server INTO local_schema",
+            .kind = .import_foreign_schema,
+            .reason = .import_foreign_schema_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
             .sql = "DROP ACCESS METHOD IF EXISTS usage_am",

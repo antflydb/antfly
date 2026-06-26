@@ -329,6 +329,21 @@ fn assertBuildZigTestFiltersReferenceManifest(source: []const u8) void {
     }
 }
 
+fn assertBuildZigDoesNotPassDirectTestFilterArgs(source: []const u8) void {
+    const needles = .{
+        "--test-filter",
+        "--skip-test-filter",
+    };
+    inline for (needles) |needle| {
+        if (std.mem.indexOf(u8, source, needle)) |start| {
+            std.debug.panic(
+                "build.zig passes direct test filter arg '{s}' at line {}; keep exact test-title filters in pkg/antfly/build/tests.zig",
+                .{ needle, lineNumberForOffset(source, start) },
+            );
+        }
+    }
+}
+
 fn isDBFocusedTestStepName(name: []const u8) bool {
     if (std.mem.eql(u8, name, db_root_step_name)) return true;
     if (std.mem.eql(u8, name, db_storage_step_name)) return true;
@@ -378,6 +393,7 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
     assertBuildZigTestFiltersReferenceManifest(source);
+    assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
 }
 
@@ -1337,6 +1353,7 @@ pub const APITestFilters = struct {
         "fanout planner uses io cap and request shape",
         "merge distributed text stats sums shard corpus stats by field and term",
         "merge distributed background text stats keys preserve embedded separators",
+        "collect significant terms field requests gathers unique field terms from hits",
         "graph hydrate resolved doc filter applies include and exclude sets",
         "graph edge local read rejects stale identity generation",
         "graph edge local read rejects stale identity namespace",

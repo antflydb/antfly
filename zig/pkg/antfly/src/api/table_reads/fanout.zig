@@ -14,7 +14,14 @@
 
 const std = @import("std");
 const db_mod = @import("../../storage/db/mod.zig");
+const db_query_search = @import("../../storage/db/query/search_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const json_helpers = @import("../json_helpers.zig");
+const search_analysis = @import("../../search/analysis.zig");
+const table_read_remote_wire = @import("remote_wire.zig");
+
+const OwnedTextStatsFieldRequest = table_read_remote_wire.OwnedTextStatsFieldRequest;
+const OwnedBackgroundTextStatsFieldRequest = table_read_remote_wire.OwnedBackgroundTextStatsFieldRequest;
 
 pub const ParallelFanoutKind = enum {
     text_stats,
@@ -267,6 +274,187 @@ pub fn planQueryFanout(
         .width = if (target_width > 0) target_width else 1,
         .reason = if (target_width > 1) .parallel else .small_request,
     };
+}
+
+pub fn queryNeedsDistributedTextStats(req: db_mod.types.SearchRequest) bool {
+    if (req.distributed_text_stats.len > 0) return false;
+    if (req.full_text != null) return true;
+    if (db_query_search.isTextQuery(req.query) and !db_query_search.isDefaultMatchAll(req.query)) return true;
+    return req.full_text_queries.len > 0;
+}
+
+pub fn collectSignificantTermsFieldRequests(
+    alloc: std.mem.Allocator,
+    requests: []const db_mod.aggregations.SearchAggregationRequest,
+    hits: []const db_mod.types.SearchHit,
+) ![]OwnedTextStatsFieldRequest {
+    var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)){};
+    defer {
+        var it = grouped.iterator();
+        while (it.next()) |entry| {
+            var term_it = entry.value_ptr.keyIterator();
+            while (term_it.next()) |term| alloc.free(term.*);
+            entry.value_ptr.deinit(alloc);
+            alloc.free(entry.key_ptr.*);
+        }
+        grouped.deinit(alloc);
+    }
+
+    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits);
+    if (grouped.count() == 0) return &.{};
+
+    const out = try alloc.alloc(OwnedTextStatsFieldRequest, grouped.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*item| item.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    var it = grouped.iterator();
+    while (it.next()) |entry| {
+        const terms = try alloc.alloc([]const u8, entry.value_ptr.count());
+        var term_index: usize = 0;
+        var term_it = entry.value_ptr.keyIterator();
+        while (term_it.next()) |term| {
+            terms[term_index] = try alloc.dupe(u8, term.*);
+            term_index += 1;
+        }
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, entry.key_ptr.*),
+            .terms = terms,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn collectSignificantTermsBackgroundFieldRequests(
+    alloc: std.mem.Allocator,
+    requests: []const db_mod.aggregations.SearchAggregationRequest,
+    hits: []const db_mod.types.SearchHit,
+) ![]OwnedBackgroundTextStatsFieldRequest {
+    var out = std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest).empty;
+    errdefer {
+        for (out.items) |*item| item.deinit(alloc);
+        out.deinit(alloc);
+    }
+    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectSignificantTermsBackgroundFieldRequestsRecursive(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest),
+    requests: []const db_mod.aggregations.SearchAggregationRequest,
+    hits: []const db_mod.types.SearchHit,
+) !void {
+    for (requests) |request| {
+        if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query != null) {
+            var seen_terms = std.StringHashMapUnmanaged(void){};
+            defer {
+                var term_it = seen_terms.keyIterator();
+                while (term_it.next()) |term| alloc.free(term.*);
+                seen_terms.deinit(alloc);
+            }
+            try collectSignificantTermsFromHits(alloc, hits, request.field, &seen_terms);
+            if (seen_terms.count() > 0) {
+                const terms = try alloc.alloc([]const u8, seen_terms.count());
+                var term_index: usize = 0;
+                var term_it = seen_terms.keyIterator();
+                while (term_it.next()) |term| {
+                    terms[term_index] = try alloc.dupe(u8, term.*);
+                    term_index += 1;
+                }
+                try out.append(alloc, .{
+                    .aggregation_name = try alloc.dupe(u8, request.name),
+                    .field = try alloc.dupe(u8, request.field),
+                    .terms = terms,
+                    .background_query = try cloneBackgroundQuery(alloc, request.background_query.?),
+                });
+            }
+        }
+        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits);
+    }
+}
+
+fn cloneBackgroundQuery(
+    alloc: std.mem.Allocator,
+    query: db_mod.aggregations.BackgroundQuery,
+) !db_mod.aggregations.BackgroundQuery {
+    return switch (query) {
+        .match_all => .{ .match_all = {} },
+        .match => |match| .{ .match = .{
+            .field = try alloc.dupe(u8, match.field),
+            .text = try alloc.dupe(u8, match.text),
+        } },
+        .term => |term| .{ .term = .{
+            .field = try alloc.dupe(u8, term.field),
+            .term = try alloc.dupe(u8, term.term),
+        } },
+    };
+}
+
+fn collectSignificantTermsFieldRequestsRecursive(
+    alloc: std.mem.Allocator,
+    grouped: *std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
+    requests: []const db_mod.aggregations.SearchAggregationRequest,
+    hits: []const db_mod.types.SearchHit,
+) !void {
+    for (requests) |request| {
+        if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query == null) {
+            const gop = try grouped.getOrPut(alloc, request.field);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try alloc.dupe(u8, request.field);
+                gop.value_ptr.* = .{};
+            }
+            try collectSignificantTermsFromHits(alloc, hits, request.field, gop.value_ptr);
+        }
+        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits);
+    }
+}
+
+fn collectSignificantTermsFromHits(
+    alloc: std.mem.Allocator,
+    hits: []const db_mod.types.SearchHit,
+    field: []const u8,
+    seen_terms: *std.StringHashMapUnmanaged(void),
+) !void {
+    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, seen_terms);
+}
+
+fn collectSignificantTermsFromStoredAlloc(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+    field: []const u8,
+    seen_terms: *std.StringHashMapUnmanaged(void),
+) !void {
+    var parsed = (try json_helpers.parseJsonPathValueAlloc(alloc, stored, field)) orelse return;
+    defer parsed.deinit();
+    try collectSignificantTermsFromValue(alloc, parsed.value, seen_terms);
+}
+
+fn collectSignificantTermsFromValue(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    seen_terms: *std.StringHashMapUnmanaged(void),
+) !void {
+    switch (value) {
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .string => {
+            const tokens = try search_analysis.default_analyzer.analyze(alloc, value.string);
+            defer search_analysis.Analyzer.freeTokens(alloc, tokens);
+            for (tokens) |tok| {
+                const entry = try seen_terms.getOrPut(alloc, tok.term);
+                if (entry.found_existing) continue;
+                entry.key_ptr.* = try alloc.dupe(u8, tok.term);
+            }
+        },
+        else => {},
+    }
+}
+
+pub fn extractJsonValueAtPath(value: std.json.Value, path: []const u8) ?std.json.Value {
+    return json_helpers.extractJsonPathValue(value, path);
 }
 
 pub const TextStatsFanoutSlot = struct {
@@ -970,4 +1158,64 @@ test "merge distributed background text stats keys preserve embedded separators"
     try std.testing.expectEqualStrings("field\x1fname", right.field);
     try std.testing.expectEqual(@as(u32, 3), right.background_doc_count);
     try std.testing.expectEqual(@as(?u32, 3), backgroundTermDocFreq(right.term_doc_freqs, "beta"));
+}
+
+test "collect significant terms field requests gathers unique field terms from hits" {
+    const alloc = std.testing.allocator;
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"body\":\"alpha beta\",\"nested\":{\"body\":\"beta gamma\"}}"),
+    };
+    hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .stored_data = try alloc.dupe(u8, "{\"body\":\"alpha\",\"nested\":{\"body\":\"gamma\"}}"),
+    };
+
+    const requests = [_]db_mod.aggregations.SearchAggregationRequest{
+        .{
+            .name = "sig_body",
+            .type = "significant_terms",
+            .field = "body",
+        },
+        .{
+            .name = "outer_terms",
+            .type = "terms",
+            .field = "status",
+            .aggregations = &.{
+                .{
+                    .name = "nested_sig_body",
+                    .type = "significant_terms",
+                    .field = "nested.body",
+                },
+            },
+        },
+    };
+
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits);
+    defer {
+        for (field_requests) |*item| item.deinit(alloc);
+        if (field_requests.len > 0) alloc.free(field_requests);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), field_requests.len);
+
+    const body = for (field_requests) |item| {
+        if (std.mem.eql(u8, item.field, "body")) break item;
+    } else unreachable;
+    try std.testing.expectEqual(@as(usize, 2), body.terms.len);
+    try std.testing.expect(std.mem.eql(u8, body.terms[0], "alpha") or std.mem.eql(u8, body.terms[1], "alpha"));
+    try std.testing.expect(std.mem.eql(u8, body.terms[0], "beta") or std.mem.eql(u8, body.terms[1], "beta"));
+
+    const nested = for (field_requests) |item| {
+        if (std.mem.eql(u8, item.field, "nested.body")) break item;
+    } else unreachable;
+    try std.testing.expectEqual(@as(usize, 2), nested.terms.len);
+    try std.testing.expect(std.mem.eql(u8, nested.terms[0], "beta") or std.mem.eql(u8, nested.terms[1], "beta"));
+    try std.testing.expect(std.mem.eql(u8, nested.terms[0], "gamma") or std.mem.eql(u8, nested.terms[1], "gamma"));
 }

@@ -5629,18 +5629,24 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        std.log.err("provisioned txn prepare start table={s} group={} writes={} deletes={} transforms={} predicates={}", .{ table_name, group_id, req.writes.len, req.deletes.len, req.transforms.len, req.predicates.len });
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        std.log.err("provisioned txn prepare topology ok table={s} group={}", .{ table_name, group_id });
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
+        std.log.err("provisioned txn prepare db open table={s} group={}", .{ table_name, group_id });
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
+        std.log.err("provisioned txn prepare recovered table={s} group={}", .{ table_name, group_id });
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
+        std.log.err("provisioned txn prepare schema ok table={s} group={}", .{ table_name, group_id });
         db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
+        std.log.err("provisioned txn prepare done table={s} group={}", .{ table_name, group_id });
     }
 
     fn txnResolveGroupLocal(
@@ -9324,15 +9330,21 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        std.log.err("hosted txn prepare start table={s} group={} writes={} deletes={} transforms={} predicates={}", .{ table_name, group_id, req.writes.len, req.deletes.len, req.transforms.len, req.predicates.len });
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        std.log.err("hosted txn prepare topology ok table={s} group={}", .{ table_name, group_id });
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
+        std.log.err("hosted txn prepare db open table={s} group={}", .{ table_name, group_id });
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        std.log.err("hosted txn prepare recovered table={s} group={}", .{ table_name, group_id });
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
+        std.log.err("hosted txn prepare schema ok table={s} group={}", .{ table_name, group_id });
         cached.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
+        std.log.err("hosted txn prepare done table={s} group={}", .{ table_name, group_id });
     }
 
     fn txnResolveGroupLocal(

@@ -420,7 +420,7 @@ extension families.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points that Antfly does not type yet, including
 `ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
-trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
+foreign-schema imports; trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
 foreign-server DDL; access-method DDL; ownership maintenance statements; and
 `ALTER INDEX`/`ALTER SYSTEM`. PostgreSQL conversion, event-trigger, extended
 statistics, operator/aggregate ALTER forms, operator class/family, and text-search
@@ -1115,7 +1115,7 @@ variants for:
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
   `SECURITY LABEL`, `UNLISTEN`, `MOVE`,
   `ALTER MATERIALIZED VIEW`, foreign table,
-  foreign data wrapper, user mapping, language, rule, server, and trigger DDL
+  foreign data wrapper, foreign schema import, user mapping, language, rule, server, and trigger DDL
   forms, plus bare, simple, optioned, and `EXPLAIN ANALYZE` forms
   with command spans, subject ranges where present, and stable unsupported
   reason metadata. Parsed SQL now distinguishes
@@ -1161,7 +1161,7 @@ Generated grammar work needs evidence at multiple levels:
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
   `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
   `SECURITY LABEL`, `UNLISTEN`, cursor command `MOVE`, PostgreSQL foreign-data
-  declarations for foreign data wrappers, foreign tables, servers, and user
+  declarations for foreign data wrappers, foreign tables, schema imports, servers, and user
   mappings, plus language, rule, trigger, conversion, event-trigger, extended
   statistics, operator/aggregate ALTER forms, operator class/family, and text-search
   configuration/dictionary/parser/template DDL, and bare, simple, optioned,

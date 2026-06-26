@@ -1224,6 +1224,9 @@ fn addOpenApiGeneratedCheckStep(
 }
 
 pub fn build(b: *std.Build) void {
+    // Keep focused test inventories in pkg/antfly/build/tests.zig. build.zig
+    // wires durable suites and modules; it should not grow exact test-title
+    // lists as API/storage refactors move coverage closer to implementation.
     antfly_tests_build.assertBuildZigDoesNotOwnTestInventory(b);
 
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
