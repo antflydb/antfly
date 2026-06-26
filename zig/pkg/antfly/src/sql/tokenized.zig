@@ -1225,9 +1225,18 @@ fn parseStatement(
 ) ParsedStatement {
     if (generated_statement) |generated_raw| {
         switch (generated_raw.statement) {
-            .session => return .{ .session = .{ .raw = raw_statement } },
-            .transaction => return .{ .transaction = .{ .raw = raw_statement } },
-            .prepared => return .{ .prepared = .{ .raw = raw_statement } },
+            .session => |kind| if (generatedSessionAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .session = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
+            .transaction => |kind| if (generatedTransactionAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .transaction = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
+            .prepared => |kind| if (generatedPreparedAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .prepared = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
             .ddl => |kind| if (generatedDdlAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
                 return .{ .ddl = .{ .raw = raw_statement } }
             else
@@ -1254,7 +1263,10 @@ fn parseStatement(
                 return .{ .ddl = .{ .raw = raw_statement } }
             else
                 return .{ .unknown = raw_statement },
-            .cursor => |kind| return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } },
+            .cursor => |kind| if (generatedCursorAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
             .unsupported => |kind| {
                 if (!generatedUnsupportedAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind)) return .{ .unknown = raw_statement };
                 if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
@@ -1277,6 +1289,111 @@ fn parseStatement(
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
     };
+}
+
+fn generatedSessionAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlSessionKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const session_ast = switch (ast_value) {
+        .session => |session| session,
+        else => return false,
+    };
+    if (session_ast.kind != expected_kind) return false;
+    const end = generatedControlStatementEnd(tokens, session_ast.statement_span) orelse return false;
+    if (!std.meta.eql(session_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, session_ast.name_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, session_ast.value_tokens)) return false;
+    return switch (session_ast.kind) {
+        .set, .reset, .show => session_ast.name_tokens != null,
+        .discard_all => session_ast.name_tokens == null and session_ast.value_tokens == null,
+    };
+}
+
+fn generatedTransactionAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlTransactionKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const transaction_ast = switch (ast_value) {
+        .transaction => |transaction| transaction,
+        else => return false,
+    };
+    if (transaction_ast.kind != expected_kind) return false;
+    const end = generatedControlStatementEnd(tokens, transaction_ast.statement_span) orelse return false;
+    if (!std.meta.eql(transaction_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, transaction_ast.boundary_tail_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, transaction_ast.mode_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, transaction_ast.name_tokens)) return false;
+    return switch (transaction_ast.kind) {
+        .set_transaction => transaction_ast.mode_tokens != null,
+        .savepoint, .release_savepoint, .rollback_to_savepoint => transaction_ast.name_tokens != null,
+        .start_transaction, .begin, .commit, .rollback => true,
+    };
+}
+
+fn generatedPreparedAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlPreparedKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const prepared_ast = switch (ast_value) {
+        .prepared => |prepared| prepared,
+        else => return false,
+    };
+    if (prepared_ast.kind != expected_kind) return false;
+    const end = generatedControlStatementEnd(tokens, prepared_ast.statement_span) orelse return false;
+    if (!std.meta.eql(prepared_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, prepared_ast.name_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, prepared_ast.parameter_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, prepared_ast.argument_tokens)) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, prepared_ast.inner_statement_tokens)) return false;
+    return switch (prepared_ast.kind) {
+        .prepare => prepared_ast.name_tokens != null and prepared_ast.inner_statement_tokens != null,
+        .execute, .deallocate => prepared_ast.name_tokens != null,
+    };
+}
+
+fn generatedCursorAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlCursorKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const cursor_ast = switch (ast_value) {
+        .cursor => |cursor| cursor,
+        else => return false,
+    };
+    if (cursor_ast.kind != expected_kind) return false;
+    const end = generatedControlStatementEnd(tokens, cursor_ast.statement_span) orelse return false;
+    if (!std.meta.eql(cursor_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, cursor_ast.tail_tokens)) return false;
+    return cursor_ast.tail_tokens != null;
+}
+
+fn generatedControlStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) {
+        end -= 1;
+    }
+    if (end == 0) return null;
+    if (tokens[0].sourceSpan().start != statement_span.start) return null;
+    if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
+    return end;
+}
+
+fn generatedControlOptionalTokenRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
+    return true;
 }
 
 fn generatedDdlKindFromExtensionIndexKind(kind: generated_parser.GeneratedSqlExtensionIndexKind) generated_parser.GeneratedSqlDdlKind {
@@ -4403,8 +4520,64 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
 }
 
-test "sql adapter parsed sql rejects malformed generated DDL classification payloads" {
+test "sql adapter parsed sql rejects malformed generated classification payloads" {
     const alloc = std.testing.allocator;
+
+    var session = try ParsedSql.initAlloc(alloc, "SET work_mem = '64MB'");
+    defer session.deinit(alloc);
+    var missing_session_name = session.generated_statement.?;
+    if (missing_session_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .session => |*session_ast| session_ast.name_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(session.raw_statement, missing_session_name, &session.tokenized_sql)),
+    );
+
+    var transaction = try ParsedSql.initAlloc(alloc, "SAVEPOINT usage_batch");
+    defer transaction.deinit(alloc);
+    var missing_savepoint_name = transaction.generated_statement.?;
+    if (missing_savepoint_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .transaction => |*transaction_ast| transaction_ast.name_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(transaction.raw_statement, missing_savepoint_name, &transaction.tokenized_sql)),
+    );
+
+    var prepared = try ParsedSql.initAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records");
+    defer prepared.deinit(alloc);
+    var missing_prepared_inner = prepared.generated_statement.?;
+    if (missing_prepared_inner.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .prepared => |*prepared_ast| prepared_ast.inner_statement_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(prepared.raw_statement, missing_prepared_inner, &prepared.tokenized_sql)),
+    );
+
+    var cursor = try ParsedSql.initAlloc(alloc, "FETCH FROM usage_cursor");
+    defer cursor.deinit(alloc);
+    var missing_cursor_tail = cursor.generated_statement.?;
+    if (missing_cursor_tail.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .cursor => |*cursor_ast| cursor_ast.tail_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(cursor.raw_statement, missing_cursor_tail, &cursor.tokenized_sql)),
+    );
 
     var publication = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records");
     defer publication.deinit(alloc);

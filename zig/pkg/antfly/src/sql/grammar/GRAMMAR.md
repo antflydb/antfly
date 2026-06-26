@@ -59,12 +59,17 @@ plus parity coverage against the existing token-based lowerer, including typed
 `PREPARE name(type, ...) AS ...` parameter lists and generated `DEALLOCATE ALL`.
 Prepared-statement command heads now require generated parser success at SQL
 ingress for `PREPARE`, `EXECUTE`, and `DEALLOCATE`, including malformed
-multi-token tails.
+multi-token tails. Parsed-statement classification validates retained
+prepared AST kind, statement/command spans, prepared-statement name ranges,
+parameter ranges, argument ranges, and inner-statement ranges before
+publishing the prepared family.
 Session catalog commands now have generated AST-to-plan parity
 for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
 Session command heads now require generated parser success at SQL ingress, so
 malformed multi-token session commands cannot fall back to the legacy session
-adapter.
+adapter. Parsed-statement classification validates retained session AST kind,
+statement/command spans, setting-name ranges, and value ranges before
+publishing the session family.
 Transaction boundary commands now dispatch through generated AST-to-plan
 lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
 adapter-noop boundaries, including retained statement/command source-span and
@@ -74,7 +79,10 @@ tails cannot fall back to the legacy transaction adapter. Transaction mode and
 savepoint controls are also lowered from generated transaction ASTs: `SET TRANSACTION`,
 `START TRANSACTION`, `BEGIN ...` mode tails, `SAVEPOINT`, `RELEASE [SAVEPOINT]`,
 and `ROLLBACK TO [SAVEPOINT]` retain validated mode/name token ranges before
-lowering to the typed transaction-control or savepoint plans.
+lowering to the typed transaction-control or savepoint plans. Parsed-statement
+classification validates retained transaction AST kind, statement/command
+spans, boundary-tail ranges, mode ranges, and savepoint-name ranges before
+publishing the transaction family.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for
@@ -507,7 +515,9 @@ Legacy-supported cursor commands use generated cursor AST nodes for `DECLARE`,
 typed tail token ranges before delegating to typed cursor portal planning.
 Those cursor heads now require generated parser success at SQL ingress so
 incomplete cursor commands fail closed instead of falling back to the legacy
-DDL-like command adapter.
+DDL-like command adapter. Parsed-statement classification validates retained
+cursor AST kind, statement/command spans, and tail ranges before publishing
+cursor-backed unsupported statements for typed cursor planning.
 Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
 `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
 savepoint planning. Savepoint heads and rollback-to/release prefixes now
