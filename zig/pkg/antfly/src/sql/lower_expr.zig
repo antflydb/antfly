@@ -4620,6 +4620,10 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
+        try validateGeneratedExpressionPredicateKind(
+            options.generated_expression_ast,
+            generatedRegexPredicateKind(regex_operator.case_insensitive, regex_operator.negated),
+        );
         const condition = try parseExpressionRegexpMatchConditionAlloc(
             alloc,
             tokens,
@@ -4891,6 +4895,10 @@ pub fn parseExpressionWhereConditionsAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
+        try validateGeneratedExpressionPredicateKind(
+            options.generated_expression_ast,
+            generatedRegexPredicateKind(regex_operator.case_insensitive, regex_operator.negated),
+        );
         const condition = try parseExpressionRegexpMatchConditionAlloc(
             alloc,
             tokens,
@@ -4912,6 +4920,9 @@ pub fn parseExpressionWhereConditionsAlloc(
 
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+        const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
+        const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+        try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
         const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
             try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
@@ -4926,6 +4937,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "in")) {
+        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .in_list);
         try appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_or_predicates, lhs);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -4935,6 +4947,9 @@ pub fn parseExpressionWhereConditionsAlloc(
     if (parser.matchKeyword(tokens, pos, "not")) {
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+            const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
+            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+            try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
             const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
                 try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
@@ -4948,12 +4963,14 @@ pub fn parseExpressionWhereConditionsAlloc(
             return;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
+            try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .not_in_list);
             try appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_not_predicates, lhs);
             freeExpression(alloc, lhs);
             lhs_transferred = true;
             return;
         }
         try parser.expectKeyword(tokens, pos, "between");
+        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .not_between);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const lower_expression = try parseExpressionWhereConditionRowExpressionAlloc(alloc, tokens, pos, type_context, options);
         var lower_transferred = false;
@@ -5025,6 +5042,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "between")) {
+        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .between);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const upper_lhs = try cloneExpressionAlloc(alloc, lhs);
         var upper_lhs_transferred = false;
@@ -5089,12 +5107,14 @@ pub fn parseExpressionWhereConditionsAlloc(
         switch (is_tail.kind) {
             .distinct_comparison, .null_test => {},
             .boolean_unknown => {
+                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 try type_context.validateBooleanRowExpression(lhs);
                 try expression_predicates.append(alloc, expressionNullTestCondition(lhs, is_tail.op));
                 lhs_transferred = true;
                 return;
             },
             .boolean_literal => {
+                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
                     try appendExpressionBooleanIsNotGroups(alloc, expression_or_predicates, lhs, is_tail.boolean_value);
@@ -5118,6 +5138,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         try parseComparisonOp(tokens, pos);
 
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5128,6 +5149,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5138,6 +5160,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5148,6 +5171,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5174,6 +5198,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
+    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(op));
     try validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     try expression_predicates.append(alloc, .{
@@ -25096,6 +25121,52 @@ fn validateGeneratedPatternPredicateExpression(
     if (!requires_quantifier and expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedExpressionPredicateKind(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+}
+
+fn generatedRegexPredicateKind(
+    case_insensitive: bool,
+    negated: bool,
+) generated_parser.GeneratedSqlExpressionKind {
+    if (case_insensitive) {
+        return if (negated) .regex_not_imatch else .regex_imatch;
+    }
+    return if (negated) .regex_not_match else .regex_match;
+}
+
+fn generatedIsTailExpressionKind(
+    is_tail: ExpressionIsTail,
+) generated_parser.GeneratedSqlExpressionKind {
+    return switch (is_tail.kind) {
+        .distinct_comparison => if (is_tail.op == .is_not_distinct) .is_not_distinct_from else .is_distinct_from,
+        .null_test => if (is_tail.op == .is_not_null) .is_not_null else .is_null,
+        .boolean_unknown => if (is_tail.op == .is_not_null) .is_not_unknown else .is_unknown,
+        .boolean_literal => if (is_tail.boolean_negated)
+            if (is_tail.boolean_value) .is_not_true else .is_not_false
+        else if (is_tail.boolean_value)
+            .is_true
+        else
+            .is_false,
+    };
+}
+
+fn generatedComparisonExpressionKindForOp(
+    op: runtime_schema.RelationalCheckOp,
+) generated_parser.GeneratedSqlExpressionKind {
+    return switch (op) {
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        .is_distinct => .is_distinct_from,
+        .is_not_distinct => .is_not_distinct_from,
+        .eq, .ne, .gt, .gte, .lt, .lte => .comparison,
+    };
+}
+
 pub fn parseWhereAtomAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -29865,6 +29936,20 @@ test "sql adapter lower expr lowers arithmetic predicates" {
         schema,
         &.{},
     ));
+
+    var malformed_generated_expression_comparison = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE amount * quantity - discount > $1 ORDER BY id ASC LIMIT 5",
+    );
+    defer malformed_generated_expression_comparison.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_expression_comparison, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_expression_comparison,
+        schema,
+        &.{.{ .integer = 10 }},
+        .{},
+    ));
 }
 
 test "sql adapter lower expr lowers coalesce predicates" {
@@ -29968,6 +30053,20 @@ test "sql adapter lower expr lowers array length predicates" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, ranged.plan.query.expression_predicates[1].op);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, ranged.plan.query.expression_predicates[1].lhs.kind);
     try std.testing.expectEqualStrings("3", ranged.plan.query.expression_predicates[1].rhs[0].value_json);
+
+    var malformed_generated_expression_between = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN 1 AND $1 ORDER BY id ASC LIMIT 5",
+    );
+    defer malformed_generated_expression_between.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_expression_between, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_expression_between,
+        schema,
+        &.{.{ .integer = 3 }},
+        .{},
+    ));
 
     var explicit_asymmetric = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -31871,6 +31970,24 @@ fn clearGeneratedReadWhereQuantifierRange(parsed_sql: *tokenized.ParsedSql) !voi
                 .read => |read| {
                     if (read.where_expression.quantifier_tokens == null) return error.TestUnexpectedResult;
                     read.where_expression.quantifier_tokens = null;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn setGeneratedReadWhereExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    read.where_expression.kind = kind;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
@@ -34702,6 +34819,20 @@ test "sql adapter lower expr lowers text pattern predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_computed_pattern_any,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_computed_pattern_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(name) LIKE ANY(ARRAY['ada%', 'grace%']) ORDER BY id",
+    );
+    defer malformed_computed_pattern_kind.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_computed_pattern_kind, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_computed_pattern_kind,
         schema,
         &.{},
         .{},

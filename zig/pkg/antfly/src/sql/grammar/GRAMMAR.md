@@ -987,8 +987,10 @@ Unsupported DDL remains on the existing parser until
    the typed atom parsers so quantified `ANY`/`SOME`/`ALL` branches fail
    closed when the retained generated expression kind does not match; typed
    expression predicate lowering similarly consumes generated single-atom
-   metadata for `LIKE`/`ILIKE` set predicates so stale quantifier payloads
-   cannot be accepted by the legacy pattern lowering path;
+   metadata for comparison, null/boolean/distinct `IS` predicates,
+   `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates so stale operator
+   kinds or quantifier payloads cannot be accepted by the legacy expression
+   lowering paths;
    aggregate `HAVING` clauses apply the same clause-span guard.
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
