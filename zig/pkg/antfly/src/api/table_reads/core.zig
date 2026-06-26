@@ -115,6 +115,91 @@ pub fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_ro
     };
 }
 
+pub const DocIdentityInternalWorkerBoundary = enum {
+    query,
+    vector_worker,
+    preflight,
+    graph_expand,
+    graph_hydrate,
+    graph_edges,
+    search_request_text_stats,
+    explicit_text_stats,
+    background_text_stats,
+    aggregation_context,
+    aggregation_full_result_rerun,
+    algebraic_partials,
+    distributed_join_right_fanout,
+    distributed_join_worker,
+    distributed_join_unmatched_followup,
+    distributed_join_finalizer,
+    shuffle_worker,
+    shuffle_finalizer,
+    graph_result_ref,
+};
+
+pub const DocIdentityInternalWorkerPolicy = enum {
+    carries_shard_doc_set,
+    validates_generation_projection,
+    fail_closed_before_fanout,
+};
+
+pub fn docIdentityInternalWorkerPolicy(boundary: DocIdentityInternalWorkerBoundary) DocIdentityInternalWorkerPolicy {
+    return switch (boundary) {
+        .query,
+        .vector_worker,
+        .preflight,
+        .graph_expand,
+        .graph_hydrate,
+        .search_request_text_stats,
+        .explicit_text_stats,
+        .background_text_stats,
+        => .carries_shard_doc_set,
+
+        .graph_edges,
+        .aggregation_context,
+        .aggregation_full_result_rerun,
+        .algebraic_partials,
+        .distributed_join_right_fanout,
+        .distributed_join_worker,
+        .distributed_join_unmatched_followup,
+        .distributed_join_finalizer,
+        .shuffle_worker,
+        .shuffle_finalizer,
+        .graph_result_ref,
+        => .validates_generation_projection,
+    };
+}
+
+test "internal worker doc identity exchange audit covers every boundary" {
+    var carries_shard_doc_set: usize = 0;
+    var validates_generation_projection: usize = 0;
+    var fail_closed_before_fanout: usize = 0;
+
+    inline for (std.meta.fields(DocIdentityInternalWorkerBoundary)) |field| {
+        const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
+        switch (docIdentityInternalWorkerPolicy(boundary)) {
+            .carries_shard_doc_set => carries_shard_doc_set += 1,
+            .validates_generation_projection => validates_generation_projection += 1,
+            .fail_closed_before_fanout => fail_closed_before_fanout += 1,
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), carries_shard_doc_set);
+    try std.testing.expectEqual(@as(usize, 11), validates_generation_projection);
+    try std.testing.expectEqual(@as(usize, 0), fail_closed_before_fanout);
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.query));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.vector_worker));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.search_request_text_stats));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.distributed_join_worker));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.distributed_join_unmatched_followup));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.shuffle_worker));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.algebraic_partials));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.aggregation_full_result_rerun));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.validates_generation_projection, docIdentityInternalWorkerPolicy(.graph_result_ref));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.explicit_text_stats));
+    try std.testing.expectEqual(DocIdentityInternalWorkerPolicy.carries_shard_doc_set, docIdentityInternalWorkerPolicy(.background_text_stats));
+}
+
 pub const ReadPreparation = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

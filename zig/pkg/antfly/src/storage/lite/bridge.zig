@@ -780,7 +780,7 @@ const ContainerAtomicWriteSink = struct {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     if (builtin.os.tag == .freestanding) return false;
-    platform_sync.lockYielding(mutex);
+    _ = platform_sync.lockAtomic(mutex);
     return true;
 }
 
