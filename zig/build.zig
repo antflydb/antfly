@@ -2362,80 +2362,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_capi_tests = capi_test.run;
 
-    // Tests
-    const lib_regex_tests = b.addTest(.{
-        .root_module = regex_mod,
+    const fuzz_tabular_loader_mod = b.createModule(.{
+        .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const run_lib_regex_tests = b.addRunArtifact(lib_regex_tests);
-    const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
-    lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
-
-    const lib_jsonschema_tests = b.addTest(.{
-        .root_module = jsonschema_mod,
-    });
-    const run_lib_jsonschema_tests = b.addRunArtifact(lib_jsonschema_tests);
-    const lib_jsonschema_test_step = b.step("lib-jsonschema-test", "Run standalone lib/jsonschema tests");
-    lib_jsonschema_test_step.dependOn(&run_lib_jsonschema_tests.step);
-
-    const lib_json_tests = b.addTest(.{
-        .root_module = json_mod,
-    });
-    const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
-    const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
-    lib_json_test_step.dependOn(&run_lib_json_tests.step);
-
-    const lib_ml_tabular_tests = b.addTest(.{
-        .root_module = ml_tabular_mod,
-    });
-    const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
-    const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
-    lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
-
-    const fuzz_tabular_loader = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_fuzz_tabular_loader = b.addRunArtifact(fuzz_tabular_loader);
-    const fuzz_tabular_loader_step = b.step("fuzz-tabular-loader", "Fuzz the tabular_model.json loader (--fuzz to keep running)");
-    fuzz_tabular_loader_step.dependOn(&run_fuzz_tabular_loader.step);
-
-    const lib_toon_tests = b.addTest(.{
-        .root_module = toon_mod,
-    });
-    const run_lib_toon_tests = b.addRunArtifact(lib_toon_tests);
-    const lib_toon_test_step = b.step("lib-toon-test", "Run standalone lib/toon tests");
-    lib_toon_test_step.dependOn(&run_lib_toon_tests.step);
-
-    const lib_mcp_tests = b.addTest(.{
-        .root_module = mcp_mod,
-    });
-    const run_lib_mcp_tests = b.addRunArtifact(lib_mcp_tests);
-    const lib_mcp_test_step = b.step("lib-mcp-test", "Run standalone lib/mcp tests");
-    lib_mcp_test_step.dependOn(&run_lib_mcp_tests.step);
-
-    const lib_a2a_tests = b.addTest(.{
-        .root_module = a2a_mod,
-    });
-    const run_lib_a2a_tests = b.addRunArtifact(lib_a2a_tests);
-    const lib_a2a_test_step = b.step("lib-a2a-test", "Run standalone lib/a2a tests");
-    lib_a2a_test_step.dependOn(&run_lib_a2a_tests.step);
-
-    const lib_matcher_tests = b.addTest(.{
-        .root_module = matcher_mod,
-    });
-    const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
-    lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
-
-    const lib_resolver_tests = b.addTest(.{
-        .root_module = resolver_mod,
-    });
-    const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
-    lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
         .name = "lib-toon-conformance",
@@ -2486,19 +2417,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     httpx_json_test_mod.addImport("antfly-json", json_mod);
-    const httpx_json_tests = b.addTest(.{
-        .root_module = httpx_json_test_mod,
-    });
-    const run_httpx_json_tests = b.addRunArtifact(httpx_json_tests);
-    const lib_httpx_json_test_step = b.step("lib-httpx-json-test", "Run standalone lib/httpx JSON helper tests");
-    lib_httpx_json_test_step.dependOn(&run_httpx_json_tests.step);
-
-    const httpx_tests = b.addTest(.{
-        .root_module = httpx_mod,
-    });
-    const run_httpx_tests = b.addRunArtifact(httpx_tests);
-    const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
-    lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
@@ -2506,12 +2424,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     api_json_helpers_test_mod.addImport("antfly-json", json_mod);
-    const api_json_helpers_tests = b.addTest(.{
-        .root_module = api_json_helpers_test_mod,
-    });
-    const run_api_json_helpers_tests = b.addRunArtifact(api_json_helpers_tests);
-    const lib_api_json_helpers_test_step = b.step("lib-api-json-helpers-test", "Run standalone api/json_helpers tests");
-    lib_api_json_helpers_test_step.dependOn(&run_api_json_helpers_tests.step);
 
     const api_artifact_reprocess_jobs_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig"),
@@ -2531,60 +2443,12 @@ pub fn build(b: *std.Build) void {
         },
     ).run;
 
-    const lib_generating_tests = b.addTest(.{
-        .root_module = generating_mod,
-    });
-    const run_lib_generating_tests = b.addRunArtifact(lib_generating_tests);
-    const lib_generating_test_step = b.step("lib-generating-test", "Run standalone lib/generating tests");
-    lib_generating_test_step.dependOn(&run_lib_generating_tests.step);
-
-    const lib_embeddings_tests = b.addTest(.{
-        .root_module = embeddings_mod,
-    });
-    const run_lib_embeddings_tests = b.addRunArtifact(lib_embeddings_tests);
-    const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
-    lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
-
-    const lib_vectorindex_tests = b.addTest(.{
-        .root_module = vectorindex_mod,
-    });
-    const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
-    const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
-    lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
-
-    const lib_chunking_tests = b.addTest(.{
-        .root_module = chunking_mod,
-    });
-    const run_lib_chunking_tests = b.addRunArtifact(lib_chunking_tests);
-    const lib_chunking_test_step = b.step("lib-chunking-test", "Run standalone lib/chunking tests");
-    lib_chunking_test_step.dependOn(&run_lib_chunking_tests.step);
-
-    const lib_readers_tests = b.addTest(.{
-        .root_module = readers_mod,
-    });
-    const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
-    const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
-    lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
-
-    const lib_extracting_tests = b.addTest(.{
-        .root_module = extracting_mod,
-    });
-    const run_lib_extracting_tests = b.addRunArtifact(lib_extracting_tests);
-    const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
-    lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
-
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     image_test_mod.addImport("antfly_image", image_mod);
-    const lib_image_tests = b.addTest(.{
-        .root_module = image_test_mod,
-    });
-    const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
-    const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
-    lib_image_test_step.dependOn(&run_lib_image_tests.step);
 
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
@@ -2835,13 +2699,6 @@ pub fn build(b: *std.Build) void {
         .{ .filters = &antfly_tests_build.PackageTestFilters.generating_runtime },
     ).run;
 
-    const lib_reranking_tests = b.addTest(.{
-        .root_module = reranking_mod,
-    });
-    const run_lib_reranking_tests = b.addRunArtifact(lib_reranking_tests);
-    const lib_reranking_test_step = b.step("lib-reranking-test", "Run standalone lib/reranking tests");
-    lib_reranking_test_step.dependOn(&run_lib_reranking_tests.step);
-
     const run_lib_reranking_runtime_tests = antfly_tests_build.addModuleTestStep(
         b,
         lib_test_mod,
@@ -2868,20 +2725,6 @@ pub fn build(b: *std.Build) void {
             .simple_runner = true,
         },
     ).run;
-
-    const lib_casbin_tests = b.addTest(.{
-        .root_module = casbin_mod,
-    });
-    const run_lib_casbin_tests = b.addRunArtifact(lib_casbin_tests);
-    const lib_casbin_test_step = b.step("lib-casbin-test", "Run standalone lib/casbin tests");
-    lib_casbin_test_step.dependOn(&run_lib_casbin_tests.step);
-
-    const lib_usermgr_tests = b.addTest(.{
-        .root_module = usermgr_mod,
-    });
-    const run_lib_usermgr_tests = b.addRunArtifact(lib_usermgr_tests);
-    const lib_usermgr_test_step = b.step("lib-usermgr-test", "Run standalone pkg/antfly/src/usermgr tests");
-    lib_usermgr_test_step.dependOn(&run_lib_usermgr_tests.step);
 
     const embedded_test_run = antfly_tests_build.addModuleTestStep(
         b,
@@ -3298,12 +3141,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, template_test_mod, false, true);
-    const lib_template_tests = b.addTest(.{
-        .root_module = template_test_mod,
+    const standalone_module_tests = antfly_tests_build.addStandaloneModuleTestSteps(b, .{
+        .regex = regex_mod,
+        .jsonschema = jsonschema_mod,
+        .json = json_mod,
+        .ml_tabular = ml_tabular_mod,
+        .fuzz_tabular_loader = fuzz_tabular_loader_mod,
+        .toon = toon_mod,
+        .mcp = mcp_mod,
+        .a2a = a2a_mod,
+        .matcher = matcher_mod,
+        .resolver = resolver_mod,
+        .httpx_json = httpx_json_test_mod,
+        .httpx = httpx_mod,
+        .api_json_helpers = api_json_helpers_test_mod,
+        .generating = generating_mod,
+        .embeddings = embeddings_mod,
+        .vectorindex = vectorindex_mod,
+        .chunking = chunking_mod,
+        .readers = readers_mod,
+        .extracting = extracting_mod,
+        .image = image_test_mod,
+        .reranking = reranking_mod,
+        .casbin = casbin_mod,
+        .usermgr = usermgr_mod,
+        .template = template_test_mod,
     });
-    const run_lib_template_tests = b.addRunArtifact(lib_template_tests);
-    const lib_template_test_step = b.step("lib-template-test", "Run template rendering tests");
-    lib_template_test_step.dependOn(&run_lib_template_tests.step);
 
     const audio_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/audio_test_root.zig"),
@@ -3453,19 +3316,19 @@ pub fn build(b: *std.Build) void {
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
-    unit_test_step.dependOn(&run_lib_regex_tests.step);
-    unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
-    unit_test_step.dependOn(&run_lib_generating_tests.step);
-    unit_test_step.dependOn(&run_lib_embeddings_tests.step);
-    unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
-    unit_test_step.dependOn(&run_lib_chunking_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.regex.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.jsonschema.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.generating.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.embeddings.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.vectorindex.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.chunking.run.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
-    unit_test_step.dependOn(&run_lib_reranking_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.reranking.run.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
-    unit_test_step.dependOn(&run_lib_casbin_tests.step);
-    unit_test_step.dependOn(&run_lib_usermgr_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.casbin.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.usermgr.run.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
@@ -3486,11 +3349,11 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
-    unit_test_step.dependOn(&run_lib_template_tests.step);
-    unit_test_step.dependOn(&run_lib_toon_tests.step);
-    unit_test_step.dependOn(&run_lib_mcp_tests.step);
-    unit_test_step.dependOn(&run_lib_a2a_tests.step);
-    unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.template.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.toon.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.mcp.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.a2a.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.image.run.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
@@ -3506,7 +3369,7 @@ pub fn build(b: *std.Build) void {
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft-transport-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, serverless_tests, "serverless-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, standalone_module_tests.template.tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
     const lmdb_unit_tests = b.addTest(.{
@@ -3821,10 +3684,10 @@ pub fn build(b: *std.Build) void {
     // Focused aliases stay available as separate steps; broader module suites
     // are wired here once.
     dependOnAll(unit_test_step, &.{
-        &run_lib_json_tests.step,
-        &run_httpx_json_tests.step,
-        &run_httpx_tests.step,
-        &run_api_json_helpers_tests.step,
+        &standalone_module_tests.json.run.step,
+        &standalone_module_tests.httpx_json.run.step,
+        &standalone_module_tests.httpx.run.step,
+        &standalone_module_tests.api_json_helpers.run.step,
         &run_antfly_client_pkg_tests.step,
         &root_module_tests.run.step,
         &run_lib_metadata_tests.step,

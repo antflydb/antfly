@@ -280,13 +280,14 @@ fn isDBFocusedTestStepName(name: []const u8) bool {
 }
 
 fn isStandaloneModuleTestStepName(name: []const u8) bool {
-    for (standalone_module_test_steps) |step| {
+    inline for (std.meta.fields(@TypeOf(standalone_module_test_steps))) |field| {
+        const step = @field(standalone_module_test_steps, field.name);
         if (std.mem.eql(u8, name, step.name)) return true;
     }
     return false;
 }
 
-fn assertBuildZigDoesNotDeclareDBFocusedTestSteps(source: []const u8) void {
+fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
     while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
@@ -308,7 +309,7 @@ pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
     assertBuildZigTestFiltersReferenceManifest(source);
-    assertBuildZigDoesNotDeclareDBFocusedTestSteps(source);
+    assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
 }
 
 pub const capi_default_filters = [_][]const u8{
@@ -2314,6 +2315,105 @@ const db_storage_module_steps = [_]DBTestStep{
     },
 };
 
+const standalone_module_test_steps = .{
+    .regex = StandaloneModuleTestStep{
+        .name = "lib-regex-test",
+        .description = "Run standalone lib/regex tests",
+    },
+    .jsonschema = StandaloneModuleTestStep{
+        .name = "lib-jsonschema-test",
+        .description = "Run standalone lib/jsonschema tests",
+    },
+    .json = StandaloneModuleTestStep{
+        .name = "lib-json-test",
+        .description = "Run standalone lib/json tests",
+    },
+    .ml_tabular = StandaloneModuleTestStep{
+        .name = "lib-ml-tabular-test",
+        .description = "Run standalone lib/ml/tabular tests",
+    },
+    .fuzz_tabular_loader = StandaloneModuleTestStep{
+        .name = "fuzz-tabular-loader",
+        .description = "Fuzz the tabular_model.json loader (--fuzz to keep running)",
+    },
+    .toon = StandaloneModuleTestStep{
+        .name = "lib-toon-test",
+        .description = "Run standalone lib/toon tests",
+    },
+    .mcp = StandaloneModuleTestStep{
+        .name = "lib-mcp-test",
+        .description = "Run standalone lib/mcp tests",
+    },
+    .a2a = StandaloneModuleTestStep{
+        .name = "lib-a2a-test",
+        .description = "Run standalone lib/a2a tests",
+    },
+    .matcher = StandaloneModuleTestStep{
+        .name = "lib-matcher-test",
+        .description = "Run standalone lib/matcher tests",
+    },
+    .resolver = StandaloneModuleTestStep{
+        .name = "lib-resolver-test",
+        .description = "Run standalone lib/resolver tests",
+    },
+    .httpx_json = StandaloneModuleTestStep{
+        .name = "lib-httpx-json-test",
+        .description = "Run standalone lib/httpx JSON helper tests",
+    },
+    .httpx = StandaloneModuleTestStep{
+        .name = "lib-httpx-test",
+        .description = "Run standalone lib/httpx tests",
+    },
+    .api_json_helpers = StandaloneModuleTestStep{
+        .name = "lib-api-json-helpers-test",
+        .description = "Run standalone api/json_helpers tests",
+    },
+    .generating = StandaloneModuleTestStep{
+        .name = "lib-generating-test",
+        .description = "Run standalone lib/generating tests",
+    },
+    .embeddings = StandaloneModuleTestStep{
+        .name = "lib-embeddings-test",
+        .description = "Run standalone lib/embeddings tests",
+    },
+    .vectorindex = StandaloneModuleTestStep{
+        .name = "lib-vectorindex-test",
+        .description = "Run standalone lib/vectorindex tests",
+    },
+    .chunking = StandaloneModuleTestStep{
+        .name = "lib-chunking-test",
+        .description = "Run standalone lib/chunking tests",
+    },
+    .readers = StandaloneModuleTestStep{
+        .name = "lib-readers-test",
+        .description = "Run standalone lib/readers tests",
+    },
+    .extracting = StandaloneModuleTestStep{
+        .name = "lib-extracting-test",
+        .description = "Run standalone lib/extracting tests",
+    },
+    .image = StandaloneModuleTestStep{
+        .name = "lib-image-test",
+        .description = "Run shared image tests",
+    },
+    .reranking = StandaloneModuleTestStep{
+        .name = "lib-reranking-test",
+        .description = "Run standalone lib/reranking tests",
+    },
+    .casbin = StandaloneModuleTestStep{
+        .name = "lib-casbin-test",
+        .description = "Run standalone lib/casbin tests",
+    },
+    .usermgr = StandaloneModuleTestStep{
+        .name = "lib-usermgr-test",
+        .description = "Run standalone pkg/antfly/src/usermgr tests",
+    },
+    .template = StandaloneModuleTestStep{
+        .name = "lib-template-test",
+        .description = "Run template rendering tests",
+    },
+};
+
 fn addProgressBanner(b: *std.Build, label: []const u8) *std.Build.Step.Run {
     return b.addSystemCommand(&.{
         "sh",
@@ -2417,6 +2517,56 @@ pub fn addModuleTestStep(
         .tests = tests,
         .run = run,
         .step = step,
+    };
+}
+
+fn addStandaloneModuleTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    test_step: StandaloneModuleTestStep,
+) ModuleTestRun {
+    const tests = b.addTest(.{
+        .root_module = root_module,
+    });
+    const run = b.addRunArtifact(tests);
+    const step = b.step(test_step.name, test_step.description);
+    step.dependOn(&run.step);
+    return .{
+        .tests = tests,
+        .run = run,
+        .step = step,
+    };
+}
+
+pub fn addStandaloneModuleTestSteps(
+    b: *std.Build,
+    modules: StandaloneModuleTestModules,
+) StandaloneModuleTestRuns {
+    return .{
+        .regex = addStandaloneModuleTestStep(b, modules.regex, standalone_module_test_steps.regex),
+        .jsonschema = addStandaloneModuleTestStep(b, modules.jsonschema, standalone_module_test_steps.jsonschema),
+        .json = addStandaloneModuleTestStep(b, modules.json, standalone_module_test_steps.json),
+        .ml_tabular = addStandaloneModuleTestStep(b, modules.ml_tabular, standalone_module_test_steps.ml_tabular),
+        .fuzz_tabular_loader = addStandaloneModuleTestStep(b, modules.fuzz_tabular_loader, standalone_module_test_steps.fuzz_tabular_loader),
+        .toon = addStandaloneModuleTestStep(b, modules.toon, standalone_module_test_steps.toon),
+        .mcp = addStandaloneModuleTestStep(b, modules.mcp, standalone_module_test_steps.mcp),
+        .a2a = addStandaloneModuleTestStep(b, modules.a2a, standalone_module_test_steps.a2a),
+        .matcher = addStandaloneModuleTestStep(b, modules.matcher, standalone_module_test_steps.matcher),
+        .resolver = addStandaloneModuleTestStep(b, modules.resolver, standalone_module_test_steps.resolver),
+        .httpx_json = addStandaloneModuleTestStep(b, modules.httpx_json, standalone_module_test_steps.httpx_json),
+        .httpx = addStandaloneModuleTestStep(b, modules.httpx, standalone_module_test_steps.httpx),
+        .api_json_helpers = addStandaloneModuleTestStep(b, modules.api_json_helpers, standalone_module_test_steps.api_json_helpers),
+        .generating = addStandaloneModuleTestStep(b, modules.generating, standalone_module_test_steps.generating),
+        .embeddings = addStandaloneModuleTestStep(b, modules.embeddings, standalone_module_test_steps.embeddings),
+        .vectorindex = addStandaloneModuleTestStep(b, modules.vectorindex, standalone_module_test_steps.vectorindex),
+        .chunking = addStandaloneModuleTestStep(b, modules.chunking, standalone_module_test_steps.chunking),
+        .readers = addStandaloneModuleTestStep(b, modules.readers, standalone_module_test_steps.readers),
+        .extracting = addStandaloneModuleTestStep(b, modules.extracting, standalone_module_test_steps.extracting),
+        .image = addStandaloneModuleTestStep(b, modules.image, standalone_module_test_steps.image),
+        .reranking = addStandaloneModuleTestStep(b, modules.reranking, standalone_module_test_steps.reranking),
+        .casbin = addStandaloneModuleTestStep(b, modules.casbin, standalone_module_test_steps.casbin),
+        .usermgr = addStandaloneModuleTestStep(b, modules.usermgr, standalone_module_test_steps.usermgr),
+        .template = addStandaloneModuleTestStep(b, modules.template, standalone_module_test_steps.template),
     };
 }
 

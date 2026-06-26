@@ -3447,6 +3447,11 @@ const collectRowsFromRoutedScansAlloc = table_read_relational_rows.collectRowsFr
 const routedRowsPlanRangesForJoinAlloc = table_read_relational_rows.routedRowsPlanRangesForJoinAlloc;
 const routedRowsPlanRangesForJoinCtesAlloc = table_read_relational_rows.routedRowsPlanRangesForJoinCtesAlloc;
 const relationalRowsScanPayloadCanStripSyntheticKey = table_read_relational_rows.scanPayloadCanStripSyntheticKey;
+const resolveSingleUniqueOwnerGroup = table_read_relational_rows.resolveSingleUniqueOwnerGroup;
+const relationalUniqueOwnerKeyAlloc = table_read_relational_rows.relationalUniqueOwnerKeyAlloc;
+const lookupRelationalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalUniqueOwnerInDb;
+const lookupRelationalTemporalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalTemporalUniqueOwnerInDb;
+const lookupRelationalTemporalUniqueOverlapOwnerInDb = table_read_relational_rows.lookupRelationalTemporalUniqueOverlapOwnerInDb;
 
 fn collectProvisionedSearchRequestTextStatsParallel(
     self: *ProvisionedTableReadSource,
@@ -4411,91 +4416,6 @@ fn lookupLocal(
         .json = try alloc.dupe(u8, result.json),
         .version = try db.getTimestamp(alloc, key),
     };
-}
-
-fn resolveSingleUniqueOwnerGroup(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-) !u64 {
-    var owner = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint_name, encoded_value);
-    defer owner.deinit(alloc);
-    if (!owner.configured or owner.groups.len != 1) return error.UniqueOwnerTopologyUnavailable;
-    return owner.groups[0];
-}
-
-fn relationalUniqueOwnerKeyAlloc(
-    alloc: std.mem.Allocator,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-) ![]u8 {
-    return try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, constraint_name, encoded_value);
-}
-
-fn lookupRelationalUniqueOwnerInDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    group_id: u64,
-    reads: raft_mod.FeatureReads,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-    consistency: raft_mod.ReadConsistency,
-) !?[]u8 {
-    const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
-    defer alloc.free(key);
-    reads.prepareLookupWithConsistency(group_id, key, .{}, consistency) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    return db.getRawStoreValue(alloc, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => err,
-    };
-}
-
-fn lookupRelationalTemporalUniqueOwnerInDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    group_id: u64,
-    reads: raft_mod.FeatureReads,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-    encoded_point: []const u8,
-    consistency: raft_mod.ReadConsistency,
-) !?[]u8 {
-    const prefix = try db_mod.internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
-    defer alloc.free(prefix);
-    const upper = try db_mod.internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
-    defer if (upper) |buf| alloc.free(buf);
-    reads.prepareScanWithConsistency(group_id, prefix, if (upper) |buf| buf else "", .{}, consistency) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    return try db.lookupRelationalTemporalUniqueOwner(alloc, constraint_name, encoded_value, encoded_point);
-}
-
-fn lookupRelationalTemporalUniqueOverlapOwnerInDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    group_id: u64,
-    reads: raft_mod.FeatureReads,
-    constraint_name: []const u8,
-    encoded_value: []const u8,
-    encoded_start: []const u8,
-    encoded_end: []const u8,
-    consistency: raft_mod.ReadConsistency,
-) !?[]u8 {
-    const prefix = try db_mod.internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
-    defer alloc.free(prefix);
-    const upper = try db_mod.internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
-    defer if (upper) |buf| alloc.free(buf);
-    reads.prepareScanWithConsistency(group_id, prefix, if (upper) |buf| buf else "", .{}, consistency) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    return try db.lookupRelationalTemporalUniqueOverlapOwner(alloc, constraint_name, encoded_value, encoded_start, encoded_end);
 }
 
 fn lookupRelationalUniqueOwnerProvisionedLocal(
