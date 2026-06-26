@@ -711,6 +711,48 @@ pub fn openProvisionedQueryDbForTableWithCache(
     return db;
 }
 
+pub fn openProvisionedWarmStatusDbForTable(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    identity_namespace: ?db_mod.DocIdentityNamespace,
+) !db_mod.DB {
+    var db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .status_only,
+        .lsm_root_generation = lsm_root_generation,
+        .backend_runtime = backend_runtime,
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = identity_namespace != null,
+    });
+    errdefer db.close();
+    try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+    return db;
+}
+
+pub fn openProvisionedLookupDbForTable(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    lsm_cache: ?*lsm_backend.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    identity_namespace: ?db_mod.DocIdentityNamespace,
+) !db_mod.DB {
+    var db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .status_only,
+        .lsm_cache = lsm_cache,
+        .lsm_root_generation = lsm_root_generation,
+        .resource_manager = resource_manager,
+        .backend_runtime = backend_runtime,
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = identity_namespace != null,
+    });
+    errdefer db.close();
+    try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+    return db;
+}
+
 pub fn loadTableIndexesJson(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -963,6 +1005,102 @@ test "provisioned query runtime db rejects stale identity namespace" {
 
     var catalog_state = CatalogState{};
     if (openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, backend_current_root_generation, null)) |opened| {
+        var db = opened;
+        db.close();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.DocIdentityNamespaceMismatch, err);
+}
+
+test "provisioned lookup db opens with identity namespace" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-lookup-identity-namespace";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const namespace: db_mod.DocIdentityNamespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7103,
+    };
+    var db = try openProvisionedLookupDbForTable(alloc, path, null, backend_current_root_generation, null, null, namespace);
+    defer db.close();
+
+    try std.testing.expect(db.core.identity_namespace.eql(namespace));
+}
+
+test "provisioned warm status db opens with identity namespace" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-warm-status-identity-namespace";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const namespace: db_mod.DocIdentityNamespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7104,
+    };
+    var db = try openProvisionedWarmStatusDbForTable(alloc, path, backend_current_root_generation, null, namespace);
+    defer db.close();
+
+    try std.testing.expect(db.core.identity_namespace.eql(namespace));
+}
+
+test "provisioned direct read db opens reject stale identity namespace" {
+    const alloc = std.testing.allocator;
+    const lookup_path = "/tmp/antfly-api-provisioned-lookup-stale-identity-namespace";
+    const status_path = "/tmp/antfly-api-provisioned-status-stale-identity-namespace";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), lookup_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), status_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), lookup_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), status_path) catch {};
+
+    const stale_namespace: db_mod.DocIdentityNamespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7198,
+    };
+    const expected_namespace: db_mod.DocIdentityNamespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7199,
+    };
+
+    {
+        var db = try db_mod.DB.open(alloc, lookup_path, .{
+            .start_index_workers = false,
+            .identity_namespace = stale_namespace,
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+        db.close();
+    }
+    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, backend_current_root_generation, null, null, expected_namespace)) |opened| {
+        var db = opened;
+        db.close();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.DocIdentityNamespaceMismatch, err);
+
+    {
+        var db = try db_mod.DB.open(alloc, status_path, .{
+            .start_index_workers = false,
+            .identity_namespace = stale_namespace,
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+        db.close();
+    }
+    if (openProvisionedWarmStatusDbForTable(alloc, status_path, backend_current_root_generation, null, expected_namespace)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;

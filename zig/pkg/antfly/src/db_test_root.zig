@@ -17,6 +17,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = @import("storage/db/mod.zig");
+    _ = @import("storage/db/internal.zig");
     _ = @import("storage/db/lifecycle.zig");
     _ = @import("storage/db/ha_replication.zig");
     _ = @import("storage/db/write_path.zig");

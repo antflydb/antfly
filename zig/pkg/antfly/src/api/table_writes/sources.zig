@@ -803,21 +803,21 @@ pub const ProvisionedTableWriteSource = struct {
         self.waitForNoReadBlockingActivityLocked(table_name);
     }
 
-    fn beginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn beginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginTableRequestLocked(table_name);
     }
 
-    fn endTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn endTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endTableRequestLocked(table_name);
     }
 
-    fn beginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+    pub fn beginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
@@ -843,21 +843,21 @@ pub const ProvisionedTableWriteSource = struct {
         entry.operation_active = true;
     }
 
-    fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+    pub fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginGroupOperationLocked(table_name, group_id);
     }
 
-    fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+    pub fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endGroupOperationLocked(table_name, group_id);
     }
 
-    fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+    pub fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
@@ -871,14 +871,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginStructuralTableActivityLocked(table_name);
     }
 
-    fn endStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn endStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStructuralTableActivityLocked(table_name);
     }
 
-    fn beginLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn beginLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.beginStructuralTableActivity(table_name);
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
@@ -886,7 +886,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRuntimeStatusCache(table_name);
     }
 
-    fn finishLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn finishLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();
         self.endStructuralTableActivity(table_name);
@@ -1133,7 +1133,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn publishManagedRuntimeStatusBestEffort(
+    pub fn publishManagedRuntimeStatusBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
@@ -1234,7 +1234,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .data);
     }
 
-    fn invalidateWriteCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn invalidateWriteCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         _ = self.publishWriteCacheStatusBeforeInvalidate(table_name);
         self.detachWriteCacheVisibilityHooksBeforeInvalidate(table_name);
         if (self.write_cache) |cache| cache.invalidateTable(table_name);
@@ -2136,7 +2136,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn takeStatusesWithoutActiveGroups(
+    pub fn takeStatusesWithoutActiveGroups(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
@@ -2244,7 +2244,7 @@ pub const ProvisionedTableWriteSource = struct {
         return .{ .items = try merged.toOwnedSlice(alloc) };
     }
 
-    fn replaceRuntimeStatusesWithMergedRefresh(
+    pub fn replaceRuntimeStatusesWithMergedRefresh(
         alloc: std.mem.Allocator,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
         refresh: *const runtime_status.LocalTableRuntimeStatuses,
@@ -2583,7 +2583,7 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
-    fn isWriteCacheDirtyForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+    pub fn isWriteCacheDirtyForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
@@ -2638,7 +2638,7 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
-    fn markWriteCacheDirty(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn markWriteCacheDirty(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (self.write_cache == null) return;
         lockAtomic(&self.dirty_write_tables_mutex);
         const table_hash = writeCacheTableHash(table_name);
@@ -2686,7 +2686,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .data);
     }
 
-    fn enqueueRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn enqueueRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const alloc = std.heap.page_allocator;
         const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("restore repair completion allocation failed table={s} err={}", .{ table_name, err });
@@ -6255,7 +6255,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn overlayReadCacheIndexVisibilityBestEffort(
+    pub fn overlayReadCacheIndexVisibilityBestEffort(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -6798,14 +6798,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
-    fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
+    pub fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
         const hosted_cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
         lockAtomic(&hosted_cache.mutex);
         defer hosted_cache.mutex.unlock();
         hosted_cache.write_cache.invalidateTable(table_name);
     }
 
-    fn getOrOpenCachedDbMode(
+    pub fn getOrOpenCachedDbMode(
         self: *HostedProvisionedTableWriteSource,
         cache: *HostedManagedDbCache,
         path: []const u8,

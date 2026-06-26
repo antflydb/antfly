@@ -742,13 +742,13 @@ fn emitZigMetadata(
         \\};
         \\
         \\pub const ActionKind = enum { shift, reduce, accept };
-        \\pub const Action = struct { state: u16, terminal: u16, kind: ActionKind, target: u16 };
+        \\pub const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
         \\pub const TableRange = struct { start: u32, len: u16 };
         \\pub const actions = [_]Action{
         \\
     );
     for (tables.actions) |action| {
-        try appendFmt(allocator, &out, "    .{{ .state = {d}, .terminal = {d}, .kind = .{s}, .target = {d} }},\n", .{ action.state, action.terminal, @tagName(action.kind), action.target });
+        try appendFmt(allocator, &out, "    .{{ .terminal = {d}, .kind = .{s}, .target = {d} }},\n", .{ action.terminal, @tagName(action.kind), action.target });
     }
     try out.appendSlice(allocator,
         \\};
@@ -759,12 +759,12 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
-        \\pub const Goto = struct { state: u16, nonterminal: u16, target: u16 };
+        \\pub const Goto = struct { nonterminal: u16, target: u16 };
         \\pub const gotos = [_]Goto{
         \\
     );
     for (tables.gotos) |goto_entry| {
-        try appendFmt(allocator, &out, "    .{{ .state = {d}, .nonterminal = {d}, .target = {d} }},\n", .{ goto_entry.state, goto_entry.nonterminal, goto_entry.target });
+        try appendFmt(allocator, &out, "    .{{ .nonterminal = {d}, .target = {d} }},\n", .{ goto_entry.nonterminal, goto_entry.target });
     }
     try out.appendSlice(allocator,
         \\};

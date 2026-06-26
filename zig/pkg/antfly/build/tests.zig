@@ -567,14 +567,91 @@ fn assertDBTestRootImportsDBAggregateRoot(source: []const u8) void {
     }
 }
 
-fn assertDBTestRootAggregation(b: *std.Build) void {
-    const source = readBuildRootFileAlloc(
-        b,
-        db_test_root_path,
-        max_build_zig_bytes,
-        "DB test root aggregation guardrail",
+fn assertDBTestRootImportsPath(test_root_source: []const u8, import_path: []const u8) void {
+    if (std.mem.indexOf(u8, test_root_source, import_path) != null) return;
+    std.debug.panic(
+        "{s} must explicitly import {s} because that DB implementation module owns inline tests",
+        .{ db_test_root_path, import_path },
     );
-    assertDBTestRootImportsDBAggregateRoot(source);
+}
+
+fn importPathForAlias(source: []const u8, alias: []const u8) ?[]const u8 {
+    var line_start: usize = 0;
+    while (line_start < source.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        const line = std.mem.trim(u8, source[line_start..line_end], " \t");
+        defer line_start = if (line_end == source.len) source.len else line_end + 1;
+
+        if (!std.mem.startsWith(u8, line, "const ")) continue;
+        const binding = line["const ".len..];
+        const name_end = std.mem.indexOfAny(u8, binding, " \t=") orelse continue;
+        if (!std.mem.eql(u8, binding[0..name_end], alias)) continue;
+
+        const import_start = std.mem.indexOf(u8, line, "@import(\"") orelse continue;
+        const path_start = import_start + "@import(\"".len;
+        const path_end = std.mem.indexOfScalarPos(u8, line, path_start, '"') orelse continue;
+        return line[path_start..path_end];
+    }
+    return null;
+}
+
+fn assertDBImplModuleContract(
+    b: *std.Build,
+    db_source: []const u8,
+    test_root_source: []const u8,
+    module_alias: []const u8,
+    impl_offset: usize,
+) void {
+    const import_path = importPathForAlias(db_source, module_alias) orelse {
+        std.debug.panic(
+            "storage/db/db.zig instantiates {s}.Impl at line {}, but no matching const import was found",
+            .{ module_alias, lineNumberForOffset(db_source, impl_offset) },
+        );
+    };
+    if (std.mem.startsWith(u8, import_path, "../") or std.mem.indexOfScalar(u8, import_path, '/') != null) {
+        std.debug.panic(
+            "storage/db/db.zig instantiates {s}.Impl from {s} at line {}; DB implementation modules must live directly under storage/db",
+            .{ module_alias, import_path, lineNumberForOffset(db_source, impl_offset) },
+        );
+    }
+
+    const module_path = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ db_source_root, import_path }) catch |err| {
+        std.debug.panic("failed to build storage/db module path for {s}: {}", .{ import_path, err });
+    };
+    const module_source = readBuildRootFileAlloc(
+        b,
+        module_path,
+        max_db_module_zig_bytes,
+        "DB implementation module contract guardrail",
+    );
+    if (std.mem.indexOf(u8, module_source, "pub fn Impl(comptime DB: type) type") == null) {
+        std.debug.panic(
+            "storage/db/{s} is instantiated from db.zig at line {} but does not declare pub fn Impl(comptime DB: type) type",
+            .{ import_path, lineNumberForOffset(db_source, impl_offset) },
+        );
+    }
+
+    if (std.mem.indexOf(u8, module_source, "\ntest \"") != null or std.mem.startsWith(u8, module_source, "test \"")) {
+        const test_import_path = std.fmt.allocPrint(b.allocator, "storage/db/{s}", .{import_path}) catch |err| {
+            std.debug.panic("failed to build DB test import path for {s}: {}", .{ import_path, err });
+        };
+        assertDBTestRootImportsPath(test_root_source, test_import_path);
+    }
+}
+
+fn assertDBInstantiatedImplContracts(b: *std.Build, db_source: []const u8, test_root_source: []const u8) void {
+    var line_start: usize = 0;
+    while (line_start < db_source.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, db_source, line_start, '\n') orelse db_source.len;
+        const line = std.mem.trim(u8, db_source[line_start..line_end], " \t");
+        defer line_start = if (line_end == db_source.len) db_source.len else line_end + 1;
+
+        const suffix = ".Impl(@This());";
+        const suffix_start = std.mem.indexOf(u8, line, suffix) orelse continue;
+        const equals_start = std.mem.indexOf(u8, line, " = ") orelse continue;
+        const module_alias = line[equals_start + " = ".len .. suffix_start];
+        assertDBImplModuleContract(b, db_source, test_root_source, module_alias, line_start);
+    }
 }
 
 fn dbSourceMayImportDBRoot(path: []const u8) bool {
@@ -647,9 +724,16 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
         max_db_zig_bytes,
         "DB refactor boundary guardrail",
     );
+    const test_root_source = readBuildRootFileAlloc(
+        b,
+        db_test_root_path,
+        max_build_zig_bytes,
+        "DB test root aggregation guardrail",
+    );
     assertDBRootDoesNotOwnInlineTests(source);
     assertDBRootDoesNotOwnPrivateHelpers(source);
-    assertDBTestRootAggregation(b);
+    assertDBTestRootImportsDBAggregateRoot(test_root_source);
+    assertDBInstantiatedImplContracts(b, source, test_root_source);
     assertDBImplementationModuleContract(b);
 }
 
@@ -1485,8 +1569,6 @@ pub const APITestFilters = struct {
         "graph result_ref fails closed when unbounded resolved doc-set cannot project",
         "graph result_ref uses complete node doc-set when hits are paged",
         "graph query result doc-set resolution receives identity generation",
-        "provisioned direct read db opens reject stale identity namespace",
-        "provisioned query runtime db rejects stale identity namespace",
     };
 
     pub const transactions_docid = [_][]const u8{
@@ -1543,9 +1625,8 @@ pub const APITestFilters = struct {
     };
 
     pub const table_writes_docid = [_][]const u8{
-        // Prefer owner-module prefixes for tests moved out of api/table_writes.zig.
-        // Keep exact names here only for facade/integration tests that still live
-        // in the monolithic table_writes module.
+        // Prefer owner-module and suite-name prefixes. Exact test names should
+        // move with their owner module instead of accumulating here.
         "api.table_writes.backup_restore.test.",
         "api.table_writes.bulk_ingest.test.",
         "api.table_writes.cache.test.",
@@ -1557,30 +1638,7 @@ pub const APITestFilters = struct {
         "api.table_writes.remote_wire.test.",
         "api.table_writes.schema_jobs.test.",
         "api.table_writes.sources.test.",
-        "api auto bulk ingest does not open sessions for normal online writes",
-        "provisioned table write source rejects stale doc identity namespace before write",
-        "bound table write source backs up and restores a local table",
-        "bound table write source backs up and restores a portable local table",
-        "provisioned table write source backs up a portable local table",
-        "provisioned table restore rejects mismatched doc identity namespace",
-        "provisioned restore repair open rejects stale doc identity namespace",
-        "primary lookup adopts seeded write cache across visible generation bump",
-        "provisioned table write source coalesces same-group waiters",
-        "provisioned table write coalescer isolates failed waiters",
-        "provisioned secondary index rebuild worker pass repairs projected catalog range",
-        "provisioned schema rewrite worker pass drains projected catalog range job",
-        "provisioned table write source drop table does not hold local db mutex during background delete",
-        "provisioned table write source drop table waits for in-flight group batch on same table",
-        "unique schema controller maintenance",
-        "provisioned foreign key action job drains owner range page",
-        "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
-        "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
-        "provisioned table write source routes cross-table rows insert source through catalog owners",
-        "provisioned table write source stages relational mutation source on single owner range",
-        "provisioned table write source globally plans relational mutation source across ranges",
-        "hosted provisioned table write source globally plans relational mutation source across local owner ranges",
-        "provisioned table write source consistent visibility hook does not block on busy apply lock",
-        "provisioned table write source consistent visibility refreshes stale dense status",
+        "api.table_writes.test.docid focused ",
     };
 
     pub const provisioned_query_visibility = [_][]const u8{
@@ -1588,6 +1646,8 @@ pub const APITestFilters = struct {
     };
 
     pub const table_reads_docid = [_][]const u8{
+        // Prefer owner-module and suite-name prefixes. Exact test names should
+        // move with their owner module instead of accumulating here.
         "api.table_reads.cache.test.",
         "api.table_reads.core.test.",
         "api.table_reads.document_sql.test.",
@@ -1597,22 +1657,7 @@ pub const APITestFilters = struct {
         "api.table_reads.relational_rows.test.",
         "api.table_reads.remote_wire.test.",
         "api.http_internal_group_read_routes.test.",
-        "routed rows query plan executes over scanned owner rows with ctes",
-        "external lake rows query and aggregate plans route through lake scan hook",
-        "lowered sql cross-table read plans execute through routed scans",
-        "lowered sql set operation plans preserve overlapping union all rows",
-        "lowered document sql read plans execute native lookup and bounded scan",
-        "document sql catalog read producers treat catalog misses as terminal",
-        "lowered document sql aggregate executes native grouped avg materialization",
-        "lowered document sql aggregate uses catalog target for non-default namespace materialization",
-        "provisioned table read source executes relational row query plans across ranges",
-        "explicit text stats requests preserve identity generation",
-        "explicit text stats requests carry resolved doc filters and apply exact projection",
-        "explicit text stats requests reject stale identity generation",
-        "algebraic partial request fails closed when lifecycle is stale",
-        "algebraic partial request accepts current identity generation and rejects stale",
-        "hosted remote temporal unique owner lookup resolves point interval",
-        "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+        "api.table_reads.test.docid focused ",
     };
 
     pub const table_reads_graph_metric = [_][]const u8{
@@ -1677,7 +1722,6 @@ pub const APITestFilters = struct {
         "hosted table read source coordinates relational row plans without local owner ranges",
         "hosted relational row plans fail closed when remote range topology moves during collection",
         "hosted relational lateral plans fail closed when remote range topology moves during right collection",
-        "relational unique owner lookup requires one active owner range",
         "bound table read source executes SQL system-time as-of by commit sequence",
         "relational rows mutation source updates claimed base rows transactionally",
         "relational rows mutation source plans across injected owner ranges",

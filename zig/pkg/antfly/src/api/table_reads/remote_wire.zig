@@ -27,6 +27,7 @@ const http_client = @import("../http_client.zig");
 const http_common = @import("../../raft/transport/http_common.zig");
 const query_api = @import("../query.zig");
 const query_contract = @import("../query_contract.zig");
+const storage_schema = @import("../../storage/schema.zig");
 const table_read_core = @import("core.zig");
 const table_read_relational_rows = @import("relational_rows.zig");
 
@@ -533,6 +534,116 @@ pub fn lookupRelationalTemporalUniqueOverlapOwnerRemote(
     var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
     defer parsed.deinit();
     return try alloc.dupe(u8, parsed.value.owner_key);
+}
+
+test "hosted remote temporal unique owner lookup resolves point interval" {
+    const alloc = std.testing.allocator;
+    const column = storage_schema.RelationalColumn{
+        .name = "valid_at",
+        .path = "valid_at",
+        .field_type = .numeric,
+    };
+    const point_15 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "15", column);
+    defer alloc.free(point_15);
+    const start_12 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "12", column);
+    defer alloc.free(start_12);
+    const end_18 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "18", column);
+    defer alloc.free(end_18);
+
+    const ExecutorState = struct {
+        point_15: []const u8,
+        start_12: []const u8,
+        end_18: []const u8,
+        point_calls: usize = 0,
+        overlap_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-owner") and req.method == .POST) {
+                var parsed = try std.json.parseFromSlice(struct {
+                    constraint_name: []const u8,
+                    encoded_value: []const u8,
+                    encoded_point: []const u8,
+                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
+                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
+                try std.testing.expectEqualStrings(self.point_15, parsed.value.encoded_point);
+                self.point_calls += 1;
+                return .{
+                    .status = 200,
+                    .content_type = try alloc_inner.dupe(u8, "application/json"),
+                    .body = try std.fmt.allocPrint(
+                        alloc_inner,
+                        "{{\"owner_key\":{f}}}",
+                        .{std.json.fmt("price:a:v2", .{})},
+                    ),
+                };
+            }
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-overlap-owner") and req.method == .POST) {
+                var parsed = try std.json.parseFromSlice(struct {
+                    constraint_name: []const u8,
+                    encoded_value: []const u8,
+                    encoded_start: []const u8,
+                    encoded_end: []const u8,
+                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
+                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
+                try std.testing.expectEqualStrings(self.start_12, parsed.value.encoded_start);
+                try std.testing.expectEqualStrings(self.end_18, parsed.value.encoded_end);
+                self.overlap_calls += 1;
+                return .{
+                    .status = 200,
+                    .content_type = try alloc_inner.dupe(u8, "application/json"),
+                    .body = try std.fmt.allocPrint(
+                        alloc_inner,
+                        "{{\"owner_key\":{f}}}",
+                        .{std.json.fmt("price:a:v2", .{})},
+                    ),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor = ExecutorState{ .point_15 = point_15, .start_12 = start_12, .end_18 = end_18 };
+    const owner = (try lookupRelationalTemporalUniqueOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        point_15,
+    )).?;
+    defer alloc.free(owner);
+
+    try std.testing.expectEqualStrings("price:a:v2", owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.overlap_calls);
+
+    const overlap_owner = (try lookupRelationalTemporalUniqueOverlapOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        start_12,
+        end_18,
+    )).?;
+    defer alloc.free(overlap_owner);
+
+    try std.testing.expectEqualStrings("price:a:v2", overlap_owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.overlap_calls);
 }
 
 pub fn scanRemote(

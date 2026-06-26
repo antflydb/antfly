@@ -139,6 +139,85 @@ pub fn resolveSingleUniqueOwnerGroup(
     return owner.groups[0];
 }
 
+test "relational unique owner lookup requires one active owner range" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "users",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = "m",
+                        .group_id = 7101,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "m",
+                        .end_encoded_value = null,
+                        .group_id = 7102,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_phone_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7201,
+                        .state = metadata_table_manager.unique_constraint_range_rebuilding,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_handle_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7202,
+                        .state = metadata_table_manager.unique_constraint_range_splitting,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_username_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7203,
+                        .state = metadata_table_manager.unique_constraint_range_merging,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    try std.testing.expectEqual(@as(u64, 7101), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "a"));
+    try std.testing.expectEqual(@as(u64, 7102), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "z"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_phone_key", "p"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_handle_key", "h"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_username_key", "u"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "a"));
+}
+
 pub fn relationalUniqueOwnerKeyAlloc(
     alloc: std.mem.Allocator,
     constraint_name: []const u8,

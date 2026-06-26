@@ -13335,54 +13335,6 @@ test "db search runtime identity explicit doc-id filter resolution honors identi
     try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
 }
 
-test "db search runtime identity doc set planning stats record ordinal bitmap promotion" {
-    const DB = @import("mod.zig").DB;
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
-    defer TestHelpers.cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .primary_backend = .{ .mem = .{} },
-    });
-    defer db.close();
-
-    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer writes.deinit(alloc);
-    var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-    defer doc_ids.deinit(alloc);
-    var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (owned_doc_ids.items) |doc_id| alloc.free(doc_id);
-        owned_doc_ids.deinit(alloc);
-    }
-
-    for (0..doc_set.bitmap_min_cardinality) |i| {
-        const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
-        errdefer alloc.free(doc_id);
-        try owned_doc_ids.append(alloc, doc_id);
-        try doc_ids.append(alloc, doc_id);
-        try writes.append(alloc, .{ .key = doc_id, .value = "{\"ok\":true}" });
-    }
-
-    try db.batch(.{ .writes = writes.items });
-
-    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, doc_ids.items);
-    defer resolved.deinit(alloc);
-    switch (resolved) {
-        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
-        else => return error.ExpectedOrdinalBitmapDocSet,
-    }
-
-    const stats = try db.stats(alloc);
-    defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.resolved_set_count);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.ordinal_bitmap_count);
-    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
-}
-
 test "db search runtime identity sparse index uses identity ordinals as physical doc nums for primary docs" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;

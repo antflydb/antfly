@@ -1618,6 +1618,10 @@ pub fn Impl(comptime DB: type) type {
             return ttl_mod.isExpired(ts, duration_ns, currentTimeNs());
         }
 
+        pub fn hasActiveDenseBulkWork(self: *const DB) bool {
+            return asyncContextHasActiveDenseBulkWork(self.async_context);
+        }
+
         pub fn batchContext(self: *DB) BatchExecutionContext(DB) {
             const resources = self.core.batchExecutionResources();
             return .{
@@ -2105,6 +2109,29 @@ pub const DocSetPlanningRuntimeStats = struct {
         };
     }
 };
+
+test "doc set planning stats record ordinal bitmap promotion" {
+    const alloc = std.testing.allocator;
+
+    var ordinals: [doc_set.bitmap_min_cardinality]doc_set.DocOrdinal = undefined;
+    for (&ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
+
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, &ordinals);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
+        else => return error.ExpectedOrdinalBitmapDocSet,
+    }
+
+    var stats = DocSetPlanningRuntimeStats{};
+    stats.recordResolvedSet(&resolved, false);
+
+    const snapshot = stats.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.ordinal_bitmap_count);
+    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), snapshot.ordinal_bitmap_docs);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.bitmap_promotion_count);
+}
 
 pub const ForeignKeyRuntimeStats = struct {
     child_write_rejects: AtomicU64 = AtomicU64.init(0),

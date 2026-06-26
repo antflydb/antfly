@@ -1093,9 +1093,13 @@ Important performance requirements:
   catch-all symbol-name lookup for parser ingress.
 - **Indexed parse tables**: generated action/goto tables carry per-state row
   ranges and use binary search inside the active row instead of scanning the
-  full table. Future compression can move from row ranges to row displacement,
-  packed transition arrays, default reductions, or another measured scheme if
-  table size or lookup cost becomes material.
+  full table. Generated action and goto rows elide the redundant state id
+  because row membership is already encoded by `action_ranges`/`goto_ranges`;
+  `sql-parser-bench` reports the compact entry widths (`action=6`,
+  `goto=4`, `range=8`) and the current static table footprint
+  (`static_bytes=1081392`). Future compression can move from state-elided row
+  ranges to row displacement, packed transition arrays, default reductions, or
+  another measured scheme if table size or lookup cost becomes material.
 - **Allocation-light AST construction**: allocate AST nodes in an arena owned
   by `ParsedSql`; avoid per-token heap allocation and avoid copying token text
   unless normalized text is required. Generated parser metadata now also emits

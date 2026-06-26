@@ -364,8 +364,7 @@ pub const DB = struct {
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
-        try write_path_impl.finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
-        try write_path_impl.beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
+        return try write_path_impl.rollPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(
@@ -384,8 +383,7 @@ pub const DB = struct {
 
     pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
-        try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
-        try write_path_impl.beginDenseAutoBulkIngestSessionAfterGate(self);
+        return try write_path_impl.rollDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
@@ -480,7 +478,7 @@ pub const DB = struct {
     }
 
     pub fn hasActiveDenseBulkWork(self: *const DB) bool {
-        return db_internal.asyncContextHasActiveDenseBulkWork(self.async_context);
+        return internal_impl.hasActiveDenseBulkWork(self);
     }
 
     pub fn runLsmMaintenanceUntilIdle(self: *DB) !usize {

@@ -439,7 +439,7 @@ pub const BoundTableWriteSource = table_write_sources.BoundTableWriteSource;
 pub const ProvisionedTableWriteSource = table_write_sources.ProvisionedTableWriteSource;
 pub const HostedProvisionedTableWriteSource = table_write_sources.HostedProvisionedTableWriteSource;
 
-test "provisioned secondary index rebuild worker pass repairs projected catalog range" {
+test "docid focused provisioned secondary index rebuild worker pass repairs projected catalog range" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -612,7 +612,7 @@ test "provisioned secondary index rebuild worker pass repairs projected catalog 
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, inactive_amount_key));
 }
 
-test "provisioned schema rewrite worker pass drains projected catalog range job" {
+test "docid focused provisioned schema rewrite worker pass drains projected catalog range job" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -894,7 +894,7 @@ test "provisioned table write source seeds doc identity namespace from table ran
     }));
 }
 
-test "provisioned table write source rejects stale doc identity namespace before write" {
+test "docid focused provisioned table write source rejects stale doc identity namespace before write" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1101,7 +1101,7 @@ test "provisioned table write source backs up and restores a local table" {
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned table write source backs up a portable local table" {
+test "docid focused provisioned table write source backs up a portable local table" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup");
     defer alloc.free(path);
@@ -1195,7 +1195,7 @@ test "provisioned table write source backs up a portable local table" {
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned table restore rejects mismatched doc identity namespace" {
+test "docid focused provisioned table restore rejects mismatched doc identity namespace" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-docid-mismatch");
     defer alloc.free(path);
@@ -2402,7 +2402,7 @@ test "provisioned table write source routes batch writes across ranges" {
     try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
 }
 
-test "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
+test "docid focused provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-identity-rewrite-routing";
 
@@ -2560,7 +2560,7 @@ const ProvisionedWriteCoalesceBatchWorker = struct {
     }
 };
 
-test "provisioned table write source coalesces same-group waiters" {
+test "docid focused provisioned table write source coalesces same-group waiters" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-waiters");
     defer alloc.free(path);
@@ -2617,7 +2617,7 @@ test "provisioned table write source coalesces same-group waiters" {
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
 }
 
-test "provisioned table write coalescer isolates failed waiters" {
+test "docid focused provisioned table write coalescer isolates failed waiters" {
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-failure-isolation");
     defer alloc.free(path);
@@ -5225,7 +5225,7 @@ test "provisioned table write source restore repair completion retires cached ve
     try std.testing.expectEqual(stats_before.miss_count + 1, stats_after.miss_count);
 }
 
-test "provisioned restore repair open rejects stale doc identity namespace" {
+test "docid focused provisioned restore repair open rejects stale doc identity namespace" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -5462,7 +5462,7 @@ test "provisioned replicated sync marks local runtime status dirty" {
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 }
 
-test "provisioned table write source consistent visibility hook does not block on busy apply lock" {
+test "docid focused provisioned table write source consistent visibility hook does not block on busy apply lock" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -5512,7 +5512,7 @@ test "provisioned table write source consistent visibility hook does not block o
     try std.testing.expect(published == null);
 }
 
-test "provisioned table write source consistent visibility refreshes stale dense status" {
+test "docid focused provisioned table write source consistent visibility refreshes stale dense status" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -6814,7 +6814,7 @@ test "provisioned table write source maintenance probes are best effort when loc
     try std.testing.expect(!try source.runLsmMaintenanceRoundBestEffort());
 }
 
-test "provisioned foreign key action job drains owner range page" {
+test "docid focused provisioned foreign key action job drains owner range page" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-fk-action-job-owner-range";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -6929,7 +6929,7 @@ test "provisioned foreign key action job drains owner range page" {
     try std.testing.expectEqualStrings("{\"status\":\"open\"}", child);
 }
 
-test "provisioned same-table foreign key action job routes runtime parent through catalog owner range" {
+test "docid focused provisioned same-table foreign key action job routes runtime parent through catalog owner range" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-fk-action-job-same-table-owner-range";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -7463,7 +7463,7 @@ test "provisioned table write source group batch does not hold local db mutex du
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
 }
 
-test "provisioned table write source drop table does not hold local db mutex during background delete" {
+test "docid focused provisioned table write source drop table does not hold local db mutex during background delete" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -7550,7 +7550,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path, .{}));
 }
 
-test "provisioned table write source drop table waits for in-flight group batch on same table" {
+test "docid focused provisioned table write source drop table waits for in-flight group batch on same table" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -8599,7 +8599,7 @@ test "write cache adopts just-created db across reconcile generation bump" {
     try std.testing.expect(write_cache.hit_count.load(.monotonic) > 0);
 }
 
-test "primary lookup adopts seeded write cache across visible generation bump" {
+test "docid focused primary lookup adopts seeded write cache across visible generation bump" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

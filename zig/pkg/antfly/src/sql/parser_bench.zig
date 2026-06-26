@@ -164,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
         \\throughput tokens_per_second={d:.2} statements_per_second={d:.2}
         \\allocation bytes_per_statement={d:.2} peak_live_bytes={}
         \\generated_table states={} actions={} gotos={} rules={} productions={} rhs={} state_items={} static_bytes={} symbol_name_bytes={} estimated_bytes={}
+        \\generated_table_entry_bytes action={} goto={} range={}
         \\generated_table_rows action_max={} action_avg={d:.2} goto_max={} goto_avg={d:.2}
         \\
     , .{
@@ -191,6 +192,9 @@ pub fn main(init: std.process.Init) !void {
         generated.parse_table_static_bytes,
         generated.symbol_name_bytes,
         generated.parse_table_estimated_bytes,
+        @sizeOf(generated.Action),
+        @sizeOf(generated.Goto),
+        @sizeOf(generated.TableRange),
         action_range_stats.max,
         action_range_stats.avg,
         goto_range_stats.max,

@@ -8489,6 +8489,11 @@ pub fn Impl(comptime DB: type) type {
             if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
         }
 
+        pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+            try finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
+            try beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
+        }
+
         pub fn finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
             try flushBulkIngestCoalescerWithSyncLevel(self, .write, null);
             var external_session_tracked = true;
@@ -8519,6 +8524,11 @@ pub fn Impl(comptime DB: type) type {
                 );
             }
             if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+        }
+
+        pub fn rollDenseAutoBulkIngestSessionWithOptionsAfterGate(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+            try finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
+            try beginDenseAutoBulkIngestSessionAfterGate(self);
         }
 
         pub fn abortDenseAutoBulkIngestSession(self: *DB) void {

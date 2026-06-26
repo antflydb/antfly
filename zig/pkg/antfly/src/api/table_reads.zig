@@ -228,6 +228,8 @@ pub const ProvisionedTableReadCache = table_read_cache.ProvisionedTableReadCache
 const openProvisionedQueryDbForTable = table_read_cache.openProvisionedQueryDbForTable;
 const openProvisionedQueryDbForTableWithRuntime = table_read_cache.openProvisionedQueryDbForTableWithRuntime;
 const openProvisionedQueryDbForTableWithCache = table_read_cache.openProvisionedQueryDbForTableWithCache;
+const openProvisionedWarmStatusDbForTable = table_read_cache.openProvisionedWarmStatusDbForTable;
+const openProvisionedLookupDbForTable = table_read_cache.openProvisionedLookupDbForTable;
 const loadTableIndexesJson = table_read_cache.loadTableIndexesJson;
 const loadTableIdentityNamespaceForGroup = table_read_cache.loadTableIdentityNamespaceForGroup;
 const validateProvisionedDbIdentityNamespace = table_read_cache.validateProvisionedDbIdentityNamespace;
@@ -4944,48 +4946,6 @@ fn queryHostedLocalDetailed(
     };
 }
 
-fn openProvisionedWarmStatusDbForTable(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    lsm_root_generation: u64,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    identity_namespace: ?db_mod.DocIdentityNamespace,
-) !db_mod.DB {
-    var db = try db_mod.DB.open(alloc, path, .{
-        .open_mode = .status_only,
-        .lsm_root_generation = lsm_root_generation,
-        .backend_runtime = backend_runtime,
-        .identity_namespace = identity_namespace,
-        .prefer_existing_identity_namespace = identity_namespace != null,
-    });
-    errdefer db.close();
-    try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
-    return db;
-}
-
-fn openProvisionedLookupDbForTable(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    lsm_cache: ?*lsm_backend.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    identity_namespace: ?db_mod.DocIdentityNamespace,
-) !db_mod.DB {
-    var db = try db_mod.DB.open(alloc, path, .{
-        .open_mode = .status_only,
-        .lsm_cache = lsm_cache,
-        .lsm_root_generation = lsm_root_generation,
-        .resource_manager = resource_manager,
-        .backend_runtime = backend_runtime,
-        .identity_namespace = identity_namespace,
-        .prefer_existing_identity_namespace = identity_namespace != null,
-    });
-    errdefer db.close();
-    try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
-    return db;
-}
-
 fn applyAggregationResults(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
@@ -6171,7 +6131,7 @@ fn queryRemote(
     );
 }
 
-test "routed rows query plan executes over scanned owner rows with ctes" {
+test "docid focused routed rows query plan executes over scanned owner rows with ctes" {
     const alloc = std.testing.allocator;
 
     var columns = [_]storage_schema.RelationalColumn{
@@ -6522,7 +6482,7 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "oversized", schema, .{}, .read_index));
 }
 
-test "external lake rows query and aggregate plans route through lake scan hook" {
+test "docid focused external lake rows query and aggregate plans route through lake scan hook" {
     const alloc = std.testing.allocator;
 
     var columns = [_]storage_schema.RelationalColumn{
@@ -7378,7 +7338,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqualStrings("{\"count_all\":1,\"sum_amount\":30}", cte_aggregate_result.rows[0]);
 }
 
-test "lowered sql cross-table read plans execute through routed scans" {
+test "docid focused lowered sql cross-table read plans execute through routed scans" {
     const alloc = std.testing.allocator;
     const orders_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -7554,7 +7514,7 @@ test "lowered sql cross-table read plans execute through routed scans" {
     }
 }
 
-test "lowered sql set operation plans preserve overlapping union all rows" {
+test "docid focused lowered sql set operation plans preserve overlapping union all rows" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -8297,7 +8257,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     );
 }
 
-test "lowered document sql read plans execute native lookup and bounded scan" {
+test "docid focused lowered document sql read plans execute native lookup and bounded scan" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-document-sql-read";
 
@@ -8805,7 +8765,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     }
 }
 
-test "document sql catalog read producers treat catalog misses as terminal" {
+test "docid focused document sql catalog read producers treat catalog misses as terminal" {
     const alloc = std.testing.allocator;
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
@@ -9051,7 +9011,7 @@ test "document sql catalog read producers treat catalog misses as terminal" {
     try std.testing.expectEqual(@as(usize, 0), scan_source.legacy_scan_calls);
 }
 
-test "lowered document sql aggregate executes native grouped avg materialization" {
+test "docid focused lowered document sql aggregate executes native grouped avg materialization" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-document-sql-grouped-avg";
 
@@ -9164,7 +9124,7 @@ test "lowered document sql aggregate executes native grouped avg materialization
     }
 }
 
-test "lowered document sql aggregate uses catalog target for non-default namespace materialization" {
+test "docid focused lowered document sql aggregate uses catalog target for non-default namespace materialization" {
     const alloc = std.testing.allocator;
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
@@ -9629,7 +9589,7 @@ test "provisioned table read source routes lookup and scan across ranges" {
     try std.testing.expectEqualStrings("zeta", rows[1].title);
 }
 
-test "provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
+test "docid focused provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
     const alloc = std.testing.allocator;
     const root = ".zig-cache/tmp/table-reads-ha-read-gate";
 
@@ -11212,7 +11172,7 @@ test "remote preflight rejects resolved doc filters before query encoding" {
     try std.testing.expectEqual(@as(usize, 0), state.calls);
 }
 
-test "explicit text stats requests preserve identity generation" {
+test "docid focused explicit text stats requests preserve identity generation" {
     const alloc = std.testing.allocator;
 
     var terms = [_][]const u8{"alpha"};
@@ -11314,7 +11274,7 @@ test "explicit text stats requests preserve identity generation" {
     try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(alloc, "docs", mismatched_envelope_generation));
 }
 
-test "explicit text stats requests carry resolved doc filters and apply exact projection" {
+test "docid focused explicit text stats requests carry resolved doc filters and apply exact projection" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-text-stats-resolved-doc-filter";
 
@@ -11401,7 +11361,7 @@ test "explicit text stats requests carry resolved doc filters and apply exact pr
     try std.testing.expectEqual(@as(u32, 0), gamma_bg);
 }
 
-test "explicit text stats requests reject stale identity generation" {
+test "docid focused explicit text stats requests reject stale identity generation" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-text-stats-stale-identity-generation";
 
@@ -11658,7 +11618,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
     try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[1].aggregations[1].value_json.?);
 }
 
-test "algebraic partial request fails closed when lifecycle is stale" {
+test "docid focused algebraic partial request fails closed when lifecycle is stale" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-algebraic-partials-stale-lifecycle";
 
@@ -11706,7 +11666,7 @@ test "algebraic partial request fails closed when lifecycle is stale" {
     try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
 }
 
-test "algebraic partial request accepts current identity generation and rejects stale" {
+test "docid focused algebraic partial request accepts current identity generation and rejects stale" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-algebraic-partials-stale-identity-generation";
 
@@ -14552,102 +14512,6 @@ test "hosted cross-range graph metric fan-in rejects unpublished or incompatible
     try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", metric_req, .read_index));
 }
 
-test "provisioned lookup db opens with identity namespace" {
-    const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-lookup-identity-namespace";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    const namespace: db_mod.DocIdentityNamespace = .{
-        .table_id = 7,
-        .shard_id = 7001,
-        .range_id = 7103,
-    };
-    var db = try openProvisionedLookupDbForTable(alloc, path, null, backend_current_root_generation, null, null, namespace);
-    defer db.close();
-
-    try std.testing.expect(db.core.identity_namespace.eql(namespace));
-}
-
-test "provisioned warm status db opens with identity namespace" {
-    const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-warm-status-identity-namespace";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    const namespace: db_mod.DocIdentityNamespace = .{
-        .table_id = 7,
-        .shard_id = 7001,
-        .range_id = 7104,
-    };
-    var db = try openProvisionedWarmStatusDbForTable(alloc, path, backend_current_root_generation, null, namespace);
-    defer db.close();
-
-    try std.testing.expect(db.core.identity_namespace.eql(namespace));
-}
-
-test "provisioned direct read db opens reject stale identity namespace" {
-    const alloc = std.testing.allocator;
-    const lookup_path = "/tmp/antfly-api-provisioned-lookup-stale-identity-namespace";
-    const status_path = "/tmp/antfly-api-provisioned-status-stale-identity-namespace";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), lookup_path) catch {};
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), status_path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), lookup_path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), status_path) catch {};
-
-    const stale_namespace: db_mod.DocIdentityNamespace = .{
-        .table_id = 7,
-        .shard_id = 7001,
-        .range_id = 7198,
-    };
-    const expected_namespace: db_mod.DocIdentityNamespace = .{
-        .table_id = 7,
-        .shard_id = 7001,
-        .range_id = 7199,
-    };
-
-    {
-        var db = try db_mod.DB.open(alloc, lookup_path, .{
-            .start_index_workers = false,
-            .identity_namespace = stale_namespace,
-        });
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
-        });
-        db.close();
-    }
-    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, backend_current_root_generation, null, null, expected_namespace)) |opened| {
-        var db = opened;
-        db.close();
-        return error.TestExpectedError;
-    } else |err| try std.testing.expectEqual(error.DocIdentityNamespaceMismatch, err);
-
-    {
-        var db = try db_mod.DB.open(alloc, status_path, .{
-            .start_index_workers = false,
-            .identity_namespace = stale_namespace,
-        });
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
-        });
-        db.close();
-    }
-    if (openProvisionedWarmStatusDbForTable(alloc, status_path, backend_current_root_generation, null, expected_namespace)) |opened| {
-        var db = opened;
-        db.close();
-        return error.TestExpectedError;
-    } else |err| try std.testing.expectEqual(error.DocIdentityNamespaceMismatch, err);
-}
-
 test "provisioned primary lookup lease fails on identity namespace mismatch" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-primary-lookup-identity-mismatch";
@@ -14746,193 +14610,4 @@ test "provisioned primary lookup lease fails on identity namespace mismatch" {
         .{},
         .stale,
     ));
-}
-
-test "relational unique owner lookup requires one active owner range" {
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "users",
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{
-                    .{
-                        .table_id = 7,
-                        .constraint_name = "users_email_key",
-                        .start_encoded_value = "",
-                        .end_encoded_value = "m",
-                        .group_id = 7101,
-                    },
-                    .{
-                        .table_id = 7,
-                        .constraint_name = "users_email_key",
-                        .start_encoded_value = "m",
-                        .end_encoded_value = null,
-                        .group_id = 7102,
-                    },
-                    .{
-                        .table_id = 7,
-                        .constraint_name = "users_phone_key",
-                        .start_encoded_value = "",
-                        .end_encoded_value = null,
-                        .group_id = 7201,
-                        .state = metadata_table_manager.unique_constraint_range_rebuilding,
-                    },
-                    .{
-                        .table_id = 7,
-                        .constraint_name = "users_handle_key",
-                        .start_encoded_value = "",
-                        .end_encoded_value = null,
-                        .group_id = 7202,
-                        .state = metadata_table_manager.unique_constraint_range_splitting,
-                    },
-                    .{
-                        .table_id = 7,
-                        .constraint_name = "users_username_key",
-                        .start_encoded_value = "",
-                        .end_encoded_value = null,
-                        .group_id = 7203,
-                        .state = metadata_table_manager.unique_constraint_range_merging,
-                    },
-                })[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    try std.testing.expectEqual(@as(u64, 7101), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "a"));
-    try std.testing.expectEqual(@as(u64, 7102), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "z"));
-    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_phone_key", "p"));
-    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_handle_key", "h"));
-    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_username_key", "u"));
-    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "a"));
-}
-
-test "hosted remote temporal unique owner lookup resolves point interval" {
-    const alloc = std.testing.allocator;
-    const column = storage_schema.RelationalColumn{
-        .name = "valid_at",
-        .path = "valid_at",
-        .field_type = .numeric,
-    };
-    const point_15 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "15", column);
-    defer alloc.free(point_15);
-    const start_12 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "12", column);
-    defer alloc.free(start_12);
-    const end_18 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "18", column);
-    defer alloc.free(end_18);
-
-    const ExecutorState = struct {
-        point_15: []const u8,
-        start_12: []const u8,
-        end_18: []const u8,
-        point_calls: usize = 0,
-        overlap_calls: usize = 0,
-
-        fn iface(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-owner") and req.method == .POST) {
-                var parsed = try std.json.parseFromSlice(struct {
-                    constraint_name: []const u8,
-                    encoded_value: []const u8,
-                    encoded_point: []const u8,
-                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
-                defer parsed.deinit();
-                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
-                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
-                try std.testing.expectEqualStrings(self.point_15, parsed.value.encoded_point);
-                self.point_calls += 1;
-                return .{
-                    .status = 200,
-                    .content_type = try alloc_inner.dupe(u8, "application/json"),
-                    .body = try std.fmt.allocPrint(
-                        alloc_inner,
-                        "{{\"owner_key\":{f}}}",
-                        .{std.json.fmt("price:a:v2", .{})},
-                    ),
-                };
-            }
-            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-overlap-owner") and req.method == .POST) {
-                var parsed = try std.json.parseFromSlice(struct {
-                    constraint_name: []const u8,
-                    encoded_value: []const u8,
-                    encoded_start: []const u8,
-                    encoded_end: []const u8,
-                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
-                defer parsed.deinit();
-                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
-                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
-                try std.testing.expectEqualStrings(self.start_12, parsed.value.encoded_start);
-                try std.testing.expectEqualStrings(self.end_18, parsed.value.encoded_end);
-                self.overlap_calls += 1;
-                return .{
-                    .status = 200,
-                    .content_type = try alloc_inner.dupe(u8, "application/json"),
-                    .body = try std.fmt.allocPrint(
-                        alloc_inner,
-                        "{{\"owner_key\":{f}}}",
-                        .{std.json.fmt("price:a:v2", .{})},
-                    ),
-                };
-            }
-            return error.UnexpectedHttpRequest;
-        }
-    };
-
-    var executor = ExecutorState{ .point_15 = point_15, .start_12 = start_12, .end_18 = end_18 };
-    const owner = (try lookupRelationalTemporalUniqueOwnerRemote(
-        executor.iface(),
-        alloc,
-        "http://remote.test",
-        7102,
-        "prices",
-        "prices_sku_valid_time_key",
-        "sku:a",
-        point_15,
-    )).?;
-    defer alloc.free(owner);
-
-    try std.testing.expectEqualStrings("price:a:v2", owner);
-    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
-    try std.testing.expectEqual(@as(usize, 0), executor.overlap_calls);
-
-    const overlap_owner = (try lookupRelationalTemporalUniqueOverlapOwnerRemote(
-        executor.iface(),
-        alloc,
-        "http://remote.test",
-        7102,
-        "prices",
-        "prices_sku_valid_time_key",
-        "sku:a",
-        start_12,
-        end_18,
-    )).?;
-    defer alloc.free(overlap_owner);
-
-    try std.testing.expectEqualStrings("price:a:v2", overlap_owner);
-    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
-    try std.testing.expectEqual(@as(usize, 1), executor.overlap_calls);
 }
