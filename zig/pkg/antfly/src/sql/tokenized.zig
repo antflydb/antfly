@@ -311,11 +311,27 @@ fn parseGeneratedRawStatementAlloc(
     const result = if (allowsGeneratedGrammarFallback(tokens, raw_statement))
         try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens)
     else
-        try generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens);
+        generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
+            error.UnsupportedSqlShape, error.UnexpectedToken => {
+                if (generatedStrictParseFailureShouldPropagate(tokens, raw_statement)) return err;
+                return null;
+            },
+            else => return err,
+        };
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
     return null;
+}
+
+fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return true;
+    if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
+    if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
+    return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
+        isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
+        isIncompleteGeneratedReadBoundary(tokens, raw_statement) or
+        isIncompleteGeneratedUnsupportedBoundary(tokens, raw_statement);
 }
 
 fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -362,6 +378,7 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
+    if (isPreparedTransactionStatement(tokens, raw_statement)) return false;
     const first = tokens[start];
     if (tokenMatchesKeyword(first, .set)) {
         if (start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction")) return true;
@@ -588,10 +605,22 @@ fn isGeneratedPreparedStatementHead(tokens: []const Token, raw_statement: RawSql
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
+    if (isPreparedTransactionStatement(tokens, raw_statement)) return false;
     const first = tokens[start];
     return tokenMatchesKeyword(first, .prepare) or
         tokenMatchesKeyword(first, .execute) or
         tokenMatchesKeyword(first, .deallocate);
+}
+
+fn isPreparedTransactionStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    const second = tokens[start + 1];
+    return (tokenMatchesKeyword(first, .prepare) and tokenMatchesText(second, "transaction")) or
+        (tokenMatchesKeyword(first, .commit) and tokenMatchesText(second, "prepared")) or
+        (tokenMatchesKeyword(first, .rollback) and tokenMatchesText(second, "prepared"));
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -1263,7 +1292,7 @@ fn parseStatement(
             else
                 return .{ .unknown = raw_statement },
             .cursor => |kind| if (generatedCursorAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
-                return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } }
+                return .{ .ddl = .{ .raw = raw_statement } }
             else
                 return .{ .unknown = raw_statement },
             .unsupported => |kind| {
@@ -1769,14 +1798,6 @@ fn generatedUnsupportedOptionalTokenRangeIsValid(
 ) bool {
     if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
     return true;
-}
-
-fn generatedCursorUnsupportedKind(kind: generated_parser.GeneratedSqlCursorKind) generated_parser.GeneratedSqlUnsupportedKind {
-    return switch (kind) {
-        .declare => .declare,
-        .fetch => .fetch,
-        .close => .close,
-    };
 }
 
 const GeneratedDmlStatementKind = struct {
@@ -2744,7 +2765,6 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .insert_overriding_value,
         .import_foreign_schema,
         .load,
-        .move,
         .reassign_owned,
         .role_session_control,
         .security_label,
@@ -3913,11 +3933,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .lock_not_planned_by_generated_parser,
         },
         .{
-            .sql = "MOVE FROM usage_cursor",
-            .kind = .move,
-            .reason = .move_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "NOTIFY usage_events, 'changed'",
             .kind = .notify,
             .reason = .notify_not_planned_by_generated_parser,
@@ -4185,6 +4200,21 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var move_cursor = try ParsedSql.initAlloc(alloc, "MOVE FORWARD 10 IN usage_cursor");
+    defer move_cursor.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.cursor, move_cursor.generatedStatementKind().?);
+    switch (move_cursor.generated_statement.?.ast.?) {
+        .cursor => |generated_cursor| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlCursorKind.move, generated_cursor.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 5 }, generated_cursor.tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (move_cursor.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var session_characteristics = try ParsedSql.initAlloc(alloc, "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE");
     defer session_characteristics.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, session_characteristics.generatedStatementKind().?);
@@ -4206,6 +4236,30 @@ test "sql adapter parsed sql owns typed statement variants" {
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared, deallocate_prepare.generatedStatementKind().?);
     switch (deallocate_prepare.statement) {
         .prepared => |statement| try std.testing.expectEqualStrings("DEALLOCATE PREPARE read_stmt", statement.raw.sql(deallocate_prepare.sql())),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var prepare_transaction = try ParsedSql.initAlloc(alloc, "PREPARE TRANSACTION 'usage_batch'");
+    defer prepare_transaction.deinit(alloc);
+    try std.testing.expect(prepare_transaction.generatedStatementKind() == null);
+    switch (prepare_transaction.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var commit_prepared = try ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch'");
+    defer commit_prepared.deinit(alloc);
+    try std.testing.expect(commit_prepared.generatedStatementKind() == null);
+    switch (commit_prepared.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rollback_prepared = try ParsedSql.initAlloc(alloc, "ROLLBACK PREPARED 'usage_batch'");
+    defer rollback_prepared.deinit(alloc);
+    try std.testing.expect(rollback_prepared.generatedStatementKind() == null);
+    switch (rollback_prepared.statement) {
+        .ddl => {},
         else => return error.TestUnexpectedResult,
     }
 

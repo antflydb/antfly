@@ -594,6 +594,9 @@ pub fn parseDdlPlanAlloc(
     if (cursor.matchKeyword("fetch")) {
         return .{ .cursor_portal = .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
     }
+    if (cursor.matchKeyword("move")) {
+        return .{ .cursor_portal = .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
+    }
     if (cursor.matchKeyword("close")) {
         return .{ .cursor_portal = .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens, pos) } };
     }
@@ -1676,12 +1679,14 @@ pub const DeallocatePreparedStatementPlan = struct {
 pub const CursorPortalPlan = union(enum) {
     declare: DeclareCursorPortalPlan,
     fetch: FetchCursorPortalPlan,
+    move: FetchCursorPortalPlan,
     close: CloseCursorPortalPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .declare => |*plan| plan.deinit(alloc),
             .fetch => |*plan| plan.deinit(alloc),
+            .move => |*plan| plan.deinit(alloc),
             .close => |*plan| plan.deinit(alloc),
         }
         self.* = undefined;
@@ -3059,6 +3064,7 @@ pub fn cursorPortalPlanFromGeneratedAstAlloc(
     var plan: LoweredDdlPlan = switch (ast.kind) {
         .declare => .{ .cursor_portal = .{ .declare = try parseDeclareCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
         .fetch => .{ .cursor_portal = .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
+        .move => .{ .cursor_portal = .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
         .close => .{ .cursor_portal = .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) } },
     };
     errdefer plan.deinit(alloc);
@@ -3077,6 +3083,7 @@ fn validateGeneratedCursorAstSpans(
     switch (ast.kind) {
         .declare => if (!tokens[0].matchesKeywordTag(.declare)) return error.UnsupportedSqlShape,
         .fetch => if (!tokens[0].matchesKeywordTag(.fetch)) return error.UnsupportedSqlShape,
+        .move => if (!tokens[0].matchesKeywordTag(.move)) return error.UnsupportedSqlShape,
         .close => if (!tokens[0].matchesKeywordTag(.close)) return error.UnsupportedSqlShape,
     }
     const tail = ast.tail_tokens orelse return error.UnsupportedSqlShape;
@@ -11074,7 +11081,6 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .listen => .listen_not_planned_by_generated_parser,
         .load => .load_not_planned_by_generated_parser,
         .lock => .lock_not_planned_by_generated_parser,
-        .move => .move_not_planned_by_generated_parser,
         .notify => .notify_not_planned_by_generated_parser,
         .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
         .reindex => .reindex_not_planned_by_generated_parser,
@@ -17145,6 +17151,31 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
         }
     }
 
+    const move_cases = [_]struct {
+        sql: []const u8,
+        direction: CursorFetchDirection,
+        count: ?i64 = null,
+    }{
+        .{ .sql = "MOVE NEXT FROM usage_cursor;", .direction = .next },
+        .{ .sql = "MOVE FORWARD 10 IN usage_cursor;", .direction = .forward, .count = 10 },
+        .{ .sql = "MOVE usage_cursor;", .direction = .next },
+    };
+    for (move_cases) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .cursor_portal => |plan| switch (plan) {
+                .move => |move| {
+                    try std.testing.expectEqualStrings("usage_cursor", move.portal_name);
+                    try std.testing.expectEqual(case.direction, move.direction);
+                    try std.testing.expectEqual(case.count, move.count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
     var close_cursor = try lowerDdlPlanForTestAlloc(alloc, "CLOSE usage_cursor;");
     defer close_cursor.deinit(alloc);
     switch (close_cursor) {
@@ -18401,6 +18432,25 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
                 try std.testing.expectEqualStrings("usage_cursor", fetch.portal_name);
                 try std.testing.expectEqual(CursorFetchDirection.forward, fetch.direction);
                 try std.testing.expectEqual(@as(?i64, 10), fetch.count);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var move_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MOVE FORWARD 10 IN usage_cursor;",
+    );
+    defer move_sql.deinit(alloc);
+    var move_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &move_sql);
+    defer move_plan.deinit(alloc);
+    switch (move_plan) {
+        .cursor_portal => |cursor| switch (cursor) {
+            .move => |move| {
+                try std.testing.expectEqualStrings("usage_cursor", move.portal_name);
+                try std.testing.expectEqual(CursorFetchDirection.forward, move.direction);
+                try std.testing.expectEqual(@as(?i64, 10), move.count);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -21476,6 +21526,13 @@ test "SQL adapter DDL prepared statement and cursor plans own strings" {
         .count = 10,
     } };
     fetch.deinit(alloc);
+
+    var move: CursorPortalPlan = .{ .move = .{
+        .portal_name = try alloc.dupe(u8, "usage_cursor"),
+        .direction = .forward,
+        .count = 10,
+    } };
+    move.deinit(alloc);
 
     var close: CursorPortalPlan = .{ .close = .{
         .portal_name = try alloc.dupe(u8, "usage_cursor"),

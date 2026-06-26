@@ -581,6 +581,11 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
                 try expectOptionalTableName(summary.table_name, fetch.portal_name);
                 if (fetch.count) |count| try expectOptionalUsize(summary.operations, @intCast(count));
             },
+            .move => |move| {
+                try std.testing.expectEqual(AppParityDdlTag.fetch_cursor, expected);
+                try expectOptionalTableName(summary.table_name, move.portal_name);
+                if (move.count) |count| try expectOptionalUsize(summary.operations, @intCast(count));
+            },
             .close => |close| {
                 try std.testing.expectEqual(AppParityDdlTag.close_cursor, expected);
                 if (close.portal_name) |portal| {

@@ -475,8 +475,7 @@ maintenance `VACUUM`/`REINDEX`, ownership and system administration statements
 such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `DROP OWNED`, and `REASSIGN OWNED`, utility/control statements such as
 `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
-`CHECKPOINT`, `LOAD`, `SECURITY LABEL`, and `UNLISTEN`, plus
-the remaining unsupported cursor movement command `MOVE`, plus common PostgreSQL extension
+`CHECKPOINT`, `LOAD`, `SECURITY LABEL`, and `UNLISTEN`, plus common PostgreSQL extension
 catalog families for conversions, event triggers, extended statistics,
 operator/aggregate ALTER forms, operator class/family objects, and text-search
 configuration/dictionary/parser/template objects, plus simple `EXPLAIN` forms
@@ -550,14 +549,16 @@ Those cursor heads now require generated parser success at SQL ingress so
 incomplete cursor commands fail closed instead of falling back to the legacy
 DDL-like command adapter. Parsed-statement classification validates retained
 cursor AST kind, statement/command spans, and tail ranges before publishing
-cursor-backed unsupported statements for typed cursor planning.
+cursor statements into typed cursor portal planning. `MOVE` uses the same
+direction/count/name tail parser as `FETCH` but lowers to a distinct cursor
+portal plan variant so runtime code can preserve PostgreSQL cursor movement
+semantics separately from row-producing fetches.
 Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
 `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
 savepoint planning. Savepoint heads and rollback-to/release prefixes now pass
 through the same generated LR parse gate as the rest of the transaction family
 and require generated parser success at SQL ingress, including malformed or
-incomplete savepoint-name tails. `MOVE` remains an unsupported generated
-diagnostic because there is no typed cursor plan for it yet. Bulk I/O commands use the validated
+incomplete savepoint-name tails. Bulk I/O commands use the validated
 unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
@@ -1275,12 +1276,12 @@ variants for:
   graph-metric rerank search request and materializing reranked hits through
   the existing graph table-function row schema
 - cursor statement, including generated AST payloads for command spans and
-  typed tail token ranges for `DECLARE`, `FETCH`, and `CLOSE`, plus
+  typed tail token ranges for `DECLARE`, `FETCH`, `MOVE`, and `CLOSE`, plus
   generated-first AST-to-plan lowering into typed cursor portal plans
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`,
-  `SECURITY LABEL`, `UNLISTEN`, `MOVE`,
+  `SECURITY LABEL`, `UNLISTEN`,
   `ALTER MATERIALIZED VIEW`, foreign table,
   foreign data wrapper, foreign schema import, user mapping, language,
   unsupported routine/language/transform DDL, large-object administration,
@@ -1336,7 +1337,7 @@ Generated grammar work needs evidence at multiple levels:
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
   `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `DISCARD`, `LOAD`,
   role session controls,
-  `SECURITY LABEL`, `UNLISTEN`, cursor command `MOVE`, PostgreSQL foreign-data
+  `SECURITY LABEL`, `UNLISTEN`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, schema imports, servers, and user
   mappings, plus language, unsupported routine/language/transform DDL,
   large-object administration, rule, trigger, conversion, event-trigger, extended

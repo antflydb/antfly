@@ -1022,6 +1022,18 @@ pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![
                     "ddl:fetch_cursor:portal={s}:direction={s}",
                     .{ fetch.portal_name, @tagName(fetch.direction) },
                 ),
+            .move => |move| if (move.count) |count|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:move_cursor:portal={s}:direction={s}:count={d}",
+                    .{ move.portal_name, @tagName(move.direction), count },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:move_cursor:portal={s}:direction={s}",
+                    .{ move.portal_name, @tagName(move.direction) },
+                ),
             .close => |close| if (close.all)
                 try std.fmt.allocPrint(
                     alloc,

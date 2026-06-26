@@ -307,6 +307,15 @@ should call coarse helpers such as `addDBRootModuleTestSteps`,
 individual test titles. New tests should prefer stable module/category prefixes
 over one-off titles in build files.
 
+Use test-name prefixes as the fine-grained selection mechanism. DB tests should
+start with an owning category such as `db lifecycle`, `db write path`,
+`db schema runtime`, `db relational rows`, or `db search runtime`; split API
+table modules can be selected by their module path prefix, while remaining
+monolith tests should use suite prefixes such as `api.table_reads.docid`,
+`api.table_writes.docid`, and `api.table_writes.query_visibility`. Exact test
+title filters are for temporary local diagnosis, not long-lived build
+contracts.
+
 HA and Lite tests should be kept where they prove the boundary:
 
 - HA write-gate and mirror-helper tests stay with the HA helper module if one is

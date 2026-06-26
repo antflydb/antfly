@@ -62,6 +62,7 @@ pub const GeneratedSqlPreparedKind = enum {
 pub const GeneratedSqlCursorKind = enum {
     declare,
     fetch,
+    move,
     close,
 };
 
@@ -286,7 +287,6 @@ pub const GeneratedSqlUnsupportedKind = enum {
     listen,
     load,
     lock,
-    move,
     notify,
     reassign_owned,
     reindex,
@@ -408,7 +408,6 @@ pub const GeneratedSqlUnsupportedReason = enum {
     listen_not_planned_by_generated_parser,
     load_not_planned_by_generated_parser,
     lock_not_planned_by_generated_parser,
-    move_not_planned_by_generated_parser,
     notify_not_planned_by_generated_parser,
     reassign_owned_not_planned_by_generated_parser,
     reindex_not_planned_by_generated_parser,
@@ -1914,6 +1913,7 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DEALLOCATE ALL", .kind = .prepared },
     .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records", .kind = .cursor },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
+    .{ .sql = "MOVE FROM usage_cursor", .kind = .cursor },
     .{ .sql = "CLOSE usage_cursor", .kind = .cursor },
     .{ .sql = "CLOSE ALL", .kind = .cursor },
 };
@@ -2225,7 +2225,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
     .{ .sql = "LOAD 'auto_explain'", .kind = .unsupported },
     .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
-    .{ .sql = "MOVE FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
@@ -2679,6 +2678,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.close)) return .{ .cursor = .close };
     if (first.matchesKeywordTag(.declare)) return .{ .cursor = .declare };
     if (first.matchesKeywordTag(.fetch)) return .{ .cursor = .fetch };
+    if (first.matchesKeywordTag(.move)) return .{ .cursor = .move };
     if (first.matchesKeywordTag(.create) and tokens.len > 1) {
         if (generatedCreateTableAsTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .relation_population };
         if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
@@ -2933,7 +2933,6 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.listen)) return .{ .unsupported = .listen };
     if (first.matchesKeywordTag(.load)) return .{ .unsupported = .load };
     if (first.matchesKeywordTag(.lock)) return .{ .unsupported = .lock };
-    if (first.matchesKeywordTag(.move)) return .{ .unsupported = .move };
     if (first.matchesKeywordTag(.notify)) return .{ .unsupported = .notify };
     if (first.matchesKeywordTag(.refresh) and tokens.len > 2 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
         return .{ .ddl = .refresh_materialized_view };
@@ -3211,7 +3210,6 @@ fn buildUnsupportedAst(
             .listen => .listen_not_planned_by_generated_parser,
             .load => .load_not_planned_by_generated_parser,
             .lock => .lock_not_planned_by_generated_parser,
-            .move => .move_not_planned_by_generated_parser,
             .notify => .notify_not_planned_by_generated_parser,
             .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
             .reindex => .reindex_not_planned_by_generated_parser,
@@ -7766,7 +7764,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .listen }, (try parseSqlAlloc(alloc, "LISTEN usage_events")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .load }, (try parseSqlAlloc(alloc, "LOAD 'auto_explain'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_statistics }, (try parseSqlAlloc(alloc, "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_configuration }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)")).statement);

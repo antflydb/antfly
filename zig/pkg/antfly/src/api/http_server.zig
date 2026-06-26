@@ -4356,6 +4356,7 @@ pub const ApiHttpServer = struct {
             .cursor_portal => |cursor| switch (cursor) {
                 .declare => |declare| declare.statement_kind == .read,
                 .fetch,
+                .move,
                 .close,
                 => true,
             },

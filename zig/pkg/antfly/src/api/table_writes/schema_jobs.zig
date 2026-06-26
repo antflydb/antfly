@@ -453,17 +453,15 @@ pub fn runSchemaRewriteWorkerPassForCatalog(
 
 test "secondary index rebuild worker helper claims repairs and finishes range" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-secondary-index-rebuild-worker";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secondary-index-rebuild-worker", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var db = try db_mod.DB.open(alloc, path, .{});
-    defer {
-        db.close();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    }
+    defer db.close();
 
     const building_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
