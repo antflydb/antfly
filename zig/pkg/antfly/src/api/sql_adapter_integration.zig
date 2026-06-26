@@ -21,6 +21,7 @@ const sql_adapter_runtime = @import("../sql/runtime.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
+const sql_catalog_apply = @import("../sql/catalog_apply.zig");
 const ddl_plan = @import("../sql/ddl_plan.zig");
 const table_catalog = @import("table_catalog.zig");
 const transactions_mod = @import("../storage/transactions.zig");
@@ -2776,7 +2777,7 @@ const MergeExecutionTargetRow = sql_adapter.MergeExecutionTargetRow;
 
 const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32FingerprintAlloc;
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
-const applyLoweredDdlPlanToSchemaJsonForTestAlloc = sql_adapter.applyLoweredDdlPlanToSchemaJsonForTestAlloc;
+const applyLoweredDdlPlanToSchemaJsonForTestAlloc = sql_catalog_apply.applyLoweredDdlPlanToSchemaJsonForTestAlloc;
 const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
 const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbAcrossRangesAlloc;
 const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
@@ -6124,6 +6125,13 @@ fn lowerWritePlanForSqlAdapterEdgeCaseAlloc(
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{ .unique_resolver = resolver });
 }
 
+fn planDdlLogicalPlanParsedSqlAllocForEdgeCase(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !sql_adapter.LogicalSqlPlan {
+    return try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+}
+
 test "postgres sql adapter rejects data-driven application edge cases explicitly" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -6149,7 +6157,7 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
         .lower_update = lowerUpdateParsedSqlAlloc,
         .lower_delete = lowerDeleteParsedSqlAlloc,
         .lower_insert = lowerInsertWithResolverParsedSqlAlloc,
-        .lower_ddl = lowerDdlPlanParsedSqlAlloc,
+        .plan_ddl = planDdlLogicalPlanParsedSqlAllocForEdgeCase,
         .lower_write_plan = lowerWritePlanForSqlAdapterEdgeCaseAlloc,
     };
     for (root.cases) |edge_case| {

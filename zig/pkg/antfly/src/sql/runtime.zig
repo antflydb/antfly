@@ -596,8 +596,10 @@ pub const AppliedDdlRowRewritePlan = sql_adapter.AppliedDdlRowRewritePlan;
 pub const AppliedDdlRowRewriteRename = sql_adapter.AppliedDdlRowRewriteRename;
 pub const runtimeSchemaFromCreateTablePlanAlloc = sql_adapter.runtimeSchemaFromCreateTablePlanAlloc;
 pub const schemaJsonFromCreateTablePlanAlloc = sql_adapter.schemaJsonFromCreateTablePlanAlloc;
-pub const applyDdlPlanToRuntimeSchemaAlloc = sql_adapter.applyDdlPlanToRuntimeSchemaAlloc;
-pub const applyDdlPlanToSchemaJsonAlloc = sql_adapter.applyDdlPlanToSchemaJsonAlloc;
+pub const applyLogicalDdlPlanToRuntimeSchemaAlloc = sql_adapter.applyLogicalDdlPlanToRuntimeSchemaAlloc;
+pub const applyLogicalDdlPlanToSchemaJsonAlloc = sql_adapter.applyLogicalDdlPlanToSchemaJsonAlloc;
+pub const applyTableDdlPlanToRuntimeSchemaAlloc = sql_adapter.applyTableDdlPlanToRuntimeSchemaAlloc;
+pub const applyTableDdlPlanToSchemaJsonAlloc = sql_adapter.applyTableDdlPlanToSchemaJsonAlloc;
 pub const appliedDdlTableWorkItemsForFlagsAlloc = sql_adapter.appliedDdlTableWorkItemsForFlagsAlloc;
 
 pub const OwnedSqlCatalogSession = sql_adapter.OwnedSqlCatalogSession;

@@ -1485,26 +1485,20 @@ Status as of 2026-05-19:
   `resolved_set_delta=0`, and ordinal/public ratios around 0.84-0.88 across the
   real DB shapes. These benchmarks are now the first pass/fail evidence hooks
   for validating whether the compact ordinal machinery is still earning its
-  complexity as sparse-ID alternatives evolve. `scripts/run_docid_query_matrix.sh`
-  wraps that benchmark into timestamped evidence runs under
-  `bench/results/docid-query-matrix/`, preserving `environment.txt`,
-  `commands.txt`, `status.tsv`, per-case stdout/stderr/JSONL, a combined
-  `docid-query-matrix-combined.jsonl`, and a summary-only
-  `docid-query-matrix-summary.jsonl`. Set `DOCID_QUERY_MATRIX_SMOKE=1` for a
-  fast local matrix; the default non-smoke matrix is a bounded developer
-  evidence run, and larger release-scale runs should override the
-  `DOCID_QUERY_MATRIX_*` case sizes and `DOCID_QUERY_MATRIX_MAX_ORDINAL_RATIO`.
+  complexity as sparse-ID alternatives evolve. Use `zig build
+  docid-query-bench -- <args>` directly for evidence runs. Callers should
+  record environment, command lines, status, stdout/stderr, and JSONL summaries
+  in their run artifact directory instead of relying on a repo-local matrix
+  wrapper.
   `zig build docid-lifecycle-test` is now the durable focused hardening target
   for lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
-  and near-capacity boundary coverage. `scripts/run_docid_lifecycle_matrix.sh`
-  wraps that target, focused DB/storage checks, and the DOCID query matrix into
-  timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
-  defaults to smoke-sized query evidence and can be expanded with
-  `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
+  and near-capacity boundary coverage. Release evidence should compose `zig
+  build docid-lifecycle-test`, focused DB/storage checks, and explicit
+  `docid-query-bench` cases directly.
   Release-evidence runs should compose the focused lifecycle target, the
-  operational chaos buckets, the DOCID query matrix, current auth e2e checks,
-  and old/new binary compatibility smokes directly instead of adding another
-  one-off umbrella build step or wrapper script.
+  operational chaos buckets, explicit DOCID query benchmark cases, current auth
+  e2e checks, and old/new binary compatibility smokes directly instead of
+  adding another one-off umbrella build step or wrapper script.
   The scripted cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three
@@ -2079,15 +2073,13 @@ Status as of 2026-05-19:
   --query-shape hybrid-filter-exclude-project` profile, these changes moved the
   handler path from roughly 570ms before this pass to roughly 55ms while
   preserving the filled `k=20` correctness guardrail.
-  `scripts/run_docid_perf_matrix.sh` now captures a broader 100k public-query
-  evidence pass across full-text, dense-filter, sparse-filter, graph expansion,
-  algebraic-filter, and hybrid-composed shapes. The default wrapper no longer
-  requires symbolic dense profile rows because handler/local guardrail runs do
-  not currently expose dense/HBC profile counters for dense-filter or
-  hybrid-composed requests; set
-  `DOCID_PERF_MATRIX_REQUIRE_SYMBOLIC_PROFILE=1` only when using a route that is
-  expected to emit those profiles. A 100k handler-mode pass on this branch
-  showed query-side full-text is no longer the visible query bottleneck
+  Use `zig build public-query-guardrail -- <args>` directly for 100k
+  public-query evidence across full-text, dense-filter, sparse-filter, graph
+  expansion, algebraic-filter, and hybrid-composed shapes. Symbolic dense
+  profile requirements should be passed explicitly only when using a route that
+  is expected to emit dense/HBC profile counters for dense-filter or
+  hybrid-composed requests. A 100k handler-mode pass on this branch showed
+  query-side full-text is no longer the visible query bottleneck
   (`~15.6ms` DB, `~16.3ms` handler), dense-filter is fast through the public
   handler (`~22ms`, with direct DB-search still varying between `~43-107ms`),
   sparse-filter is about `~126-128ms`, algebraic-filter is still expensive

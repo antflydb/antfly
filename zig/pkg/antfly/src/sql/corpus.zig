@@ -20,6 +20,7 @@ const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const logical_ddl_plan = @import("logical_ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -7125,25 +7126,28 @@ const AppParitySetupSqlSummary = struct {
     partial_expression_unique_concat_ws: bool = false,
     partial_expression_unique_amount_inequality: bool = false,
 
-    fn observePlan(self: *@This(), plan: ddl_plan.LoweredDdlPlan) void {
+    fn observePlan(self: *@This(), plan: binder.LogicalSqlPlan) void {
         switch (plan) {
-            .create_table => |create| {
-                for (create.unique_constraints) |constraint| self.observeCreateTableUniqueConstraint(constraint);
-            },
-            .create_index => |create| self.observeCreateIndex(create),
-            .alter_table => |alter| {
-                for (alter.operations) |operation| switch (operation) {
-                    .add_unique_constraint => |constraint| self.observeAlterUniqueConstraint(constraint),
-                    .rename_constraint => |rename| {
-                        if (std.ascii.eqlIgnoreCase(rename.old_name, "usage_records_pkey") and
-                            std.ascii.eqlIgnoreCase(rename.new_name, "usage_records_id_pk"))
-                        {
-                            self.renamed_usage_records_primary_constraint = true;
-                        }
-                    },
-                    .validate_constraint => self.validated_constraint = true,
-                    else => {},
-                };
+            .table_ddl => |table_plan| switch (table_plan) {
+                .create_table => |create| {
+                    for (create.unique_constraints) |constraint| self.observeCreateTableUniqueConstraint(constraint);
+                },
+                .create_index => |create| self.observeCreateIndex(create),
+                .alter_table => |alter| {
+                    for (alter.operations) |operation| switch (operation) {
+                        .add_unique_constraint => |constraint| self.observeAlterUniqueConstraint(constraint),
+                        .rename_constraint => |rename| {
+                            if (std.ascii.eqlIgnoreCase(rename.old_name, "usage_records_pkey") and
+                                std.ascii.eqlIgnoreCase(rename.new_name, "usage_records_id_pk"))
+                            {
+                                self.renamed_usage_records_primary_constraint = true;
+                            }
+                        },
+                        .validate_constraint => self.validated_constraint = true,
+                        else => {},
+                    };
+                },
+                else => {},
             },
             else => {},
         }
@@ -7213,7 +7217,7 @@ fn appParitySetupSqlSummaryAlloc(alloc: std.mem.Allocator, setup_sql: []const []
     for (setup_sql) |sql| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var plan = try ddl_plan.lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+        var plan = try logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
         defer plan.deinit(alloc);
         summary.observePlan(plan);
     }

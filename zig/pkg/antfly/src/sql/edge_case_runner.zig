@@ -14,8 +14,8 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const corpus = @import("corpus.zig");
-const ddl_plan = @import("ddl_plan.zig");
 const plan = @import("plan.zig");
 const relational_rows = @import("../api/relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -50,10 +50,10 @@ pub const SqlAdapterEdgeCaseLoweringCallbacks = struct {
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
     ) anyerror!plan.LoweredInsert,
-    lower_ddl: *const fn (
+    plan_ddl: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
-    ) anyerror!ddl_plan.LoweredDdlPlan,
+    ) anyerror!binder.LogicalSqlPlan,
     lower_write_plan: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
@@ -178,17 +178,20 @@ fn expectSqlAdapterEdgeCaseDdl(
     parsed_sql: *const tokenized.ParsedSql,
     callbacks: SqlAdapterEdgeCaseLoweringCallbacks,
 ) !void {
-    var lowered = callbacks.lower_ddl(alloc, parsed_sql) catch |err| {
+    var logical = callbacks.plan_ddl(alloc, parsed_sql) catch |err| {
         try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
-    defer lowered.deinit(alloc);
+    defer logical.deinit(alloc);
     try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
     if (edge_case.expected_ddl_tag) |tag| switch (tag) {
-        .create_table => switch (lowered) {
-            .create_table => |create_table_plan| {
-                if (edge_case.expected_table) |table_name| try std.testing.expectEqualStrings(table_name, create_table_plan.table_name);
-                if (edge_case.expected_if_not_exists) |if_not_exists| try std.testing.expectEqual(if_not_exists, create_table_plan.if_not_exists);
+        .create_table => switch (logical) {
+            .table_ddl => |table_plan| switch (table_plan) {
+                .create_table => |create_table_plan| {
+                    if (edge_case.expected_table) |table_name| try std.testing.expectEqualStrings(table_name, create_table_plan.table_name);
+                    if (edge_case.expected_if_not_exists) |if_not_exists| try std.testing.expectEqual(if_not_exists, create_table_plan.if_not_exists);
+                },
+                else => return error.TestUnexpectedResult,
             },
             else => return error.TestUnexpectedResult,
         },

@@ -3782,16 +3782,16 @@ pub fn parseWhereAlloc(
     }
     while (true) {
         if (canParseScalarNotWhere(tokens, pos.*)) {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseScalarNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, not_predicates, realtime_ns, generated_condition_expression);
         } else if (canParseExpressionNotWhere(tokens, pos.*)) {
             try parseExpressionNotWhereWithGeneratedAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_not_predicates, expression_alternatives_hooks, generated_expression_ast);
         } else if (canParseAccessNotWhere(tokens, pos.*)) {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseAccessNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_not_predicates, realtime_ns, generated_condition_expression);
         } else if (peekStringToArrayFunctionCall(tokens, pos.*)) {
             if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
-                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast), .contains);
+                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -3832,7 +3832,7 @@ pub fn parseWhereAlloc(
             defer_row_expression_field_validation,
         )) {
             var expression_condition_hooks_with_generated = expression_condition_hooks;
-            expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseExpressionWhereConditionsAlloc(
                 alloc,
                 tokens,
@@ -3846,7 +3846,7 @@ pub fn parseWhereAlloc(
                 expression_condition_hooks_with_generated,
             );
         } else {
-            const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_atom_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseWhereAtomAlloc(
                 alloc,
                 tokens,
@@ -3987,6 +3987,7 @@ pub fn whereTopLevelOrHasAccessPredicate(tokens: []const Token, pos: usize) bool
 }
 
 fn generatedPredicateExpressionAtStart(
+    tokens: []const Token,
     pos: usize,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !?*const generated_parser.GeneratedSqlExpressionAst {
@@ -3995,7 +3996,10 @@ fn generatedPredicateExpressionAtStart(
     if (expression_tokens.start == pos) {
         switch (expression.kind) {
             .logical_or, .logical_and, .grouped => {},
-            else => return expression,
+            else => {
+                try validateGeneratedExpressionPayloads(tokens, expression.*);
+                return expression;
+            },
         }
     }
 
@@ -4004,15 +4008,18 @@ fn generatedPredicateExpressionAtStart(
             const list = expression.boolean_condition_items;
             if (list.count == 0 or list.items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
             for (list.items, 0..) |item, index| {
-                if (item.start == pos) return &list.expressions[index];
+                if (item.start == pos) {
+                    try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+                    return &list.expressions[index];
+                }
                 if (item.start <= pos and pos < item.end) {
-                    if (try generatedPredicateExpressionAtStart(pos, &list.expressions[index])) |child| return child;
+                    if (try generatedPredicateExpressionAtStart(tokens, pos, &list.expressions[index])) |child| return child;
                 }
             }
             return null;
         },
-        .grouped => return try generatedPredicateExpressionAtStart(pos, expression.inner_expression),
-        .logical_not => return try generatedPredicateExpressionAtStart(pos, expression.right_expression),
+        .grouped => return try generatedPredicateExpressionAtStart(tokens, pos, expression.inner_expression),
+        .logical_not => return try generatedPredicateExpressionAtStart(tokens, pos, expression.right_expression),
         else => return null,
     }
 }
@@ -4321,7 +4328,7 @@ pub fn parseScalarNotWhereAlloc(
             branch.deinit(alloc);
         }
         while (true) {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             const predicate = try parseScalarWherePredicateAlloc(
                 alloc,
                 tokens,
@@ -4378,7 +4385,7 @@ pub fn parseScalarOrWhereAlloc(
         try branches.append(alloc, .empty);
 
         while (true) {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             if (try parseScalarBooleanIsNotIntoOrBranchesAlloc(
                 alloc,
                 tokens,
@@ -4638,7 +4645,7 @@ pub fn parseExpressionNotWhereWithGeneratedAlloc(
             errdefer freeExpressionPredicateGroups(alloc, alternatives.items);
             var hooks_with_generated = hooks;
             if (generated_expression_ast != null) {
-                hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             }
             try parseExpressionWhereConditionAlternativesAlloc(
                 alloc,
@@ -4714,7 +4721,7 @@ pub fn parseExpressionOrWhereWithGeneratedAlloc(
                 errdefer freeExpressionPredicateGroups(alloc, alternatives.items);
                 var hooks_with_generated = hooks;
                 if (generated_expression_ast != null) {
-                    hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                    hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
                 }
                 try parseExpressionWhereConditionAlternativesAlloc(
                     alloc,
@@ -6397,7 +6404,7 @@ pub fn parseAccessPredicateGroupsAlloc(
     try branches.append(alloc, .{});
 
     while (true) {
-        const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+        const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
         if (!(try parseArrayOverlapIntoAccessBranchesAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &branches, generated_condition_expression))) {
             const atom = try parseAccessPredicateAtomGroupAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns, generated_condition_expression);
             defer freeAccessPredicateGroup(alloc, atom);
@@ -12277,7 +12284,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
         try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
-    const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+    const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
     var expression_hooks_with_generated = expression_hooks;
     expression_hooks_with_generated.generated_expression_ast = generated_condition_expression;
 
@@ -12603,7 +12610,7 @@ pub fn parseAggregateFilterAlloc(
     } else {
         while (true) {
             if (canParseAggregateFilterNot(tokens, pos.*)) {
-                const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
                 try parseAggregateFilterNotGroupAlloc(
                     alloc,
                     tokens,
@@ -12623,7 +12630,7 @@ pub fn parseAggregateFilterAlloc(
                 saw_boolean_constant = true;
                 if (!enabled) try appendBooleanConstantExpressionCondition(alloc, &expressions, false);
             } else if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
-                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast), .contains);
+                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -12637,10 +12644,10 @@ pub fn parseAggregateFilterAlloc(
                 try expression_array_contains.append(alloc, predicate);
                 predicate_transferred = true;
             } else if (aggregateJsonPathEqFilterCanStartAt(tokens, pos.*)) {
-                try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns, try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast));
+                try parseAggregateFilterAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &predicates, &array_any, &array_contains, &array_eq, &in_predicates, &json_contains, &json_path_eq, &json_path_exists, &text_patterns, realtime_ns, try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast));
             } else if (peekAggregateExpressionFilter(tokens, pos.*)) {
                 var expression_condition_hooks_with_generated = expression_condition_hooks;
-                expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
                 try parseExpressionWhereConditionsAlloc(
                     alloc,
                     tokens,
@@ -12654,7 +12661,7 @@ pub fn parseAggregateFilterAlloc(
                     expression_condition_hooks_with_generated,
                 );
             } else {
-                const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+                const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
                 if (try parseAggregateFilterBooleanIsNotGroupsAlloc(
                     alloc,
                     tokens,
@@ -12711,7 +12718,7 @@ pub fn parseAggregateHavingConditionAlternativesAlloc(
         try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
-    const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+    const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
     var field_options_with_generated = field_options;
     field_options_with_generated.generated_expression_ast = generated_condition_expression;
     var expression_options_with_generated = expression_options;
@@ -12878,20 +12885,20 @@ pub fn parseAggregateHavingAlloc(
     }
     while (true) {
         if (canParseAggregateHavingNot(tokens, pos.*)) {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options, generated_condition_expression);
         } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
             if (!enabled) try appendBooleanConstantExpressionCondition(alloc, expressions, false);
         } else if (peekAggregateHavingExpression(tokens, pos.*)) {
             var expression_options_with_generated = expression_condition_options;
-            expression_options_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            expression_options_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             const condition = try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options_with_generated);
             var condition_transferred = false;
             errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
             try expressions.append(alloc, condition);
             condition_transferred = true;
         } else {
-            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, output_field_options);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
@@ -26127,7 +26134,7 @@ pub fn parseJoinWhereAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
-        const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+        const generated_atom_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
 
         if (try joinedMutationExpressionSideAt(tokens, pos.*, left_alias, right_alias, string_to_array_predicate_is_containment)) |expression_side| {
             var expression_where_options_with_generated = expression_where_options;
@@ -26350,7 +26357,7 @@ pub fn parseJoinOnAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
-        const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+        const generated_atom_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
 
         if (try joinedMutationExpressionSideAt(tokens, pos.*, left_alias, right_alias, string_to_array_predicate_is_containment)) |_| {
             var unused_left_expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
@@ -32756,6 +32763,44 @@ fn setGeneratedExpressionFirstBooleanConditionKind(
     }
 }
 
+fn corruptGeneratedExpressionFirstBooleanConditionOperatorTokens(
+    expression: *generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    switch (expression.kind) {
+        .logical_or, .logical_and => {
+            if (expression.boolean_condition_items.expressions.len == 0) return false;
+            var condition = &expression.boolean_condition_items.expressions[0];
+            const condition_tokens = condition.tokens orelse return false;
+            condition.operator_tokens = condition_tokens;
+            return true;
+        },
+        .logical_not => {
+            const right = expression.right_expression orelse return false;
+            return corruptGeneratedExpressionFirstBooleanConditionOperatorTokens(right);
+        },
+        .grouped => {
+            const inner = expression.inner_expression orelse return false;
+            return corruptGeneratedExpressionFirstBooleanConditionOperatorTokens(inner);
+        },
+        else => return false,
+    }
+}
+
+fn corruptGeneratedReadWhereFirstBooleanConditionOperatorTokens(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (!corruptGeneratedExpressionFirstBooleanConditionOperatorTokens(&read.where_expression)) return error.TestUnexpectedResult;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -36180,6 +36225,20 @@ test "sql adapter lower expr lowers scalar or predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_scalar_quantified_or,
+        schema,
+        &.{.{ .json = "[\"closed\",\"pending\"]" }},
+        .{},
+    ));
+
+    var malformed_generated_scalar_quantified_or_operator = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY($1::text[]) OR status = 'open' ORDER BY created_at DESC",
+    );
+    defer malformed_generated_scalar_quantified_or_operator.deinit(alloc);
+    try corruptGeneratedReadWhereFirstBooleanConditionOperatorTokens(&malformed_generated_scalar_quantified_or_operator);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_scalar_quantified_or_operator,
         schema,
         &.{.{ .json = "[\"closed\",\"pending\"]" }},
         .{},

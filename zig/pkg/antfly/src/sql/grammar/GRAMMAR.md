@@ -1051,7 +1051,10 @@ contract until storage and API row plans grow those outer-join semantics.
    the typed `LIKE`/`ILIKE` operator
    token and optional `ANY`/`SOME`/`ALL` quantifier token, so stale operator
    kinds or quantifier payloads cannot be accepted by the legacy expression
-   lowering paths; generated scalar `OR`/`NOT` predicate groups now thread the
+   lowering paths; generated child predicate expressions returned from
+   generated boolean `OR`/`AND`/`NOT` groups must now be internally
+   payload-valid before typed lowering can consume them, including exact
+   retained operator spans; generated scalar `OR`/`NOT` predicate groups now thread the
    same child metadata into scalar comparison, boolean-test, `IN`, and
    quantified-list expansion branches; scalar atom, access predicate, direct
    join `WHERE`/`ON` predicates, and joined expression-predicate lowering now
