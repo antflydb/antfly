@@ -876,6 +876,7 @@ const TransportOutbox = struct {
                 const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
                 try snapshot_transport.sendSnapshot(.{
                     .group_id = item.group_id,
+                    .from = item.message.from,
                     .to = item.message.to,
                     .term = item.message.term,
                     .snapshot = snapshot,

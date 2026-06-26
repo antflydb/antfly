@@ -104,6 +104,7 @@ pub const HttpTransportStack = struct {
         self: *HttpTransportStack,
         batch_handler: http_server.BatchHandler,
         snapshot_store: ?http_server.SnapshotStore,
+        snapshot_upload_handler: ?http_server.SnapshotUploadHandler,
     ) http_server.HttpServer {
         return http_server.HttpServer.init(
             self.alloc,
@@ -111,6 +112,7 @@ pub const HttpTransportStack = struct {
             raft_engine.runtime.BinaryCodec.codec(),
             batch_handler,
             snapshot_store,
+            snapshot_upload_handler,
         );
     }
 };
