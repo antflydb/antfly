@@ -2519,7 +2519,7 @@ fn keywordSymbolId(tok: token_mod.Token) !?u16 {
     if (tok.text.len > 128) return error.UnsupportedSqlShape;
     var name_buffer: [128]u8 = undefined;
     const name = uppercaseKeyword(&name_buffer, tok.text);
-    return generated.symbolId(name);
+    return generated.tokenIdByName(name);
 }
 
 fn uppercaseKeyword(buffer: []u8, text: []const u8) []const u8 {

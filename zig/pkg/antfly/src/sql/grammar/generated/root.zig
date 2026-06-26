@@ -180380,6 +180380,14 @@ pub fn tokenId(token: Token) u16 {
     return @intFromEnum(token) + 1;
 }
 
+pub fn tokenIdByName(name: []const u8) ?u16 {
+    var idx: usize = 1;
+    while (idx < token_count + 1) : (idx += 1) {
+        if (std.mem.eql(u8, symbols[idx].name, name)) return @intCast(idx);
+    }
+    return null;
+}
+
 pub const Rule = enum {
     statement,
     session_statement,
