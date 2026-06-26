@@ -481,8 +481,11 @@ maintenance `VACUUM`/`REINDEX`, ownership and system administration statements
 such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `DROP OWNED`, and `REASSIGN OWNED`, utility/control statements such as
 `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
-`CHECKPOINT`, `LOAD`, `SECURITY LABEL`, and `UNLISTEN`, plus common PostgreSQL extension
-catalog families for conversions, event triggers, extended statistics,
+`CHECKPOINT`, `LOAD`, `SECURITY LABEL`, and `UNLISTEN`, plus non-table-function
+graph query heads such as Cypher-style `MATCH ... RETURN ...` as explicit
+`graph_query_not_planned_by_generated_parser` unsupported diagnostics, plus
+common PostgreSQL extension catalog families for conversions, event triggers,
+extended statistics,
 operator/aggregate ALTER forms, operator class/family objects, and text-search
 configuration/dictionary/parser/template objects, plus simple `EXPLAIN` forms
 with stable reason metadata. Generated
@@ -571,8 +574,8 @@ unsupported boundary before delegating to typed explain planning, including
 generated option payloads and subject-range validation before the inner
 read/write statement is reparsed.
 Generated unsupported utility command heads that require a subject, such as
-`CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `NOTIFY`, `REINDEX`, `REVOKE`,
-and `UNLISTEN`, now fail closed through the generated parser when
+`CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `MATCH`, `NOTIFY`, `REINDEX`,
+`REVOKE`, and `UNLISTEN`, now fail closed through the generated parser when
 the statement stops at the command head instead of falling through to legacy
 DDL probing.
 Generated unsupported nodes now also participate in the parsed statement

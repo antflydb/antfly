@@ -2852,6 +2852,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_type_multi,
         .drop_user_mapping,
         .drop_view_multi,
+        .graph_query,
         .insert_overriding_value,
         .import_foreign_schema,
         .load,

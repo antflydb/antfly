@@ -221,17 +221,17 @@ state should make the facades boring and small.
 ## Build And Test Registration
 
 `zig/build.zig` should stay at suite granularity. It should create durable
-aggregates such as `api-table-writes-docid-test`, `api-table-reads-docid-test`,
-`unit-test`, and `lib-api-docid-test`, but it should not become an inventory of
-every migrated leaf module or regression.
+aggregates such as `api-table-writes-test`, `api-table-reads-test`,
+`unit-test`, and `lib-api-test`, but it should not become an inventory of every
+migrated leaf module or regression.
 
 Focused API test inventory belongs in `pkg/antfly/build/tests.zig`:
 
 - root test module paths live in the API test-root manifest
 - exact or prefix filters live in `APITestFilters`
 - aggregate dependency rules live in helper functions such as
-  `addAPIDocIdTestRootSteps`, `addAPIDocIdAggregateTestStep`, and
-  `dependOnAPIDocIdUnitTestRuns`
+  `addAPITableTestRootSteps`, `addAPITableAggregateTestStep`, and
+  `dependOnAPITableUnitTestRuns`
 
 Leaf modules are reached through root aggregators:
 
@@ -292,8 +292,8 @@ roots, or reference API table read/write implementation paths.
 
 Keep the existing focused test roots stable:
 
-- `api-table-reads-docid-test`
-- `api-table-writes-docid-test`
+- `api-table-reads-test`
+- `api-table-writes-test`
 
 Keep `zig/build.zig` at suite granularity. The API read/write refactor should
 not add one `b.addTest` block or one top-level build step per extracted leaf
@@ -310,8 +310,8 @@ Treat this as a build-file ownership contract:
 - `pkg/antfly/build/tests.zig` owns focused test inventories, exact test-title
   filters, and API read/write focused-step registration.
 - Focused test roots import the facade and migrated leaf modules so moved tests
-  keep running under the existing `zig build api-table-reads-docid-test` and
-  `zig build api-table-writes-docid-test` commands.
+  keep running under the existing `zig build api-table-reads-test` and
+  `zig build api-table-writes-test` commands.
 - A new extracted helper should not introduce a new top-level `zig/build.zig`
   test step unless it is a durable product-level suite rather than an
   implementation regression bucket.
@@ -495,15 +495,15 @@ Expected long-term test placement:
 - `table_writes/sources.zig` owns provisioned/hosted/bound write source
   integration tests that prove catalog routing, namespace resolution, managed DB
   opening through the source, vtable dispatch, and write lifecycle behavior.
-- `api-table-reads-docid-test` and `api-table-writes-docid-test` remain stable
+- `api-table-reads-test` and `api-table-writes-test` remain stable
   test aggregators. They import the facade and leaf modules so the command-line
   test targets remain stable while implementation tests live with their owners.
 
 Each extraction should run at least:
 
 ```sh
-zig build api-table-reads-docid-test
-zig build api-table-writes-docid-test
+zig build api-table-reads-test
+zig build api-table-writes-test
 ```
 
 When a chunk touches SQL lowering, HTTP routing, or generated OpenAPI behavior,

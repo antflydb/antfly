@@ -1608,8 +1608,8 @@ pub const APITestFilters = struct {
         "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
     };
 
-    const table_writes_prefix = "api.table_writes.docid ";
-    const table_reads_prefix = "api.table_reads.docid ";
+    const table_writes_docid_prefix = "api.table_writes.docid ";
+    const table_reads_docid_prefix = "api.table_reads.docid ";
     const table_writes_query_visibility_prefix = "api.table_writes.query_visibility ";
 
     pub const table_writes = [_][]const u8{
@@ -1626,7 +1626,7 @@ pub const APITestFilters = struct {
         "api.table_writes.remote_wire.test.",
         "api.table_writes.schema_jobs.test.",
         "api.table_writes.sources.test.",
-        table_writes_prefix,
+        table_writes_docid_prefix,
     };
 
     pub const provisioned_query_visibility = [_][]const u8{
@@ -1645,7 +1645,7 @@ pub const APITestFilters = struct {
         "api.table_reads.relational_rows.test.",
         "api.table_reads.remote_wire.test.",
         "api.http_internal_group_read_routes.test.",
-        table_reads_prefix,
+        table_reads_docid_prefix,
     };
 
     pub const table_reads_graph_metric = [_][]const u8{
@@ -3469,9 +3469,9 @@ pub fn addAPITableTestSteps(
     const raft_transition_runtime_docid = addSimpleAPITestRun(b, modules.raft_transition_runtime_docid, &APITestFilters.raft_transition_runtime_docid, false);
 
     addFocusedAPITestStep(b, "api-transactions-test", "Run focused API transaction coordinator tests", transactions_docid);
-    addFocusedAPITestStep(b, "api-table-writes-docid-test", "Run focused API table write DOCID tests", table_writes);
+    addFocusedAPITestStep(b, "api-table-writes-test", "Run focused API table write tests", table_writes);
     addFocusedAPITestStep(b, "provisioned-query-visibility-test", "Run focused provisioned query visibility tests", provisioned_query_visibility);
-    addFocusedAPITestStep(b, "api-table-reads-docid-test", "Run focused API table read DOCID tests", table_reads);
+    addFocusedAPITestStep(b, "api-table-reads-test", "Run focused API table read tests", table_reads);
     addFocusedAPITestStep(b, "api-internal-group-write-routes-test", "Run focused internal group write route tests", internal_group_write_routes);
     addFocusedAPITestStep(b, "api-rows-test", "Run focused relational row API tests", rows);
     addFocusedAPITestStep(b, "sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests", sql_api_parity);
@@ -3569,7 +3569,7 @@ pub fn addAPITableAggregateTestStep(
     runs: APITableTestRuns,
     deps: APITableAggregateDependencies,
 ) *std.Build.Step {
-    const step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
+    const step = b.step("lib-api-test", "Run focused API boundary tests");
     step.dependOn(&runs.docid.step);
     step.dependOn(&runs.serverless_docid.step);
     step.dependOn(&runs.transactions_docid.step);
@@ -3590,7 +3590,7 @@ pub fn addAPITableAggregateTestStep(
     return step;
 }
 
-pub fn addAPIDocIdLifecycleDependencies(
+pub fn addDocIdLifecycleDependencies(
     focused: APIFocusedTestRun,
     runs: APITableTestRuns,
     db_result_shape: *std.Build.Step.Run,

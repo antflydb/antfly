@@ -11108,6 +11108,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
         .explain => .explain_not_planned_by_generated_parser,
         .fetch => .fetch_not_planned_by_generated_parser,
+        .graph_query => .graph_query_not_planned_by_generated_parser,
         .grant => .grant_not_planned_by_generated_parser,
         .import_foreign_schema => .import_foreign_schema_not_planned_by_generated_parser,
         .listen => .listen_not_planned_by_generated_parser,
