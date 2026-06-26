@@ -270,7 +270,11 @@ forms now retain generated per-CTE body metadata and validate generated CTE and
 command ranges plus full generated child-read parses for each recorded CTE body
 before dispatching to the typed recursive write-plan variants;
 and `TRUNCATE`
-lowers directly from generated AST ranges into mutation-source plans. Incomplete
+lowers directly from generated AST ranges into mutation-source plans. Generated
+direct `UPDATE` and `DELETE` point-vs-source selection now uses generated
+target and `WHERE` ranges, including target aliases, before reusing the typed
+selector semantics, so generated DML lowering no longer rediscovers those
+clause boundaries through legacy token classification. Incomplete
 migrated DML statements that stop at required generated clause boundaries,
 including `INSERT ... ON CONFLICT ... DO` tails and `MERGE` action bodies, now
 fail closed through the generated parser instead of falling back to the legacy

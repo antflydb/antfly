@@ -42,7 +42,7 @@ pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPl
     return null;
 }
 
-pub fn lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
+pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
@@ -74,7 +74,7 @@ pub fn planParsedSqlWithSessionAlloc(
         return try binder.logicalReadPlanFromBoundStatement(&bound);
     }
 
-    return try lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, options.function_bindings);
+    return try planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, options.function_bindings);
 }
 
 test "sql executor classifies statement families and owns ddl plans" {
@@ -92,7 +92,7 @@ test "sql executor classifies statement families and owns ddl plans" {
 
     var ddl_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
     defer ddl_sql.deinit(alloc);
-    var ddl_logical = try lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &ddl_sql, .{});
+    var ddl_logical = try planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &ddl_sql, .{});
     defer ddl_logical.deinit(alloc);
     try std.testing.expectEqualStrings("table_ddl", ddl_logical.statementKindName());
 }

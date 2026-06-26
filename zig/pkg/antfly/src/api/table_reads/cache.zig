@@ -21,10 +21,8 @@ const metadata_transition_state = @import("../../metadata/transition_state.zig")
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
-const asset_producer_runtime = @import("../../asset_producer_runtime.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
-const asset_producer_mod = @import("../../storage/db/enrichment/asset_producer.zig");
 const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
@@ -590,27 +588,22 @@ pub fn openProvisionedQueryDbForTableWithCache(
     const EnrichmentSet = struct {
         dense: ?db_embedder.DenseEmbedder = null,
         sparse: ?db_embedder.SparseEmbedder = null,
-        asset_runtime: ?*asset_producer_runtime.Runtime = null,
         generated: bool = false,
 
         fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             if (self.dense) |owned| owned.deinit(allocator);
             if (self.sparse) |owned| owned.deinit(allocator);
-            if (self.asset_runtime) |runtime| {
-                runtime.deinit();
-                allocator.destroy(runtime);
-            }
         }
 
         fn enabled(self: @This()) bool {
-            return self.dense != null or self.sparse != null or self.asset_runtime != null or self.generated;
+            return self.dense != null or self.sparse != null or self.generated;
         }
 
         fn config(self: @This()) db_mod.enrichment_runtime.Config {
             return .{
                 .dense_embedder = self.dense,
                 .sparse_embedder = self.sparse,
-                .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+                .asset_producer = null,
                 .enable_without_producers = self.generated,
             };
         }
@@ -618,7 +611,6 @@ pub fn openProvisionedQueryDbForTableWithCache(
         fn take(self: *@This()) void {
             self.dense = null;
             self.sparse = null;
-            self.asset_runtime = null;
             self.generated = false;
         }
     };
@@ -632,21 +624,10 @@ pub fn openProvisionedQueryDbForTableWithCache(
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
         ) !EnrichmentSet {
-            const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
-                const io = if (runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
-                break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
-                    .antfly_provider = local_provider,
-                    .secret_store = store,
-                });
-            } else null;
-            errdefer if (asset_runtime) |owned| {
-                owned.deinit();
-                allocator.destroy(owned);
-            };
+            _ = runtime;
             return .{
                 .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
                 .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
-                .asset_runtime = asset_runtime,
                 .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
             };
         }
@@ -764,13 +745,6 @@ pub fn loadTableIndexesJson(
     return try alloc.dupe(u8, table.indexes_json);
 }
 
-fn indexesJsonNeedsAssetProducer(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
-    if (indexes_json.len == 0) return false;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    return try jsonValueNeedsAssetProducer(alloc, parsed.value);
-}
-
 fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
     if (indexes_json.len == 0) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
@@ -798,42 +772,6 @@ fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
         },
         else => return false,
     }
-}
-
-fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) !bool {
-    switch (value) {
-        .object => |object| {
-            if (try objectIsModelBackedAssetEnrichment(alloc, object)) return true;
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (try jsonValueNeedsAssetProducer(alloc, entry.value_ptr.*)) return true;
-            }
-            return false;
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                if (try jsonValueNeedsAssetProducer(alloc, item)) return true;
-            }
-            return false;
-        },
-        else => return false,
-    }
-}
-
-fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json.ObjectMap) !bool {
-    const kind = object.get("kind") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return false;
-    const producer_value = object.get("producer_json") orelse return false;
-    const producer_json = switch (producer_value) {
-        .string => |raw| raw,
-        .object, .array => try std.json.Stringify.valueAlloc(alloc, producer_value, .{}),
-        else => return false,
-    };
-    const owns_producer_json = producer_value != .string;
-    defer if (owns_producer_json) alloc.free(@constCast(producer_json));
-    var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
-    defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy;
 }
 
 pub fn loadTableIdentityNamespaceForGroup(

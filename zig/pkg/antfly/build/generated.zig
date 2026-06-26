@@ -30,6 +30,10 @@ const snowball_languages = [_][]const u8{
 pub const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
 const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
 const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
+const onnx_proto_desc = "lib/onnx/proto/onnx.desc";
+const sentencepiece_proto_desc = "lib/tokenizer/proto/sentencepiece_model.desc";
+const sentencepiece_proto_patch_tool = "pkg/inference/tools/patch_sentencepiece_proto.zig";
+const xla_hlo_proto_desc = "lib/pjrt/proto/hlo.desc";
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -252,6 +256,7 @@ pub fn addGeneratedArtifactSteps(ctx: anytype) GeneratedArtifactSteps {
     const target = ctx.target;
     const optimize = ctx.optimize;
     const httpx_mod = ctx.httpx_mod;
+    const protobuf_dep = ctx.protobuf_dep;
 
     const snowball_regen_step = addSnowballRegenStep(b);
     const snowball_check_step = addSnowballCheckStep(b);
@@ -262,6 +267,7 @@ pub fn addGeneratedArtifactSteps(ctx: anytype) GeneratedArtifactSteps {
     const openapi_generated_check_step = addOpenApiGeneratedCheckStep(b, openapi_codegen);
     const sql_grammar_regen_step = addSqlGrammarRegenStep(b, yacc_codegen);
     const sql_grammar_generated_check_step = addSqlGrammarGeneratedCheckStep(b, yacc_codegen);
+    const protobuf_generated_check_step = addProtobufDescriptorSmokeCheckStep(b, target, optimize, protobuf_dep);
     const snowball_sources_available = pathExists(b, "deps/snowball/zig/env.zig") and pathExists(b, "deps/snowball/compiler/analyser.c");
 
     const generate_step = b.step("generate", "Regenerate checked-in Zig generated artifacts");
@@ -282,6 +288,7 @@ pub fn addGeneratedArtifactSteps(ctx: anytype) GeneratedArtifactSteps {
     const generated_check_step = b.step("generated-check", "Check checked-in Zig generated artifacts are current");
     generated_check_step.dependOn(openapi_check_step);
     generated_check_step.dependOn(sql_grammar_generated_check_step);
+    generated_check_step.dependOn(protobuf_generated_check_step);
     if (snowball_sources_available) {
         generated_check_step.dependOn(snowball_check_step);
     }
@@ -376,6 +383,140 @@ fn addLocalYaccCodegen(
     return exe;
 }
 
+pub fn addSentencePieceProtoModule(
+    b: *std.Build,
+    protobuf_dep: *std.Build.Dependency,
+) *std.Build.Module {
+    const raw_dir = addProtobufGeneratedDirectory(
+        b,
+        protobuf_dep,
+        b.path(sentencepiece_proto_desc),
+        "sentencepiece_proto_raw",
+        &.{},
+    );
+
+    const fixup_tool = b.addExecutable(.{
+        .name = "patch_sentencepiece_proto",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(sentencepiece_proto_patch_tool),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const fixup_run = b.addRunArtifact(fixup_tool);
+    fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
+    fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
+    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
+
+    const mod = b.createModule(.{
+        .root_source_file = gen_dir.path(b, "root.zig"),
+    });
+    mod.addImport("protobuf", protobuf_dep.module("protobuf"));
+    return mod;
+}
+
+pub fn addProtobufGeneratedModule(
+    b: *std.Build,
+    protobuf_dep: *std.Build.Dependency,
+    desc_file: std.Build.LazyPath,
+    module_name: []const u8,
+    extra_args: []const []const u8,
+) *std.Build.Module {
+    const gen_dir = addProtobufGeneratedDirectory(b, protobuf_dep, desc_file, module_name, extra_args);
+    const mod = b.createModule(.{
+        .root_source_file = gen_dir.path(b, "root.zig"),
+    });
+    mod.addImport("protobuf", protobuf_dep.module("protobuf"));
+    return mod;
+}
+
+pub fn addOnnxProtoModule(b: *std.Build, protobuf_dep: *std.Build.Dependency) *std.Build.Module {
+    return addProtobufGeneratedModule(b, protobuf_dep, b.path(onnx_proto_desc), "onnx_proto", &.{});
+}
+
+pub fn addXlaProtoModule(b: *std.Build, protobuf_dep: *std.Build.Dependency) *std.Build.Module {
+    return addProtobufGeneratedModule(b, protobuf_dep, b.path(xla_hlo_proto_desc), "xla_proto", &.{});
+}
+
+fn addProtobufDescriptorSmokeCheckStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    protobuf_dep: *std.Build.Dependency,
+) *std.Build.Step {
+    const check_step = b.step("protobuf-generated-check", "Compile generated ONNX and XLA protobuf descriptor bindings");
+    const onnx_proto_mod = addProtobufGeneratedModule(b, protobuf_dep, b.path(onnx_proto_desc), "onnx_proto_check", &.{});
+    const xla_proto_mod = addProtobufGeneratedModule(b, protobuf_dep, b.path(xla_hlo_proto_desc), "xla_proto_check", &.{});
+
+    const smoke_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.addWriteFiles().add("protobuf_generated_smoke.zig",
+                \\const std = @import("std");
+                \\const onnx = @import("onnx_proto").onnx;
+                \\const xla = @import("xla_proto").xla;
+                \\
+                \\test "generated ONNX proto bindings encode and decode a model" {
+                \\    const alloc = std.testing.allocator;
+                \\    var opsets = [_]onnx.OperatorSetIdProto{.{ .domain = "", .version = 17 }};
+                \\    var model = onnx.ModelProto{
+                \\        .ir_version = 8,
+                \\        .graph = .{ .name = "generated-smoke" },
+                \\        .opset_import = opsets[0..],
+                \\    };
+                \\    const bytes = try model.encode(alloc);
+                \\    defer alloc.free(bytes);
+                \\
+                \\    var decoded = try onnx.ModelProto.decode(alloc, bytes);
+                \\    defer decoded.deinit(alloc);
+                \\    try std.testing.expectEqual(@as(i64, 8), decoded.ir_version);
+                \\    try std.testing.expectEqualStrings("generated-smoke", decoded.graph.name);
+                \\    try std.testing.expectEqual(@as(usize, 1), decoded.opset_import.len);
+                \\    try std.testing.expectEqual(@as(i64, 17), decoded.opset_import[0].version);
+                \\}
+                \\
+                \\test "generated XLA HLO proto bindings encode and decode a module" {
+                \\    const alloc = std.testing.allocator;
+                \\    var module = xla.HloModuleProto{
+                \\        .name = "generated-xla-smoke",
+                \\        .entry_computation_name = "entry",
+                \\    };
+                \\    const bytes = try module.encode(alloc);
+                \\    defer alloc.free(bytes);
+                \\
+                \\    var decoded = try xla.HloModuleProto.decode(alloc, bytes);
+                \\    defer decoded.deinit(alloc);
+                \\    try std.testing.expectEqualStrings("generated-xla-smoke", decoded.name);
+                \\    try std.testing.expectEqualStrings("entry", decoded.entry_computation_name);
+                \\}
+            ),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "onnx_proto", .module = onnx_proto_mod },
+                .{ .name = "xla_proto", .module = xla_proto_mod },
+            },
+        }),
+    });
+    check_step.dependOn(&b.addRunArtifact(smoke_test).step);
+    return check_step;
+}
+
+fn addProtobufGeneratedDirectory(
+    b: *std.Build,
+    protobuf_dep: *std.Build.Dependency,
+    desc_file: std.Build.LazyPath,
+    output_dir_name: []const u8,
+    extra_args: []const []const u8,
+) std.Build.LazyPath {
+    const codegen = b.addRunArtifact(protobuf_dep.artifact("protoc-zig"));
+    codegen.addArg("--desc");
+    codegen.addFileArg(desc_file);
+    codegen.addArg("--output");
+    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
+    for (extra_args) |arg| codegen.addArg(arg);
+    return gen_dir;
+}
+
 fn addYaccTestStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -396,20 +537,36 @@ fn addYaccTestStep(
 
 fn addSqlGrammarRegenStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
     const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
+
+    const generated = addSqlGrammarGeneratedRootOutput(b, yacc_codegen, "regen_sql_grammar_root.zig");
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(generated, sql_grammar_generated_root);
+
+    const fmt = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "fmt",
+        sql_grammar_generated_root,
+    });
+    fmt.step.dependOn(&update.step);
+    regen_step.dependOn(&fmt.step);
+    return regen_step;
+}
+
+fn addSqlGrammarGeneratedRootOutput(
+    b: *std.Build,
+    yacc_codegen: *std.Build.Step.Compile,
+    output_name: []const u8,
+) std.Build.LazyPath {
     const run = b.addRunArtifact(yacc_codegen);
     run.addFileArg(b.path(sql_grammar_source));
-    run.addArg(sql_grammar_generated_root);
+    const generated = run.addOutputFileArg(output_name);
     run.addArg(sql_grammar_source);
-    regen_step.dependOn(&run.step);
-    return regen_step;
+    return generated;
 }
 
 fn addSqlGrammarGeneratedCheckStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
     const check_step = b.step("sql-grammar-generated-check", "Check checked-in Antfly SQL grammar metadata is current");
-    const run = b.addRunArtifact(yacc_codegen);
-    run.addFileArg(b.path(sql_grammar_source));
-    const generated = run.addOutputFileArg("sql_grammar_root.zig");
-    run.addArg(sql_grammar_source);
+    const generated = addSqlGrammarGeneratedRootOutput(b, yacc_codegen, "check_sql_grammar_root.zig");
 
     const fmt = b.addSystemCommand(&.{
         b.graph.zig_exe,

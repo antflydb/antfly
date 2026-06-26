@@ -24,13 +24,14 @@ pub fn build(b: *std.Build) void {
     });
     const protobuf_mod = protobuf_dep.module("protobuf");
 
-    // NOTE: onnx_proto generation via `@import("protobuf").addProtoModule` was
-    // removed when the pinned protobuf library dropped its build-time codegen
-    // helper. None of the files under src/ currently import `onnx_proto` — the
-    // ONNX wire code hand-rolls its own messages via `protobuf.message` /
-    // `protobuf.wire`, so the generated module is no longer needed. If/when
-    // consumers need the auto-generated bindings again, either restore the
-    // upstream codegen helper or check in a generated `onnx_proto.zig`.
+    const protobuf_build = @import("protobuf");
+    const onnx_proto_mod = protobuf_build.addProtoModule(
+        b,
+        protobuf_dep,
+        b.path("proto/onnx.desc"),
+        "onnx_proto",
+        &.{},
+    );
 
     const onnx_mod = b.addModule("onnx", .{
         .root_source_file = b.path("src/root.zig"),
@@ -39,9 +40,6 @@ pub fn build(b: *std.Build) void {
     });
     onnx_mod.addImport("protobuf", protobuf_mod);
 
-    // Tests — when run standalone, proto.zig and attrs.zig tests don't
-    // need ml/protobuf imports (they only test pure logic). Files that
-    // import ml or protobuf require the parent build to inject deps.
     const test_step = b.step("test", "Run unit tests");
 
     // Standalone-testable files (no external imports)
@@ -55,8 +53,45 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(file),
                 .target = target,
                 .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "protobuf", .module = protobuf_mod },
+                },
             }),
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    const generated_proto_smoke = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.addWriteFiles().add("onnx_generated_proto_smoke.zig",
+                \\const std = @import("std");
+                \\const onnx = @import("onnx_proto").onnx;
+                \\
+                \\test "generated ONNX proto bindings encode and decode a model" {
+                \\    const alloc = std.testing.allocator;
+                \\    var opsets = [_]onnx.OperatorSetIdProto{.{ .domain = "", .version = 17 }};
+                \\    var model = onnx.ModelProto{
+                \\        .ir_version = 8,
+                \\        .graph = .{ .name = "generated-smoke" },
+                \\        .opset_import = opsets[0..],
+                \\    };
+                \\    const bytes = try model.encode(alloc);
+                \\    defer alloc.free(bytes);
+                \\
+                \\    var decoded = try onnx.ModelProto.decode(alloc, bytes);
+                \\    defer decoded.deinit(alloc);
+                \\    try std.testing.expectEqual(@as(i64, 8), decoded.ir_version);
+                \\    try std.testing.expectEqualStrings("generated-smoke", decoded.graph.name);
+                \\    try std.testing.expectEqual(@as(usize, 1), decoded.opset_import.len);
+                \\    try std.testing.expectEqual(@as(i64, 17), decoded.opset_import[0].version);
+                \\}
+            ),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "onnx_proto", .module = onnx_proto_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(generated_proto_smoke).step);
 }

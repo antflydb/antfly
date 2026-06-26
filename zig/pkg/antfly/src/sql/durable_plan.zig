@@ -71,33 +71,6 @@ pub const DurableSqlPlan = union(enum) {
         };
     }
 
-    pub fn fromDdlPayload(plan: *ddl_plan.LoweredDdlPlan) DurableSqlPlan {
-        var logical = binder.logicalPlanFromLoweredDdlPlan(plan);
-        plan.* = .{ .adapter_noop = .{ .reason = .transaction_control } };
-        return fromLogical(&logical) catch unreachable;
-    }
-
-    pub fn takeLoweredDdlPayload(self: *@This()) ?ddl_plan.LoweredDdlPlan {
-        return switch (self.*) {
-            .table_ddl => |*plan| blk: {
-                const lowered = plan.intoLoweredDdlPlan();
-                self.* = .{ .moved = {} };
-                break :blk lowered;
-            },
-            .catalog_ddl => |*plan| blk: {
-                const lowered = plan.intoLoweredDdlPlan();
-                self.* = .{ .moved = {} };
-                break :blk lowered;
-            },
-            .other_ddl => |*plan| blk: {
-                const lowered = plan.intoLoweredDdlPlan();
-                self.* = .{ .moved = {} };
-                break :blk lowered;
-            },
-            else => null,
-        };
-    }
-
     fn moveLogical(logical: *binder.LogicalSqlPlan, durable: DurableSqlPlan) DurableSqlPlan {
         logical.* = .{ .read = classifier.SqlReadStatementKind.query };
         return durable;

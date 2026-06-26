@@ -261,36 +261,6 @@ fn detectSpngPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?SpngPaths {
     return null;
 }
 
-fn addLocalSentencePieceProtoModule(
-    b: *std.Build,
-    protobuf_dep: *std.Build.Dependency,
-) *std.Build.Module {
-    const codegen = b.addRunArtifact(protobuf_dep.artifact("protoc-zig"));
-    codegen.addArg("--desc");
-    codegen.addFileArg(b.path("lib/tokenizer/proto/sentencepiece_model.desc"));
-    codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
-
-    const fixup_tool = b.addExecutable(.{
-        .name = "patch_sentencepiece_proto",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/inference/tools/patch_sentencepiece_proto.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        }),
-    });
-    const fixup_run = b.addRunArtifact(fixup_tool);
-    fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
-    fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
-
-    const mod = b.createModule(.{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-    mod.addImport("protobuf", protobuf_dep.module("protobuf"));
-    return mod;
-}
-
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -563,11 +533,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Protobuf wire format
+    const protobuf_dep = b.dependency("protobuf", .{});
+    const protobuf_mod = protobuf_dep.module("protobuf");
     const generated_steps = antfly_generated_build.addGeneratedArtifactSteps(.{
         .b = b,
         .target = target,
         .optimize = optimize,
         .httpx_mod = httpx_mod,
+        .protobuf_dep = protobuf_dep,
     });
     const openapi_modules = antfly_generated_build.addCommittedOpenApiModules(.{
         .b = b,
@@ -605,9 +579,6 @@ pub fn build(b: *std.Build) void {
     const handlebars_dep = b.dependency("handlebars", .{});
     const handlebars_mod = handlebars_dep.module("handlebars");
 
-    // Protobuf wire format
-    const protobuf_dep = b.dependency("protobuf", .{});
-    const protobuf_mod = protobuf_dep.module("protobuf");
     const platform_mod = b.createModule(.{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .target = target,
@@ -840,7 +811,7 @@ pub fn build(b: *std.Build) void {
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
 
-    const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
+    const sentencepiece_proto_mod = antfly_generated_build.addSentencePieceProtoModule(b, protobuf_dep);
     const termite_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
@@ -863,12 +834,7 @@ pub fn build(b: *std.Build) void {
     });
     termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     termite_onnx_graph_mod.addImport("ml", termite_ml_mod);
-    const termite_pjrt_xla_proto_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    termite_pjrt_xla_proto_mod.addImport("protobuf", protobuf_mod);
+    const termite_pjrt_xla_proto_mod = antfly_generated_build.addXlaProtoModule(b, protobuf_dep);
     const termite_pjrt_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/src/root.zig"),
         .target = target,

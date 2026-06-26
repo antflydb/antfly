@@ -2364,6 +2364,79 @@ pub fn classifyDeleteSelectorParsedSqlAlloc(
     return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
 }
 
+fn parseGeneratedDmlTargetAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !plan_mod.TableAlias {
+    if (target_range.start >= target_range.end or target_range.end > end or end > tokens.len) return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens[target_range.start..end], &pos);
+}
+
+fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    resolver: ?relational_rows.UniqueSelectorResolver,
+) !plan_mod.MutationSelectorKind {
+    if (ast.kind != .update) return error.UnsupportedSqlShape;
+    if (ast.source_tokens != null) return .source;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+    const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, end);
+    defer plan_mod.freeTableAlias(alloc, target_table);
+
+    const where_range = ast.where_tokens orelse return .source;
+    if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    var pos = where_range.start;
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return .source,
+        else => return err,
+    };
+    defer alloc.free(where_json);
+    if (pos != where_range.end) return .source;
+    return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
+}
+
+fn classifyGeneratedDeleteSelectorFromDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    resolver: ?relational_rows.UniqueSelectorResolver,
+) !plan_mod.MutationSelectorKind {
+    if (ast.kind != .delete) return error.UnsupportedSqlShape;
+    if (ast.source_tokens != null) return .source;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+    const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, end);
+    defer plan_mod.freeTableAlias(alloc, target_table);
+
+    const where_range = ast.where_tokens orelse return .source;
+    if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    var pos = where_range.start;
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens[0..where_range.end], &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return .source,
+        else => return err,
+    };
+    defer alloc.free(where_json);
+    if (pos != where_range.end) return .source;
+    return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
+}
+
 pub fn parseConflictUpdateSetAssignmentAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -12684,7 +12757,7 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     }
     if (dml_ast.kind == .update) {
         switch (write_kind) {
-            .update => switch (try classifyUpdateSelectorParsedSqlAlloc(alloc, parsed_sql, schema, params, options.unique_resolver)) {
+            .update => switch (try classifyGeneratedUpdateSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options.unique_resolver)) {
                 .point => if (updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |update| {
                     return .{ .update = update };
                 } else |err| switch (err) {
@@ -12715,7 +12788,7 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     }
     if (dml_ast.kind == .delete) {
         switch (write_kind) {
-            .delete => switch (try classifyDeleteSelectorParsedSqlAlloc(alloc, parsed_sql, schema, params, options.unique_resolver)) {
+            .delete => switch (try classifyGeneratedDeleteSelectorFromDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options.unique_resolver)) {
                 .point => if (deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |delete| {
                     return .{ .delete = delete };
                 } else |err| switch (err) {
@@ -14879,6 +14952,23 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         else => return error.TestUnexpectedResult,
     }
 
+    var generated_aliased_update = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records AS u SET status = 'ready' WHERE u.id = 'u1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_aliased_update.deinit(alloc);
+    switch (generated_aliased_update) {
+        .update => |update| {
+            try std.testing.expectEqualStrings("usage_records", update.table_name);
+            try std.testing.expectEqual(@as(u32, 1), update.batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), update.batch.returning_rows.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var parsed_generated_delete = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DELETE FROM usage_records WHERE id = 'u1' RETURNING id",
@@ -14919,6 +15009,23 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
             try std.testing.expectEqualStrings("usage_records", delete.table_name);
             try std.testing.expectEqual(@as(usize, 0), delete.returning_expression_count);
             try std.testing.expectEqual(@as(u32, 1), delete.batch.deleted);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_aliased_delete = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records AS u WHERE u.id = 'u2' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_aliased_delete.deinit(alloc);
+    switch (generated_aliased_delete) {
+        .delete => |delete| {
+            try std.testing.expectEqualStrings("usage_records", delete.table_name);
+            try std.testing.expectEqual(@as(u32, 1), delete.batch.deleted);
+            try std.testing.expectEqual(@as(usize, 1), delete.batch.returning_rows.len);
         },
         else => return error.TestUnexpectedResult,
     }

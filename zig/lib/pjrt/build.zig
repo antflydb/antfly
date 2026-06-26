@@ -24,20 +24,14 @@ pub fn build(b: *std.Build) void {
     });
     const protobuf_mod = protobuf_dep.module("protobuf");
 
-    // NOTE: The real `xla_proto` bindings used to be generated at build
-    // time from `proto/hlo.desc` via
-    // `@import("protobuf").addProtoModule(...)`. That helper was removed
-    // when the pinned protobuf library dropped its codegen support. Until
-    // a replacement is wired up we fall back to a hand-written stub that
-    // provides just the struct surface used by `src/hlo.zig` so the
-    // module compiles; runtime serialization via this module is a no-op
-    // and should only be reached when pjrt support is genuinely enabled.
-    const xla_proto_mod = b.createModule(.{
-        .root_source_file = b.path("proto/xla_proto_stub.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    xla_proto_mod.addImport("protobuf", protobuf_mod);
+    const protobuf_build = @import("protobuf");
+    const xla_proto_mod = protobuf_build.addProtoModule(
+        b,
+        protobuf_dep,
+        b.path("proto/hlo.desc"),
+        "xla_proto",
+        &.{},
+    );
 
     const pjrt_mod = b.addModule("pjrt", .{
         .root_source_file = b.path("src/root.zig"),

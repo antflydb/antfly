@@ -1288,6 +1288,140 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
     return result;
 }
 
+pub fn applyTableDdlPlanToSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    plan: binder.TableDdlLogicalPlan,
+) !ddl_plan.AppliedDdlSchemaJson {
+    switch (plan) {
+        .moved => return error.UnsupportedSqlShape,
+        .create_table => |create_table| {
+            try validateTemporalForeignKeysSupported(create_table.foreign_keys);
+            if (current_schema_json.len != 0) {
+                if (create_table.replace_existing) return try appliedDdlSchemaJsonWithFlagsAlloc(
+                    alloc,
+                    try schema_json.schemaJsonFromCreateTablePlanAlloc(alloc, create_table),
+                    true,
+                    true,
+                    true,
+                    null,
+                    .{},
+                );
+                if (!create_table.if_not_exists) return error.InvalidSqlCatalog;
+                return .{ .schema_json = try alloc.dupe(u8, current_schema_json) };
+            }
+            return .{ .schema_json = try schema_json.schemaJsonFromCreateTablePlanAlloc(alloc, create_table) };
+        },
+        .table_clone => |table_clone| return try appliedDdlSchemaJsonWithFlagsAlloc(
+            alloc,
+            try schema_json.schemaJsonFromTableClonePlanAlloc(alloc, current_schema_json, table_clone),
+            table_clone.options.indexes,
+            table_clone.options.constraints or table_clone.options.checks,
+            false,
+            null,
+            .{},
+        ),
+        .drop_table => |drop_table| {
+            if (current_schema_json.len == 0) {
+                if (drop_table.if_exists) return .{ .schema_json = try alloc.dupe(u8, "") };
+                return error.InvalidSqlCatalog;
+            }
+            try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, current_schema_json);
+            return .{ .schema_json = try alloc.dupe(u8, "") };
+        },
+        .view_catalog,
+        .materialized_view_catalog,
+        .relation_lifetime,
+        .table_partition_catalog,
+        => return error.UnsupportedSqlShape,
+        .create_index, .drop_index, .alter_table, .create_update_policy => {},
+    }
+
+    if (current_schema_json.len == 0) {
+        return switch (plan) {
+            .moved => unreachable,
+            .drop_index => |drop_index| if (drop_index.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
+            .alter_table => |alter_table| if (alter_table.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
+            .create_table => unreachable,
+            .table_clone => unreachable,
+            .view_catalog => unreachable,
+            .materialized_view_catalog => unreachable,
+            .relation_lifetime => unreachable,
+            .table_partition_catalog => unreachable,
+            .drop_table => unreachable,
+            .create_index, .create_update_policy => error.InvalidSqlCatalog,
+        };
+    }
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, current_schema_json, .{});
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+
+    var result: ddl_plan.AppliedDdlSchemaJson = .{ .schema_json = &.{} };
+    switch (plan) {
+        .moved => unreachable,
+        .create_table => unreachable,
+        .table_clone => unreachable,
+        .view_catalog => unreachable,
+        .materialized_view_catalog => unreachable,
+        .relation_lifetime => unreachable,
+        .table_partition_catalog => unreachable,
+        .drop_table => unreachable,
+        .create_index => |create_index| {
+            const changed = try schema_json.applyCreateIndexPlanToSchemaJsonValue(arena, root, create_index);
+            result.requires_rebuild = changed;
+            result.validation_required = changed and create_index.unique;
+        },
+        .drop_index => |drop_index| try schema_json.applyDropIndexPlanToSchemaJsonValue(arena, root, drop_index),
+        .alter_table => |alter_table| {
+            const flags = try alterTablePlanWorkFlagsForSchemaJson(root, alter_table);
+            result.requires_rebuild = flags.requires_rebuild;
+            result.validation_required = flags.validation_required;
+            result.rewrite_required = flags.rewrite_required;
+            try schema_json.applyAlterTablePlanToSchemaJsonValue(arena, root, alter_table);
+        },
+        .create_update_policy => |update_policy| {
+            try schema_json.applyCreateUpdatePolicyPlanToSchemaJsonValue(arena, root, update_policy);
+        },
+    }
+    const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(updated_schema_json);
+    const rewrite_source = switch (plan) {
+        .alter_table => |alter_table| try alterTableRewriteExpressionSourceAlloc(alloc, alter_table),
+        else => null,
+    };
+    defer if (rewrite_source) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
+    const row_rewrite_source = switch (plan) {
+        .alter_table => |alter_table| blk: {
+            const old_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, current_schema_json);
+            defer runtime_schema.freeSchema(alloc, old_schema);
+            const new_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, updated_schema_json);
+            defer runtime_schema.freeSchema(alloc, new_schema);
+            break :blk try alterTableRowRewritePlanSourceAlloc(alloc, old_schema, new_schema, alter_table);
+        },
+        else => AppliedDdlRowRewritePlanSource{},
+    };
+    defer freeAppliedDdlRowRewritePlanSource(alloc, row_rewrite_source);
+    if (rewrite_source != null and !row_rewrite_source.empty()) return error.UnsupportedSqlShape;
+    result = try appliedDdlSchemaJsonWithFlagsAlloc(
+        alloc,
+        updated_schema_json,
+        result.requires_rebuild,
+        result.validation_required,
+        result.rewrite_required,
+        rewrite_source,
+        row_rewrite_source,
+    );
+    errdefer result.deinit(alloc);
+    try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
+    return result;
+}
+
 pub fn appliedDdlTableWorkItemsForFlagsAlloc(
     alloc: std.mem.Allocator,
     requires_rebuild: bool,

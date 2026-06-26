@@ -51,6 +51,24 @@ pub fn executeRelationalSqlDdlPlanOnService(
     }
 }
 
+pub fn executeRelationalSqlExtensionPlanOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.ExtensionCatalogPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    switch (plan) {
+        .create => |create| return try executeCreate(service, alloc, create),
+        .update => |update| return try executeUpdate(service, alloc, update),
+        .drop => |drop| return try executeDrop(service, alloc, drop),
+    }
+}
+
+pub fn executeRelationalSqlExtensionNoopAlloc(
+    alloc: std.mem.Allocator,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    return try noopRecordAlloc(alloc);
+}
+
 fn executeCreate(
     service: anytype,
     alloc: std.mem.Allocator,

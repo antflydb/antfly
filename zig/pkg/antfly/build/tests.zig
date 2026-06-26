@@ -1644,6 +1644,7 @@ pub const APITestFilters = struct {
         "api.table_reads.graph.test.",
         "api.table_reads.relational_rows.test.",
         "api.table_reads.remote_wire.test.",
+        "api.table_reads.sources.test.",
         "api.http_internal_group_read_routes.test.",
         table_reads_docid_prefix,
     };

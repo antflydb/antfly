@@ -226,7 +226,7 @@ pub const AdminSource = struct {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
         defer logical_plan.deinit(alloc);
         var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
         defer durable_plan.deinit(alloc);
@@ -236,13 +236,11 @@ pub const AdminSource = struct {
     pub fn applyRelationalSqlDdlPlanWithSession(
         self: AdminSource,
         alloc: std.mem.Allocator,
-        plan: *sql_adapter.LoweredDdlPlan,
+        plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
-        var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
-        defer durable_plan.deinit(alloc);
-        return try fn_ptr(self.ptr, alloc, &durable_plan, session);
+        return try fn_ptr(self.ptr, alloc, plan, session);
     }
 
     pub fn updateForeignKeyValidationState(
@@ -2239,12 +2237,10 @@ fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, ta
 fn applyRelationalSqlDdlPlanOnMetadataServiceWithSession(
     service_impl: anytype,
     alloc: std.mem.Allocator,
-    plan: *sql_adapter.LoweredDdlPlan,
+    plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
-    defer durable_plan.deinit(alloc);
-    return try applyDurableSqlPlanOnMetadataServiceWithSession(service_impl, alloc, &durable_plan, session);
+    return try applyDurableSqlPlanOnMetadataServiceWithSession(service_impl, alloc, plan, session);
 }
 
 fn applyDurableSqlPlanOnMetadataServiceWithSession(
@@ -3206,6 +3202,14 @@ test "metadata http extension ownership helpers protect internal table mutations
     try std.testing.expect(!extensionOwnsTableScopedObject(&snapshot, "sessions"));
 }
 
+fn durableSqlPlanForMetadataTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !sql_adapter.DurableSqlPlan {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+    defer logical_plan.deinit(alloc);
+    return try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+}
+
 test "metadata catalog validation requires cross-table foreign keys to reference parent unique columns" {
     const orders: metadata_table_manager.TableRecord = .{
         .table_id = 7,
@@ -3440,14 +3444,14 @@ test "metadata catalog validation applies sql drop table cascade through child s
         .placement_role = "data",
     });
 
-    var drop_restrict = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP TABLE customers;");
+    var drop_restrict = try durableSqlPlanForMetadataTestAlloc(alloc, "DROP TABLE customers;");
     defer drop_restrict.deinit(alloc);
     try std.testing.expectError(
         error.TableReferencedByForeignKey,
         applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &drop_restrict, catalog_resources.SqlCatalogSession.default()),
     );
 
-    var drop_cascade = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP TABLE customers CASCADE;");
+    var drop_cascade = try durableSqlPlanForMetadataTestAlloc(alloc, "DROP TABLE customers CASCADE;");
     defer drop_cascade.deinit(alloc);
     var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &drop_cascade, catalog_resources.SqlCatalogSession.default());
     defer applied.deinit(alloc);
@@ -3588,7 +3592,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
     var fake = FakeService{};
     defer fake.deinit(alloc);
 
-    var graph_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON docs EDGE (id -> body) TYPE edge_type WITH (edge_policy = 'all');");
+    var graph_plan = try durableSqlPlanForMetadataTestAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON docs EDGE (id -> body) TYPE edge_type WITH (edge_policy = 'all');");
     defer graph_plan.deinit(alloc);
     var graph = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &graph_plan, catalog_resources.SqlCatalogSession.default());
     defer graph.deinit(alloc);
@@ -3597,7 +3601,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"docs_edge_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"type\":\"graph\"") != null);
 
-    var metric_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC docs_pagerank USING pagerank WITH (max_iterations = 40);");
+    var metric_plan = try durableSqlPlanForMetadataTestAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC docs_pagerank USING pagerank WITH (max_iterations = 40);");
     defer metric_plan.deinit(alloc);
     var metric = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &metric_plan, catalog_resources.SqlCatalogSession.default());
     defer metric.deinit(alloc);
@@ -3744,7 +3748,7 @@ test "metadata catalog applies SQL ALTER COLUMN USING through typed schema rewri
     var service_fake = FakeService{};
     defer service_fake.deinit(alloc);
 
-    var rewrite_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    var rewrite_plan = try durableSqlPlanForMetadataTestAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer rewrite_plan.deinit(alloc);
     var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&service_fake, alloc, &rewrite_plan, catalog_resources.SqlCatalogSession.default());
     defer applied.deinit(alloc);
