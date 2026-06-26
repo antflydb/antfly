@@ -53,7 +53,9 @@ const runtime_status = @import("../runtime_status.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../table_catalog.zig");
-const table_reads = @import("../table_reads.zig");
+const table_read_cache = @import("../table_reads/cache.zig");
+const table_read_core = @import("../table_reads/core.zig");
+const table_read_sources = @import("../table_reads/sources.zig");
 const table_router = @import("../table_router.zig");
 const tables_api = @import("../tables.zig");
 const http_common = @import("../../raft/transport/http_common.zig");
@@ -330,7 +332,7 @@ fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
 }
 
-fn testingVisibleRootGenerationSource(value: *u64) table_reads.GroupVisibleRootGenerationSource {
+fn testingVisibleRootGenerationSource(value: *u64) table_read_core.GroupVisibleRootGenerationSource {
     return .{
         .ptr = value,
         .visible_root_generation_for_group = testingVisibleRootGenerationForGroup,
@@ -367,7 +369,7 @@ pub const ProvisionedTableWriteSource = struct {
     write_coalesce_mutex: Io.Mutex = .init,
     write_coalesce_ready: Io.Condition = .init,
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
-    read_cache: ?*table_reads.ProvisionedTableReadCache = null,
+    read_cache: ?*table_read_cache.ProvisionedTableReadCache = null,
     write_cache: ?*ProvisionedTableWriteCache = null,
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
@@ -380,7 +382,7 @@ pub const ProvisionedTableWriteSource = struct {
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
-    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?table_read_core.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -445,13 +447,13 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withGroupVisibleRootGeneration(
         self: *ProvisionedTableWriteSource,
-        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
+        generation_source: ?table_read_core.GroupVisibleRootGenerationSource,
     ) *ProvisionedTableWriteSource {
         self.group_visible_root_generation = generation_source;
         return self;
     }
 
-    fn groupVisibleRootGenerationSource(self: *const ProvisionedTableWriteSource) ?table_reads.GroupVisibleRootGenerationSource {
+    fn groupVisibleRootGenerationSource(self: *const ProvisionedTableWriteSource) ?table_read_core.GroupVisibleRootGenerationSource {
         return self.group_visible_root_generation;
     }
 
@@ -1488,7 +1490,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
 
             fn visibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) u64 {
-                const generation_source: *table_reads.GroupVisibleRootGenerationSource = @ptrCast(@alignCast(ptr));
+                const generation_source: *table_read_core.GroupVisibleRootGenerationSource = @ptrCast(@alignCast(ptr));
                 return generation_source.visibleRootGenerationForGroup(group_id);
             }
         };
@@ -2522,7 +2524,7 @@ pub const ProvisionedTableWriteSource = struct {
         return cache.entries.items.len;
     }
 
-    pub fn readPreparation(self: *ProvisionedTableWriteSource) table_reads.ReadPreparation {
+    pub fn readPreparation(self: *ProvisionedTableWriteSource) table_read_core.ReadPreparation {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -2531,14 +2533,14 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    pub fn primaryLookupDbSource(self: *ProvisionedTableWriteSource) table_reads.PrimaryLookupDbSource {
+    pub fn primaryLookupDbSource(self: *ProvisionedTableWriteSource) table_read_core.PrimaryLookupDbSource {
         return .{
             .ptr = self,
             .lease_group = leasePrimaryLookupDb,
         };
     }
 
-    fn prepareForRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) void {
+    fn prepareForRead(ptr: *anyopaque, table_name: []const u8, kind: table_read_core.ReadPreparation.Kind) void {
         _ = kind;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.waitForNoStructuralActivity(table_name);
@@ -2559,7 +2561,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?table_reads.PrimaryLookupDbLease {
+    ) !?table_read_core.PrimaryLookupDbLease {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.local_db_mutex);
         var cached: ?ProvisionedTableWriteCache.CachedDb = null;
@@ -3854,7 +3856,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
-        var read_source = table_reads.ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, raft_mod.read_gate.noopReadableLeaseRequester());
+        var read_source = table_read_sources.ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, raft_mod.read_gate.noopReadableLeaseRequester());
         read_source.cache = self.read_cache;
         read_source.backend_runtime = self.backend_runtime;
         read_source.primary_lookup_db = self.primaryLookupDbSource();
@@ -4224,7 +4226,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?ForeignKeyIntegrityResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (action == .explain_delete) {
-            var read_source = table_reads.ProvisionedTableReadSource.init(
+            var read_source = table_read_sources.ProvisionedTableReadSource.init(
                 self.replica_root_dir,
                 self.catalog,
                 raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -6775,7 +6777,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
-    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?table_read_core.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     foreground_derived_progress: bool = false,
@@ -6801,7 +6803,7 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withGroupVisibleRootGeneration(
         self: *HostedProvisionedTableWriteSource,
-        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
+        generation_source: ?table_read_core.GroupVisibleRootGenerationSource,
     ) *HostedProvisionedTableWriteSource {
         self.group_visible_root_generation = generation_source;
         return self;
@@ -7656,7 +7658,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
-        var read_source = table_reads.HostedProvisionedTableReadSource.init(
+        var read_source = table_read_sources.HostedProvisionedTableReadSource.init(
             self.replica_root_dir,
             self.catalog,
             raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -7906,7 +7908,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (action == .explain_delete) {
             var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
-            var read_source = table_reads.HostedProvisionedTableReadSource.init(
+            var read_source = table_read_sources.HostedProvisionedTableReadSource.init(
                 self.replica_root_dir,
                 self.catalog,
                 raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -12324,7 +12326,7 @@ test "api.table_writes.query_visibility table write source invalidates cached qu
     FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
     FakeEmbeddingProvider.allow_all.store(false, .monotonic);
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -12868,7 +12870,7 @@ test "api.table_writes.query_visibility table write source runtime status does n
     var hbc_cache = hbc_mod.Cache.init(alloc);
     defer hbc_cache.deinit();
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
     read_cache.hbc_cache = &hbc_cache;
 
@@ -12978,7 +12980,7 @@ test "api.table_writes.query_visibility table write source read cache overlay pr
     var hbc_cache = hbc_mod.Cache.init(alloc);
     defer hbc_cache.deinit();
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
     read_cache.hbc_cache = &hbc_cache;
 
@@ -13092,7 +13094,7 @@ test "provisioned table write source restore repair completion retires cached ve
     var hbc_cache = hbc_mod.Cache.init(alloc);
     defer hbc_cache.deinit();
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
     read_cache.hbc_cache = &hbc_cache;
 
@@ -19421,7 +19423,7 @@ test "provisioned table write source backs up and restores full_text writes from
         .manifest = &manifest,
     });
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(
+    var read_source = table_read_sources.ProvisionedTableReadSource.init(
         path,
         FakeCatalog.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -21297,7 +21299,7 @@ test "provisioned table read source serves profiled dense query without runtime 
         });
     }
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -21315,7 +21317,7 @@ test "provisioned table read source serves profiled dense query without runtime 
 
     try std.testing.expect((try write_source.source().localRuntimeStatuses(alloc, "docs")) == null);
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_read_sources.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     read_source.cache = &read_cache;
 
     var owned = try query_api.parseQueryRequest(alloc, null, "docs",
@@ -21432,7 +21434,7 @@ test "hosted provisioned table read source serves profiled dense query after ext
     });
 
     var executor_state = ExecutorState{};
-    var hosted = table_reads.HostedProvisionedTableReadSource.init(
+    var hosted = table_read_sources.HostedProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -21522,7 +21524,7 @@ test "provisioned table read source survives many external write-sync batches be
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-profiled-external-write-sync-many", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    var read_cache = table_read_cache.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -21563,7 +21565,7 @@ test "provisioned table read source survives many external write-sync batches be
     defer alloc.free(query_json);
 
     {
-        var cold_read_source = table_reads.ProvisionedTableReadSource.init(
+        var cold_read_source = table_read_sources.ProvisionedTableReadSource.init(
             replica_root_dir,
             Catalog.iface(),
             raft_mod.read_gate.noopReadableLeaseRequester(),
@@ -21597,7 +21599,7 @@ test "provisioned table read source survives many external write-sync batches be
         });
     }
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(
+    var read_source = table_read_sources.ProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),

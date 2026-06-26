@@ -11755,8 +11755,94 @@ pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !binder.LogicalSqlPlan {
-    var lowered = try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    return try parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
+}
+
+pub fn parseLogicalDdlPlanAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !binder.LogicalSqlPlan {
+    switch (parsed_sql.statement) {
+        .unsupported => return error.UnsupportedSqlShape,
+        else => {},
+    }
+    const tokens = parsed_sql.items();
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .function_bindings = function_bindings,
+    };
+    const options = DdlPlanParserOptions{
+        .schema = state.schema,
+        .field_expression_qualifiers = state.field_expression_qualifiers,
+        .returning_expression_qualifiers = state.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
+        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
+        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
+        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
+    };
+    if (parsed_sql.generated_statement) |generated_statement| {
+        if (generated_statement.ast) |generated_ast| {
+            if (try planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options)) |logical_plan| {
+                return logical_plan;
+            }
+        }
+    }
+    var lowered = try parseDdlPlanAlloc(alloc, tokens, &state.pos, options);
     return logicalPlanFromLoweredDdlPlan(&lowered);
+}
+
+pub fn planGeneratedLogicalDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    tokens: []const grammar.Token,
+    state: *parser_context.ParserState,
+    generated_statement: tokenized.GeneratedRawSqlStatement,
+    generated_ast: generated_parser.GeneratedSqlAst,
+    options: DdlPlanParserOptions,
+) !?binder.LogicalSqlPlan {
+    switch (generated_ast) {
+        .session => |session_ast| return .{ .session = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, session_ast) },
+        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+        .prepared_transaction => |prepared_transaction_ast| return .{ .transaction = .{ .prepared = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) } },
+        .transaction => |transaction_ast| {
+            var lowered = try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast);
+            return logicalPlanFromLoweredDdlPlan(&lowered);
+        },
+        .cursor => |cursor_ast| {
+            var lowered = try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast);
+            return logicalPlanFromLoweredDdlPlan(&lowered);
+        },
+        .ddl, .extension_index => |ddl_ast| {
+            if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
+                var lowered = try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
+                return logicalPlanFromLoweredDdlPlan(&lowered);
+            }
+        },
+        .graph => |graph_ast| {
+            var lowered = try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast);
+            return logicalPlanFromLoweredDdlPlan(&lowered);
+        },
+        .unsupported => |unsupported_ast| {
+            if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
+                if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
+                    return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } };
+                }
+                var lowered = catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
+                    error.UnsupportedSqlShape => switch (boundary.family) {
+                        .update_policy_trigger => return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } },
+                        else => return err,
+                    },
+                    else => return err,
+                };
+                return logicalPlanFromLoweredDdlPlan(&lowered);
+            }
+        },
+        .dml, .read => {},
+    }
+    return null;
 }
 
 pub fn logicalPlanFromLoweredDdlPlan(plan: *LoweredDdlPlan) binder.LogicalSqlPlan {
