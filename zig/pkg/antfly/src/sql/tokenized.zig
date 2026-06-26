@@ -2562,6 +2562,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .load,
         .move,
         .reassign_owned,
+        .role_session_control,
         .security_label,
         => false,
     };
@@ -3756,6 +3757,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
             .kind = .revoke,
             .reason = .revoke_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "SET ROLE app_user",
+            .kind = .role_session_control,
+            .reason = .role_session_control_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "RESET ROLE",
+            .kind = .role_session_control,
+            .reason = .role_session_control_not_planned_by_generated_parser,
         },
         .{
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",

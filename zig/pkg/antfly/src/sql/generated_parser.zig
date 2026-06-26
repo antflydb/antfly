@@ -292,6 +292,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     reindex,
     release,
     revoke,
+    role_session_control,
     savepoint,
     security_label,
     drop_materialized_view,
@@ -413,6 +414,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     reindex_not_planned_by_generated_parser,
     release_not_planned_by_generated_parser,
     revoke_not_planned_by_generated_parser,
+    role_session_control_not_planned_by_generated_parser,
     savepoint_not_planned_by_generated_parser,
     security_label_not_planned_by_generated_parser,
     drop_materialized_view_not_planned_by_generated_parser,
@@ -2210,6 +2212,8 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
     .{ .sql = "REASSIGN OWNED BY old_role TO new_role", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
+    .{ .sql = "SET ROLE app_user", .kind = .unsupported },
+    .{ .sql = "RESET ROLE", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
@@ -2586,7 +2590,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (tokens.len == 0) return .other;
     const first = tokens[0];
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .transaction = .set_transaction };
+    if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
+    if (first.matchesKeywordTag(.reset) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.reset)) return .{ .session = .reset };
     if (first.matchesKeywordTag(.show)) return .{ .session = .show };
     if (first.matchesKeywordTag(.discard)) {
@@ -3147,6 +3153,7 @@ fn buildUnsupportedAst(
             .reindex => .reindex_not_planned_by_generated_parser,
             .release => .release_not_planned_by_generated_parser,
             .revoke => .revoke_not_planned_by_generated_parser,
+            .role_session_control => .role_session_control_not_planned_by_generated_parser,
             .savepoint => .savepoint_not_planned_by_generated_parser,
             .security_label => .security_label_not_planned_by_generated_parser,
             .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,

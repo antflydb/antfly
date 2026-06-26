@@ -10539,6 +10539,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .reindex => .reindex_not_planned_by_generated_parser,
         .release => .release_not_planned_by_generated_parser,
         .revoke => .revoke_not_planned_by_generated_parser,
+        .role_session_control => .role_session_control_not_planned_by_generated_parser,
         .savepoint => .savepoint_not_planned_by_generated_parser,
         .security_label => .security_label_not_planned_by_generated_parser,
         .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,
