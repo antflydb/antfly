@@ -1037,6 +1037,9 @@ contract until storage and API row plans grow those outer-join semantics.
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates; generated
    comparison predicate metadata must now agree with exact `=`, `<>`, `<`,
    `<=`, `>`, or `>=` operator tokens on direct typed-comparison handoffs;
+   generated `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`,
+   `ISNULL`, and `NOTNULL` predicate metadata must now agree with exact
+   multi-token or postfix operator spans;
    generated
    `IN`/`BETWEEN` predicate metadata must now agree with exact operator,
    optional `NOT`, and optional `SYMMETRIC`/`ASYMMETRIC` token payloads;

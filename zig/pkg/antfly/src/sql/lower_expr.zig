@@ -4922,9 +4922,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         .allow_boolean_literal_negation = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => {},
+            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 const condition = expressionNullTestCondition(lhs, is_tail.op);
                 lhs_transferred = true;
@@ -4932,7 +4932,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
                     try appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
@@ -4947,10 +4947,10 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
             },
         }
         break :blk is_tail.op;
-    } else if (matchPostfixNullTest(tokens, pos)) |postfix_null_test|
-        postfix_null_test
-    else
-        try parseComparisonOp(tokens, pos);
+    } else if (matchPostfixNullTest(tokens, pos)) |postfix_null_test| blk: {
+        try validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
+        break :blk postfix_null_test;
+    } else try parseComparisonOp(tokens, pos);
 
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
         try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
@@ -5279,16 +5279,16 @@ pub fn parseExpressionWhereConditionsAlloc(
         .allow_boolean_literal_negation = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => {},
+            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 try expression_predicates.append(alloc, expressionNullTestCondition(lhs, is_tail.op));
                 lhs_transferred = true;
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
                     try appendExpressionBooleanIsNotGroups(alloc, expression_or_predicates, lhs, is_tail.boolean_value);
@@ -5306,10 +5306,10 @@ pub fn parseExpressionWhereConditionsAlloc(
             },
         }
         break :blk is_tail.op;
-    } else if (matchPostfixNullTest(tokens, pos)) |postfix_null_test|
-        postfix_null_test
-    else
-        try parseComparisonOp(tokens, pos);
+    } else if (matchPostfixNullTest(tokens, pos)) |postfix_null_test| blk: {
+        try validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
+        break :blk postfix_null_test;
+    } else try parseComparisonOp(tokens, pos);
 
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
         try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
@@ -11951,14 +11951,14 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         .allow_boolean_literal = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => {},
+            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 break :blk is_tail.op;
             },
             .boolean_literal => {
-                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 errdefer alloc.free(value_json);
@@ -12903,14 +12903,14 @@ pub fn parseAggregateHavingAlloc(
                 .allow_boolean_literal = true,
             })) |is_tail| blk: {
                 switch (is_tail.kind) {
-                    .distinct_comparison, .null_test => {},
+                    .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail),
                     .boolean_unknown => {
-                        try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedIsTailExpressionKind(is_tail));
+                        try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         break :blk is_tail.op;
                     },
                     .boolean_literal => {
-                        try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedIsTailExpressionKind(is_tail));
+                        try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                         var value_transferred = false;
@@ -25461,6 +25461,39 @@ fn validateGeneratedExpressionPredicateKind(
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedIsTailPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    is_tail: ExpressionIsTail,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    const expected_kind = generatedIsTailExpressionKind(is_tail);
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
+}
+
+fn validateGeneratedPostfixNullPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    op: runtime_schema.RelationalCheckOp,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    const expected_kind = generatedComparisonExpressionKindForOp(op);
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
+}
+
 fn betweenModifierTokenIndex(tokens: []const Token, index: usize) ?usize {
     if (index >= tokens.len) return null;
     if (tokens[index].matchesKeywordTag(.asymmetric) or tokens[index].matchesKeywordTag(.symmetric)) return index;
@@ -25830,6 +25863,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     const column = maybe_column orelse return error.InvalidSqlCatalog;
+    const is_tail_token_index = pos.*;
     if (try parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
@@ -25837,7 +25871,7 @@ pub fn parseWhereAtomAlloc(
     })) |is_tail| {
         switch (is_tail.kind) {
             .distinct_comparison => {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
@@ -25852,7 +25886,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_unknown => {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 try predicates.append(alloc, .{
                     .name = "",
@@ -25864,7 +25898,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 if (is_tail.boolean_negated) {
                     try appendBooleanIsNotPredicateGroups(alloc, or_predicates, field, is_tail.boolean_value);
@@ -25885,7 +25919,7 @@ pub fn parseWhereAtomAlloc(
             },
             .null_test => {},
         }
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+        try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -25895,8 +25929,9 @@ pub fn parseWhereAtomAlloc(
         field_transferred = true;
         return;
     }
+    const postfix_null_token_index = pos.*;
     if (matchPostfixNullTest(tokens, pos)) |op| {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+        try validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -26219,7 +26254,7 @@ pub fn parseJoinWhereAlloc(
             .allow_boolean_literal = true,
             .allow_boolean_literal_negation = true,
         })) |is_tail| blk: {
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedIsTailExpressionKind(is_tail));
+            try validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
             switch (is_tail.kind) {
                 .distinct_comparison, .null_test => {},
                 .boolean_unknown => {
@@ -26416,7 +26451,7 @@ pub fn parseJoinOnAlloc(
             .allow_boolean_unknown = true,
             .allow_boolean_literal = true,
         })) |is_tail| blk: {
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedIsTailExpressionKind(is_tail));
+            try validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
             switch (is_tail.kind) {
                 .distinct_comparison => unreachable,
                 .null_test => {},
@@ -27033,12 +27068,14 @@ pub fn parseScalarWherePredicateAlloc(
     const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
     if (column.field_type == .array or column.field_type == .json) return error.UnsupportedSqlShape;
 
+    const is_tail_token_index = pos.*;
     if (try parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
     })) |is_tail| {
         switch (is_tail.kind) {
             .distinct_comparison => {
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
@@ -27052,7 +27089,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_unknown => {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 field_transferred = true;
                 return .{
@@ -27063,7 +27100,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_literal => {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
+                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 var value_transferred = false;
@@ -27079,7 +27116,7 @@ pub fn parseScalarWherePredicateAlloc(
             },
             .null_test => {},
         }
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(is_tail.op));
+        try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
         field_transferred = true;
         return .{
             .name = "",
@@ -27089,8 +27126,9 @@ pub fn parseScalarWherePredicateAlloc(
         };
     }
 
+    const postfix_null_token_index = pos.*;
     if (matchPostfixNullTest(tokens, pos)) |op| {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+        try validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
         field_transferred = true;
         return .{
             .name = "",
@@ -39101,6 +39139,42 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gt),
+    );
+    const distinct_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "is", .keyword = .is },
+        .{ .kind = .identifier, .text = "not", .keyword = .not },
+        .{ .kind = .identifier, .text = "distinct", .keyword = .distinct },
+        .{ .kind = .identifier, .text = "from", .keyword = .from },
+        .{ .kind = .string, .text = "active" },
+    };
+    const distinct_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .is_not_distinct_from,
+        .operator_tokens = .{ .start = 1, .end = 5 },
+    };
+    try validateGeneratedIsTailPredicateExpression(&distinct_expression, &distinct_tokens, 1, .{
+        .op = .is_not_distinct,
+        .kind = .distinct_comparison,
+    });
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedIsTailPredicateExpression(&distinct_expression, &distinct_tokens, 2, .{
+            .op = .is_not_distinct,
+            .kind = .distinct_comparison,
+        }),
+    );
+    const postfix_null_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .identifier, .text = "notnull", .keyword = .notnull },
+    };
+    const postfix_null_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .is_not_null,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+    };
+    try validateGeneratedPostfixNullPredicateExpression(&postfix_null_expression, &postfix_null_tokens, 1, .is_not_null);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedPostfixNullPredicateExpression(&postfix_null_expression, &postfix_null_tokens, 1, .is_null),
     );
     const json_key_set_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },

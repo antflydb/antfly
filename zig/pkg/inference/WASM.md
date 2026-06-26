@@ -1320,8 +1320,8 @@ The current Electron shell is intentionally thin. It exists to give the existing
    - `node web/test-relation-support.mjs` — REBEL page-helper coverage for relation-config defaults, generated-triplet parsing, and structured relation output conversion
    - `node web/test-projector-wasm.mjs` — projector export coverage plus worker-mode RPC dispatch and Gemma4 cached multimodal generation-wrapper checks for the external Gemma3/Gemma4 browser multimodal path
 5. **Focused backend unit tests**:
-   - `zig build test-wasm-compute -Dskip-openapi=true` — targeted `wasm_compute` tests for backend ops, integer-token handoff, sampling, prepared decoder-runtime slots, and dense FFN residual coverage
-   - `zig build test-web-projector` — focused projector store/runtime-handle tests in normal package context
+   - `zig build wasm-compute-test -Dskip-openapi=true` — targeted `wasm_compute` tests for backend ops, integer-token handoff, sampling, prepared decoder-runtime slots, and dense FFN residual coverage
+   - `zig build web-projector-test` — focused projector store/runtime-handle tests in normal package context
 6. **Browser test**: Open `web/index.html`, load a GGUF, verify tokenizer/chat-template inference, then run generation
 7. **WebGPU test**: Same with `{ gpu, worker: true }`, verify results match SIMD-only path
 8. **Browser matrix**: Chrome, Firefox, Safari — SIMD works in all, WebGPU where available

@@ -80,7 +80,7 @@ fn expectAppliedDdlCorpusPlan(
         defer parsed_setup_sql.deinit(alloc);
         var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -88,7 +88,7 @@ fn expectAppliedDdlCorpusPlan(
         current_schema_json = next_schema_json;
     }
 
-    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, lowered);
+    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, lowered);
     defer applied.deinit(alloc);
     const fingerprint = try ddlAppliedFingerprintAlloc(alloc, applied);
     defer alloc.free(fingerprint);
@@ -139,7 +139,7 @@ fn schemaJsonFromSetupSqlAlloc(
         defer parsed_sql.deinit(alloc);
         var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -1228,7 +1228,7 @@ fn appParityAppliedDdlPlanAlloc(
         defer parsed_setup_sql.deinit(alloc);
         var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -1238,7 +1238,7 @@ fn appParityAppliedDdlPlanAlloc(
 
     var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql);
     defer lowered.deinit(alloc);
-    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, lowered);
+    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, lowered);
     defer applied.deinit(alloc);
     return try ddlAppliedFingerprintAlloc(alloc, applied);
 }
@@ -2776,7 +2776,7 @@ const MergeExecutionTargetRow = sql_adapter.MergeExecutionTargetRow;
 
 const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32FingerprintAlloc;
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
-const applyDdlPlanToSchemaJsonAlloc = sql_adapter.applyDdlPlanToSchemaJsonAlloc;
+const applyLoweredDdlPlanToSchemaJsonForTestAlloc = sql_adapter.applyLoweredDdlPlanToSchemaJsonForTestAlloc;
 const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
 const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbAcrossRangesAlloc;
 const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
