@@ -2374,9 +2374,8 @@ const TokenIdSink = union(enum) {
         }
     }
 
-    fn appendSymbol(self: *TokenIdSink, name: []const u8) !void {
-        const id = generated.symbolId(name) orelse return error.UnsupportedSqlShape;
-        try self.append(id);
+    fn appendToken(self: *TokenIdSink, token: generated.Token) !void {
+        try self.append(generated.tokenId(token));
     }
 };
 
@@ -2405,65 +2404,65 @@ fn appendTokenIds(
             const allow_trailing_dot = next != null and next.?.kind == .star;
             try appendIdentifierIds(ids, tok.text, allow_trailing_dot);
         },
-        .string => try ids.appendSymbol("STRING"),
-        .number => try ids.appendSymbol("NUMBER"),
-        .placeholder => try ids.appendSymbol("PLACEHOLDER"),
-        .comma => try ids.appendSymbol("COMMA"),
-        .star => try ids.appendSymbol("STAR"),
-        .eq => try ids.appendSymbol("EQ"),
-        .neq => try ids.appendSymbol("NEQ"),
-        .gt => try ids.appendSymbol("GT"),
-        .gte => try ids.appendSymbol("GTE"),
-        .lt => try ids.appendSymbol("LT"),
-        .lte => try ids.appendSymbol("LTE"),
-        .plus => try ids.appendSymbol("PLUS"),
-        .minus => try ids.appendSymbol("MINUS"),
-        .slash => try ids.appendSymbol("SLASH"),
-        .percent => try ids.appendSymbol("PERCENT"),
-        .pipe_concat => try ids.appendSymbol("PIPE_CONCAT"),
-        .at_contains => try ids.appendSymbol("AT_CONTAINS"),
-        .range_overlap => try ids.appendSymbol("RANGE_OVERLAP"),
-        .question => try ids.appendSymbol("QUESTION"),
-        .question_any => try ids.appendSymbol("QUESTION_ANY"),
-        .question_all => try ids.appendSymbol("QUESTION_ALL"),
-        .regex_match => try ids.appendSymbol("REGEX_MATCH"),
-        .regex_imatch => try ids.appendSymbol("REGEX_IMATCH"),
-        .regex_not_match => try ids.appendSymbol("REGEX_NOT_MATCH"),
-        .regex_not_imatch => try ids.appendSymbol("REGEX_NOT_IMATCH"),
-        .lparen => try ids.appendSymbol("LPAREN"),
-        .rparen => try ids.appendSymbol("RPAREN"),
-        .lbracket => try ids.appendSymbol("LBRACKET"),
-        .rbracket => try ids.appendSymbol("RBRACKET"),
-        .arrow_json => try ids.appendSymbol("ARROW_JSON"),
-        .arrow_text => try ids.appendSymbol("ARROW_TEXT"),
-        .path_arrow_json => try ids.appendSymbol("PATH_ARROW_JSON"),
-        .path_arrow_text => try ids.appendSymbol("PATH_ARROW_TEXT"),
-        .semicolon => try ids.appendSymbol("SEMICOLON"),
+        .string => try ids.appendToken(.STRING),
+        .number => try ids.appendToken(.NUMBER),
+        .placeholder => try ids.appendToken(.PLACEHOLDER),
+        .comma => try ids.appendToken(.COMMA),
+        .star => try ids.appendToken(.STAR),
+        .eq => try ids.appendToken(.EQ),
+        .neq => try ids.appendToken(.NEQ),
+        .gt => try ids.appendToken(.GT),
+        .gte => try ids.appendToken(.GTE),
+        .lt => try ids.appendToken(.LT),
+        .lte => try ids.appendToken(.LTE),
+        .plus => try ids.appendToken(.PLUS),
+        .minus => try ids.appendToken(.MINUS),
+        .slash => try ids.appendToken(.SLASH),
+        .percent => try ids.appendToken(.PERCENT),
+        .pipe_concat => try ids.appendToken(.PIPE_CONCAT),
+        .at_contains => try ids.appendToken(.AT_CONTAINS),
+        .range_overlap => try ids.appendToken(.RANGE_OVERLAP),
+        .question => try ids.appendToken(.QUESTION),
+        .question_any => try ids.appendToken(.QUESTION_ANY),
+        .question_all => try ids.appendToken(.QUESTION_ALL),
+        .regex_match => try ids.appendToken(.REGEX_MATCH),
+        .regex_imatch => try ids.appendToken(.REGEX_IMATCH),
+        .regex_not_match => try ids.appendToken(.REGEX_NOT_MATCH),
+        .regex_not_imatch => try ids.appendToken(.REGEX_NOT_IMATCH),
+        .lparen => try ids.appendToken(.LPAREN),
+        .rparen => try ids.appendToken(.RPAREN),
+        .lbracket => try ids.appendToken(.LBRACKET),
+        .rbracket => try ids.appendToken(.RBRACKET),
+        .arrow_json => try ids.appendToken(.ARROW_JSON),
+        .arrow_text => try ids.appendToken(.ARROW_TEXT),
+        .path_arrow_json => try ids.appendToken(.PATH_ARROW_JSON),
+        .path_arrow_text => try ids.appendToken(.PATH_ARROW_TEXT),
+        .semicolon => try ids.appendToken(.SEMICOLON),
     }
 }
 
 fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
     _ = prev;
-    if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.symbolId("ROUTINE") orelse error.UnsupportedSqlShape;
+    if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.tokenId(.ROUTINE);
     if (!generatedTransactionControlContext(tokens, index)) return null;
-    if (tok.matchesKeyword("characteristics")) return generated.symbolId("CHARACTERISTICS") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("committed")) return generated.symbolId("COMMITTED") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("deferrable")) return generated.symbolId("DEFERRABLE") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("isolation")) return generated.symbolId("ISOLATION") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("level")) return generated.symbolId("LEVEL") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("read")) return generated.symbolId("READ") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeywordTag(.release)) return generated.symbolId("RELEASE") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("repeatable")) return generated.symbolId("REPEATABLE") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeywordTag(.as)) return generated.symbolId("AS") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeywordTag(.savepoint)) return generated.symbolId("SAVEPOINT") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("serializable")) return generated.symbolId("SERIALIZABLE") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("session")) return generated.symbolId("SESSION") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("start")) return generated.symbolId("START") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeywordTag(.to)) return generated.symbolId("TO") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("transaction")) return generated.symbolId("TRANSACTION") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("uncommitted")) return generated.symbolId("UNCOMMITTED") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("work")) return generated.symbolId("WORK") orelse error.UnsupportedSqlShape;
-    if (tok.matchesKeyword("write")) return generated.symbolId("WRITE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("characteristics")) return generated.tokenId(.CHARACTERISTICS);
+    if (tok.matchesKeyword("committed")) return generated.tokenId(.COMMITTED);
+    if (tok.matchesKeyword("deferrable")) return generated.tokenId(.DEFERRABLE);
+    if (tok.matchesKeyword("isolation")) return generated.tokenId(.ISOLATION);
+    if (tok.matchesKeyword("level")) return generated.tokenId(.LEVEL);
+    if (tok.matchesKeyword("read")) return generated.tokenId(.READ);
+    if (tok.matchesKeywordTag(.release)) return generated.tokenId(.RELEASE);
+    if (tok.matchesKeyword("repeatable")) return generated.tokenId(.REPEATABLE);
+    if (tok.matchesKeywordTag(.as)) return generated.tokenId(.AS);
+    if (tok.matchesKeywordTag(.savepoint)) return generated.tokenId(.SAVEPOINT);
+    if (tok.matchesKeyword("serializable")) return generated.tokenId(.SERIALIZABLE);
+    if (tok.matchesKeyword("session")) return generated.tokenId(.SESSION);
+    if (tok.matchesKeyword("start")) return generated.tokenId(.START);
+    if (tok.matchesKeywordTag(.to)) return generated.tokenId(.TO);
+    if (tok.matchesKeyword("transaction")) return generated.tokenId(.TRANSACTION);
+    if (tok.matchesKeyword("uncommitted")) return generated.tokenId(.UNCOMMITTED);
+    if (tok.matchesKeyword("work")) return generated.tokenId(.WORK);
+    if (tok.matchesKeyword("write")) return generated.tokenId(.WRITE);
     return null;
 }
 
@@ -2508,11 +2507,11 @@ fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: 
     var emitted = false;
     while (parts.next()) |part| {
         if (part.len == 0) return error.UnsupportedSqlShape;
-        if (emitted) try ids.appendSymbol("DOT");
-        try ids.appendSymbol("IDENT");
+        if (emitted) try ids.appendToken(.DOT);
+        try ids.appendToken(.IDENT);
         emitted = true;
     }
-    if (has_trailing_dot) try ids.appendSymbol("DOT");
+    if (has_trailing_dot) try ids.appendToken(.DOT);
 }
 
 fn keywordSymbolId(tok: token_mod.Token) !?u16 {

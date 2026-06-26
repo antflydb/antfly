@@ -789,6 +789,10 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
+        \\pub fn tokenId(token: Token) u16 {
+        \\    return @intFromEnum(token) + 1;
+        \\}
+        \\
         \\pub const Rule = enum {
         \\
     );
@@ -1259,6 +1263,7 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseErrorWithStackBuffer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenId(token: Token) u16") != null);
 }
 
 test "generateZigMetadata rejects unexpected conflict count drift" {

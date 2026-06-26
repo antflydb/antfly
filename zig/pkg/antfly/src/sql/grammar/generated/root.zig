@@ -180376,6 +180376,10 @@ pub const Token = enum {
     WEIGHT,
 };
 
+pub fn tokenId(token: Token) u16 {
+    return @intFromEnum(token) + 1;
+}
+
 pub const Rule = enum {
     statement,
     session_statement,

@@ -1070,7 +1070,9 @@ Important performance requirements:
   reduction so tokenization can remain allocation-light and reusable for
   fingerprinting, diagnostics, read-only classification, and query formatting.
 - **Compact token ids**: use dense token and nonterminal ids so parse tables are
-  cache-friendly and cheap to serialize into generated Zig.
+  cache-friendly and cheap to serialize into generated Zig. Generated metadata
+  exposes typed token-id helpers, and the SQL facade maps fixed token kinds
+  through those helpers instead of runtime string symbol-table probes.
 - **Indexed parse tables**: generated action/goto tables carry per-state row
   ranges and use binary search inside the active row instead of scanning the
   full table. Future compression can move from row ranges to row displacement,
