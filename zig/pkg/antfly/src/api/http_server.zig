@@ -6805,6 +6805,15 @@ pub const ApiHttpServer = struct {
         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, .{ .@"error" = diagnostic });
     }
 
+    fn publicSqlParsedDiagnosticResponse(
+        self: *ApiHttpServer,
+        status: u16,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        diagnostic: sql_adapter.diagnostics.SqlDiagnosticEnvelope,
+    ) !http_common.HttpResponse {
+        return try self.publicSqlDiagnosticResponse(status, diagnostic.withSpan(parsed_sql.statement.raw().source_span));
+    }
+
     pub fn handlePublicSqlRequest(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         var outcome = try self.executePublicSqlRequestResult(request, authenticated_identity);
         switch (outcome) {
@@ -7917,14 +7926,14 @@ pub const ApiHttpServer = struct {
         defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
         if (write_statement_kind) |statement_kind| {
             if (try self.publicSqlReadOnlyActive(session)) {
-                return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .read_only_transaction).withMessage("cannot execute write statement in a read-only transaction")) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .read_only_transaction).withMessage("cannot execute write statement in a read-only transaction")) };
             }
             switch (statement_kind) {
                 .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
             }
 
             const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
-                error.InvalidRoleSetting => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_role_setting)) },
+                error.InvalidRoleSetting => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_role_setting)) },
             };
             const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
                 .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
@@ -7952,17 +7961,17 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => {
                 if (write_statement_kind != null) std.log.err("public sql write bind not found err={}", .{err});
-                return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => {
-                if (write_statement_kind != null) return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) };
-                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) };
+                if (write_statement_kind != null) return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_write)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
             },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
                 if (write_statement_kind == null and parsed_sql.readStatementKind() == null and try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
-                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
             },
-            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.plan, .unique_owner_unavailable)) },
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlParsedDiagnosticResponse(503, parsed_sql, .init(.plan, .unique_owner_unavailable)) },
             else => return err,
         };
         errdefer logical_plan.deinit(self.alloc);
@@ -7979,7 +7988,7 @@ pub const ApiHttpServer = struct {
         const session = request.session;
 
         if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
-            return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .current_transaction_aborted)) };
+            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .current_transaction_aborted)) };
         }
         if (try self.handlePublicSqlPostgresCompatibilityRead(parsed_sql, session)) |outcome_value| {
             var outcome = outcome_value;
@@ -8004,19 +8013,19 @@ pub const ApiHttpServer = struct {
         var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_view_mapping_unsupported)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
             },
             error.SqlReadOnlyTransaction => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .read_only_transaction)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
             },
             error.UnsupportedSqlShape => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
             },
             error.StatementTimeout => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlDiagnosticResponse(408, .init(.execute, .statement_timeout)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
             },
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
@@ -8027,7 +8036,7 @@ pub const ApiHttpServer = struct {
             error.RoleSettingNotFound,
             => {
                 self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
             },
             else => return err,
         };
@@ -8045,24 +8054,24 @@ pub const ApiHttpServer = struct {
                 var outcome: PublicSqlResultOrResponse = switch (planned.logical_plan) {
                     .catalog_write => try self.handlePublicSqlWrite(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                     .catalog_read => try self.handlePublicSqlRead(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
-                    .read, .write => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
+                    .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
                     else => ddl_blk: {
                         const applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, &planned.logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
                             error.DocumentSqlViewMappingUnsupported => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_view_mapping_unsupported)) };
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
                             },
                             error.SqlReadOnlyTransaction => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .read_only_transaction)) };
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
                             },
                             error.UnsupportedSqlShape => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
                             },
                             error.StatementTimeout => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlDiagnosticResponse(408, .init(.execute, .statement_timeout)) };
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
                             },
                             error.InvalidSqlSession,
                             error.PreparedStatementAlreadyExists,
@@ -8073,7 +8082,7 @@ pub const ApiHttpServer = struct {
                             error.RoleSettingNotFound,
                             => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
                             },
                             else => return err,
                         };

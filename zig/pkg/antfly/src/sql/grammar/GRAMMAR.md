@@ -1169,6 +1169,11 @@ contract until storage and API row plans grow those outer-join semantics.
    function/group delimiters, or quantified/pattern predicate heads such as
    `= ANY`, `LIKE ANY`, `@>`, regex operators, and `||` also propagate the
    generated syntax diagnostic instead of re-entering legacy read parsing.
+   Generated read CTE prefixes now validate the exact `WITH`/`WITH RECURSIVE`
+   list boundary, each CTE item name and optional column-alias group, required
+   `AS`, optional `MATERIALIZED`/`NOT MATERIALIZED`, body parentheses, comma
+   separation, and final item boundary before CTE body planning consumes the
+   generated metadata.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
@@ -1183,9 +1188,9 @@ contract until storage and API row plans grow those outer-join semantics.
    and window function surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery semantic planning/lowering beyond retained generated payload
    validation, remaining specialized expression operators, richer
-   inline window-expression semantic planning beyond current generated `OVER`
-   clause span and argument-range validation, broader recursive CTE semantic planning beyond the
-   current generated-first lowering boundary and validated body
+   inline window-expression semantic planning beyond current generated exact `OVER`
+   layout and argument-range validation, broader recursive CTE semantic planning beyond the
+   current generated-first lowering boundary and validated CTE prefix/item/body
    clause/list/expression/join/window/pagination/row-lock metadata, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,

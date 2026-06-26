@@ -516,7 +516,7 @@ fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: *
     const cte_tokens = read_ast.cte_tokens orelse return error.UnsupportedSqlShape;
     const cte_list_tokens = read_ast.cte_list_tokens orelse return error.UnsupportedSqlShape;
     if (read_ast.cte_count != read_ast.cte_items.len) return error.UnsupportedSqlShape;
-    if (cte_list_tokens.start < cte_tokens.start or cte_list_tokens.end > cte_tokens.end) return error.UnsupportedSqlShape;
+    try validateGeneratedCtePrefixLayout(tokens, cte_tokens, cte_list_tokens, read_ast.cte_recursive);
     const first = read_ast.cte_items[0];
     const last = read_ast.cte_items[read_ast.cte_items.len - 1];
     if (!std.meta.eql(read_ast.cte_name_tokens orelse return error.UnsupportedSqlShape, first.name_tokens)) return error.UnsupportedSqlShape;
@@ -529,16 +529,8 @@ fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: *
             return error.UnsupportedSqlShape;
         }
         const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
-        if (body.start <= cte.name_tokens.end or body.end > cte_list_tokens.end) return error.UnsupportedSqlShape;
-        if (body.start == 0 or body.end >= tokens.len or tokens[body.start - 1].kind != .lparen or tokens[body.end].kind != .rparen) {
-            return error.UnsupportedSqlShape;
-        }
+        try validateGeneratedCteItemLayout(tokens, cte_list_tokens, cte, index, if (index == 0) null else read_ast.cte_items[index - 1]);
         try validateGeneratedCteBodyMetadata(tokens, cte);
-        if (index > 0) {
-            const previous = read_ast.cte_items[index - 1];
-            const previous_body = previous.body_tokens orelse return error.UnsupportedSqlShape;
-            if (cte.name_tokens.start <= previous_body.end) return error.UnsupportedSqlShape;
-        }
         if (cte.column_tokens) |column_tokens| {
             const column_name_tokens = cte.column_name_tokens orelse return error.UnsupportedSqlShape;
             if (column_tokens.start < cte.name_tokens.end or column_tokens.end > body.start) return error.UnsupportedSqlShape;
@@ -558,6 +550,85 @@ fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: *
             return error.UnsupportedSqlShape;
         }
     }
+    const last_body = last.body_tokens orelse return error.UnsupportedSqlShape;
+    if (last_body.end + 1 != cte_list_tokens.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedCtePrefixLayout(
+    tokens: []const tokenized.Token,
+    cte_tokens: generated_parser.GeneratedSqlTokenRange,
+    cte_list_tokens: generated_parser.GeneratedSqlTokenRange,
+    recursive: bool,
+) !void {
+    if (cte_tokens.start == 0 or cte_tokens.end > tokens.len or cte_tokens.start >= cte_tokens.end) return error.UnsupportedSqlShape;
+    if (!tokens[cte_tokens.start - 1].matchesKeywordTag(.with)) return error.UnsupportedSqlShape;
+    if (cte_list_tokens.end != cte_tokens.end) return error.UnsupportedSqlShape;
+    if (recursive) {
+        if (cte_list_tokens.start != cte_tokens.start + 1) return error.UnsupportedSqlShape;
+        if (!tokens[cte_tokens.start].matchesKeywordTag(.recursive)) return error.UnsupportedSqlShape;
+    } else {
+        if (cte_list_tokens.start != cte_tokens.start) return error.UnsupportedSqlShape;
+        if (tokens[cte_tokens.start].matchesKeywordTag(.recursive)) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedCteItemLayout(
+    tokens: []const tokenized.Token,
+    cte_list_tokens: generated_parser.GeneratedSqlTokenRange,
+    cte: generated_parser.GeneratedSqlCteAst,
+    index: usize,
+    previous: ?generated_parser.GeneratedSqlCteAst,
+) !void {
+    const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
+    if (cte.name_tokens.start < cte_list_tokens.start or cte.name_tokens.end > cte_list_tokens.end or cte.name_tokens.start >= cte.name_tokens.end) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (previous) |previous_cte| {
+        const previous_body = previous_cte.body_tokens orelse return error.UnsupportedSqlShape;
+        const comma_index = previous_body.end + 1;
+        if (comma_index >= tokens.len or comma_index >= cte_list_tokens.end or tokens[comma_index].kind != .comma) return error.UnsupportedSqlShape;
+        if (cte.name_tokens.start != comma_index + 1) return error.UnsupportedSqlShape;
+    } else {
+        if (index != 0 or cte.name_tokens.start != cte_list_tokens.start) return error.UnsupportedSqlShape;
+    }
+
+    var cursor = cte.name_tokens.end;
+    if (cte.column_tokens) |column_tokens| {
+        if (column_tokens.start != cursor or column_tokens.end <= column_tokens.start + 1 or column_tokens.end > body.start) return error.UnsupportedSqlShape;
+        if (tokens[column_tokens.start].kind != .lparen or tokens[column_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+        cursor = column_tokens.end;
+    }
+
+    if (cursor >= tokens.len or !tokens[cursor].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    cursor += 1;
+
+    if (cte.materialization_tokens) |materialization_tokens| {
+        if (materialization_tokens.start != cursor or materialization_tokens.end > body.start) return error.UnsupportedSqlShape;
+        switch (cte.materialization orelse return error.UnsupportedSqlShape) {
+            .materialized => {
+                if (materialization_tokens.end != materialization_tokens.start + 1) return error.UnsupportedSqlShape;
+                if (!tokens[materialization_tokens.start].matchesKeywordTag(.materialized)) return error.UnsupportedSqlShape;
+            },
+            .not_materialized => {
+                if (materialization_tokens.end != materialization_tokens.start + 2) return error.UnsupportedSqlShape;
+                if (!tokens[materialization_tokens.start].matchesKeywordTag(.not) or
+                    !tokens[materialization_tokens.start + 1].matchesKeywordTag(.materialized))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+        }
+        cursor = materialization_tokens.end;
+    } else if (cte.materialization != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (body.start != cursor + 1 or body.end >= tokens.len or body.end >= cte_list_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[cursor].kind != .lparen or tokens[body.end].kind != .rparen) return error.UnsupportedSqlShape;
+    if (body.end + 1 > cte_list_tokens.end) return error.UnsupportedSqlShape;
+    if (body.end + 1 == cte_list_tokens.end) return;
+    if (tokens[body.end + 1].kind != .comma) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: generated_parser.GeneratedSqlCteAst) !void {
@@ -6021,6 +6092,20 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &cte_parsed_sql, cte_read_ast),
     );
+    cte_read_ast = switch (cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    cte_read_ast.cte_items[0].name_tokens = .{
+        .start = cte_read_ast.cte_items[0].name_tokens.start,
+        .end = cte_read_ast.cte_items[0].name_tokens.end + 1,
+    };
+    cte_read_ast.cte_name_tokens = cte_read_ast.cte_items[0].name_tokens;
+    cte_read_ast.cte_last_name_tokens = cte_read_ast.cte_items[0].name_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(cte_parsed_sql.items(), &cte_read_ast),
+    );
 
     var multi_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6037,6 +6122,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &multi_cte_parsed_sql, multi_cte_read_ast),
     );
+    multi_cte_read_ast = switch (multi_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    multi_cte_read_ast.cte_items[1].name_tokens = .{
+        .start = multi_cte_read_ast.cte_items[1].name_tokens.start - 1,
+        .end = multi_cte_read_ast.cte_items[1].name_tokens.end,
+    };
+    multi_cte_read_ast.cte_last_name_tokens = multi_cte_read_ast.cte_items[1].name_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(multi_cte_parsed_sql.items(), &multi_cte_read_ast),
+    );
 
     var materialized_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6052,6 +6150,19 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &materialized_cte_parsed_sql, materialized_cte_read_ast),
+    );
+    materialized_cte_read_ast = switch (materialized_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_materialization_tokens = materialized_cte_read_ast.cte_items[0].materialization_tokens orelse return error.UnsupportedSqlShape;
+    materialized_cte_read_ast.cte_items[0].materialization_tokens = .{
+        .start = malformed_materialization_tokens.start - 1,
+        .end = malformed_materialization_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(materialized_cte_parsed_sql.items(), &materialized_cte_read_ast),
     );
 
     var malformed_cte_body_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(
