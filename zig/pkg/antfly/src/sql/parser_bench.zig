@@ -152,6 +152,8 @@ pub fn main(init: std.process.Init) !void {
     const avg_ns_per_statement = @as(f64, @floatFromInt(elapsed_ns)) / total_parses_f;
     const tokens_per_second = @as(f64, @floatFromInt(total_tokens)) / elapsed_seconds;
     const allocated_bytes_per_statement = @as(f64, @floatFromInt(total_allocated_bytes)) / total_parses_f;
+    const action_range_stats = tableRangeStats(&generated.action_ranges);
+    const goto_range_stats = tableRangeStats(&generated.goto_ranges);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -162,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
         \\throughput tokens_per_second={d:.2} statements_per_second={d:.2}
         \\allocation bytes_per_statement={d:.2} peak_live_bytes={}
         \\generated_table states={} actions={} gotos={} rules={} productions={} rhs={} state_items={} static_bytes={} symbol_name_bytes={} estimated_bytes={}
+        \\generated_table_rows action_max={} action_avg={d:.2} goto_max={} goto_avg={d:.2}
         \\
     , .{
         cases.len,
@@ -188,8 +191,28 @@ pub fn main(init: std.process.Init) !void {
         generated.parse_table_static_bytes,
         generated.symbol_name_bytes,
         generated.parse_table_estimated_bytes,
+        action_range_stats.max,
+        action_range_stats.avg,
+        goto_range_stats.max,
+        goto_range_stats.avg,
     });
     try stdout.flush();
+}
+
+const TableRangeStats = struct {
+    max: u16,
+    avg: f64,
+};
+
+fn tableRangeStats(ranges: []const generated.TableRange) TableRangeStats {
+    var total: usize = 0;
+    var max: u16 = 0;
+    for (ranges) |range| {
+        total += range.len;
+        max = @max(max, range.len);
+    }
+    const avg = if (ranges.len == 0) 0 else @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(ranges.len));
+    return .{ .max = max, .avg = avg };
 }
 
 fn parseIterations(alloc: std.mem.Allocator, args: std.process.Args) !usize {

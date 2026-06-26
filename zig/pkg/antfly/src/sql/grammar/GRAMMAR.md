@@ -1123,7 +1123,8 @@ microbenchmark over the generated SQL compatibility corpus, including
 Antfly-specific table-function reads. It pre-tokenizes the corpus and measures
 generated parse throughput, token throughput, latency percentiles, gross
 allocated bytes per statement, peak live parser bytes, generated table counts,
-generated RHS/state item counts, and generated parse table byte estimates.
+generated RHS/state item counts, action/goto row-density statistics, and
+generated parse table byte estimates.
 Track generated Zig compile time and binary size impact with build-system
 metrics around that target. Add larger end-to-end SQL benchmarks only after a
 statement family actually switches to the generated parser.
