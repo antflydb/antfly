@@ -7185,6 +7185,9 @@ pub const ApiHttpServer = struct {
                 .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
             };
         }
+        if (try self.postgresCompatibilitySelectLiteralAlloc(parsed_sql)) |literal| {
+            return literal;
+        }
         if (self.postgresCompatibilityShowSettingName(parsed_sql)) |setting_name| {
             return .{
                 .column_name = setting_name,
@@ -7192,6 +7195,42 @@ pub const ApiHttpServer = struct {
             };
         }
         return null;
+    }
+
+    fn postgresCompatibilitySelectLiteralAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) !?PostgresCompatibilityScalar {
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return null;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len < 2 or !tokens[0].matchesKeywordTag(.select)) return null;
+
+        const value_token = tokens[1];
+        const value: []const u8 = switch (value_token.kind) {
+            .number,
+            .string,
+            => value_token.text,
+            else => if (value_token.matchesKeywordTag(.true) or value_token.matchesKeywordTag(.false) or value_token.matchesKeywordTag(.null))
+                value_token.text
+            else
+                return null,
+        };
+
+        const column_name: []const u8 = if (tokens.len == 2)
+            "?column?"
+        else if (tokens.len == 4 and tokens[2].matchesKeywordTag(.as) and tokens[3].kind == .identifier)
+            tokens[3].text
+        else if (tokens.len == 3 and tokens[2].kind == .identifier)
+            tokens[2].text
+        else
+            return null;
+
+        return .{
+            .column_name = column_name,
+            .value = try self.alloc.dupe(u8, value),
+        };
     }
 
     fn postgresCompatibilitySelectFunction(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, function_name: []const u8) bool {
@@ -27696,14 +27735,15 @@ test "api http server exposes psql-style SQL session endpoint" {
     defer missing_session_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), missing_session_resp.status);
 
-    var unsupported_resp = try server.handle(.{
+    var select_one_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
         .content_type = "application/json",
         .body = "{\"sql\":\"SELECT 1;\"}",
     });
-    defer unsupported_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), unsupported_resp.status);
+    defer select_one_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), select_one_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, select_one_resp.body, "\"?column?\":\"1\"") != null);
     try std.testing.expectEqual(@as(usize, 1), server.sql_catalog_session_runtime.sessionCountForTest());
 
     var readonly_write_resp = try server.handle(.{

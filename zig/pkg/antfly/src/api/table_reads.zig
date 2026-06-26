@@ -2989,7 +2989,6 @@ pub const materializeLoweredSqlRecursiveCteRowsWithSessionAlloc = table_read_rel
 
 const catalogTargetForLoweredSqlTable = table_read_relational_rows.catalogTargetForLoweredSqlTable;
 const loweredSqlSetOperationToRowsOperation = table_read_relational_rows.loweredSetOperationToRowsOperation;
-const executeRelationalRowsSetOperationOnQueryResultsAlloc = table_read_relational_rows.executeSetOperationOnQueryResultsAlloc;
 
 const catalogRuntimeSchemaUnlessDefaultAlloc = table_read_relational_rows.catalogRuntimeSchemaUnlessDefaultAlloc;
 
@@ -3014,14 +3013,7 @@ fn rowsQueryPlanFromRoutedScansAlloc(
     if (runtime_schema.external_base_source != null) {
         return try rowsQueryPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
     }
-    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
-
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
-    defer scanned_rows.deinit(alloc);
-
-    var local_plan = plan;
-    local_plan.ranges = &.{};
-    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+    return try table_read_relational_rows.rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
 }
 
 fn rowsAggregatePlanFromRoutedScansAlloc(
@@ -3035,14 +3027,7 @@ fn rowsAggregatePlanFromRoutedScansAlloc(
     if (runtime_schema.external_base_source != null) {
         return try rowsAggregatePlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
     }
-    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
-
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
-    defer scanned_rows.deinit(alloc);
-
-    var local_plan = plan;
-    local_plan.ranges = &.{};
-    return try relational_rows_api.executeRowsAggregatePlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+    return try table_read_relational_rows.rowsAggregatePlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
 }
 
 fn rowsSetOperationPlanFromRoutedScansAlloc(
@@ -3053,11 +3038,14 @@ fn rowsSetOperationPlanFromRoutedScansAlloc(
     plan: db_mod.types.RelationalRowsSetOperationPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
-    var left = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
-    defer left.deinit(alloc);
-    var right = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;
-    defer right.deinit(alloc);
-    return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+    if (runtime_schema.external_base_source != null) {
+        var left = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
+        defer left.deinit(alloc);
+        var right = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;
+        defer right.deinit(alloc);
+        return try table_read_relational_rows.executeSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+    }
+    return try table_read_relational_rows.rowsSetOperationPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
 }
 
 const rowsQueryPlanFromLakeScanAlloc = table_read_external_lake.rowsQueryPlanFromLakeScanAlloc;
@@ -3097,14 +3085,7 @@ fn rowsWindowPlanFromRoutedScansAlloc(
     if (runtime_schema.external_base_source != null) {
         return try rowsWindowPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
     }
-    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
-
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
-    defer scanned_rows.deinit(alloc);
-
-    var local_plan = plan;
-    local_plan.ranges = &.{};
-    return try relational_rows_api.executeRowsWindowPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+    return try table_read_relational_rows.rowsWindowPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency);
 }
 
 fn rowsJoinPlanFromRoutedScansAlloc(
@@ -3169,10 +3150,8 @@ const relationalRowsEffectiveSideTable = table_read_relational_rows.effectiveSid
 const RoutedRows = table_read_relational_rows.RoutedRows;
 const collectMergeTargetRowsFromRoutedScansAlloc = table_read_relational_rows.collectMergeTargetRowsFromRoutedScansAlloc;
 const collectMergeSourceRowsFromRoutedScansAlloc = table_read_relational_rows.collectMergeSourceRowsFromRoutedScansAlloc;
-const collectRowsFromRoutedScansAlloc = table_read_relational_rows.collectRowsFromRoutedScansAlloc;
 const routedRowsPlanRangesForJoinAlloc = table_read_relational_rows.routedRowsPlanRangesForJoinAlloc;
 const routedRowsPlanRangesForJoinCtesAlloc = table_read_relational_rows.routedRowsPlanRangesForJoinCtesAlloc;
-const relationalRowsScanPayloadCanStripSyntheticKey = table_read_relational_rows.scanPayloadCanStripSyntheticKey;
 const resolveSingleUniqueOwnerGroup = table_read_relational_rows.resolveSingleUniqueOwnerGroup;
 const lookupRelationalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalUniqueOwnerInDb;
 const lookupRelationalTemporalUniqueOwnerInDb = table_read_relational_rows.lookupRelationalTemporalUniqueOwnerInDb;

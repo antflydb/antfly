@@ -2926,6 +2926,38 @@ pub fn deallocatePreparedStatementPlanFromSyntaxAlloc(
     return .{ .statement_name = try alloc.dupe(u8, statement_name) };
 }
 
+pub fn preparedTransactionPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedTransactionAst,
+) !PreparedTransactionPlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end != 3 or tokens.len < end) return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    const second_expected = switch (ast.kind) {
+        .prepare => "transaction",
+        .commit, .rollback => "prepared",
+    };
+    const action: PreparedTransactionAction = switch (ast.kind) {
+        .prepare => .prepare,
+        .commit => .commit,
+        .rollback => .rollback,
+    };
+    switch (ast.kind) {
+        .prepare => if (!tokens[0].matchesKeywordTag(.prepare)) return error.UnsupportedSqlShape,
+        .commit => if (!tokens[0].matchesKeywordTag(.commit)) return error.UnsupportedSqlShape,
+        .rollback => if (!tokens[0].matchesKeywordTag(.rollback)) return error.UnsupportedSqlShape,
+    }
+    if (!tokens[1].matchesKeyword(second_expected)) return error.UnsupportedSqlShape;
+    const gid_tokens = ast.gid_tokens orelse return error.UnsupportedSqlShape;
+    if (gid_tokens.start != 2 or gid_tokens.end != 3) return error.UnsupportedSqlShape;
+    if (tokens[2].kind != .string or tokens[2].text.len == 0) return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return try grammar.parsePreparedTransactionTailAlloc(alloc, tokens[1..end], &pos, action);
+}
+
 pub fn preparedStatementPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -11540,6 +11572,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             switch (generated_ast) {
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+                .prepared_transaction => |prepared_transaction_ast| return .{ .prepared_transaction = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) },
                 .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
                 .cursor => |cursor_ast| return try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast),
                 .ddl, .extension_index => |ddl_ast| {
@@ -17004,6 +17037,54 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_prepare = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    defer generated_prepare.deinit(alloc);
+    var generated_prepare_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &generated_prepare);
+    defer generated_prepare_plan.deinit(alloc);
+    switch (generated_prepare_plan) {
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(PreparedTransactionAction.prepare, plan.action);
+            try std.testing.expectEqualStrings("usage_batch", plan.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_commit = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer generated_commit.deinit(alloc);
+    var generated_commit_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &generated_commit);
+    defer generated_commit_plan.deinit(alloc);
+    switch (generated_commit_plan) {
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(PreparedTransactionAction.commit, plan.action);
+            try std.testing.expectEqualStrings("usage_batch", plan.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_gid = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer malformed_gid.deinit(alloc);
+    if (malformed_gid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .prepared_transaction => |*prepared_transaction| prepared_transaction.gid_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_gid));
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .prepared_transaction => |*prepared_transaction| prepared_transaction.kind = .rollback,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
 }
 
 test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl plans" {

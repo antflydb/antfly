@@ -52,11 +52,17 @@ but does not require grammar parity
 before the existing parser can handle a statement. When the generated parser
 accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
 node and uses it for the first migrated statement variants. Session,
-transaction, and prepared statements now require generated parser success;
+transaction, prepared statements, and prepared transactions now require
+generated parser success;
 they also carry the first generated AST payload with source spans and token
 ranges for command names, values, prepared-statement arguments, and nested
-prepared statements. This AST is retained by `ParsedSql`; prepared statements
-now have an AST-to-plan conversion path with retained statement/command span,
+prepared statements. Generated prepared transaction ASTs retain the command
+kind and global transaction identifier token range for `PREPARE TRANSACTION`,
+`COMMIT PREPARED`, and `ROLLBACK PREPARED`, and lower through the typed
+prepared-transaction DDL plan boundary only when the generated command, keyword
+tail, and GID metadata agree. This AST is retained by `ParsedSql`; prepared
+statements now have an AST-to-plan conversion path with retained
+statement/command span,
 command-kind, name, parameter, argument, and nested-statement range validation
 plus parity coverage against the existing token-based lowerer, including typed
 `PREPARE name(type, ...) AS ...` parameter lists and generated `DEALLOCATE ALL`.
@@ -648,11 +654,14 @@ Suggested migration order:
 
 1. Session and control statements: `SET`, `SET LOCAL`, `RESET`,
    `RESET ALL`, `SHOW`, `SHOW ALL`, `DISCARD ALL`, `BEGIN`, `COMMIT`,
-   `ROLLBACK`, `PREPARE`, `EXECUTE`, `DEALLOCATE`.
+   `ROLLBACK`, `PREPARE`, `EXECUTE`, `DEALLOCATE`,
+   `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`.
    The generated prepared-statement grammar accepts PostgreSQL-compatible
    `DEALLOCATE PREPARE name` in addition to `DEALLOCATE name` and
    `DEALLOCATE ALL`, and the generated AST records the actual prepared
-   statement name span after the optional `PREPARE` keyword.
+   statement name span after the optional `PREPARE` keyword. Prepared
+   transactions use a separate generated AST family from named prepared
+   statements so two-phase-commit GIDs cannot be confused with statement names.
 2. DDL: `CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `ALTER TABLE`,
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,
@@ -1278,6 +1287,11 @@ variants for:
 - cursor statement, including generated AST payloads for command spans and
   typed tail token ranges for `DECLARE`, `FETCH`, `MOVE`, and `CLOSE`, plus
   generated-first AST-to-plan lowering into typed cursor portal plans
+- prepared transaction statement, including generated AST payloads for command
+  spans, action kind, and GID token ranges for `PREPARE TRANSACTION`,
+  `COMMIT PREPARED`, and `ROLLBACK PREPARED`, plus generated AST-to-plan
+  lowering that fails closed when retained generated metadata disagrees with
+  the token stream
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`,
@@ -1365,7 +1379,8 @@ Generated grammar work needs evidence at multiple levels:
   malformed database/schema/extension catalog DDL heads that no longer fall
   back to legacy DDL probing.
   Runtime DDL lowering now dispatches generated session statements, prepared
-  statements, graph DDL, database/schema/extension catalog DDL, generated
+  statements, prepared transactions, graph DDL, database/schema/extension
+  catalog DDL, generated
   `ALTER DATABASE ... SET ...` and `ALTER EXTENSION ... UPDATE` catalog DDL,
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
   generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
@@ -1401,7 +1416,10 @@ Generated grammar work needs evidence at multiple levels:
   and `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` through the
   generated AST-to-plan boundary; generated session lowering
   preserves catalog setting/search-path plans and adapter noops while failing
-  closed when retained command/name/value metadata is malformed.
+  closed when retained command/name/value metadata is malformed. Generated
+  prepared-transaction lowering has parity coverage for `PREPARE TRANSACTION`,
+  `COMMIT PREPARED`, and `ROLLBACK PREPARED`, and malformed generated action or
+  GID ranges fail closed before reaching typed planning.
   Remaining rich DDL compatibility debt is limited to generated metadata that
   still cannot represent every semantic subshape natively, especially broader
   ALTER subcommands outside the supported runtime DDL operation families.

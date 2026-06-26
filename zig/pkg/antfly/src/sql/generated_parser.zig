@@ -25,6 +25,7 @@ pub const GeneratedSqlStatementKind = enum {
     session,
     transaction,
     prepared,
+    prepared_transaction,
     ddl,
     dml,
     read,
@@ -57,6 +58,12 @@ pub const GeneratedSqlPreparedKind = enum {
     prepare,
     execute,
     deallocate,
+};
+
+pub const GeneratedSqlPreparedTransactionKind = enum {
+    prepare,
+    commit,
+    rollback,
 };
 
 pub const GeneratedSqlCursorKind = enum {
@@ -431,6 +438,7 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     session: GeneratedSqlSessionKind,
     transaction: GeneratedSqlTransactionKind,
     prepared: GeneratedSqlPreparedKind,
+    prepared_transaction: GeneratedSqlPreparedTransactionKind,
     ddl: GeneratedSqlDdlKind,
     dml: GeneratedSqlDmlKind,
     read: GeneratedSqlReadKind,
@@ -1044,6 +1052,13 @@ pub const GeneratedSqlPreparedAst = struct {
     parameter_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     inner_statement_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+pub const GeneratedSqlPreparedTransactionAst = struct {
+    kind: GeneratedSqlPreparedTransactionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+    gid_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlCursorAst = struct {
@@ -1813,6 +1828,7 @@ pub const GeneratedSqlAst = union(enum) {
     session: GeneratedSqlSessionAst,
     transaction: GeneratedSqlTransactionAst,
     prepared: GeneratedSqlPreparedAst,
+    prepared_transaction: GeneratedSqlPreparedTransactionAst,
     ddl: GeneratedSqlDdlAst,
     dml: GeneratedSqlDmlAst,
     read: *GeneratedSqlReadAst,
@@ -1911,6 +1927,9 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DEALLOCATE read_stmt", .kind = .prepared },
     .{ .sql = "DEALLOCATE PREPARE read_stmt", .kind = .prepared },
     .{ .sql = "DEALLOCATE ALL", .kind = .prepared },
+    .{ .sql = "PREPARE TRANSACTION 'usage_batch'", .kind = .prepared_transaction },
+    .{ .sql = "COMMIT PREPARED 'usage_batch'", .kind = .prepared_transaction },
+    .{ .sql = "ROLLBACK PREPARED 'usage_batch'", .kind = .prepared_transaction },
     .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records", .kind = .cursor },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
     .{ .sql = "MOVE FROM usage_cursor", .kind = .cursor },
@@ -2322,6 +2341,14 @@ pub fn parseGeneratedGateTokensStrictAlloc(alloc: std.mem.Allocator, tokens: []c
     return try parseGeneratedGateTokensStrictAllocWithAstMode(alloc, tokens, .full);
 }
 
+pub fn parseUnsupportedInsertOverridingTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+) !?GeneratedSqlParseResult {
+    if (!generatedInsertHasOverridingValue(tokens)) return null;
+    return try buildGeneratedParseResult(alloc, tokens, .{ .unsupported = .insert_overriding_value }, .full);
+}
+
 pub fn parseGeneratedGateTokensStrictAllocWithAstMode(
     alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
@@ -2334,7 +2361,7 @@ pub fn parseGeneratedGateTokensStrictAllocWithAstMode(
 
 pub fn isFirstFamilyTokens(tokens: []const token_mod.Token) bool {
     const kind = classifyTokens(tokens);
-    return kind == .session or kind == .transaction or kind == .prepared;
+    return kind == .session or kind == .transaction or kind == .prepared or kind == .prepared_transaction;
 }
 
 pub fn isGeneratedGateTokens(tokens: []const token_mod.Token) bool {
@@ -2497,8 +2524,7 @@ fn appendTokenIds(
                 try ids.append(id);
                 return;
             }
-            const allow_trailing_dot = next != null and next.?.kind == .star;
-            try appendIdentifierIds(ids, tok.text, allow_trailing_dot);
+            try appendIdentifierIds(ids, tok.text, true);
         },
         .string => try ids.appendToken(.STRING),
         .number => try ids.appendToken(.NUMBER),
@@ -2575,6 +2601,7 @@ fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: us
     if (first.matchesKeywordTag(.begin)) return true;
     if (first.matchesKeywordTag(.savepoint)) return true;
     if (first.matchesKeywordTag(.release)) return true;
+    if (first.matchesKeywordTag(.prepare)) return index <= 1;
     if (first.matchesKeywordTag(.commit)) return index <= 1;
     if (first.matchesKeywordTag(.end)) return index <= 1;
     if (first.matchesKeywordTag(.rollback)) return index <= 3;
@@ -2652,6 +2679,9 @@ fn classifyTokens(tokens: []const token_mod.Token) GeneratedSqlStatementKind {
 fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (tokens.len == 0) return .other;
     const first = tokens[0];
+    if (first.matchesKeywordTag(.prepare) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .prepared_transaction = .prepare };
+    if (first.matchesKeywordTag(.commit) and tokens.len > 1 and tokens[1].matchesKeyword("prepared")) return .{ .prepared_transaction = .commit };
+    if (first.matchesKeywordTag(.rollback) and tokens.len > 1 and tokens[1].matchesKeyword("prepared")) return .{ .prepared_transaction = .rollback };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .transaction = .set_transaction };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
@@ -3371,6 +3401,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         .session => |kind| .{ .session = buildSessionAst(tokens, end, kind, statement_span, command_span) },
         .transaction => |kind| .{ .transaction = buildTransactionAst(tokens, end, kind, statement_span, command_span) },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
+        .prepared_transaction => |kind| .{ .prepared_transaction = buildPreparedTransactionAst(end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
         .read => |kind| {
@@ -3641,9 +3672,14 @@ fn graphIndexFieldTailEnd(tokens: []const token_mod.Token, start: usize, end: us
                 depth -= 1;
             },
             .comma, .semicolon => if (depth == 0) return index,
-            else => if (depth == 0 and
+            else => if (depth == 0 and index > start and
                 (tokens[index].matchesKeywordTag(.type) or
                     tokens[index].matchesKeywordTag(.weight) or
+                    tokens[index].matchesKeywordTag(.using) or
+                    tokens[index].matchesKeywordTag(.source) or
+                    tokens[index].matchesKeyword("target") or
+                    tokens[index].matchesKeyword("model") or
+                    tokens[index].matchesKeyword("edges") or
                     tokens[index].matchesKeywordTag(.with)))
             {
                 return index;
@@ -3753,6 +3789,13 @@ fn findSetNameStart(tokens: []const token_mod.Token, end: usize) usize {
 }
 
 fn findSetValueStart(tokens: []const token_mod.Token, end: usize, name_start: usize) ?usize {
+    if (name_start + 2 < end and
+        tokens[name_start].matchesKeyword("session") and
+        tokens[name_start + 1].matchesKeyword("characteristics") and
+        tokens[name_start + 2].matchesKeywordTag(.as))
+    {
+        return null;
+    }
     var index: usize = name_start;
     while (index < end) : (index += 1) {
         if (tokens[index].kind == .eq or tokens[index].matchesKeywordTag(.to)) return index + 1;
@@ -3790,6 +3833,20 @@ fn buildPreparedAst(
         },
     }
     return ast;
+}
+
+fn buildPreparedTransactionAst(
+    end: usize,
+    kind: GeneratedSqlPreparedTransactionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlPreparedTransactionAst {
+    return .{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+        .gid_tokens = if (end == 3) .{ .start = 2, .end = 3 } else null,
+    };
 }
 
 fn buildDdlAst(
@@ -7591,6 +7648,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .execute }, (try parseSqlAlloc(alloc, "EXECUTE read_stmt()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .deallocate }, (try parseSqlAlloc(alloc, "DEALLOCATE PREPARE read_stmt")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .deallocate }, (try parseSqlAlloc(alloc, "DEALLOCATE ALL")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .prepared_transaction = .prepare }, (try parseSqlAlloc(alloc, "PREPARE TRANSACTION 'usage_batch'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .prepared_transaction = .commit }, (try parseSqlAlloc(alloc, "COMMIT PREPARED 'usage_batch'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .prepared_transaction = .rollback }, (try parseSqlAlloc(alloc, "ROLLBACK PREPARED 'usage_batch'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE usage_session_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
@@ -7975,6 +8035,29 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(prepared.parameter_tokens == null);
             try std.testing.expect(prepared.argument_tokens == null);
             try std.testing.expect(prepared.inner_statement_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const prepare_transaction_sql = "PREPARE TRANSACTION 'usage_batch'";
+    const prepare_transaction_result = try parseSqlAlloc(alloc, prepare_transaction_sql);
+    switch (prepare_transaction_result.ast.?) {
+        .prepared_transaction => |prepared_transaction| {
+            try std.testing.expectEqual(GeneratedSqlPreparedTransactionKind.prepare, prepared_transaction.kind);
+            try std.testing.expectEqualStrings("PREPARE TRANSACTION 'usage_batch'", spanText(prepare_transaction_sql, prepared_transaction.statement_span));
+            try std.testing.expectEqualStrings("PREPARE", spanText(prepare_transaction_sql, prepared_transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, prepared_transaction.gid_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const commit_prepared_sql = "COMMIT PREPARED 'usage_batch'";
+    const commit_prepared_result = try parseSqlAlloc(alloc, commit_prepared_sql);
+    switch (commit_prepared_result.ast.?) {
+        .prepared_transaction => |prepared_transaction| {
+            try std.testing.expectEqual(GeneratedSqlPreparedTransactionKind.commit, prepared_transaction.kind);
+            try std.testing.expectEqualStrings("COMMIT", spanText(commit_prepared_sql, prepared_transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, prepared_transaction.gid_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -8832,7 +8915,7 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(alloc, "SELECT docs. FROM docs"));
+    try std.testing.expectError(error.UnexpectedToken, parseSqlAlloc(alloc, "SELECT docs. FROM docs"));
 
     const star_with_extra_projection_read_sql = "SELECT *, lower(status) AS status_key, metadata->>'source' AS source FROM usage_records ORDER BY id ASC LIMIT 5";
     const star_with_extra_projection_read_result = try parseSqlAlloc(alloc, star_with_extra_projection_read_sql);

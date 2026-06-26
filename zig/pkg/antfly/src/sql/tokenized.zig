@@ -308,11 +308,15 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const result = if (allowsGeneratedGrammarFallback(tokens, raw_statement))
+    const generated_fallback_allowed = allowsGeneratedGrammarFallback(tokens, raw_statement);
+    const result = if (generated_fallback_allowed)
         try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens)
     else
         generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
             error.UnsupportedSqlShape, error.UnexpectedToken => {
+                if (try generated_parser.parseUnsupportedInsertOverridingTokensAlloc(alloc, tokens)) |parsed| {
+                    return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
+                }
                 if (generatedStrictParseFailureShouldPropagate(tokens, raw_statement)) return err;
                 return null;
             },
@@ -321,6 +325,7 @@ fn parseGeneratedRawStatementAlloc(
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
+    if (!generated_fallback_allowed and generatedStrictParseFailureShouldPropagate(tokens, raw_statement)) return error.UnexpectedToken;
     return null;
 }
 
@@ -328,6 +333,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return true;
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
+    if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedReadBoundary(tokens, raw_statement) or
@@ -378,8 +384,8 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
-    if (isPreparedTransactionStatement(tokens, raw_statement)) return false;
     const first = tokens[start];
+    if (isPreparedTransactionStatement(tokens, raw_statement)) return true;
     if (tokenMatchesKeyword(first, .set)) {
         if (start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction")) return true;
         return start + 4 < end and
@@ -463,7 +469,6 @@ fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatem
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
-        tokenMatchesText(first, "move") or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
         tokenMatchesKeyword(first, .revoke) or
@@ -587,6 +592,7 @@ fn isGeneratedCursorStatementHead(tokens: []const Token, raw_statement: RawSqlSt
     const first = tokens[start];
     return tokenMatchesText(first, "declare") or
         tokenMatchesKeyword(first, .fetch) or
+        tokenMatchesText(first, "move") or
         tokenMatchesKeyword(first, .close);
 }
 
@@ -605,7 +611,7 @@ fn isGeneratedPreparedStatementHead(tokens: []const Token, raw_statement: RawSql
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
-    if (isPreparedTransactionStatement(tokens, raw_statement)) return false;
+    if (isPreparedTransactionStatement(tokens, raw_statement)) return true;
     const first = tokens[start];
     return tokenMatchesKeyword(first, .prepare) or
         tokenMatchesKeyword(first, .execute) or
@@ -870,6 +876,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 2) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesText(tokens[start + 1], "transform")) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
     }
     if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .table)) {
         if (end <= start + 3) return true;
@@ -905,6 +915,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesText(tokens[start + 1], "transform")) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
     if (tokenMatchesKeyword(first, .drop)) {
         if (tokenMatchesKeyword(tokens[start + 1], .materialized)) {
             if (end <= start + 3) return true;
@@ -926,6 +940,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(tokens[start + 1], .schema) or
             tokenMatchesKeyword(tokens[start + 1], .extension))
         {
+            if (end <= start + 2) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+        if (tokenMatchesText(tokens[start + 1], "transform")) {
             if (end <= start + 2) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
@@ -1225,23 +1243,17 @@ fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement
     if (end != start + 1) return false;
     const first = tokens[start];
     return tokenMatchesKeyword(first, .call) or
-        tokenMatchesKeyword(first, .close) or
         tokenMatchesKeyword(first, .cluster) or
         tokenMatchesKeyword(first, .comment) or
         tokenMatchesKeyword(first, .copy) or
-        tokenMatchesText(first, "declare") or
         tokenMatchesText(first, "do") or
-        tokenMatchesKeyword(first, .fetch) or
         tokenMatchesKeyword(first, .grant) or
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
-        tokenMatchesText(first, "move") or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
-        tokenMatchesText(first, "release") or
         tokenMatchesKeyword(first, .revoke) or
-        tokenMatchesKeyword(first, .savepoint) or
         tokenMatchesKeyword(first, .security) or
         tokenMatchesKeyword(first, .unlisten);
 }
@@ -1263,6 +1275,10 @@ fn parseStatement(
                 return .{ .unknown = raw_statement },
             .prepared => |kind| if (generatedPreparedAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
                 return .{ .prepared = .{ .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
+            .prepared_transaction => |kind| if (generatedPreparedTransactionAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
+                return .{ .ddl = .{ .raw = raw_statement } }
             else
                 return .{ .unknown = raw_statement },
             .ddl => |kind| if (generatedDdlAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
@@ -1384,6 +1400,23 @@ fn generatedPreparedAstHasValidClassificationPayload(
         .prepare => prepared_ast.name_tokens != null and prepared_ast.inner_statement_tokens != null,
         .execute, .deallocate => prepared_ast.name_tokens != null,
     };
+}
+
+fn generatedPreparedTransactionAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlPreparedTransactionKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const prepared_transaction_ast = switch (ast_value) {
+        .prepared_transaction => |prepared_transaction| prepared_transaction,
+        else => return false,
+    };
+    if (prepared_transaction_ast.kind != expected_kind) return false;
+    const end = generatedControlStatementEnd(tokens, prepared_transaction_ast.statement_span) orelse return false;
+    if (!std.meta.eql(prepared_transaction_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedControlOptionalTokenRangeIsValid(tokens, end, prepared_transaction_ast.gid_tokens)) return false;
+    return prepared_transaction_ast.gid_tokens != null;
 }
 
 fn generatedCursorAstHasValidClassificationPayload(
@@ -4241,25 +4274,40 @@ test "sql adapter parsed sql owns typed statement variants" {
 
     var prepare_transaction = try ParsedSql.initAlloc(alloc, "PREPARE TRANSACTION 'usage_batch'");
     defer prepare_transaction.deinit(alloc);
-    try std.testing.expect(prepare_transaction.generatedStatementKind() == null);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared_transaction, prepare_transaction.generatedStatementKind().?);
     switch (prepare_transaction.statement) {
         .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (prepare_transaction.generated_statement.?.ast.?) {
+        .prepared_transaction => |generated| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlPreparedTransactionKind.prepare, generated.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, generated.gid_tokens.?);
+        },
         else => return error.TestUnexpectedResult,
     }
 
     var commit_prepared = try ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch'");
     defer commit_prepared.deinit(alloc);
-    try std.testing.expect(commit_prepared.generatedStatementKind() == null);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared_transaction, commit_prepared.generatedStatementKind().?);
     switch (commit_prepared.statement) {
         .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commit_prepared.generated_statement.?.ast.?) {
+        .prepared_transaction => |generated| try std.testing.expectEqual(generated_parser.GeneratedSqlPreparedTransactionKind.commit, generated.kind),
         else => return error.TestUnexpectedResult,
     }
 
     var rollback_prepared = try ParsedSql.initAlloc(alloc, "ROLLBACK PREPARED 'usage_batch'");
     defer rollback_prepared.deinit(alloc);
-    try std.testing.expect(rollback_prepared.generatedStatementKind() == null);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared_transaction, rollback_prepared.generatedStatementKind().?);
     switch (rollback_prepared.statement) {
         .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (rollback_prepared.generated_statement.?.ast.?) {
+        .prepared_transaction => |generated| try std.testing.expectEqual(generated_parser.GeneratedSqlPreparedTransactionKind.rollback, generated.kind),
         else => return error.TestUnexpectedResult,
     }
 

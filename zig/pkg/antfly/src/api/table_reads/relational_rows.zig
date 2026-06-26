@@ -2523,6 +2523,75 @@ pub fn collectRowsFromRoutedScansAlloc(
     return .{ .rows = try rows.toOwnedSlice(alloc) };
 }
 
+pub fn rowsQueryPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
+pub fn rowsAggregatePlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsAggregatePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsAggregateResult {
+    if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsAggregatePlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
+pub fn rowsSetOperationPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var left = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
+    defer left.deinit(alloc);
+    var right = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;
+    defer right.deinit(alloc);
+    return try executeSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+}
+
+pub fn rowsWindowPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsWindowPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsWindowResult {
+    if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsWindowPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
 fn appendRowsFromRoutedScanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,

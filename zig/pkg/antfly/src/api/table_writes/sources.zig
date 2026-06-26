@@ -13117,6 +13117,284 @@ test "provisioned table write source runtime status does not lease writer during
     try write_cache.finishAutoBulkIngestLocked(7001, "docs");
 }
 
+test "runtime status request does not finish expired auto bulk ingest" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-auto-bulk-expired", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
+    cached.deinit(alloc);
+
+    const now_ns = platform_time.monotonicNs();
+    try write_cache.ensureAutoBulkIngestLocked(7001, "docs", now_ns -| auto_bulk_ingest_max_idle_ns);
+    write_cache.entries.items[0].auto_bulk_ingest_last_ns = now_ns -| auto_bulk_ingest_max_idle_ns;
+    source.markWriteCacheDirty("docs");
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+
+    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    items[0] = .{
+        .group_id = 7001,
+        .stats = .{},
+    };
+    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = items },
+    };
+    snapshot_cache.replaceOwned(snapshots);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
+    try write_cache.finishAutoBulkIngestLocked(7001, "docs");
+}
+
+test "runtime status refresh preserves current snapshot on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+
+    const current_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    var current = runtime_status.LocalTableRuntimeStatuses{ .items = current_items };
+    defer current.deinit(alloc);
+    current.items[0] = .{
+        .group_id = 7001,
+        .stats = .{ .doc_count = 11 },
+    };
+
+    const refresh_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    var refresh = runtime_status.LocalTableRuntimeStatuses{ .items = refresh_items };
+    defer refresh.deinit(alloc);
+    refresh.items[0] = .{
+        .group_id = 7001,
+        .stats = .{ .doc_count = 99 },
+    };
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ProvisionedTableWriteSource.replaceRuntimeStatusesWithMergedRefresh(alloc, &current, &refresh),
+    );
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 1), current.items.len);
+    try std.testing.expectEqual(@as(u64, 11), current.items[0].stats.doc_count);
+
+    try ProvisionedTableWriteSource.replaceRuntimeStatusesWithMergedRefresh(alloc, &current, &refresh);
+    try std.testing.expectEqual(@as(usize, 1), current.items.len);
+    try std.testing.expectEqual(@as(u64, 99), current.items[0].stats.doc_count);
+}
+
+test "provisioned table write source startup snapshot preserves existing group status" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    items[0] = .{
+        .group_id = 7001,
+        .stats = .{
+            .doc_count = 9,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    items[0].stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 9,
+    };
+
+    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = items },
+    };
+    snapshot_cache.replaceOwned(snapshots);
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-startup-overlay", NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{
+        .active = true,
+        .phase = .opening_db,
+        .wal_retention_known = true,
+        .wal_retained_segments = 5,
+        .wal_retained_bytes = 123,
+    }, null, null);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
+    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.opening_db, statuses.items[0].stats.async_indexing.startup.phase);
+    try std.testing.expectEqual(@as(u64, 5), statuses.items[0].stats.async_indexing.startup.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 123), statuses.items[0].stats.async_indexing.startup.wal_retained_bytes);
+}
+
+test "startup async overlay replaces async stats while preserving cached table stats" {
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = .{
+            .doc_count = 9,
+            .index_count = 1,
+            .indexes = &.{},
+            .async_indexing = .{
+                .startup = .{
+                    .active = true,
+                    .phase = .opening_db,
+                    .wal_retention_known = true,
+                    .wal_retained_segments = 5,
+                    .wal_retained_bytes = 123,
+                },
+                .dense_catch_up = .{
+                    .active = false,
+                    .current_sequence = 1,
+                    .current_target_sequence = 2,
+                    .current_scanned_entries = 3,
+                    .current_applied_entries = 4,
+                    .progress_updates = 5,
+                },
+            },
+        },
+    };
+
+    applyStartupCatchUpAsyncOverlay(&status, .{
+        .startup = .{
+            .active = true,
+            .phase = .artifact_rebuild,
+            .configured_indexes = 2,
+            .opened_indexes = 2,
+        },
+        .dense_catch_up = .{
+            .active = true,
+            .current_sequence = 10880,
+            .current_target_sequence = 1001001,
+            .current_scanned_entries = 10880,
+            .current_applied_entries = 10880,
+            .progress_updates = 91,
+        },
+    }, .{
+        .active = true,
+        .phase = .artifact_rebuild,
+        .wal_retention_known = true,
+        .wal_retained_segments = 7,
+        .wal_retained_bytes = 456,
+    });
+
+    try std.testing.expectEqual(@as(u64, 9), status.stats.doc_count);
+    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.artifact_rebuild, status.stats.async_indexing.startup.phase);
+    try std.testing.expectEqual(@as(u64, 7), status.stats.async_indexing.startup.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 456), status.stats.async_indexing.startup.wal_retained_bytes);
+    try std.testing.expect(status.stats.async_indexing.dense_catch_up.active);
+    try std.testing.expectEqual(@as(u64, 10880), status.stats.async_indexing.dense_catch_up.current_applied_entries);
+}
+
+test "provisioned table write source maintenance probes are best effort when local db is busy" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-maintenance-probe", FakeCatalog.iface());
+    try std.testing.expect(source.local_db_mutex.tryLock());
+    defer source.local_db_mutex.unlock();
+
+    try std.testing.expectEqual(@as(u64, 0), source.lsmMaintenanceScoreBestEffort());
+    try std.testing.expect(source.hasActiveBulkIngestSession());
+    try std.testing.expect(!try source.runLsmMaintenanceRoundBestEffort());
+}
+
 test "auto bulk best-effort finish does not spin when writer cache lock is busy" {
     var source = ProvisionedTableWriteSource.init(
         "/tmp/unused-antfly-auto-bulk-finish-busy",
