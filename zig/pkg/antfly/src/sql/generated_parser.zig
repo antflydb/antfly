@@ -1775,6 +1775,14 @@ pub const GeneratedSqlGraphAst = struct {
     edge_target_tokens: ?GeneratedSqlTokenRange = null,
     edge_type_tokens: ?GeneratedSqlTokenRange = null,
     edge_weight_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_enrichment_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_input_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_model_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_edges_path_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_source_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_target_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_type_tokens: ?GeneratedSqlTokenRange = null,
+    extraction_weight_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlUnsupportedAst = struct {
@@ -3463,6 +3471,7 @@ fn buildGraphAst(
                 if (ast.source_name_tokens) |source| {
                     if (kind == .create_index) {
                         buildGraphIndexEdgeAst(tokens, end, &ast, source.end);
+                        if (ast.edge_tokens == null) buildGraphIndexExtractionAst(tokens, end, &ast, source.end);
                     } else if (source.end < end) {
                         ast.option_tokens = .{ .start = source.end, .end = end };
                     }
@@ -3518,6 +3527,81 @@ fn buildGraphIndexEdgeAst(
             if (index + 1 < end) {
                 const value_end = graphIndexFieldTailEnd(tokens, index + 1, end);
                 if (value_end > index + 1) ast.edge_weight_tokens = .{ .start = index + 1, .end = value_end };
+                index = value_end;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+}
+
+fn buildGraphIndexExtractionAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    ast: *GeneratedSqlGraphAst,
+    start: usize,
+) void {
+    var index = start;
+    if (index >= end or !tokens[index].matchesKeywordTag(.source)) return;
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeyword("enrichment")) return;
+    index += 1;
+    ast.extraction_enrichment_tokens = generatedQualifiedNameRange(tokens, index, end) orelse return;
+    index = ast.extraction_enrichment_tokens.?.end;
+    if (index >= end or !tokens[index].matchesKeywordTag(.from)) return;
+    index += 1;
+    const input_end = graphIndexFieldTailEnd(tokens, index, end);
+    if (input_end <= index) return;
+    ast.extraction_input_tokens = .{ .start = index, .end = input_end };
+    index = input_end;
+    if (index >= end or !tokens[index].matchesKeywordTag(.using)) return;
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeyword("extractor")) return;
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeyword("model")) return;
+    index += 1;
+    if (index >= end or (tokens[index].kind != .string and tokens[index].kind != .identifier)) return;
+    ast.extraction_model_tokens = .{ .start = index, .end = index + 1 };
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeyword("edges")) return;
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeyword("json_path")) return;
+    index += 1;
+    if (index >= end or tokens[index].kind != .string) return;
+    ast.extraction_edges_path_tokens = .{ .start = index, .end = index + 1 };
+    index += 1;
+    if (index >= end or !tokens[index].matchesKeywordTag(.source)) return;
+    index += 1;
+    const source_end = graphIndexFieldTailEnd(tokens, index, end);
+    if (source_end <= index) return;
+    ast.extraction_source_tokens = .{ .start = index, .end = source_end };
+    index = source_end;
+    if (index >= end or !tokens[index].matchesKeyword("target")) return;
+    index += 1;
+    const target_end = graphIndexFieldTailEnd(tokens, index, end);
+    if (target_end <= index) return;
+    ast.extraction_target_tokens = .{ .start = index, .end = target_end };
+    index = target_end;
+
+    while (index < end) {
+        if (tokens[index].matchesKeywordTag(.with)) {
+            ast.option_tokens = .{ .start = index, .end = end };
+            break;
+        }
+        if (tokens[index].matchesKeywordTag(.type)) {
+            if (index + 1 < end) {
+                const value_end = graphIndexFieldTailEnd(tokens, index + 1, end);
+                if (value_end > index + 1) ast.extraction_type_tokens = .{ .start = index + 1, .end = value_end };
+                index = value_end;
+                continue;
+            }
+            break;
+        }
+        if (tokens[index].matchesKeywordTag(.weight)) {
+            if (index + 1 < end) {
+                const value_end = graphIndexFieldTailEnd(tokens, index + 1, end);
+                if (value_end > index + 1) ast.extraction_weight_tokens = .{ .start = index + 1, .end = value_end };
                 index = value_end;
                 continue;
             }
@@ -11421,6 +11505,26 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, graph.edge_type_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, graph.edge_weight_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 22 }, graph.option_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_extraction_sql = "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all')";
+    const graph_extraction_result = try parseSqlAlloc(alloc, graph_extraction_sql);
+    switch (graph_extraction_result.ast.?) {
+        .graph => |graph| {
+            try std.testing.expectEqual(GeneratedSqlGraphKind.create_index, graph.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, graph.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, graph.source_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, graph.extraction_enrichment_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, graph.extraction_input_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, graph.extraction_model_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, graph.extraction_edges_path_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, graph.extraction_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, graph.extraction_target_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 23, .end = 24 }, graph.extraction_type_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 25, .end = 26 }, graph.extraction_weight_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 26, .end = 32 }, graph.option_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -1542,6 +1542,14 @@ fn generatedGraphAstHasValidClassificationPayload(
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_target_tokens)) return false;
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_type_tokens)) return false;
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_weight_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_enrichment_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_input_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_model_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_edges_path_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_source_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_target_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_type_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.extraction_weight_tokens)) return false;
     return generatedGraphRequiredPayloadIsValid(tokens, end, graph_ast);
 }
 
@@ -1585,7 +1593,8 @@ fn generatedGraphRequiredPayloadIsValid(
                 graph_ast.edge_source_tokens == null and
                 graph_ast.edge_target_tokens == null and
                 graph_ast.edge_type_tokens == null and
-                graph_ast.edge_weight_tokens == null;
+                graph_ast.edge_weight_tokens == null and
+                generatedGraphExtractionPayloadIsEmpty(graph_ast);
             return generatedGraphIndexEdgePayloadIsValid(tokens, end, source.end, graph_ast);
         },
         .alter_metric => {
@@ -1609,12 +1618,15 @@ fn generatedGraphIndexEdgePayloadIsValid(
     source_end: usize,
     graph_ast: generated_parser.GeneratedSqlGraphAst,
 ) bool {
+    if (graph_ast.extraction_enrichment_tokens != null) return generatedGraphIndexExtractionPayloadIsValid(tokens, end, source_end, graph_ast);
     const edge = graph_ast.edge_tokens orelse {
         return graph_ast.edge_source_tokens == null and
             graph_ast.edge_target_tokens == null and
             graph_ast.edge_type_tokens == null and
-            graph_ast.edge_weight_tokens == null;
+            graph_ast.edge_weight_tokens == null and
+            generatedGraphExtractionPayloadIsEmpty(graph_ast);
     };
+    if (!generatedGraphExtractionPayloadIsEmpty(graph_ast)) return false;
     if (edge.start != source_end or edge.end > end or edge.start + 4 > edge.end) return false;
     if (!tokens[edge.start].matchesKeyword("edge") or tokens[edge.start + 1].kind != .lparen or tokens[edge.end - 1].kind != .rparen) return false;
     const source = graph_ast.edge_source_tokens orelse return false;
@@ -1626,6 +1638,54 @@ fn generatedGraphIndexEdgePayloadIsValid(
     if (!generatedGraphOptionalTailFieldIsValid(edge.end, end, graph_ast.edge_weight_tokens)) return false;
     const tail_end = generatedGraphIndexTailEnd(edge.end, graph_ast.edge_type_tokens, graph_ast.edge_weight_tokens);
     return generatedGraphOptionsFollow(end, tail_end, graph_ast.option_tokens);
+}
+
+fn generatedGraphIndexExtractionPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    source_end: usize,
+    graph_ast: generated_parser.GeneratedSqlGraphAst,
+) bool {
+    if (graph_ast.edge_tokens != null or
+        graph_ast.edge_source_tokens != null or
+        graph_ast.edge_target_tokens != null or
+        graph_ast.edge_type_tokens != null or
+        graph_ast.edge_weight_tokens != null)
+    {
+        return false;
+    }
+    const enrichment = graph_ast.extraction_enrichment_tokens orelse return false;
+    const input = graph_ast.extraction_input_tokens orelse return false;
+    const model = graph_ast.extraction_model_tokens orelse return false;
+    const path = graph_ast.extraction_edges_path_tokens orelse return false;
+    const source = graph_ast.extraction_source_tokens orelse return false;
+    const target = graph_ast.extraction_target_tokens orelse return false;
+    if (source_end + 2 > enrichment.start) return false;
+    if (!tokens[source_end].matchesKeywordTag(.source) or !tokens[source_end + 1].matchesKeyword("enrichment")) return false;
+    if (enrichment.end >= input.start or !tokens[input.start - 1].matchesKeywordTag(.from)) return false;
+    if (input.end + 3 > model.start) return false;
+    if (!tokens[input.end].matchesKeywordTag(.using) or !tokens[input.end + 1].matchesKeyword("extractor") or !tokens[input.end + 2].matchesKeyword("model")) return false;
+    if (model.start + 1 != model.end or (tokens[model.start].kind != .string and tokens[model.start].kind != .identifier)) return false;
+    if (model.end + 2 > path.start) return false;
+    if (!tokens[model.end].matchesKeyword("edges") or !tokens[model.end + 1].matchesKeyword("json_path")) return false;
+    if (path.start + 1 != path.end or tokens[path.start].kind != .string) return false;
+    if (path.end >= source.start or !tokens[source.start - 1].matchesKeywordTag(.source)) return false;
+    if (source.end >= target.start or !tokens[target.start - 1].matchesKeyword("target")) return false;
+    if (!generatedGraphOptionalTailFieldIsValid(target.end, end, graph_ast.extraction_type_tokens)) return false;
+    if (!generatedGraphOptionalTailFieldIsValid(target.end, end, graph_ast.extraction_weight_tokens)) return false;
+    const tail_end = generatedGraphIndexTailEnd(target.end, graph_ast.extraction_type_tokens, graph_ast.extraction_weight_tokens);
+    return generatedGraphOptionsFollow(end, tail_end, graph_ast.option_tokens);
+}
+
+fn generatedGraphExtractionPayloadIsEmpty(graph_ast: generated_parser.GeneratedSqlGraphAst) bool {
+    return graph_ast.extraction_enrichment_tokens == null and
+        graph_ast.extraction_input_tokens == null and
+        graph_ast.extraction_model_tokens == null and
+        graph_ast.extraction_edges_path_tokens == null and
+        graph_ast.extraction_source_tokens == null and
+        graph_ast.extraction_target_tokens == null and
+        graph_ast.extraction_type_tokens == null and
+        graph_ast.extraction_weight_tokens == null;
 }
 
 fn generatedGraphNestedRangeIsValid(

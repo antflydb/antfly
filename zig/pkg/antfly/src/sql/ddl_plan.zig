@@ -4613,7 +4613,7 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     var plan: LoweredDdlPlan = switch (ast.kind) {
-        .create_index => .{ .create_index = if (ast.edge_tokens != null)
+        .create_index => .{ .create_index = if (ast.edge_tokens != null or ast.extraction_enrichment_tokens != null)
             try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
         else
             try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
@@ -4697,7 +4697,8 @@ fn validateGeneratedGraphNoEdgePayload(ast: generated_parser.GeneratedSqlGraphAs
         ast.edge_source_tokens != null or
         ast.edge_target_tokens != null or
         ast.edge_type_tokens != null or
-        ast.edge_weight_tokens != null)
+        ast.edge_weight_tokens != null or
+        !generatedGraphExtractionPayloadIsEmpty(ast))
     {
         return error.UnsupportedSqlShape;
     }
@@ -4709,16 +4710,19 @@ fn validateGeneratedGraphIndexEdgePayload(
     source_end: usize,
     ast: generated_parser.GeneratedSqlGraphAst,
 ) !void {
+    if (ast.extraction_enrichment_tokens != null) return validateGeneratedGraphIndexExtractionPayload(tokens, end, source_end, ast);
     const edge = ast.edge_tokens orelse {
         if (ast.edge_source_tokens != null or
             ast.edge_target_tokens != null or
             ast.edge_type_tokens != null or
-            ast.edge_weight_tokens != null)
+            ast.edge_weight_tokens != null or
+            !generatedGraphExtractionPayloadIsEmpty(ast))
         {
             return error.UnsupportedSqlShape;
         }
         return;
     };
+    if (!generatedGraphExtractionPayloadIsEmpty(ast)) return error.UnsupportedSqlShape;
     if (edge.start != source_end or edge.end > end or edge.start + 4 > edge.end) return error.UnsupportedSqlShape;
     if (!tokens[edge.start].matchesKeyword("edge") or tokens[edge.start + 1].kind != .lparen or tokens[edge.end - 1].kind != .rparen) {
         return error.UnsupportedSqlShape;
@@ -4732,6 +4736,55 @@ fn validateGeneratedGraphIndexEdgePayload(
     try validateGeneratedGraphOptionalTailField(edge.end, end, ast.edge_type_tokens);
     try validateGeneratedGraphOptionalTailField(edge.end, end, ast.edge_weight_tokens);
     try validateGeneratedGraphOptions(end, generatedGraphIndexTailEnd(edge.end, ast.edge_type_tokens, ast.edge_weight_tokens), ast.option_tokens);
+}
+
+fn validateGeneratedGraphIndexExtractionPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    source_end: usize,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !void {
+    if (ast.edge_tokens != null or
+        ast.edge_source_tokens != null or
+        ast.edge_target_tokens != null or
+        ast.edge_type_tokens != null or
+        ast.edge_weight_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const enrichment = ast.extraction_enrichment_tokens orelse return error.UnsupportedSqlShape;
+    const input = ast.extraction_input_tokens orelse return error.UnsupportedSqlShape;
+    const model = ast.extraction_model_tokens orelse return error.UnsupportedSqlShape;
+    const path = ast.extraction_edges_path_tokens orelse return error.UnsupportedSqlShape;
+    const source = ast.extraction_source_tokens orelse return error.UnsupportedSqlShape;
+    const target = ast.extraction_target_tokens orelse return error.UnsupportedSqlShape;
+    if (source_end + 2 > enrichment.start) return error.UnsupportedSqlShape;
+    if (!tokens[source_end].matchesKeywordTag(.source) or !tokens[source_end + 1].matchesKeyword("enrichment")) return error.UnsupportedSqlShape;
+    if (enrichment.end >= input.start or !tokens[input.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    if (input.end + 3 > model.start) return error.UnsupportedSqlShape;
+    if (!tokens[input.end].matchesKeywordTag(.using) or !tokens[input.end + 1].matchesKeyword("extractor") or !tokens[input.end + 2].matchesKeyword("model")) {
+        return error.UnsupportedSqlShape;
+    }
+    if (model.start + 1 != model.end or (tokens[model.start].kind != .string and tokens[model.start].kind != .identifier)) return error.UnsupportedSqlShape;
+    if (model.end + 2 > path.start) return error.UnsupportedSqlShape;
+    if (!tokens[model.end].matchesKeyword("edges") or !tokens[model.end + 1].matchesKeyword("json_path")) return error.UnsupportedSqlShape;
+    if (path.start + 1 != path.end or tokens[path.start].kind != .string) return error.UnsupportedSqlShape;
+    if (path.end >= source.start or !tokens[source.start - 1].matchesKeywordTag(.source)) return error.UnsupportedSqlShape;
+    if (source.end >= target.start or !tokens[target.start - 1].matchesKeyword("target")) return error.UnsupportedSqlShape;
+    try validateGeneratedGraphOptionalTailField(target.end, end, ast.extraction_type_tokens);
+    try validateGeneratedGraphOptionalTailField(target.end, end, ast.extraction_weight_tokens);
+    try validateGeneratedGraphOptions(end, generatedGraphIndexTailEnd(target.end, ast.extraction_type_tokens, ast.extraction_weight_tokens), ast.option_tokens);
+}
+
+fn generatedGraphExtractionPayloadIsEmpty(ast: generated_parser.GeneratedSqlGraphAst) bool {
+    return ast.extraction_enrichment_tokens == null and
+        ast.extraction_input_tokens == null and
+        ast.extraction_model_tokens == null and
+        ast.extraction_edges_path_tokens == null and
+        ast.extraction_source_tokens == null and
+        ast.extraction_target_tokens == null and
+        ast.extraction_type_tokens == null and
+        ast.extraction_weight_tokens == null;
 }
 
 fn validateGeneratedGraphNestedRange(
@@ -4769,6 +4822,7 @@ fn createGraphIndexPlanFromGeneratedAstAlloc(
 ) !CreateIndexPlan {
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedGraphIndexEdgePayload(tokens, end, (ast.source_name_tokens orelse return error.UnsupportedSqlShape).end, ast);
+    if (ast.extraction_enrichment_tokens != null) return createGraphExtractionIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, end);
 
     const index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
     var index_transferred = false;
@@ -4818,6 +4872,94 @@ fn createGraphIndexPlanFromGeneratedAstAlloc(
         .columns = columns,
         .derived_index_config_json = config_json,
     };
+}
+
+fn createGraphExtractionIndexPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+    end: usize,
+) !CreateIndexPlan {
+    try validateGeneratedGraphIndexExtractionPayload(tokens, end, (ast.source_name_tokens orelse return error.UnsupportedSqlShape).end, ast);
+
+    const index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var index_transferred = false;
+    errdefer if (!index_transferred) alloc.free(index_name);
+
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.source_name_tokens orelse return error.UnsupportedSqlShape);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    const enrichment_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.extraction_enrichment_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(enrichment_name);
+
+    const input_field = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, ast.extraction_input_tokens orelse return error.UnsupportedSqlShape);
+    var input_transferred = false;
+    errdefer if (!input_transferred) alloc.free(input_field);
+
+    const source_path = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, ast.extraction_source_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(source_path);
+    if (!std.mem.eql(u8, source_path, "_id")) return error.UnsupportedSqlShape;
+
+    const target_path = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, ast.extraction_target_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(target_path);
+
+    const type_path = if (ast.extraction_type_tokens) |range| try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, range) else null;
+    defer if (type_path) |path| alloc.free(path);
+    const weight_path = if (ast.extraction_weight_tokens) |range| try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, range) else null;
+    defer if (weight_path) |path| alloc.free(path);
+
+    const model_range = ast.extraction_model_tokens orelse return error.UnsupportedSqlShape;
+    const model = try generatedGraphSingleStringOrIdentifierAlloc(alloc, tokens, model_range);
+    defer alloc.free(model);
+    const path_range = ast.extraction_edges_path_tokens orelse return error.UnsupportedSqlShape;
+    const edges_path = try generatedGraphSingleStringAlloc(alloc, tokens, path_range);
+    defer alloc.free(edges_path);
+
+    var pos = if (ast.option_tokens) |range| range.start else generatedGraphIndexTailEnd((ast.extraction_target_tokens orelse return error.UnsupportedSqlShape).end, ast.extraction_type_tokens, ast.extraction_weight_tokens);
+    const config_json = try graphExtractionIndexConfigJsonAlloc(alloc, tokens, &pos, enrichment_name, input_field, model, edges_path, target_path, type_path, weight_path);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, &pos);
+
+    const columns = try alloc.alloc([]const u8, 1);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) alloc.free(columns);
+    columns[0] = input_field;
+
+    index_transferred = true;
+    table_transferred = true;
+    input_transferred = true;
+    config_transferred = true;
+    columns_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph,
+        .columns = columns,
+        .derived_index_config_json = config_json,
+    };
+}
+
+fn generatedGraphSingleStringOrIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.start + 1 != range.end) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .string and tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
+}
+
+fn generatedGraphSingleStringAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.start + 1 != range.end or tokens[range.start].kind != .string) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
 }
 
 fn parseGeneratedDerivedIndexFieldPathRangeAlloc(
@@ -4937,6 +5079,10 @@ fn validateGeneratedGraphPlanMatchesAstAlloc(
                 try validateGeneratedGraphConfigFieldAlloc(alloc, tokens, ast.edge_target_tokens, create_index.derived_index_config_json, "target_field");
                 try validateGeneratedGraphOptionalConfigFieldAlloc(alloc, tokens, ast.edge_type_tokens, create_index.derived_index_config_json, "type_field");
                 try validateGeneratedGraphOptionalConfigFieldAlloc(alloc, tokens, ast.edge_weight_tokens, create_index.derived_index_config_json, "weight_field");
+            } else if (ast.extraction_enrichment_tokens != null) {
+                try validateGeneratedGraphPlanFieldAlloc(alloc, tokens, ast.extraction_input_tokens, create_index.columns, 0);
+                try validateGeneratedGraphConfigIdentifierAlloc(alloc, tokens, ast.extraction_enrichment_tokens, create_index.derived_index_config_json, "artifact");
+                try validateGeneratedGraphConfigFieldAlloc(alloc, tokens, ast.extraction_input_tokens, create_index.derived_index_config_json, "field");
             }
         },
         .create_metric => {
@@ -17294,6 +17440,30 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const graph_extraction_sql = "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');";
+    var legacy_graph_extraction = try lowerDdlPlanForTestAlloc(alloc, graph_extraction_sql);
+    defer legacy_graph_extraction.deinit(alloc);
+    var generated_graph_extraction = try generatedGraphDdlPlanForTestAlloc(alloc, graph_extraction_sql);
+    defer generated_graph_extraction.deinit(alloc);
+    switch (generated_graph_extraction) {
+        .create_index => |generated| switch (legacy_graph_extraction) {
+            .create_index => |legacy| {
+                try std.testing.expectEqual(legacy.method, generated.method);
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+                const config = generated.derived_index_config_json orelse return error.TestUnexpectedResult;
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"artifact\":\"relations_v1\"") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"target\":\"{{ _item.target.document_id }}\"") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const graph_alter_metric_sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40);";
     var generated_graph_alter_metric = try generatedGraphDdlPlanForTestAlloc(alloc, graph_alter_metric_sql);
     defer generated_graph_alter_metric.deinit(alloc);
@@ -17359,6 +17529,19 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_edge.items(), malformed_graph_edge_ast),
+    );
+
+    var malformed_graph_extraction = try tokenized.ParsedSql.initAlloc(alloc, graph_extraction_sql);
+    defer malformed_graph_extraction.deinit(alloc);
+    const malformed_graph_extraction_raw = malformed_graph_extraction.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_graph_extraction_ast = switch (malformed_graph_extraction_raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_graph_extraction_ast.extraction_target_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_extraction.items(), malformed_graph_extraction_ast),
     );
 }
 
