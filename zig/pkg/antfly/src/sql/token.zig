@@ -255,6 +255,7 @@ pub const TokenKeyword = enum {
     order,
     outer,
     owned,
+    overriding,
     overlay,
     over,
     partition,
@@ -360,8 +361,10 @@ pub const TokenKeyword = enum {
     unknown,
     update,
     upper,
+    user,
     using,
     validate,
+    value,
     values,
     vacuum,
     verbose,
@@ -540,6 +543,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);
     try std.testing.expectEqual(TokenKeyword.notify, keywordFromIdentifier("NOTIFY").?);
     try std.testing.expectEqual(TokenKeyword.owned, keywordFromIdentifier("OWNED").?);
+    try std.testing.expectEqual(TokenKeyword.overriding, keywordFromIdentifier("OVERRIDING").?);
     try std.testing.expectEqual(TokenKeyword.following, keywordFromIdentifier("FOLLOWING").?);
     try std.testing.expectEqual(TokenKeyword.fetch, keywordFromIdentifier("FETCH").?);
     try std.testing.expectEqual(TokenKeyword.full, keywordFromIdentifier("FULL").?);
@@ -590,6 +594,8 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.subscription, keywordFromIdentifier("SUBSCRIPTION").?);
     try std.testing.expectEqual(TokenKeyword.tablespace, keywordFromIdentifier("TABLESPACE").?);
     try std.testing.expectEqual(TokenKeyword.unbounded, keywordFromIdentifier("UNBOUNDED").?);
+    try std.testing.expectEqual(TokenKeyword.user, keywordFromIdentifier("USER").?);
+    try std.testing.expectEqual(TokenKeyword.value, keywordFromIdentifier("VALUE").?);
     try std.testing.expectEqual(TokenKeyword.window, keywordFromIdentifier("WINDOW").?);
     try std.testing.expectEqual(TokenKeyword.yes, keywordFromIdentifier("YES").?);
     try std.testing.expectEqual(TokenKeyword.off, keywordFromIdentifier("OFF").?);

@@ -2557,6 +2557,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_type_multi,
         .drop_user_mapping,
         .drop_view_multi,
+        .insert_overriding_value,
         .import_foreign_schema,
         .load,
         .move,
@@ -2936,7 +2937,6 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT (id) VALUES"));
-    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMP"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMPORARY TABLE usage_session_records ("));
@@ -3436,6 +3436,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
             .kind = .copy,
             .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')",
+            .kind = .insert_overriding_value,
+            .reason = .insert_overriding_value_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "INSERT INTO usage_records OVERRIDING USER VALUE VALUES ('u1')",
+            .kind = .insert_overriding_value,
+            .reason = .insert_overriding_value_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler",

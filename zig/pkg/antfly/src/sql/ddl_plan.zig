@@ -10439,6 +10439,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .cluster => .cluster_not_planned_by_generated_parser,
         .comment => .comment_not_planned_by_generated_parser,
         .copy => .copy_not_planned_by_generated_parser,
+        .insert_overriding_value => .insert_overriding_value_not_planned_by_generated_parser,
         .alter_aggregate => .alter_aggregate_not_planned_by_generated_parser,
         .alter_index => .alter_index_not_planned_by_generated_parser,
         .alter_conversion => .alter_conversion_not_planned_by_generated_parser,

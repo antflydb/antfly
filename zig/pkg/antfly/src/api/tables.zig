@@ -4928,7 +4928,7 @@ test "public algebraic index definitions cannot declare internal materialization
 test "derived index field refs validate against relational and embedded json schema" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"embedding":{"type":"embedding"},"source_doc":{"type":"keyword"},"target_doc":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"},"source":{"type":"keyword"},"target":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"}},"additionalProperties":true}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"embedding":{"type":"embedding"},"source_doc":{"type":"keyword"},"target_doc":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"},"source":{"type":"keyword"},"target":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"}},"additionalProperties":true}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}}
     ;
 
     try validateDerivedIndexFieldRefsForSchemaAlloc(

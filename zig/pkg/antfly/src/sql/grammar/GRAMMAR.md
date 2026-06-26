@@ -210,7 +210,10 @@ Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
 predicates, conflict clauses, returning clauses, values lists, default-values
-inserts, and truncate options. Supported explicit-column `INSERT ... VALUES`
+inserts, and truncate options. PostgreSQL `INSERT ... OVERRIDING
+{SYSTEM|USER} VALUE ...` syntax is recognized by the generated grammar as an
+explicit unsupported diagnostic until identity-column override semantics are
+implemented in the write planner. Supported explicit-column `INSERT ... VALUES`
 plans, including `ON CONFLICT` actions and field/all-field/expression
 `RETURNING` lists, and `INSERT ... DEFAULT VALUES` plans, including
 `ON CONFLICT` actions and returning lists, now lower directly from generated

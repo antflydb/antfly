@@ -1339,6 +1339,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .doc_count = 3,
     };
     const refresh = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(refresh);
     refresh[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = refresh_docs_items },
@@ -1534,7 +1535,6 @@ test "table runtime snapshot cache can clone a single group status" {
     defer cache.deinit();
 
     const statuses = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
-    defer std.testing.allocator.free(statuses);
     statuses[0] = .{
         .group_id = 7,
         .stats = .{ .doc_count = 1, .indexes = &.{} },

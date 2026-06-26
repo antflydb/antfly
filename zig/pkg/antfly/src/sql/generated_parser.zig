@@ -192,6 +192,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    insert_overriding_value,
     alter_aggregate,
     alter_index,
     alter_conversion,
@@ -313,6 +314,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    insert_overriding_value_not_planned_by_generated_parser,
     alter_aggregate_not_planned_by_generated_parser,
     alter_index_not_planned_by_generated_parser,
     alter_conversion_not_planned_by_generated_parser,
@@ -2813,6 +2815,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
     }
     if (first.matchesKeywordTag(.insert)) {
+        if (generatedInsertHasOverridingValue(tokens)) return .{ .unsupported = .insert_overriding_value };
         for (tokens) |token| {
             if (token.matchesKeywordTag(.select)) return .{ .dml = .insert_select };
         }
@@ -2998,6 +3001,18 @@ fn generatedWriteKindForWithStatement(tokens: []const token_mod.Token) ?Generate
     return null;
 }
 
+fn generatedInsertHasOverridingValue(tokens: []const token_mod.Token) bool {
+    const end = statementTokenEnd(tokens);
+    const overriding_index = findTopLevelKeyword(tokens, 1, end, .overriding) orelse return false;
+    if (overriding_index + 2 >= end) return false;
+    if (!(tokens[overriding_index + 1].matchesKeywordTag(.system) or
+        tokens[overriding_index + 1].matchesKeywordTag(.user)))
+    {
+        return false;
+    }
+    return tokens[overriding_index + 2].matchesKeywordTag(.value);
+}
+
 fn buildUnsupportedAst(
     tokens: []const token_mod.Token,
     end: usize,
@@ -3015,6 +3030,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .insert_overriding_value => .insert_overriding_value_not_planned_by_generated_parser,
             .alter_aggregate => .alter_aggregate_not_planned_by_generated_parser,
             .alter_index => .alter_index_not_planned_by_generated_parser,
             .alter_conversion => .alter_conversion_not_planned_by_generated_parser,
