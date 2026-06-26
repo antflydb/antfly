@@ -367,7 +367,8 @@ ranges, `DISTINCT ON` expression-list AST items, and match the production
 aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
 validate the left query plus generated set-operation operator, `UNION ALL`,
-right-query projection/source, right-predicate payloads, and parent read
+right-query projection/source, right-projection boundary expressions,
+right-predicate payloads, and parent read
 result-tail ordering/pagination ranges before calling the set-operation lowerer
 directly;
 single- and multi-CTE reads now expose generated CTE-list, first-CTE, and

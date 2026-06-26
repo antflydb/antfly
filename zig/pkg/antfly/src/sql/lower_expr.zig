@@ -403,7 +403,8 @@ fn validateGeneratedSetOperationPayloads(
     if (set_operation.right_projection_tokens) |projection_range| {
         if (projection_range.start < right_query_tokens.start or projection_range.end > right_query_tokens.end) return error.UnsupportedSqlShape;
         try validateGeneratedProjectionListForClause(tokens, projection_range, set_operation.right_projection_items);
-    } else if (set_operation.right_projection_items.count != 0) {
+        try validateGeneratedReadListBoundaryExpressions(tokens, set_operation.right_projection_items, set_operation.right_projection_first_expression, set_operation.right_projection_last_expression);
+    } else if (set_operation.right_projection_items.count != 0 or set_operation.right_projection_first_expression.tokens != null or set_operation.right_projection_last_expression.tokens != null) {
         return error.UnsupportedSqlShape;
     }
     if (set_operation.right_where_tokens) |where_range| {
@@ -30722,6 +30723,28 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
         .{},
     ));
 
+    var malformed_generated_set_operation_projection_boundary = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_projection_boundary.deinit(alloc);
+    if (malformed_generated_set_operation_projection_boundary.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.right_projection_first_expression.tokens == null or read.projection_items.expression_items.len == 0) return error.TestUnexpectedResult;
+                read.set_operation.right_projection_first_expression.tokens = read.projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_projection_boundary,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var aggregate = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT ALL OFFSET 3 ROWS",
@@ -37040,6 +37063,33 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     } else |err| {
         try std.testing.expectEqual(error.UnsupportedSqlShape, err);
     }
+
+    var malformed_cte_body_set_operation = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH combined_orders AS (SELECT id FROM orders UNION SELECT id FROM orders) SELECT id FROM combined_orders",
+    );
+    defer malformed_cte_body_set_operation.deinit(alloc);
+    if (malformed_cte_body_set_operation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.cte_items.len == 0 or
+                    read_ast.cte_items[0].body_set_operation.right_projection_first_expression.tokens == null or
+                    read_ast.cte_items[0].body_projection_items.expression_items.len == 0)
+                {
+                    return error.TestUnexpectedResult;
+                }
+                read_ast.cte_items[0].body_set_operation.right_projection_first_expression.tokens = read_ast.cte_items[0].body_projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_cte_body_set_operation,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var column_alias_list = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
