@@ -3704,7 +3704,7 @@ pub fn parseWhereAlloc(
         if (whereTopLevelOrHasExpressionPredicateStart(tokens, pos.*)) {
             try parseExpressionOrWhereWithGeneratedAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_or_predicates, expression_alternatives_hooks, generated_expression_ast);
         } else if (whereTopLevelOrHasAccessPredicate(tokens, pos.*)) {
-            try parseAccessOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_or_predicates, realtime_ns);
+            try parseAccessOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_or_predicates, realtime_ns, generated_expression_ast);
         } else {
             try parseScalarOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, or_predicates, realtime_ns, generated_expression_ast);
         }
@@ -3719,7 +3719,7 @@ pub fn parseWhereAlloc(
         returning_expression_qualifiers,
         defer_row_expression_field_validation,
     )) {
-        try parseAccessOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_or_predicates, realtime_ns);
+        try parseAccessOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_or_predicates, realtime_ns, generated_expression_ast);
         return;
     }
     while (true) {
@@ -3729,9 +3729,11 @@ pub fn parseWhereAlloc(
         } else if (canParseExpressionNotWhere(tokens, pos.*)) {
             try parseExpressionNotWhereWithGeneratedAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_not_predicates, expression_alternatives_hooks, generated_expression_ast);
         } else if (canParseAccessNotWhere(tokens, pos.*)) {
-            try parseAccessNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_not_predicates, realtime_ns);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            try parseAccessNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_not_predicates, realtime_ns, generated_condition_expression);
         } else if (peekStringToArrayFunctionCall(tokens, pos.*)) {
             if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
+                try validateGeneratedExpressionPredicateKind(try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast), .contains);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -3772,7 +3774,7 @@ pub fn parseWhereAlloc(
             defer_row_expression_field_validation,
         )) {
             var expression_condition_hooks_with_generated = expression_condition_hooks;
-            expression_condition_hooks_with_generated.generated_expression_ast = generatedSingleWhereAtomExpression(tokens, pos.*, generated_expression_ast);
+            expression_condition_hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
             try parseExpressionWhereConditionsAlloc(
                 alloc,
                 tokens,
@@ -3786,7 +3788,7 @@ pub fn parseWhereAlloc(
                 expression_condition_hooks_with_generated,
             );
         } else {
-            const generated_atom_expression = generatedSingleWhereAtomExpression(tokens, pos.*, generated_expression_ast);
+            const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
             try parseWhereAtomAlloc(
                 alloc,
                 tokens,
@@ -4133,6 +4135,7 @@ pub fn parseArrayOverlapIntoAccessBranchesAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     branches: *std.ArrayListUnmanaged(AccessPredicateBranch),
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
     const parsed_field = parseRowExpressionFieldOwnedAlloc(
@@ -4176,6 +4179,7 @@ pub fn parseArrayOverlapIntoAccessBranchesAlloc(
         return false;
     };
     _ = parser.matchToken(tokens, pos, .range_overlap);
+    try validateGeneratedExpressionPredicateKind(generated_expression_ast, .overlaps);
     const values_json = try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params);
     defer alloc.free(values_json);
     try value_mod.validateSqlArrayValueJson(alloc, column, values_json);
@@ -6339,14 +6343,16 @@ pub fn parseAccessPredicateGroupsAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) ![]const db_mod.types.RelationalRowsAccessPredicateGroup {
     var branches = std.ArrayListUnmanaged(AccessPredicateBranch).empty;
     errdefer freeAccessPredicateBranches(alloc, &branches);
     try branches.append(alloc, .{});
 
     while (true) {
-        if (!(try parseArrayOverlapIntoAccessBranchesAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &branches))) {
-            const atom = try parseAccessPredicateAtomGroupAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns);
+        const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+        if (!(try parseArrayOverlapIntoAccessBranchesAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, &branches, generated_condition_expression))) {
+            const atom = try parseAccessPredicateAtomGroupAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns, generated_condition_expression);
             defer freeAccessPredicateGroup(alloc, atom);
             try appendAccessPredicateGroupToBranches(alloc, &branches, atom);
         }
@@ -6379,6 +6385,7 @@ pub fn parseAccessPredicateAtomGroupAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !db_mod.types.RelationalRowsAccessPredicateGroup {
     var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
     errdefer {
@@ -6452,7 +6459,7 @@ pub fn parseAccessPredicateAtomGroupAlloc(
         &nested_or_predicates,
         false,
         realtime_ns,
-        null,
+        generated_expression_ast,
     );
     if (nested_or_predicates.items.len > 0) return error.UnsupportedSqlShape;
 
@@ -6485,10 +6492,11 @@ pub fn parseAccessOrWhereAlloc(
     defer_row_expression_field_validation: bool,
     access_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
         const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
-        const groups = try parseAccessPredicateGroupsAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns);
+        const groups = try parseAccessPredicateGroupsAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns, generated_expression_ast);
         var groups_transferred = false;
         errdefer if (!groups_transferred) {
             freeAccessPredicateGroups(alloc, groups);
@@ -6513,12 +6521,16 @@ pub fn parseAccessNotWhereAlloc(
     defer_row_expression_field_validation: bool,
     access_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup),
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
+    if (generated_expression_ast) |expression| {
+        if (expression.kind != .logical_not) return error.UnsupportedSqlShape;
+    }
     try parser.expectKeyword(tokens, pos, "not");
     try parser.expectToken(tokens, pos, .lparen);
     while (true) {
         const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
-        const groups = try parseAccessPredicateGroupsAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns);
+        const groups = try parseAccessPredicateGroupsAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, realtime_ns, generated_expression_ast);
         var groups_transferred = false;
         errdefer if (!groups_transferred) {
             freeAccessPredicateGroups(alloc, groups);
@@ -25416,6 +25428,7 @@ pub fn parseWhereAtomAlloc(
         defer alloc.free(period_field);
         if (binder.relationalPeriodForDdl(schema.periods, period_field)) |period| {
             if (parser.matchToken(tokens, pos, .at_contains) != null) {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, .contains);
                 if (negated) return error.UnsupportedSqlShape;
                 const start_column = binder.relationalColumnForField(schema, period.start_column, null) orelse return error.InvalidSqlCatalog;
                 const end_column = binder.relationalColumnForField(schema, period.end_column, null) orelse return error.InvalidSqlCatalog;
@@ -25427,6 +25440,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             }
             if (parser.matchToken(tokens, pos, .range_overlap) != null) {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, .overlaps);
                 if (negated) return error.UnsupportedSqlShape;
                 const range = try parseSqlPeriodRangeValuePairAlloc(alloc, tokens, pos, params, schema, period, realtime_ns);
                 defer freePeriodRangeValuePair(alloc, range);
@@ -25442,6 +25456,7 @@ pub fn parseWhereAtomAlloc(
     const maybe_column = binder.relationalColumnForField(schema, field, null);
 
     if (matchJsonExtractOperator(tokens, pos)) |operator| {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .comparison);
         const as_text = tokenKindIsJsonExtractTextOperator(operator);
         const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
         var path_transferred = false;
@@ -25468,6 +25483,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .at_contains) != null) {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .contains);
         const column = maybe_column orelse return error.InvalidSqlCatalog;
         const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
         var value_transferred = false;
@@ -25492,6 +25508,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .question) != null) {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .json_key_exists);
         if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
         const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
         var path_transferred = false;
@@ -25512,6 +25529,7 @@ pub fn parseWhereAtomAlloc(
     })) |is_tail| {
         switch (is_tail.kind) {
             .distinct_comparison => {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
@@ -25526,6 +25544,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_unknown => {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 try predicates.append(alloc, .{
                     .name = "",
@@ -25537,6 +25556,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_literal => {
+                try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 if (is_tail.boolean_negated) {
                     try appendBooleanIsNotPredicateGroups(alloc, or_predicates, field, is_tail.boolean_value);
@@ -25557,6 +25577,7 @@ pub fn parseWhereAtomAlloc(
             },
             .null_test => {},
         }
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedIsTailExpressionKind(is_tail));
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -25567,6 +25588,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (matchPostfixNullTest(tokens, pos)) |op| {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -25578,10 +25600,14 @@ pub fn parseWhereAtomAlloc(
     }
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+        const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
+        const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+        try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, generated_requires_quantifier);
         try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
         return;
     }
     if (parser.matchKeyword(tokens, pos, "between")) {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .between);
         const symmetric = matchBetweenSymmetricMode(tokens, pos);
         const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
         defer alloc.free(lower_json);
@@ -25593,6 +25619,7 @@ pub fn parseWhereAtomAlloc(
     }
     if (parser.matchKeyword(tokens, pos, "not")) {
         if (parser.matchKeyword(tokens, pos, "between")) {
+            try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_between);
             const symmetric = matchBetweenSymmetricMode(tokens, pos);
             const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
             defer alloc.free(lower_json);
@@ -25604,10 +25631,14 @@ pub fn parseWhereAtomAlloc(
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
+            const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
+            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
+            try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, generated_requires_quantifier);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
             return;
         }
         try parser.expectKeyword(tokens, pos, "in");
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_in_list);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -25623,6 +25654,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .in_list);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -25702,6 +25734,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (negated) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
     const value_json = if (column.field_type == .array and op == .eq)
         try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params)
     else
@@ -34187,6 +34220,20 @@ test "sql adapter lower expr accepts casted jsonb document literals" {
 
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.json_contains.len);
     try std.testing.expectEqualStrings("{\"source\":\"autoscale_delta\"}", lowered.plan.query.json_contains[0].value_json);
+
+    var malformed_generated_json_contains = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE metadata @> '{\"source\":\"autoscale_delta\"}'::jsonb",
+    );
+    defer malformed_generated_json_contains.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_json_contains, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_json_contains,
+        schema,
+        &.{},
+        .{},
+    ));
 }
 
 test "sql adapter lower expr lowers qualified single table select outputs" {
@@ -34269,6 +34316,20 @@ test "sql adapter lower expr lowers array containment and equality predicates" {
     try std.testing.expectEqualStrings("tags", contains.plan.query.array_contains[0].field);
     try std.testing.expectEqualStrings("[\"hot\",\"new\"]", contains.plan.query.array_contains[0].value_json);
 
+    var malformed_generated_contains = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE tags @> $1::text[]",
+    );
+    defer malformed_generated_contains.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_contains, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_contains,
+        schema,
+        &.{.{ .json = "[\"hot\",\"new\"]" }},
+        .{},
+    ));
+
     var constructor_contains = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']::text[]",
@@ -34306,6 +34367,20 @@ test "sql adapter lower expr lowers array containment and equality predicates" {
     try std.testing.expectEqual(@as(usize, 1), overlap.plan.query.access_or_predicates[1].array_any.len);
     try std.testing.expectEqualStrings("tags", overlap.plan.query.access_or_predicates[1].array_any[0].field);
     try std.testing.expectEqualStrings("\"new\"", overlap.plan.query.access_or_predicates[1].array_any[0].value_json);
+
+    var malformed_generated_overlap = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new']::text[]",
+    );
+    defer malformed_generated_overlap.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_overlap, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_overlap,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var overlap_and = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -34346,6 +34421,20 @@ test "sql adapter lower expr lowers array containment and equality predicates" {
     try std.testing.expectEqual(@as(usize, 2), overlap_not.plan.query.access_not_predicates.len);
     try std.testing.expectEqualStrings("\"hot\"", overlap_not.plan.query.access_not_predicates[0].array_any[0].value_json);
     try std.testing.expectEqualStrings("\"new\"", overlap_not.plan.query.access_not_predicates[1].array_any[0].value_json);
+
+    var malformed_generated_overlap_not = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (tags && ARRAY['hot','new'])",
+    );
+    defer malformed_generated_overlap_not.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_overlap_not, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_overlap_not,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var eq = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
