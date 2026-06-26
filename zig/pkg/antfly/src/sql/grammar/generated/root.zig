@@ -213262,10 +213262,19 @@ pub const ParseError = error{
     UnexpectedToken,
 };
 
-pub const ParseErrorInfo = struct {
+const ParseErrorInfo = struct {
     state: u16,
     lookahead: u16,
     token_index: usize,
+};
+
+pub const ParseDiagnostic = struct {
+    token_index: usize,
+    expected: []const []const u8,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.expected);
+    }
 };
 
 pub fn parse(allocator: std.mem.Allocator, token_ids: []const u16) !void {
@@ -213326,7 +213335,17 @@ pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseEr
     }
 }
 
-pub fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
+pub fn parseDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseDiagnostic {
+    const info = try parseError(allocator, token_ids) orelse return null;
+    return try parseDiagnosticFromInfo(allocator, info);
+}
+
+pub fn parseDiagnosticWithStackBuffer(allocator: std.mem.Allocator, token_ids: []const u16, stack_buffer: []u16) !?ParseDiagnostic {
+    const info = try parseErrorWithStackBuffer(token_ids, stack_buffer) orelse return null;
+    return try parseDiagnosticFromInfo(allocator, info);
+}
+
+fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
     var stack: std.ArrayListUnmanaged(u16) = .empty;
     defer stack.deinit(allocator);
     try stack.append(allocator, 0);
@@ -213353,7 +213372,7 @@ pub fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseE
     }
 }
 
-pub fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
+fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
     if (stack_buffer.len == 0) return ParseError.StackOverflow;
     var stack_len: usize = 1;
     stack_buffer[0] = 0;
@@ -213384,6 +213403,13 @@ pub fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) Pa
     }
 }
 
+fn parseDiagnosticFromInfo(allocator: std.mem.Allocator, info: ParseErrorInfo) !ParseDiagnostic {
+    return .{
+        .token_index = info.token_index,
+        .expected = try expectedTerminalNamesAlloc(allocator, info),
+    };
+}
+
 fn actionsForState(state: u16) []const Action {
     if (state >= action_ranges.len) return &.{};
     const range = action_ranges[state];
@@ -213391,7 +213417,7 @@ fn actionsForState(state: u16) []const Action {
     return actions[start .. start + range.len];
 }
 
-pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
+fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
     const expected_count = expectedTerminalCountForState(info.state);
     const expected = try allocator.alloc([]const u8, expected_count);
     for (expected, 0..) |*name, idx| name.* = expectedTerminalNameForState(info.state, idx);

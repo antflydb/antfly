@@ -845,10 +845,19 @@ fn emitZigMetadata(
         \\    UnexpectedToken,
         \\};
         \\
-        \\pub const ParseErrorInfo = struct {
+        \\const ParseErrorInfo = struct {
         \\    state: u16,
         \\    lookahead: u16,
         \\    token_index: usize,
+        \\};
+        \\
+        \\pub const ParseDiagnostic = struct {
+        \\    token_index: usize,
+        \\    expected: []const []const u8,
+        \\
+        \\    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        \\        allocator.free(self.expected);
+        \\    }
         \\};
         \\
         \\pub fn parse(allocator: std.mem.Allocator, token_ids: []const u16) !void {
@@ -909,7 +918,17 @@ fn emitZigMetadata(
         \\    }
         \\}
         \\
-        \\pub fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
+        \\pub fn parseDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseDiagnostic {
+        \\    const info = try parseError(allocator, token_ids) orelse return null;
+        \\    return try parseDiagnosticFromInfo(allocator, info);
+        \\}
+        \\
+        \\pub fn parseDiagnosticWithStackBuffer(allocator: std.mem.Allocator, token_ids: []const u16, stack_buffer: []u16) !?ParseDiagnostic {
+        \\    const info = try parseErrorWithStackBuffer(token_ids, stack_buffer) orelse return null;
+        \\    return try parseDiagnosticFromInfo(allocator, info);
+        \\}
+        \\
+        \\fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
         \\    var stack: std.ArrayListUnmanaged(u16) = .empty;
         \\    defer stack.deinit(allocator);
         \\    try stack.append(allocator, 0);
@@ -936,7 +955,7 @@ fn emitZigMetadata(
         \\    }
         \\}
         \\
-        \\pub fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
+        \\fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
         \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
         \\    var stack_len: usize = 1;
         \\    stack_buffer[0] = 0;
@@ -967,6 +986,13 @@ fn emitZigMetadata(
         \\    }
         \\}
         \\
+        \\fn parseDiagnosticFromInfo(allocator: std.mem.Allocator, info: ParseErrorInfo) !ParseDiagnostic {
+        \\    return .{
+        \\        .token_index = info.token_index,
+        \\        .expected = try expectedTerminalNamesAlloc(allocator, info),
+        \\    };
+        \\}
+        \\
         \\fn actionsForState(state: u16) []const Action {
         \\    if (state >= action_ranges.len) return &.{};
         \\    const range = action_ranges[state];
@@ -974,7 +1000,7 @@ fn emitZigMetadata(
         \\    return actions[start .. start + range.len];
         \\}
         \\
-        \\pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
+        \\fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8 {
         \\    const expected_count = expectedTerminalCountForState(info.state);
         \\    const expected = try allocator.alloc([]const u8, expected_count);
         \\    for (expected, 0..) |*name, idx| name.* = expectedTerminalNameForState(info.state, idx);
@@ -1334,12 +1360,17 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, ".sql_y = \"https://example.test/cockroach/sql.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseErrorWithStackBuffer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseDiagnostic = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnostic(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnosticWithStackBuffer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseErrorInfo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseError(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseErrorWithStackBuffer(") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenId(token: Token) u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn terminalIdByName(name: []const u8) ?u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn tokenIdByName") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "symbols[idx]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNamesAlloc(allocator: std.mem.Allocator, info: ParseErrorInfo) ![]const []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNamesAlloc") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalCountForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn actionsForState") == null);
