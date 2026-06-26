@@ -1795,6 +1795,7 @@ fn validateGeneratedReadPaginationPayloads(
     }
 
     if (fetch_tokens) |range| {
+        try validateGeneratedReadFetchRangeLayout(tokens, range, fetch_count_tokens);
         if (fetch_count_tokens) |count_tokens| {
             if (count_tokens.start < range.start or count_tokens.end > range.end) return error.UnsupportedSqlShape;
             const expression = fetch_count_expression orelse return error.UnsupportedSqlShape;
@@ -1805,6 +1806,23 @@ fn validateGeneratedReadPaginationPayloads(
             return error.UnsupportedSqlShape;
         }
     } else if (fetch_count_tokens != null or (fetch_count_expression != null and generatedExpressionAstHasMetadata(fetch_count_expression.?.*))) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedReadFetchRangeLayout(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    fetch_count_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range.start + 3 > range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[range.start].matchesKeywordTag(.first) and !tokens[range.start].matchesKeywordTag(.next)) return error.UnsupportedSqlShape;
+    if (!tokens[range.end - 1].matchesKeywordTag(.only)) return error.UnsupportedSqlShape;
+    const row_index = range.end - 2;
+    if (!tokens[row_index].matchesKeywordTag(.row) and !tokens[row_index].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
+    if (fetch_count_tokens) |count_tokens| {
+        if (count_tokens.start != range.start + 1 or count_tokens.end != row_index) return error.UnsupportedSqlShape;
+    } else if (row_index != range.start + 1) {
         return error.UnsupportedSqlShape;
     }
 }
@@ -4740,6 +4758,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_fetch_count_expression_parsed_sql, malformed_fetch_count_expression_read_ast),
+    );
+
+    malformed_fetch_count_expression_read_ast = switch (malformed_fetch_count_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_fetch_count_expression_read_ast.fetch_tokens.?.start += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_fetch_count_expression_parsed_sql.items(), malformed_fetch_count_expression_read_ast),
     );
 
     var malformed_projection_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(

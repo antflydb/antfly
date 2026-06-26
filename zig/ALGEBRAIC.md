@@ -1426,14 +1426,9 @@ benchmark-wide performance evidence summary for dataset, query, correctness, col
 mixed-role benchmark root-cardinality comparisons constrain algebraic sidecar reads by primary document role so derived customer/profile facts do not broaden doc-scan/full-text order-only baselines
 algebraic-summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
 algebraic-summary baseline-file comparison ratios for stable local performance guardrails
-`algebraic-performance-guardrail` build step with a checked-in JSONL fixture for coverage and baseline-ratio verifier regressions
-`algebraic-planner-ownership-guardrail` build step under `tools/guardrails/` that rejects production raw tensor-program construction outside the algebraic planner/IR layer
-`algebraic-archive-guardrail` build step that verifies archived production-hardening run directories include environment notes, raw/summary JSONL, threshold flags, optional baseline comparison, and non-smoke provenance
-`algebraic-roadmap-guardrail` build step that combines CI-safe algebraic performance, planner-ownership, and archive-evidence checks
-`scripts/run_algebraic_production_hardening.sh` runner for archived LSM analytics, adaptive coverage, cold/warm read coverage, graph traversal, public query no-schema/schema/algebraic comparisons, summary generation, threshold enforcement, optional baseline-ratio checks, bounded cardinality and per-stage sizing/churn knobs, query-shape coverage thresholds for cold/warm/constrained/wide/stats/cardinality/range/histogram records, path-promotion FST rebuild thresholds, public-query mode selection through `ALGEBRAIC_HARDENING_PUBLIC_MODE`, optional public-query symbolic-profile enforcement through `ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`, optional LSM bulk-ingest stress through `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` across LSM analytics and adaptive coverage stages, LSM bulk finish knobs for flush, compact, deferred-L0 targets, and bounded foreground compaction budgets, and optional broad unit-test evidence
+`algebraic-guardrail` build step combines the CI-safe algebraic summary fixture, planner-ownership policy check, and archived production-hardening evidence fixture
 LSM bulk-session finish direct-ingests the final mutable state as a sorted run when direct bulk ingest is enabled and no immutable flush is pending, so algebraic bulk sidecars avoid a final normal flush and archived runs can guard `total_lsm_sorted_ingest_runs`
 algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds across all flushed coalescer batches and rebuild each dirty promoted dictionary once at DB bulk-session finish, before the primary store publishes the final sorted run
-`scripts/run_algebraic_integration_matrix.sh` runner for archived enabled/disabled integration evidence across roadmap guardrails, public-query default no-schema, schema-only, schema-plus-algebraic, focused algebraic DB tests, provisioned distributed non-algebraic fallback coverage, optional broad unit tests, and optional selected e2e tests
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
@@ -1584,10 +1579,7 @@ public query shape exposes dense profile counters yet.
 Performance evidence guardrail:
 
 ```sh
-zig build algebraic-performance-guardrail
-zig build algebraic-planner-ownership-guardrail
-zig build algebraic-archive-guardrail
-zig build algebraic-roadmap-guardrail
+zig build algebraic-guardrail
 
 zig build algebraic-summary -- --input /tmp/algebraic-combined.jsonl \
   --baseline /tmp/algebraic-baseline-summary.jsonl \
@@ -1621,19 +1613,10 @@ enough tolerance to catch regressions without pinning hardware noise. The
 optional `--baseline` file should contain a prior `performance_evidence_summary`
 event from `algebraic-summary`.
 
-Production-hardening archives can be checked independently:
-
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/20260517T000000Z \
-  --require-thresholds \
-  --require-baseline \
-  --require-non-smoke
-```
-
-Use `--require-thresholds` once a run is meant to count as production evidence,
-`--require-baseline` once variance has been established from a prior summary,
-and `--require-non-smoke` for representative archived runs.
+The build guardrail is fixture-based and CI-safe. Production-hardening evidence
+is generated directly with `algebraic-bench`, public-query guardrail runs, and
+`algebraic-summary`; keep the raw JSONL, combined summary, threshold flags,
+baseline summary, and hardware/environment notes with the archived run.
 
 Bounded graph traversal smoke:
 
@@ -1942,20 +1925,6 @@ they claim instead of relying on the `smoke=0` label alone.
 
 Current local non-smoke archive evidence:
 
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/interactive-current-10k-post-resource-dist-envelope \
-  --require-thresholds \
-  --require-non-smoke \
-  --min-docs 10000 \
-  --min-repeats 2 \
-  --min-churn-ops 100 \
-  --min-public-docs 1000 \
-  --min-graph-docs 1000 \
-  --min-adaptive-docs 1000 \
-  --min-cold-docs 500
-```
-
 This thresholded archive passes the verifier and covers 23 LSM dataset cases,
 185 LSM query records, 63 algebraic query records, 61 doc-scan query records,
 61 full-text query records, cold/warm reads, constrained rollups, wide keys,
@@ -1971,11 +1940,11 @@ evidence for the current implementation state, not release thresholds; adaptive
 warmup/churn cost and public-query overhead remain explicit optimization
 targets.
 
-`zig build algebraic-planner-ownership-guardrail` is a repo policy check under
-`tools/guardrails/`, not a benchmark. It enforces that production API, graph,
-and storage DB code do not construct raw tensor programs outside the algebraic
-planner/IR layer. Test blocks may still build explicit programs to exercise
-protocol validation and executor rejection behavior.
+`zig build algebraic-guardrail` includes a repo policy check under
+`tools/guardrails/` that enforces that production API, graph, and storage DB
+code do not construct raw tensor programs outside the algebraic planner/IR
+layer. Test blocks may still build explicit programs to exercise protocol
+validation and executor rejection behavior.
 
 Failure-injection coverage should target stale lifecycle state, missing or
 conflicting dictionary ownership, adaptive backfill interruption, distributed
@@ -2281,41 +2250,29 @@ above and remove the temporary roadmap item.
    summaries, record hardware/environment notes, and set regression thresholds
    for latency, bytes, symbol/support-row growth, accumulator flushes, public
    query RSS, write cost, churn, cold/warm reads, fanout, constrained queries,
-   and public query behavior. Use
-   `scripts/run_algebraic_production_hardening.sh` as the canonical local runner
-   so every archived run includes the same raw JSONL, combined summary, and
-   environment metadata. Public-query archive comparisons default to
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=handler`, which exercises the public query
-   handler and planner without a TCP listener; use
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=local` or `swarm` for transport/server
-   overhead runs. Symbolic profile enforcement is a separate opt-in
-   (`ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`) for archives that
-   specifically validate vector-pruning profile counters. Keep the default
-   combined run direct unless the run is specifically validating LSM bulk ingest; set
-   `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` for that stress path and archive it
-   separately. Set `ALGEBRAIC_HARDENING_BASELINE` plus threshold env vars once
-   representative runs establish acceptable variance, so production archives
-   fail closed on correctness, coverage, latency, byte, and churn regressions.
-   Validate any archive used as evidence with
-   `zig build algebraic-archive-guardrail -- --archive <dir>
-   --require-thresholds --require-baseline --require-non-smoke`.
+   and public query behavior. Use direct `algebraic-bench`,
+   `public-query-guardrail`, and `algebraic-summary` commands for archive
+   generation so the public build surface stays focused on
+   `zig build algebraic-guardrail`. Public-query archive comparisons should use
+   handler mode by default, which exercises the public query handler and planner
+   without a TCP listener; use local or swarm mode only for transport/server
+   overhead runs. Symbolic profile enforcement is a separate opt-in for archives
+   that specifically validate vector-pruning profile counters. Keep the default
+   combined run direct unless the run is specifically validating LSM bulk
+   ingest; archive that stress path separately. Set a baseline summary plus
+   threshold flags once representative runs establish acceptable variance, so
+   production archives fail closed on correctness, coverage, latency, byte, and
+   churn regressions.
 
 2. Prove full-suite test health.
    Run the broad repo test/build matrix with algebraic enabled and disabled.
-   Separate unrelated existing failures from algebraic regressions, then keep a
-   focused algebraic CI path plus a periodic broader integration path. Use
-   `scripts/run_algebraic_integration_matrix.sh` as the local evidence runner:
-   its default lanes cover the disabled/default public-query path, schema-only
-   path, schema-plus-algebraic path, focused algebraic DB tests, and a
-   provisioned distributed fallback test whose name intentionally does not match
-   the broad `--test-filter algebraic` lane. Set
-   `ALGEBRAIC_MATRIX_WARM_BUILDS=0` only when the build cache is already known
-   warm; the default warm-build pass keeps archived lanes from failing during
-   first-compile setup rather than actual algebraic behavior. Set
-   `ALGEBRAIC_MATRIX_RUN_UNIT_TEST=1` and `ALGEBRAIC_MATRIX_RUN_E2E=1` for the
-   broader periodic matrix, and archive the resulting `environment.txt`,
-   `warm-builds.txt`, `commands.txt`, `status.tsv`, and per-lane stdout/stderr
-   artifacts.
+   Separate unrelated existing failures from algebraic regressions, then keep
+   `zig build algebraic-guardrail` as the focused CI-safe path and use normal
+   build/test targets for broader periodic evidence. The periodic matrix should
+   still cover default public-query behavior, schema-only behavior,
+   schema-plus-algebraic behavior, focused algebraic DB tests, and provisioned
+   distributed fallback coverage whose name intentionally does not match the
+   broad `--test-filter algebraic` lane.
 
 3. Harden crash, recovery, and rebuild behavior.
    Add failure-injection coverage for interrupted adaptive backfill,

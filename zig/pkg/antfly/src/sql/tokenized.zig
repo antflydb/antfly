@@ -2696,6 +2696,7 @@ fn generatedReadPaginationPayloadIsValid(
 
     if (fetch_tokens) |range| {
         if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+        if (!generatedReadFetchRangeLayoutIsValid(tokens, range, fetch_count_tokens)) return false;
         if (fetch_count_tokens) |count_range| {
             if (!generatedReadTokenRangeIsValid(tokens, count_range)) return false;
             if (count_range.start < range.start or count_range.end > range.end) return false;
@@ -2707,6 +2708,22 @@ fn generatedReadPaginationPayloadIsValid(
         return false;
     }
     return true;
+}
+
+fn generatedReadFetchRangeLayoutIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    fetch_count_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.start + 3 > range.end or range.end > tokens.len) return false;
+    if (!tokens[range.start].matchesKeywordTag(.first) and !tokens[range.start].matchesKeywordTag(.next)) return false;
+    if (!tokens[range.end - 1].matchesKeywordTag(.only)) return false;
+    const row_index = range.end - 2;
+    if (!tokens[row_index].matchesKeywordTag(.row) and !tokens[row_index].matchesKeywordTag(.rows)) return false;
+    if (fetch_count_tokens) |count_range| {
+        return count_range.start == range.start + 1 and count_range.end == row_index;
+    }
+    return row_index == range.start + 1;
 }
 
 fn generatedReadTokenRangeIsValid(tokens: []const Token, range: generated_parser.GeneratedSqlTokenRange) bool {
@@ -6526,6 +6543,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_offset_query.statement = parseStatement(generated_offset_query.raw_statement, malformed_offset_generated, &generated_offset_query.tokenized_sql);
     try std.testing.expect(generated_offset_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_offset_query.statement));
+
+    var generated_fetch_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FETCH FIRST 3 ROWS ONLY");
+    defer generated_fetch_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_fetch_query.generatedStatementKind().?);
+
+    var malformed_fetch_generated = generated_fetch_query.generated_statement.?;
+    if (malformed_fetch_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.fetch_tokens.?.start += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_fetch_query.statement = parseStatement(generated_fetch_query.raw_statement, malformed_fetch_generated, &generated_fetch_query.tokenized_sql);
+    try std.testing.expect(generated_fetch_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_fetch_query.statement));
 
     var generated_row_lock_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED");
     defer generated_row_lock_query.deinit(alloc);

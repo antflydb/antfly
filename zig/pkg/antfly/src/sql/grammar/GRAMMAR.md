@@ -1129,8 +1129,9 @@ contract until storage and API row plans grow those outer-join semantics.
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
    pagination tail, attach `OFFSET` expression spans to anything except the
-   exact offset value plus an optional `ROW`/`ROWS` suffix, or mismatch
-   explicit `FETCH` count spans; it also
+   exact offset value plus an optional `ROW`/`ROWS` suffix, mismatch
+   explicit `FETCH` count spans, or corrupt the fixed
+   `FETCH FIRST`/`FETCH NEXT` plus `ROW`/`ROWS ONLY` keyword layout; it also
    validates top-level clause keyword layout and payload consistency for
    projection, plain `DISTINCT` and `DISTINCT ON`, source, `WHERE`, `GROUP BY`,
    `HAVING`, `WINDOW`, `ORDER BY`, pagination, set-operation tails and

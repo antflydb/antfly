@@ -1331,79 +1331,73 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     algebraic_summary_step.dependOn(&run_algebraic_summary.step);
 
     const run_algebraic_performance_guardrail = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_performance_guardrail.addArgs(args);
-    } else {
-        run_algebraic_performance_guardrail.addArgs(&.{
-            "--input",
-            "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
-            "--baseline",
-            "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
-            "--require-performance-evidence",
-            "--min-lsm-dataset-cases",
-            "1",
-            "--min-lsm-query-records",
-            "3",
-            "--min-cold-query-records",
-            "2",
-            "--min-warm-query-records",
-            "2",
-            "--min-constrained-query-records",
-            "3",
-            "--min-wide-query-records",
-            "3",
-            "--min-stats-query-records",
-            "3",
-            "--min-cardinality-query-records",
-            "3",
-            "--min-range-query-records",
-            "3",
-            "--min-histogram-query-records",
-            "3",
-            "--min-fanout-dataset-cases",
-            "1",
-            "--min-public-query-comparison-pairs",
-            "2",
-            "--min-lsm-sorted-ingest-runs",
-            "1",
-            "--max-lsm-flushes",
-            "0",
-            "--max-lsm-write-pressure-compactions",
-            "0",
-            "--max-correctness-failures",
-            "0",
-            "--max-algebraic-query-ms",
-            "2",
-            "--max-public-query-http-us",
-            "100",
-            "--max-algebraic-bytes-per-doc",
-            "10",
-            "--max-symbol-bytes-per-doc",
-            "0",
-            "--max-support-bytes-per-doc",
-            "0",
-            "--max-accumulator-flush-count",
-            "0",
-            "--max-path-dictionary-fst-rebuild-count",
-            "1",
-            "--max-public-query-load-rss-peak-bytes",
-            "0",
-            "--max-public-query-search-rss-peak-bytes",
-            "0",
-            "--max-churn-algebraic-update-ms",
-            "2",
-            "--max-algebraic-query-ms-ratio-vs-baseline",
-            "1.0",
-            "--max-public-query-http-us-ratio-vs-baseline",
-            "1.0",
-            "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
-            "1.0",
-            "--max-churn-algebraic-update-ms-ratio-vs-baseline",
-            "1.0",
-        });
-    }
-    const algebraic_performance_guardrail_step = b.step("algebraic-performance-guardrail", "Run the algebraic benchmark summary coverage and baseline-ratio guardrail fixture");
-    algebraic_performance_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
+    run_algebraic_performance_guardrail.addArgs(&.{
+        "--input",
+        "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
+        "--baseline",
+        "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
+        "--require-performance-evidence",
+        "--min-lsm-dataset-cases",
+        "1",
+        "--min-lsm-query-records",
+        "3",
+        "--min-cold-query-records",
+        "2",
+        "--min-warm-query-records",
+        "2",
+        "--min-constrained-query-records",
+        "3",
+        "--min-wide-query-records",
+        "3",
+        "--min-stats-query-records",
+        "3",
+        "--min-cardinality-query-records",
+        "3",
+        "--min-range-query-records",
+        "3",
+        "--min-histogram-query-records",
+        "3",
+        "--min-fanout-dataset-cases",
+        "1",
+        "--min-public-query-comparison-pairs",
+        "2",
+        "--min-lsm-sorted-ingest-runs",
+        "1",
+        "--max-lsm-flushes",
+        "0",
+        "--max-lsm-write-pressure-compactions",
+        "0",
+        "--max-correctness-failures",
+        "0",
+        "--max-algebraic-query-ms",
+        "2",
+        "--max-public-query-http-us",
+        "100",
+        "--max-algebraic-bytes-per-doc",
+        "10",
+        "--max-symbol-bytes-per-doc",
+        "0",
+        "--max-support-bytes-per-doc",
+        "0",
+        "--max-accumulator-flush-count",
+        "0",
+        "--max-path-dictionary-fst-rebuild-count",
+        "1",
+        "--max-public-query-load-rss-peak-bytes",
+        "0",
+        "--max-public-query-search-rss-peak-bytes",
+        "0",
+        "--max-churn-algebraic-update-ms",
+        "2",
+        "--max-algebraic-query-ms-ratio-vs-baseline",
+        "1.0",
+        "--max-public-query-http-us-ratio-vs-baseline",
+        "1.0",
+        "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
+        "1.0",
+        "--max-churn-algebraic-update-ms-ratio-vs-baseline",
+        "1.0",
+    });
 
     const algebraic_planner_ownership_guardrail_mod = b.createModule(.{
         .root_source_file = b.path("tools/guardrails/algebraic_planner_ownership_guardrail.zig"),
@@ -1415,11 +1409,6 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
         .root_module = algebraic_planner_ownership_guardrail_mod,
     });
     const run_algebraic_planner_ownership_guardrail = b.addRunArtifact(algebraic_planner_ownership_guardrail);
-    if (b.args) |args| {
-        run_algebraic_planner_ownership_guardrail.addArgs(args);
-    }
-    const algebraic_planner_ownership_guardrail_step = b.step("algebraic-planner-ownership-guardrail", "Verify algebraic tensor programs are built by the planner layer outside tests");
-    algebraic_planner_ownership_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
 
     const algebraic_archive_guardrail_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_archive_guardrail.zig"),
@@ -1431,34 +1420,28 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
         .root_module = algebraic_archive_guardrail_mod,
     });
     const run_algebraic_archive_guardrail = b.addRunArtifact(algebraic_archive_guardrail);
-    if (b.args) |args| {
-        run_algebraic_archive_guardrail.addArgs(args);
-    } else {
-        run_algebraic_archive_guardrail.addArgs(&.{
-            "--archive",
-            "bench/storage/algebraic_production_archive_fixture",
-            "--require-thresholds",
-            "--require-baseline",
-            "--require-non-smoke",
-            "--min-docs",
-            "100",
-            "--min-repeats",
-            "1",
-            "--min-churn-ops",
-            "1",
-            "--min-public-docs",
-            "100",
-            "--min-graph-docs",
-            "100",
-        });
-    }
-    const algebraic_archive_guardrail_step = b.step("algebraic-archive-guardrail", "Verify archived algebraic production-hardening run evidence");
-    algebraic_archive_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
+    run_algebraic_archive_guardrail.addArgs(&.{
+        "--archive",
+        "bench/storage/algebraic_production_archive_fixture",
+        "--require-thresholds",
+        "--require-baseline",
+        "--require-non-smoke",
+        "--min-docs",
+        "100",
+        "--min-repeats",
+        "1",
+        "--min-churn-ops",
+        "1",
+        "--min-public-docs",
+        "100",
+        "--min-graph-docs",
+        "100",
+    });
 
-    const algebraic_roadmap_guardrail_step = b.step("algebraic-roadmap-guardrail", "Run CI-safe algebraic roadmap guardrails");
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
+    const algebraic_guardrail_step = b.step("algebraic-guardrail", "Run CI-safe algebraic guardrails");
+    algebraic_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
+    algebraic_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
+    algebraic_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
 
     const rw_lock_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
