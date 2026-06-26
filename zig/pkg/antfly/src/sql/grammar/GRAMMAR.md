@@ -840,7 +840,11 @@ Unsupported DDL remains on the existing parser until
    predicate, and ordering expressions, range-bound helper metadata for
    `lower`/`upper`-style projection, predicate, and ordering expressions, and
    searched `CASE WHEN ... THEN ... ELSE ... END` branch metadata with owned
-   per-branch condition/result expression lists.
+   per-branch condition/result expression lists. Generated expression
+   validation now also scopes retained metadata by expression family, so
+   subquery, function-call, array, cast, CASE, boolean-chain, temporal literal,
+   `EXTRACT`, and operator-specific payloads fail closed when attached to a
+   different generated expression kind.
    The read-plan lowering context now dispatches through retained generated
    read ASTs when the generated parser covers the statement, and generated read
    AST kind owns parsed-statement read-family classification for

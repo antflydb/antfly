@@ -392,6 +392,279 @@ fn validateGeneratedEmptyList(list: generated_parser.GeneratedSqlListAst) !void 
     }
 }
 
+fn validateGeneratedExpressionRangeListPayloads(
+    tokens: []const Token,
+    owner: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    expected_count: usize,
+) !void {
+    if (expected_count == 0) return validateGeneratedEmptyList(list);
+    if (list.count != expected_count or list.items.len != expected_count or list.expression_items.len != expected_count or list.expressions.len != expected_count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != 0 or list.alias_name_items.len != 0) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != 0 or list.directions.len != 0) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != 0 or list.nulls_order_items.len != 0 or list.nulls_orders.len != 0) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+    for (list.items, 0..) |item, index| {
+        if (item.start < owner.start or item.end > owner.end or item.start >= item.end) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(list.expression_items[index], item)) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, item)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+    }
+}
+
+fn generatedExpressionKindUsesOperatorPayload(kind: generated_parser.GeneratedSqlExpressionKind) bool {
+    return switch (kind) {
+        .comparison,
+        .like,
+        .ilike,
+        .in_list,
+        .between,
+        .not_like,
+        .not_ilike,
+        .not_in_list,
+        .not_between,
+        .quantified_comparison,
+        .exists_subquery,
+        .not_exists_subquery,
+        .is_null,
+        .is_not_null,
+        .is_true,
+        .is_false,
+        .is_unknown,
+        .is_not_true,
+        .is_not_false,
+        .is_not_unknown,
+        .is_distinct_from,
+        .is_not_distinct_from,
+        .logical_or,
+        .logical_and,
+        .logical_not,
+        .unary_positive,
+        .unary_negative,
+        .additive,
+        .subtractive,
+        .multiplicative,
+        .divisive,
+        .modulo,
+        .contains,
+        .overlaps,
+        .json_key_exists,
+        .json_key_any,
+        .json_key_all,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        .string_concat,
+        .json_access,
+        .json_text_access,
+        .json_path_access,
+        .json_path_text_access,
+        => true,
+        else => false,
+    };
+}
+
+fn validateGeneratedExpressionFamilyPayloads(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    expression_tokens: generated_parser.GeneratedSqlTokenRange,
+) anyerror!void {
+    if (expression.kind == .grouped) {
+        if (expression.inner_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.kind == .subquery) {
+        if (expression.inner_tokens == null or expression.inner_expression_kind != null or expression.inner_expression != null) return error.UnsupportedSqlShape;
+    } else if (expression.inner_tokens != null or expression.inner_expression_kind != null or expression.inner_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind != .subquery and
+        (expression.subquery_read_kind != null or
+            expression.subquery_select_tokens != null or
+            expression.subquery_projection_tokens != null or
+            expression.subquery_projection_items.count != 0 or
+            expression.subquery_projection_items.items.len != 0 or
+            expression.subquery_source_tokens != null or
+            expression.subquery_where_tokens != null or
+            expression.subquery_where_expression_kind != null or
+            expression.subquery_where_expression != null or
+            expression.subquery_set_operation_tokens != null or
+            expression.subquery_set_operation != null or
+            expression.subquery_tail != null))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind != .function_call and
+        (expression.function_name_tokens != null or
+            expression.argument_tokens != null or
+            expression.argument_distinct_tokens != null or
+            expression.argument_value_tokens != null or
+            expression.argument_items.count != 0 or
+            expression.argument_items.items.len != 0 or
+            expression.argument_order_tokens != null or
+            expression.argument_order_items.count != 0 or
+            expression.argument_order_items.items.len != 0 or
+            expression.within_group_tokens != null or
+            expression.within_group_order_tokens != null or
+            expression.within_group_order_items.count != 0 or
+            expression.within_group_order_items.items.len != 0 or
+            expression.filter_tokens != null or
+            expression.filter_predicate_tokens != null or
+            expression.filter_expression_kind != null or
+            expression.filter_expression != null or
+            expression.over_tokens != null or
+            expression.over_name_tokens != null or
+            expression.over_definition_tokens != null or
+            expression.over_partition_tokens != null or
+            expression.over_partition_items.count != 0 or
+            expression.over_partition_items.items.len != 0 or
+            expression.over_order_tokens != null or
+            expression.over_order_items.count != 0 or
+            expression.over_order_items.items.len != 0 or
+            expression.over_frame_tokens != null or
+            expression.over_frame_start_expression_tokens != null or
+            expression.over_frame_start_expression_kind != null or
+            expression.over_frame_start_expression != null or
+            expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_end_expression_kind != null or
+            expression.over_frame_end_expression != null))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .array_constructor) {
+        if (expression.array_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.array_tokens != null or expression.array_items.count != 0 or expression.array_items.items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .cast) {
+        if (expression.cast_expression_tokens == null or expression.cast_type_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.cast_expression_tokens != null or expression.cast_expression_kind != null or expression.cast_expression != null or expression.cast_type_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .case_expression) {
+        if (expression.case_branch_count == 0 or
+            expression.case_first_when_tokens == null or
+            expression.case_last_when_tokens == null or
+            expression.case_first_condition_tokens == null or
+            expression.case_first_result_tokens == null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedExpressionRangeListPayloads(tokens, expression_tokens, expression.case_condition_items, expression.case_branch_count);
+        try validateGeneratedExpressionRangeListPayloads(tokens, expression_tokens, expression.case_result_items, expression.case_branch_count);
+    } else if (expression.case_branch_count != 0 or
+        expression.case_first_when_tokens != null or
+        expression.case_last_when_tokens != null or
+        expression.case_first_condition_tokens != null or
+        expression.case_first_condition_kind != null or
+        expression.case_first_condition != null or
+        expression.case_first_result_tokens != null or
+        expression.case_first_result_kind != null or
+        expression.case_first_result != null or
+        expression.case_condition_items.count != 0 or
+        expression.case_condition_items.items.len != 0 or
+        expression.case_result_items.count != 0 or
+        expression.case_result_items.items.len != 0 or
+        expression.case_else_tokens != null or
+        expression.case_else_expression_tokens != null or
+        expression.case_else_expression_kind != null or
+        expression.case_else_expression != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .logical_and or expression.kind == .logical_or) {
+        if (expression.boolean_condition_count == 0 or
+            expression.boolean_first_condition_tokens == null or
+            expression.boolean_last_condition_tokens == null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedExpressionRangeListPayloads(tokens, expression_tokens, expression.boolean_condition_items, expression.boolean_condition_count);
+    } else if (expression.boolean_condition_count != 0 or
+        expression.boolean_first_condition_tokens != null or
+        expression.boolean_first_condition_kind != null or
+        expression.boolean_first_condition != null or
+        expression.boolean_last_condition_tokens != null or
+        expression.boolean_last_condition_kind != null or
+        expression.boolean_last_condition != null or
+        expression.boolean_condition_items.count != 0 or
+        expression.boolean_condition_items.items.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .interval_literal) {
+        if (expression.interval_value_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.interval_value_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind == .timestamp_literal) {
+        if (expression.timestamp_type_tokens == null or expression.timestamp_value_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.timestamp_type_tokens != null or expression.timestamp_value_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.kind != .current_timestamp and expression.current_timestamp_precision_tokens != null) return error.UnsupportedSqlShape;
+
+    if (expression.kind == .extract_expression) {
+        if (expression.extract_field_tokens == null or expression.extract_source_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.extract_field_tokens != null or expression.extract_source_tokens != null or expression.extract_source_expression_kind != null or expression.extract_source_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (generatedExpressionKindUsesOperatorPayload(expression.kind)) {
+        const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+        if (operator_tokens.start < expression_tokens.start or operator_tokens.end > expression_tokens.end or operator_tokens.start >= operator_tokens.end) return error.UnsupportedSqlShape;
+        if (expression.negation_tokens) |negation_tokens| {
+            if (negation_tokens.start < expression_tokens.start or negation_tokens.end > expression_tokens.end or negation_tokens.start >= negation_tokens.end) return error.UnsupportedSqlShape;
+        }
+        if (expression.quantifier_tokens) |quantifier_tokens| {
+            if (quantifier_tokens.start < expression_tokens.start or quantifier_tokens.end > expression_tokens.end or quantifier_tokens.end != quantifier_tokens.start + 1) return error.UnsupportedSqlShape;
+            if (!tokens[quantifier_tokens.start].matchesKeywordTag(.any) and !tokens[quantifier_tokens.start].matchesKeywordTag(.some) and !tokens[quantifier_tokens.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+        }
+        if (expression.between_modifier_tokens) |modifier_tokens| {
+            if (expression.kind != .between and expression.kind != .not_between) return error.UnsupportedSqlShape;
+            if (modifier_tokens.start < expression_tokens.start or modifier_tokens.end > expression_tokens.end or modifier_tokens.end != modifier_tokens.start + 1) return error.UnsupportedSqlShape;
+            const modifier = expression.between_modifier orelse return error.UnsupportedSqlShape;
+            switch (modifier) {
+                .asymmetric => if (!tokens[modifier_tokens.start].matchesKeywordTag(.asymmetric)) return error.UnsupportedSqlShape,
+                .symmetric => if (!tokens[modifier_tokens.start].matchesKeywordTag(.symmetric)) return error.UnsupportedSqlShape,
+            }
+        } else if (expression.between_modifier != null) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (expression.negation_tokens != null or
+        expression.operator_tokens != null or
+        expression.between_modifier_tokens != null or
+        expression.between_modifier != null or
+        expression.quantifier_tokens != null or
+        expression.left_tokens != null or
+        expression.left_expression_kind != null or
+        expression.left_expression != null or
+        expression.between_lower_tokens != null or
+        expression.between_lower_expression_kind != null or
+        expression.between_lower_expression != null or
+        expression.between_upper_tokens != null or
+        expression.between_upper_expression_kind != null or
+        expression.between_upper_expression != null or
+        expression.right_tokens != null or
+        expression.right_expression_kind != null or
+        expression.right_expression != null or
+        expression.escape_tokens != null or
+        expression.escape_expression_kind != null or
+        expression.escape_expression != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedSetOperationPayloads(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -1030,6 +1303,7 @@ fn validateGeneratedExpressionPayloads(
 ) anyerror!void {
     const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
     if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionFamilyPayloads(tokens, expression, expression_tokens);
 
     if (expression.kind != .subquery) {
         try validateGeneratedOptionalChildExpressionGroup(expression.inner_tokens, expression.inner_expression_kind, expression.inner_expression);
@@ -31093,6 +31367,41 @@ fn corruptGeneratedReadFirstProjectionOrphanChildKind(parsed_sql: *tokenized.Par
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstProjectionStaleOperatorTokens(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    const tokens = read.projection_items.expressions[0].tokens orelse return error.TestUnexpectedResult;
+                    if (read.projection_items.expressions[0].operator_tokens != null) return error.TestUnexpectedResult;
+                    read.projection_items.expressions[0].operator_tokens = tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionStaleCaseCount(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    if (read.projection_items.expressions[0].case_branch_count != 0) return error.TestUnexpectedResult;
+                    read.projection_items.expressions[0].case_branch_count = 1;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstProjectionCastChildExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -31446,6 +31755,32 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_orphan_child_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_stale_operator = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_stale_operator.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionStaleOperatorTokens(&malformed_stale_operator);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_stale_operator,
+        schema,
+        &.{},
+    ));
+
+    var malformed_stale_case = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_stale_case.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionStaleCaseCount(&malformed_stale_case);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_stale_case,
         schema,
         &.{},
     ));
