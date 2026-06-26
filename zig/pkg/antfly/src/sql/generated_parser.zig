@@ -2176,9 +2176,6 @@ pub fn parseTokensAllocWithAstMode(
     ast_mode: GeneratedSqlAstMode,
 ) !GeneratedSqlParseResult {
     const statement = classifyStatement(tokens);
-    if (generatedSavepointTransactionBypassesLrParse(tokens, statement)) {
-        return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
-    }
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
         try parseGeneratedTokenIds(alloc, token_ids);
@@ -2211,34 +2208,6 @@ fn buildGeneratedParseResult(
         .kind = std.meta.activeTag(statement),
         .statement = statement,
         .ast = if (ast_mode == .skip_read and statement == .read) null else try buildGeneratedAst(alloc, tokens, statement),
-    };
-}
-
-fn generatedSavepointTransactionBypassesLrParse(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) bool {
-    const kind = switch (statement) {
-        .transaction => |transaction| transaction,
-        else => return false,
-    };
-    const end = generatedTokenEnd(tokens);
-    return switch (kind) {
-        .savepoint => end == 2 and tokens[0].matchesKeywordTag(.savepoint) and tokens[1].kind == .identifier,
-        .release_savepoint => (end == 2 and
-            tokens[0].matchesKeywordTag(.release) and
-            tokens[1].kind == .identifier) or
-            (end == 3 and
-                tokens[0].matchesKeywordTag(.release) and
-                tokens[1].matchesKeywordTag(.savepoint) and
-                tokens[2].kind == .identifier),
-        .rollback_to_savepoint => (end == 3 and
-            tokens[0].matchesKeywordTag(.rollback) and
-            tokens[1].matchesKeywordTag(.to) and
-            tokens[2].kind == .identifier) or
-            (end == 4 and
-                tokens[0].matchesKeywordTag(.rollback) and
-                tokens[1].matchesKeywordTag(.to) and
-                tokens[2].matchesKeywordTag(.savepoint) and
-                tokens[3].kind == .identifier),
-        else => false,
     };
 }
 
