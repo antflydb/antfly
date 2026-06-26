@@ -719,47 +719,24 @@ pub const StatusSource = struct {
         session: catalog_resources.SqlCatalogSession,
         function_bindings: sql_adapter.SqlFunctionBindings,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
-        if (self.vtable.apply_relational_sql_ddl_plan_with_session) |fn_ptr| {
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
-            defer parsed_sql.deinit(alloc);
-            var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
-            defer plan.deinit(alloc);
-            return try fn_ptr(self.ptr, alloc, &plan, session);
-        }
-        if (self.vtable.apply_relational_sql_ddl_with_session_and_function_bindings) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, sql, session, function_bindings);
-        }
-        if (function_bindings.routine_expressions.len != 0 or
-            function_bindings.extension_functions.len != 0)
-        {
-            return error.UnsupportedOperation;
-        }
-        if (self.vtable.apply_relational_sql_ddl_with_session) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, sql, session);
-        }
-        if (!std.mem.eql(u8, session.currentDatabase(), catalog_resources.default_database_name) or
-            !std.mem.eql(u8, session.primarySearchPathNamespace(), catalog_resources.default_namespace_name) or
-            session.search_path.len > 1 or
-            session.settings.len > 0)
-        {
-            return error.UnsupportedOperation;
-        }
-        const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, sql);
+        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
+        defer logical_plan.deinit(alloc);
+        return try fn_ptr(self.ptr, alloc, &logical_plan.ddl, session);
     }
 
     pub fn applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(
         self: StatusSource,
         alloc: std.mem.Allocator,
-        sql: []const u8,
         plan: *sql_adapter.LoweredDdlPlan,
         session: catalog_resources.SqlCatalogSession,
         function_bindings: sql_adapter.SqlFunctionBindings,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
-        if (self.vtable.apply_relational_sql_ddl_plan_with_session) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, plan, session);
-        }
-        return try self.applyRelationalSqlDdlWithSessionAndFunctionBindings(alloc, sql, session, function_bindings);
+        _ = function_bindings;
+        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, plan, session);
     }
 
     pub fn compareAndSwapTableSchema(
@@ -1147,9 +1124,6 @@ pub const StatusSource = struct {
             .drop_table = Gen.dropTable,
             .drop_catalog_table = Gen.dropCatalogTable,
             .update_schema = Gen.updateSchema,
-            .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
-            .apply_relational_sql_ddl_with_session = Gen.applyRelationalSqlDdlWithSession,
-            .apply_relational_sql_ddl_with_session_and_function_bindings = Gen.applyRelationalSqlDdlWithSessionAndFunctionBindings,
             .apply_relational_sql_ddl_plan_with_session = Gen.applyRelationalSqlDdlPlanWithSession,
             .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
             .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
@@ -4391,7 +4365,6 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn applyRelationalParsedSqlDdlWithSession(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
-        const sql = parsed_sql.sql();
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4400,7 +4373,7 @@ pub const ApiHttpServer = struct {
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
-        var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
+        var logical_plan = sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
                 if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
@@ -4408,12 +4381,16 @@ pub const ApiHttpServer = struct {
             },
             else => return err,
         };
-        defer plan.deinit(self.alloc);
+        defer logical_plan.deinit(self.alloc);
+        const plan = switch (logical_plan) {
+            .ddl => |*ddl| ddl,
+            .read, .write => unreachable,
+        };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         if (try self.publicSqlReadOnlyActive(session)) {
-            if (!try self.loweredDdlPlanAllowedInReadOnly(session, plan)) return error.SqlReadOnlyTransaction;
+            if (!try self.loweredDdlPlanAllowedInReadOnly(session, plan.*)) return error.SqlReadOnlyTransaction;
         }
-        switch (plan) {
+        switch (plan.*) {
             .adapter_noop => |noop| {
                 if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
                     try session.clearTransactionLocalState(self.alloc);
@@ -4433,7 +4410,7 @@ pub const ApiHttpServer = struct {
             },
             else => {},
         }
-        switch (plan) {
+        switch (plan.*) {
             .session_catalog => |session_plan| {
                 const notification_session_id = session.notification_session_id;
                 const clear_prepared_statements = switch (session_plan) {
@@ -4506,7 +4483,7 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
             .extension_catalog => {
-                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, sql, &plan, session.session(), function_bindings);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, plan, session.session(), function_bindings);
                 errdefer applied.deinit(self.alloc);
                 try self.refreshSqlExtensionQueryFunctions();
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4514,23 +4491,23 @@ pub const ApiHttpServer = struct {
             },
             else => {},
         }
-        try self.rejectUnsupportedDocumentSqlViewMapping(plan, session.session());
+        try self.rejectUnsupportedDocumentSqlViewMapping(plan.*, session.session());
 
-        if (loweredDdlPlanMayDropTrigger(plan)) {
+        if (loweredDdlPlanMayDropTrigger(plan.*)) {
             if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
         }
 
         if (self.cfg.user_manager) |manager| {
-            var catalog = try self.sqlAuthCatalogForDdlPlanWithSession(plan, session.session());
+            var catalog = try self.sqlAuthCatalogForDdlPlanWithSession(plan.*, session.session());
             defer catalog.deinit(self.alloc);
-            if (try auth_sql_adapter.executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, self.alloc, plan, catalog.value)) |applied_value| {
+            if (try auth_sql_adapter.executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, self.alloc, plan.*, catalog.value)) |applied_value| {
                 var applied = applied_value;
                 errdefer applied.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             }
         }
-        var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, sql, &plan, session.session(), function_bindings);
+        var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, plan, session.session(), function_bindings);
         errdefer applied.deinit(self.alloc);
         try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -7772,33 +7749,38 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        if (parsed_sql.writeStatementKind() != null) {
-            var outcome = try self.handlePublicSqlWrite(&parsed_sql, request.params, &session, authenticated_identity);
-            errdefer outcome.deinit(self.alloc);
-            switch (outcome) {
-                .response => self.markPublicSqlTransactionFailedIfActive(&session),
-                .result => {},
+        if (sql_adapter.classifyParsedSqlForExecution(&parsed_sql)) |logical_plan| {
+            switch (logical_plan) {
+                .write => {
+                    var outcome = try self.handlePublicSqlWrite(&parsed_sql, request.params, &session, authenticated_identity);
+                    errdefer outcome.deinit(self.alloc);
+                    switch (outcome) {
+                        .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                        .result => {},
+                    }
+                    try self.savePublicSqlSession(session);
+                    switch (outcome) {
+                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                        .response => {},
+                    }
+                    return outcome;
+                },
+                .read => {
+                    var outcome = try self.handlePublicSqlRead(&parsed_sql, request.params, &session, authenticated_identity);
+                    errdefer outcome.deinit(self.alloc);
+                    switch (outcome) {
+                        .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                        .result => {},
+                    }
+                    try self.savePublicSqlSession(session);
+                    switch (outcome) {
+                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                        .response => {},
+                    }
+                    return outcome;
+                },
+                .ddl => unreachable,
             }
-            try self.savePublicSqlSession(session);
-            switch (outcome) {
-                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
-                .response => {},
-            }
-            return outcome;
-        }
-        if (parsed_sql.readStatementKind() != null) {
-            var outcome = try self.handlePublicSqlRead(&parsed_sql, request.params, &session, authenticated_identity);
-            errdefer outcome.deinit(self.alloc);
-            switch (outcome) {
-                .response => self.markPublicSqlTransactionFailedIfActive(&session),
-                .result => {},
-            }
-            try self.savePublicSqlSession(session);
-            switch (outcome) {
-                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
-                .response => {},
-            }
-            return outcome;
         }
 
         const applied = self.applyRelationalParsedSqlDdlWithSession(&parsed_sql, &session) catch |err| switch (err) {

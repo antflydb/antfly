@@ -1006,6 +1006,8 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     }
     if (tokenMatchesKeyword(first, .select) and tokenMatchesKeyword(last, .distinct)) return true;
     if (last.kind == .lparen and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .on)) return true;
+    if (last.kind == .lparen or isGeneratedReadTrailingOperatorToken(last)) return true;
+    if (isGeneratedReadTrailingQuantifier(tokens, start, end)) return true;
     if (generatedReadHasCompleteSourceBefore(tokens, start, end - 1) and
         (tokenMatchesKeyword(last, .@"union") or
             tokenMatchesKeyword(last, .intersect) or
@@ -1064,6 +1066,47 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
             tokenMatchesKeyword(last, .not);
     }
     return false;
+}
+
+fn isGeneratedReadTrailingOperatorToken(token: Token) bool {
+    return switch (token.kind) {
+        .eq,
+        .neq,
+        .gt,
+        .gte,
+        .lt,
+        .lte,
+        .plus,
+        .minus,
+        .slash,
+        .percent,
+        .at_contains,
+        .range_overlap,
+        .pipe_concat,
+        .question,
+        .question_any,
+        .question_all,
+        .arrow_json,
+        .arrow_text,
+        .path_arrow_json,
+        .path_arrow_text,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        => true,
+        else => false,
+    };
+}
+
+fn isGeneratedReadTrailingQuantifier(tokens: []const Token, start: usize, end: usize) bool {
+    if (end <= start + 1 or end > tokens.len) return false;
+    const last = tokens[end - 1];
+    if (!tokenMatchesKeyword(last, .any) and !tokenMatchesKeyword(last, .some) and !tokenMatchesKeyword(last, .all)) return false;
+    const previous = tokens[end - 2];
+    return isGeneratedReadTrailingOperatorToken(previous) or
+        tokenMatchesKeyword(previous, .like) or
+        tokenMatchesKeyword(previous, .ilike);
 }
 
 fn isIncompleteGeneratedReadRowLockTail(tokens: []const Token, start: usize, end: usize) bool {
@@ -3249,6 +3292,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IS NOT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status LIKE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE score >"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tags @>"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE name ~"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT first_name ||"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT lower("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = ANY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status LIKE ANY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'active' AND"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING COUNT(*) > 1 OR"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY"));

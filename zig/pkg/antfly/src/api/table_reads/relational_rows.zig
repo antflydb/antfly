@@ -2959,3 +2959,376 @@ test "routed rows materialization budget fails closed on row and byte caps" {
     try byte_budget.account("{\"id\":\"a\"}");
     try std.testing.expectError(error.UnsupportedRowsQuery, byte_budget.account("{\"id\":\"b\"}"));
 }
+
+test "routed rows query plan executes over scanned owner rows with ctes" {
+    const alloc = std.testing.allocator;
+
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                    .rows_aggregate_plan = rowsAggregatePlan,
+                    .rows_window_plan = rowsWindowPlan,
+                    .rows_join_plan = rowsJoinPlan,
+                    .rows_lateral_plan = rowsLateralPlan,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, "n"))
+                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
+                else if (std.mem.eql(u8, from_key, "n") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                else if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                else
+                    return error.UnexpectedRange
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+                else
+                    return error.UnexpectedRange
+            else if (std.mem.eql(u8, table_name, "oversized")) {
+                try std.testing.expectEqualStrings("", from_key);
+                try std.testing.expectEqualStrings("", to_key);
+                var out = std.ArrayListUnmanaged(u8).empty;
+                errdefer out.deinit(scan_alloc);
+                const line = "{\"key\":\"x\",\"id\":\"x\",\"status\":\"open\",\"amount\":1}\n";
+                var index: usize = 0;
+                while (index <= db_mod.types.default_relational_rows_cte_max_rows) : (index += 1) {
+                    try out.appendSlice(scan_alloc, line);
+                }
+                return .{ .ndjson = try out.toOwnedSlice(scan_alloc) };
+            } else return error.TableNotFound;
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn rowsQueryPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsAggregatePlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsAggregatePlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsAggregateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsAggregatePlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsWindowPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsWindowPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsWindowResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsWindowPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsJoinPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsJoinPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsJoinResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsJoinPlanFromRoutedScansWithSchemasAlloc(
+                plan_alloc,
+                self.source(),
+                table_name,
+                table_name,
+                table_name,
+                runtime_schema,
+                runtime_schema,
+                runtime_schema,
+                plan,
+                consistency,
+            );
+        }
+
+        fn rowsLateralPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsLateralPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsJoinResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsLateralPlanFromRoutedScansWithSchemasAlloc(
+                plan_alloc,
+                self.source(),
+                table_name,
+                table_name,
+                table_name,
+                runtime_schema,
+                runtime_schema,
+                runtime_schema,
+                plan,
+                consistency,
+            );
+        }
+    };
+
+    var fake = FakeRoutedSource{};
+    var source = fake.source();
+    const cte_select = [_][]const u8{ "id", "amount", "status" };
+    const cte_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "status_open",
+        .field = "status",
+        .value_json = "\"open\"",
+    }};
+    const ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = "open_rows",
+        .query = .{
+            .predicates = cte_predicates[0..],
+            .select = cte_select[0..],
+            .select_all = false,
+        },
+    }};
+    const ranges = [_]db_mod.types.RelationalRowsDocKeyRange{
+        .{ .start = "", .end = "n" },
+        .{ .start = "n", .end = "" },
+    };
+    const final_select = [_][]const u8{"id"};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+
+    var result = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "open_rows",
+            .select = final_select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 1,
+        },
+    }, .read_index)).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\"}", result.rows[0]);
+
+    const aggregate_group_by = [_][]const u8{"status"};
+    const aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "order_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    var aggregate_result = (try source.rowsAggregatePlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "open_rows" },
+            .group_by = aggregate_group_by[0..],
+            .aggregations = aggregate_specs[0..],
+        },
+    }, .read_index)).?;
+    defer aggregate_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"open\",\"order_count\":2,\"amount_sum\":8}", aggregate_result.rows[0]);
+
+    const window_specs = [_]db_mod.types.RelationalRowsWindowSpec{.{
+        .output = "rn",
+        .function = .row_number,
+        .order_by = &.{.{ .field = "amount", .direction = .desc }},
+    }};
+    const window_select = [_][]const u8{ "id", "amount" };
+    var window_result = (try source.rowsWindowPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "open_rows" },
+            .windows = window_specs[0..],
+            .select = window_select[0..],
+            .select_all = false,
+            .order_by = &.{.{ .field = "rn", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer window_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), window_result.total_rows);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"amount\":7,\"rn\":1}", window_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":1,\"rn\":2}", window_result.rows[1]);
+
+    const join_on = [_]db_mod.types.RelationalRowsJoinOn{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    const join_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "left_id", .side = .left, .field = "id" },
+        .{ .output = "right_id", .side = .right, .field = "id" },
+    };
+    var join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+            .order_by = &.{ .{ .field = "left_id", .direction = .asc }, .{ .field = "right_id", .direction = .asc } },
+            .limit = 1,
+        },
+    }, .read_index)).?;
+    defer join_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", join_result.rows[0]);
+
+    const lateral_correlations = [_]db_mod.types.RelationalRowsLateralCorrelation{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    const lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "left_id", .side = .left, .field = "id" },
+        .{ .output = "latest_id", .side = .right, .field = "id" },
+        .{ .output = "latest_amount", .side = .right, .field = "amount" },
+    };
+    var lateral_result = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "id", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = lateral_select[0..],
+            .order_by = &.{.{ .field = "left_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer lateral_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), lateral_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"left_id\":\"z\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[1]);
+
+    var customer_columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .nullable = false },
+        .{ .name = "name", .path = "name", .field_type = .keyword, .nullable = false },
+    };
+    const customer_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = customer_columns[0..],
+    };
+    const cross_join_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "order_id", .side = .left, .field = "id" },
+        .{ .output = "customer_name", .side = .right, .field = "name" },
+    };
+    const cross_scan_calls_before = fake.scan_calls;
+    var cross_join_result = (try rowsJoinPlanFromRoutedScansWithSchemasAlloc(alloc, source, "orders", "orders", "customers", schema, schema, customer_schema, .{
+        .right_table = "customers",
+        .join = .{
+            .left = .{},
+            .right = .{},
+            .on = join_on[0..],
+            .select = cross_join_select[0..],
+            .order_by = &.{.{ .field = "order_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer cross_join_result.deinit(alloc);
+    try std.testing.expectEqual(cross_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 3), cross_join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"order_id\":\"a\",\"customer_name\":\"Ada\"}", cross_join_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"b\",\"customer_name\":\"Grace\"}", cross_join_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"z\",\"customer_name\":\"Ada\"}", cross_join_result.rows[2]);
+
+    const cross_lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "order_id", .side = .left, .field = "id" },
+        .{ .output = "matched_customer", .side = .right, .field = "name" },
+    };
+    const cross_lateral_scan_calls_before = fake.scan_calls;
+    var cross_lateral_result = (try rowsLateralPlanFromRoutedScansWithSchemasAlloc(alloc, source, "orders", "orders", "customers", schema, schema, customer_schema, .{
+        .right_table = "customers",
+        .lateral = .{
+            .left = .{ .order_by = &.{.{ .field = "id", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "name", .direction = .asc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = cross_lateral_select[0..],
+            .order_by = &.{.{ .field = "order_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer cross_lateral_result.deinit(alloc);
+    try std.testing.expectEqual(cross_lateral_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 3), cross_lateral_result.total_rows);
+    try std.testing.expectEqualStrings("{\"order_id\":\"a\",\"matched_customer\":\"Ada\"}", cross_lateral_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"b\",\"matched_customer\":\"Grace\"}", cross_lateral_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"z\",\"matched_customer\":\"Ada\"}", cross_lateral_result.rows[2]);
+
+    var key_columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "key", .path = "key", .field_type = .keyword, .nullable = false },
+    };
+    const key_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = key_columns[0..],
+    };
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "orders", key_schema, .{}, .read_index));
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "oversized", schema, .{}, .read_index));
+}

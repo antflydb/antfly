@@ -224,15 +224,12 @@ pub const AdminSource = struct {
     }
 
     pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
-        if (self.vtable.apply_relational_sql_ddl_plan_with_session) |fn_ptr| {
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
-            defer parsed_sql.deinit(alloc);
-            var plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
-            defer plan.deinit(alloc);
-            return try fn_ptr(self.ptr, alloc, &plan, catalog_resources.SqlCatalogSession.default());
-        }
-        const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, sql);
+        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer logical_plan.deinit(alloc);
+        return try fn_ptr(self.ptr, alloc, &logical_plan.ddl, catalog_resources.SqlCatalogSession.default());
     }
 
     pub fn applyRelationalSqlDdlPlanWithSession(
@@ -433,7 +430,6 @@ pub const AdminSource = struct {
                 .restore_table = metadataServiceRestoreTable,
                 .drop_table = metadataServiceDropTable,
                 .update_schema = metadataServiceUpdateSchema,
-                .apply_relational_sql_ddl = metadataServiceApplyRelationalSqlDdl,
                 .apply_relational_sql_ddl_plan_with_session = metadataServiceApplyRelationalSqlDdlPlanWithSession,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
@@ -480,7 +476,6 @@ pub const AdminSource = struct {
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
                 .update_schema = metadataHttpServiceUpdateSchema,
-                .apply_relational_sql_ddl = metadataHttpServiceApplyRelationalSqlDdl,
                 .apply_relational_sql_ddl_plan_with_session = metadataHttpServiceApplyRelationalSqlDdlPlanWithSession,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,

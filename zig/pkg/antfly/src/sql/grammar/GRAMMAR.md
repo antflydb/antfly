@@ -1088,7 +1088,10 @@ Unsupported DDL remains on the existing parser until
    `DISTINCT`/`DISTINCT ON`, set operations, unambiguous pagination result
    tails, row-locking clauses, window clauses, joins, and CTE `AS` bodies now require
    generated parsing and fail closed instead of falling back to the legacy read
-   classifier.
+   classifier. Read expressions that end on generated-owned operators, open
+   function/group delimiters, or quantified/pattern predicate heads such as
+   `= ANY`, `LIKE ANY`, `@>`, regex operators, and `||` also propagate the
+   generated syntax diagnostic instead of re-entering legacy read parsing.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
