@@ -4614,8 +4614,8 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     var pos: usize = 0;
     var plan: LoweredDdlPlan = switch (ast.kind) {
         .create_index => .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
-        .create_metric => .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tail, &pos) },
-        .alter_metric => .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tail, &pos) },
+        .create_metric => .{ .create_index = try createGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .alter_metric => .{ .create_index = try alterGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
     errdefer plan.deinit(alloc);
     try validateGeneratedGraphPlanMatchesAstAlloc(alloc, tokens, ast, plan);
@@ -4682,6 +4682,89 @@ fn validateGeneratedGraphOptions(
     } else if (required_end != end) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn createGraphMetricPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !CreateIndexPlan {
+    const metric_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var metric_transferred = false;
+    errdefer if (!metric_transferred) alloc.free(metric_name);
+
+    const graph_index = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.source_name_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(graph_index);
+
+    var option_pos = generatedGraphOptionStart(tokens, ast) orelse return error.UnsupportedSqlShape;
+    const config_json = try createGraphMetricIndexConfigJsonAlloc(alloc, tokens, &option_pos, graph_index, metric_name);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, &option_pos);
+
+    const table_name = try alloc.dupe(u8, "");
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    metric_transferred = true;
+    config_transferred = true;
+    table_transferred = true;
+    return .{
+        .index_name = metric_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph_metric,
+        .columns = &.{},
+        .derived_index_config_json = config_json,
+    };
+}
+
+fn alterGraphMetricPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !CreateIndexPlan {
+    const graph_index = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.source_name_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(graph_index);
+
+    const metric_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var metric_transferred = false;
+    errdefer if (!metric_transferred) alloc.free(metric_name);
+
+    const algorithm = try generatedIdentifierAlloc(alloc, tokens, ast.algorithm_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(algorithm);
+
+    var option_pos = generatedGraphOptionStart(tokens, ast) orelse return error.UnsupportedSqlShape;
+    const config_json = try graphMetricIndexConfigJsonAlloc(alloc, tokens, &option_pos, graph_index, metric_name, algorithm);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, &option_pos);
+
+    const table_name = try alloc.dupe(u8, "");
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    metric_transferred = true;
+    config_transferred = true;
+    table_transferred = true;
+    return .{
+        .index_name = metric_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph_metric,
+        .columns = &.{},
+        .derived_index_config_json = config_json,
+    };
+}
+
+fn generatedGraphOptionStart(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) ?usize {
+    if (ast.option_tokens) |options| return options.start;
+    return generatedStatementEnd(tokens, ast.statement_span);
 }
 
 fn validateGeneratedGraphPlanMatchesAstAlloc(
