@@ -1190,10 +1190,10 @@ variants for:
   canonical `antfly.*` table-function reads are represented on generated read
   ASTs as source-level Antfly function item metadata, with graph function items
   retained as a subset carrying graph-specific semantic argument payloads rather
-  than as standalone graph statements; `antfly.graph_metric_rerank` is
-  generated-AST-covered as a graph rerank source shape, but it is not yet a
-  relational row-source table function because rerank materializes search hits
-  rather than graph rows or metric-score rows
+  than as standalone graph statements; `antfly.graph_metric_rerank` now lowers
+  as a relational row-source table function by owning the parsed full-text plus
+  graph-metric rerank search request and materializing reranked hits through
+  the existing graph table-function row schema
 - cursor statement, including generated AST payloads for command spans and
   typed tail token ranges for `DECLARE`, `FETCH`, and `CLOSE`, plus
   generated-first AST-to-plan lowering into typed cursor portal plans
@@ -1247,8 +1247,8 @@ Generated grammar work needs evidence at multiple levels:
   `antfly.vector_search`, `antfly.graph_traverse`, `antfly.graph_match`,
   `antfly.graph_metric`, and `antfly.graph_metric_rerank` table-function read
   source syntax with named arguments; executable relational row-source lowering
-  is limited to graph traversal/match and graph metric score table functions
-  until rerank has a dedicated row-source result contract.
+  covers graph traversal/match rows, graph metric score rows, and graph metric
+  rerank search-hit rows.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
@@ -1397,9 +1397,10 @@ Generated grammar work needs evidence at multiple levels:
   fail-closed malformed Antfly and graph-source validation at both the
   parsed-statement classification boundary and the executable lowering
   boundary. Plan/lowering tests
-  now cover `antfly.graph_metric(...)` as a direct relational table-function
-  source and joined with graph match sources, and query-function tests cover
-  transfer of parsed graph metric queries into owned table-function CTEs.
+  now cover `antfly.graph_metric(...)` and `antfly.graph_metric_rerank(...)`
+  as direct relational table-function sources, graph metric joins with graph
+  match sources, and query-function transfer of parsed graph metric and graph
+  metric rerank queries into owned table-function CTEs.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

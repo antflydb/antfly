@@ -18060,16 +18060,19 @@ pub fn parseJoinAlloc(
     const left_table_name_source = if (left_graph_source) |source| switch (source.cte.table_function.?) {
         .graph_query => |graph_query| graph_query.table_name,
         .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
+        .graph_metric_rerank_query => |graph_metric_rerank_query| graph_metric_rerank_query.table_name,
     } else left_table.name;
     const right_table_name_source = if (right_graph_source) |source| switch (source.cte.table_function.?) {
         .graph_query => |graph_query| graph_query.table_name,
         .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
+        .graph_metric_rerank_query => |graph_metric_rerank_query| graph_metric_rerank_query.table_name,
     } else right_table.name;
     if (left_graph_source != null and !std.mem.eql(u8, left_table_name_source, right_table_name_source)) return error.UnsupportedSqlShape;
     if (right_graph_source) |source| {
         const graph_table_name = switch (source.cte.table_function.?) {
             .graph_query => |graph_query| graph_query.table_name,
             .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
+            .graph_metric_rerank_query => |graph_metric_rerank_query| graph_metric_rerank_query.table_name,
         };
         if (!std.mem.eql(u8, left_table_name_source, graph_table_name)) return error.UnsupportedSqlShape;
     }
@@ -36845,12 +36848,20 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("id", graph_direct_read.plan.query.select[0]);
     try std.testing.expectEqualStrings("score", graph_direct_read.plan.query.select[1]);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+    var graph_metric_rerank_read = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id, score FROM antfly.graph_metric_rerank(table_name => 'usage_records', full_text_index => 'usage_records_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25) AS ranked",
         schema,
         &.{},
-    ));
+    );
+    defer graph_metric_rerank_read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_metric_rerank_read.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_metric_rerank_read.plan.ctes.len);
+    try std.testing.expectEqualStrings("ranked", graph_metric_rerank_read.plan.ctes[0].name);
+    try std.testing.expect(graph_metric_rerank_read.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("ranked", graph_metric_rerank_read.plan.query.source_cte);
+    try std.testing.expectEqualStrings("id", graph_metric_rerank_read.plan.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_metric_rerank_read.plan.query.select[1]);
 
     var inner_lowered = try lowerJoinForLowerExprTestAlloc(
         alloc,

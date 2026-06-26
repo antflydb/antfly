@@ -1418,6 +1418,7 @@ pub fn resolveTableFunctionBaseSourceTableAlloc(
     const table_name = switch (table_function) {
         .graph_query => |graph_query| graph_query.table_name,
         .graph_metric_query => |graph_metric_query| graph_metric_query.table_name,
+        .graph_metric_rerank_query => |graph_metric_rerank_query| graph_metric_rerank_query.table_name,
     };
     if (base_table_name.*) |base| {
         if (!std.mem.eql(u8, base, table_name)) return error.UnsupportedSqlShape;

@@ -12396,6 +12396,7 @@ pub fn Impl(comptime DB: type) type {
             const rows = switch (table_function) {
                 .graph_query => |graph_query| try @This().materializeGraphQueryTableFunctionRowsAlloc(self, alloc, graph_query),
                 .graph_metric_query => |graph_metric_query| try @This().materializeGraphMetricTableFunctionRowsAlloc(self, alloc, graph_metric_query),
+                .graph_metric_rerank_query => |graph_metric_rerank_query| try @This().materializeGraphMetricRerankTableFunctionRowsAlloc(self, alloc, graph_metric_rerank_query),
             };
             defer freeOwnedConstStringSlice(alloc, rows);
             var source_req = req;
@@ -12463,6 +12464,23 @@ pub fn Impl(comptime DB: type) type {
                 for (metric_result.scores) |score| {
                     try rows.append(alloc, try graphMetricTableFunctionScoreRowJsonAlloc(alloc, metric_result.name, score));
                 }
+            }
+            return try rows.toOwnedSlice(alloc);
+        }
+
+        fn materializeGraphMetricRerankTableFunctionRowsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            graph_metric_rerank_table_function: types.RelationalRowsGraphMetricRerankTableFunction,
+        ) ![]const []const u8 {
+            var search_result = try self.search(alloc, graph_metric_rerank_table_function.request);
+            defer search_result.deinit();
+
+            var rows = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer freeOwnedConstStringArrayList(alloc, &rows);
+
+            for (search_result.hits) |hit| {
+                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, "graph_metric_rerank", hit, null, null));
             }
             return try rows.toOwnedSlice(alloc);
         }

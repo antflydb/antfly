@@ -1444,16 +1444,19 @@ pub const RelationalRowsCte = struct {
 pub const RelationalRowsTableFunctionKind = enum {
     graph_query,
     graph_metric_query,
+    graph_metric_rerank_query,
 };
 
 pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
     graph_query: RelationalRowsGraphTableFunction,
     graph_metric_query: RelationalRowsGraphMetricTableFunction,
+    graph_metric_rerank_query: RelationalRowsGraphMetricRerankTableFunction,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         switch (self.*) {
             .graph_query => |*query| query.deinit(alloc),
             .graph_metric_query => |*query| query.deinit(alloc),
+            .graph_metric_rerank_query => |*query| query.deinit(alloc),
         }
         self.* = undefined;
     }
@@ -1477,6 +1480,24 @@ pub const RelationalRowsGraphMetricTableFunction = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.table_name));
         freeNamedGraphMetricQuery(alloc, &self.query);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphMetricRerankTableFunction = struct {
+    table_name: []const u8,
+    request: SearchRequest,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        if (self.request.primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+        if (self.request.full_text) |*full_text| full_text.deinit(alloc);
+        if (self.request.graph_metric_rerank) |rerank| {
+            alloc.free(@constCast(rerank.index_name));
+            alloc.free(@constCast(rerank.metric_name));
+        }
+        if (self.request.filter_query_json.len > 0) alloc.free(@constCast(self.request.filter_query_json));
+        if (self.request.exclusion_query_json.len > 0) alloc.free(@constCast(self.request.exclusion_query_json));
         self.* = undefined;
     }
 };

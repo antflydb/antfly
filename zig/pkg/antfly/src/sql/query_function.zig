@@ -529,7 +529,8 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
         function != .graph_shortest_path and
         function != .graph_k_shortest_paths and
         function != .graph_match and
-        function != .graph_metric)
+        function != .graph_metric and
+        function != .graph_metric_rerank)
     {
         return error.UnsupportedSqlShape;
     }
@@ -538,9 +539,7 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
         antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
     var lowered = try lowerParsedAntflyQueryFunctionAlloc(alloc, null, function, args.items);
     defer lowered.deinit(alloc);
-    if (lowered.req.full_text != null or lowered.req.dense != null or lowered.req.sparse != null or
-        lowered.req.graph_metric_rerank != null or lowered.req.merge_config != null)
-    {
+    if (lowered.req.dense != null or lowered.req.sparse != null or lowered.req.merge_config != null) {
         return error.UnsupportedSqlShape;
     }
 
@@ -548,6 +547,7 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
     errdefer alloc.free(owned_table_name);
     switch (function) {
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
             if (lowered.req.graph_queries.len != 1 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
             const graph_queries = lowered.req.graph_queries;
             const graph_query = graph_queries[0];
@@ -559,6 +559,7 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
             } };
         },
         .graph_metric => {
+            if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
             if (lowered.req.graph_metric_queries.len != 1 or lowered.req.graph_queries.len != 0) return error.UnsupportedSqlShape;
             const graph_metric_queries = lowered.req.graph_metric_queries;
             const graph_metric_query = graph_metric_queries[0];
@@ -567,6 +568,16 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
             return .{ .graph_metric_query = .{
                 .table_name = owned_table_name,
                 .query = graph_metric_query,
+            } };
+        },
+        .graph_metric_rerank => {
+            if (lowered.req.full_text == null or lowered.req.graph_metric_rerank == null) return error.UnsupportedSqlShape;
+            if (lowered.req.graph_queries.len != 0 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const request = lowered.req;
+            lowered.req = .{};
+            return .{ .graph_metric_rerank_query = .{
+                .table_name = owned_table_name,
+                .request = request,
             } };
         },
         else => return error.UnsupportedSqlShape,
@@ -1945,6 +1956,25 @@ test "sql adapter query function lowers antfly query functions into native searc
             try std.testing.expectEqualStrings("pagerank", metric_table_function.query.query.metric_name);
             try std.testing.expectEqual(@as(u32, 2), metric_table_function.query.query.top_k);
             try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, metric_table_function.query.query.freshness);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_metric_rerank_tokens = try lexer_mod.tokenizeAlloc(
+        alloc,
+        "SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25)",
+    );
+    defer lexer_mod.freeTokens(alloc, &graph_metric_rerank_tokens);
+    var graph_metric_rerank_table_function = try lowerAntflyGraphTableFunctionTokensAlloc(alloc, graph_metric_rerank_tokens.items);
+    defer graph_metric_rerank_table_function.deinit(alloc);
+    switch (graph_metric_rerank_table_function) {
+        .graph_metric_rerank_query => |rerank_table_function| {
+            try std.testing.expectEqualStrings("docs", rerank_table_function.table_name);
+            try std.testing.expectEqualStrings("docs_body_fts", rerank_table_function.request.primary_text_index_name.?);
+            try std.testing.expect(rerank_table_function.request.full_text != null);
+            try std.testing.expect(rerank_table_function.request.graph_metric_rerank != null);
+            try std.testing.expectEqualStrings("docs_edge_graph", rerank_table_function.request.graph_metric_rerank.?.index_name);
+            try std.testing.expectEqualStrings("pagerank", rerank_table_function.request.graph_metric_rerank.?.metric_name);
         },
         else => return error.TestUnexpectedResult,
     }
