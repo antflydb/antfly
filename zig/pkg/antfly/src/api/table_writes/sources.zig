@@ -9954,7 +9954,7 @@ fn reconcileLocalTableIndexCreate(
     return try reconcileUncachedLocalTableIndexCreate(self, alloc, table_name, index_name);
 }
 
-pub fn publishRuntimeStatusSnapshot(
+fn publishRuntimeStatusSnapshot(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -10024,7 +10024,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
     );
 }
 
-pub fn publishStartupCatchUpRuntimeStatusSnapshot(
+fn publishStartupCatchUpRuntimeStatusSnapshot(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -10215,11 +10215,11 @@ fn catchUpManagedDb(
     };
 }
 
-pub fn sleepNs(duration_ns: u64) void {
+fn sleepNs(duration_ns: u64) void {
     platform_time_lib.sleepNs(duration_ns);
 }
 
-pub fn lockAtomic(mutex: *std.atomic.Mutex) void {
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
     // Bounded spin, then yield (platform_sync): local_db_mutex guards cache
     // bookkeeping that can take a while under contention (opens,
     // invalidation), and a pure spin pins a core per waiter — on

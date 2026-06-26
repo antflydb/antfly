@@ -1035,6 +1035,9 @@ contract until storage and API row plans grow those outer-join semantics.
    expression predicate lowering similarly consumes generated single-atom
    metadata for comparison, null/boolean/distinct `IS` predicates,
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates; generated
+   comparison predicate metadata must now agree with exact `=`, `<>`, `<`,
+   `<=`, `>`, or `>=` operator tokens on direct typed-comparison handoffs;
+   generated
    `IN`/`BETWEEN` predicate metadata must now agree with exact operator,
    optional `NOT`, and optional `SYMMETRIC`/`ASYMMETRIC` token payloads;
    direct generated containment, overlap, and JSON-key predicate metadata

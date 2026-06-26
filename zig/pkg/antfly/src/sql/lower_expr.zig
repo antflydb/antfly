@@ -5021,7 +5021,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
     try validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
@@ -5372,7 +5372,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
     try validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     try expression_predicates.append(alloc, .{
@@ -11945,6 +11945,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
     if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
     const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
 
+    const op_token_index = pos.*;
     const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
@@ -11983,7 +11984,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         }
         break :blk is_tail.op;
     } else try parseComparisonOp(tokens, pos);
-    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
 
     const lhs: db_mod.types.RelationalRowsExpression = .{
         .kind = .field,
@@ -12896,6 +12897,7 @@ pub fn parseAggregateHavingAlloc(
             errdefer if (!field_transferred) alloc.free(field);
             if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
             const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+            const op_token_index = pos.*;
             const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
                 .allow_boolean_unknown = true,
                 .allow_boolean_literal = true,
@@ -12927,7 +12929,7 @@ pub fn parseAggregateHavingAlloc(
                 }
                 break :blk is_tail.op;
             } else try parseComparisonOp(tokens, pos);
-            try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedComparisonExpressionKindForOp(op));
+            try validateGeneratedRelationalPredicateExpression(generated_condition_expression, tokens, op_token_index, op);
             const value_json = switch (op) {
                 .is_null, .is_not_null => null,
                 else => try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params),
@@ -25629,6 +25631,58 @@ fn generatedComparisonExpressionKindForOp(
     };
 }
 
+fn tokenKindForComparisonOp(op: runtime_schema.RelationalCheckOp) !TokenKind {
+    return switch (op) {
+        .eq => .eq,
+        .ne => .neq,
+        .gt => .gt,
+        .gte => .gte,
+        .lt => .lt,
+        .lte => .lte,
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn validateGeneratedComparisonPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    op: runtime_schema.RelationalCheckOp,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != .comparison) return error.UnsupportedSqlShape;
+    const expected_token_kind = try tokenKindForComparisonOp(op);
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1 or
+        tokens[operator_token_index].kind != expected_token_kind)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.negation_tokens != null or
+        expression.quantifier_tokens != null or
+        expression.between_modifier_tokens != null or
+        expression.between_modifier != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedRelationalPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    op: runtime_schema.RelationalCheckOp,
+) !void {
+    switch (op) {
+        .eq, .ne, .gt, .gte, .lt, .lte => try validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, operator_token_index, op),
+        else => try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op)),
+    }
+}
+
 pub fn parseWhereAtomAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -25709,12 +25763,13 @@ pub fn parseWhereAtomAlloc(
     const maybe_column = binder.relationalColumnForField(schema, field, null);
 
     if (matchJsonExtractOperator(tokens, pos)) |operator| {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .comparison);
         const as_text = tokenKindIsJsonExtractTextOperator(operator);
         const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
         var path_transferred = false;
         errdefer if (!path_transferred) alloc.free(path);
+        const op_token_index = pos.*;
         try parser.expectToken(tokens, pos, .eq);
+        try validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, op_token_index, .eq);
         const value_json = if (as_text)
             try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params)
         else
@@ -25993,7 +26048,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (negated) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+    try validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
     const value_json = if (column.field_type == .array and op == .eq)
         try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params)
     else
@@ -26216,7 +26271,7 @@ pub fn parseJoinWhereAlloc(
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
-        try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedComparisonExpressionKindForOp(op));
+        try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
         const value_json = if (op == .is_null or op == .is_not_null)
             null
         else if (column.field_type == .array and op == .eq)
@@ -26355,6 +26410,7 @@ pub fn parseJoinOnAlloc(
         const lhs_side = try binder.joinSideForQualifier(lhs.qualifier, left_alias, right_alias);
         const lhs_column = try binder.joinColumnForSide(schema, joined_source_schema, lhs_side, lhs.field);
         const target_predicates = if (lhs_side == .left) targets.left_predicates else targets.right_predicates;
+        const op_token_index = pos.*;
         const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
             .allow_distinct = false,
             .allow_boolean_unknown = true,
@@ -26390,7 +26446,7 @@ pub fn parseJoinOnAlloc(
             }
             break :blk is_tail.op;
         } else try parseComparisonOp(tokens, pos);
-        try validateGeneratedExpressionPredicateKind(generated_atom_expression, generatedComparisonExpressionKindForOp(op));
+        try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
         if (op == .eq and parser.peekKind(tokens, pos.*, .identifier) and identifierContainsQualifier(tokens[pos.*].text)) {
             const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
             defer plan_mod.freeQualifiedField(alloc, rhs);
@@ -27046,8 +27102,9 @@ pub fn parseScalarWherePredicateAlloc(
 
     if (parser.peekKeywordTag(tokens, pos.*, .in) or parser.peekKeywordTag(tokens, pos.*, .not)) return error.UnsupportedSqlShape;
     if (parser.peekKeywordTag(tokens, pos.*, .between)) return error.UnsupportedSqlShape;
+    const op_token_index = pos.*;
     const op = try parseComparisonOp(tokens, pos);
-    try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op));
+    try validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
     if (parser.peekKeywordTag(tokens, pos.*, .any) or parser.peekKeywordTag(tokens, pos.*, .some)) return error.UnsupportedSqlShape;
     const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
     var value_transferred = false;
@@ -39029,6 +39086,21 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedSingleOperatorPredicateExpression(&contains_expression, .contains, &stale_contains_tokens, 1),
+    );
+    const generated_comparison_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .gte, .text = ">=" },
+        .{ .kind = .number, .text = "10" },
+    };
+    const generated_comparison_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .comparison,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+        .right_tokens = .{ .start = 2, .end = 3 },
+    };
+    try validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gte);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gt),
     );
     const json_key_set_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },
