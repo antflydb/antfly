@@ -46567,6 +46567,51 @@ test "dot_general handles batched rhs free-before-contract layout" {
     }
 }
 
+test "dot_general handles clip vision attention score shape" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    const batch = 1;
+    const heads = 12;
+    const seq = 50;
+    const dim = 64;
+
+    const lhs_data = try allocator.alloc(f32, batch * heads * seq * dim);
+    defer allocator.free(lhs_data);
+    @memset(lhs_data, 1.0);
+    const rhs_data = try allocator.alloc(f32, batch * heads * dim * seq);
+    defer allocator.free(rhs_data);
+    @memset(rhs_data, 1.0);
+
+    const lhs_ct = try compute.makeBuf(lhs_data, false);
+    defer freeTensor(&compute, lhs_ct);
+    const lhs_shaped = try compute.withLogicalShape(lhs_ct, &.{ batch, heads, seq, dim });
+
+    const rhs_ct = try compute.makeBuf(rhs_data, false);
+    defer freeTensor(&compute, rhs_ct);
+    const rhs_shaped = try compute.withLogicalShape(rhs_ct, &.{ batch, heads, dim, seq });
+
+    const out_ct = try primDotGeneralOp(
+        &compute,
+        lhs_shaped,
+        rhs_shaped,
+        &.{ -1, heads, seq, dim },
+        &.{ -1, heads, dim, seq },
+        &.{3},
+        &.{2},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    defer freeTensor(&compute, out_ct);
+
+    try std.testing.expectEqualSlices(i64, &.{ batch, heads, seq, seq }, tensorStoredShape(out_ct).?);
+    try std.testing.expectEqual(@as(usize, batch * heads * seq * seq), getData(out_ct).len);
+    for (getData(out_ct)) |value| {
+        try std.testing.expectApproxEqAbs(@as(f32, dim), value, 1e-5);
+    }
+}
+
 test "dot_general preserves declared symbolic batch factorization" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };

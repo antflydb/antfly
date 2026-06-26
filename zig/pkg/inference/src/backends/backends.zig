@@ -138,18 +138,33 @@ pub const SessionManager = struct {
             };
 
             const session = switch (backend) {
-                .onnx => if ((shared_backend_ctx != null and isOnnxFilePath(effective_model_path)) or self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                .onnx => if (comptime build_options.enable_onnx) blk: {
+                    if (self.shouldUseExternalOnnxRuntime(effective_model_path)) {
+                        break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
+                            std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                            return self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |graph_err| {
+                                std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(graph_err) });
+                                return graph_err;
+                            };
+                        };
+                    }
+                    if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path)) {
+                        break :blk self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
+                            std.log.err("imported onnx graph-runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                            continue;
+                        };
+                    }
+                    if (isOnnxFilePath(effective_model_path)) {
+                        break :blk self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
+                            std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                            continue;
+                        };
+                    }
+                    continue;
+                } else if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx graph-runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
-                    }
-                else if (build_options.enable_onnx and isOnnxFilePath(effective_model_path))
-                    onnx.createSession(self.allocator, effective_model_path) catch |err| {
-                        std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        return self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |graph_err| {
-                            std.log.err("imported onnx session create failed for {s}: {s}", .{ effective_model_path, @errorName(graph_err) });
-                            return graph_err;
-                        };
                     }
                 else if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, defaultImportedOnnxBackend(), shared_backend_ctx) catch |err| {
@@ -226,6 +241,13 @@ pub const SessionManager = struct {
         backend: BackendType,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
+        if (shouldFailClosedImportedClipclapOnnx(model_path)) {
+            std.log.err(
+                "imported clipclap ONNX graph runtime is disabled for {s}; build with -Donnx=true to use ONNX Runtime or set ANTFLY_UNSAFE_IMPORTED_CLIPCLAP_ONNX=1 for diagnostics",
+                .{model_path},
+            );
+            return error.UnsupportedImportedClipclapOnnxRuntime;
+        }
         return imported_onnx_session.createSessionWithOptions(self.allocator, model_path, backend, .{
             .graph_runtime_strategy = self.graph_runtime_strategy,
             .shared_backend_ctx = shared_backend_ctx,
@@ -235,6 +257,10 @@ pub const SessionManager = struct {
 
     fn shouldUseImportedOnnxGraphRuntime(self: *const SessionManager, model_path: []const u8) bool {
         return self.graph_runtime_strategy != null and isOnnxFilePath(model_path);
+    }
+
+    fn shouldUseExternalOnnxRuntime(self: *const SessionManager, model_path: []const u8) bool {
+        return build_options.enable_onnx and isOnnxFilePath(model_path) and !self.shouldUseImportedOnnxGraphRuntime(model_path);
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
@@ -297,9 +323,23 @@ test "preferred backend override keeps fallback backends" {
 test "explicit graph runtime uses imported onnx path before external runtime" {
     var manager = SessionManager.init(std.testing.allocator);
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
+    try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     manager.graph_runtime_strategy = .partitioned;
     try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
+    try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
+    try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
+}
+
+test "clipclap imported onnx paths fail closed by default" {
+    try std.testing.expect(isClipclapOnnxPath("/tmp/clipclap/text_model.onnx"));
+    try std.testing.expect(isClipclapOnnxPath("/tmp/antflydb/clipclap/text_projection.onnx"));
+    try std.testing.expect(isClipclapOnnxPath("/tmp/clip-clap/visual_model.onnx"));
+    try std.testing.expect(!isClipclapOnnxPath("/tmp/other/text_model.onnx"));
+    try std.testing.expect(!isClipclapOnnxPath("/tmp/clipclap/model.gguf"));
+    if (build_options.enable_wasm or !build_options.link_libc) {
+        try std.testing.expect(shouldFailClosedImportedClipclapOnnx("/tmp/clipclap/text_model.onnx"));
+    }
 }
 
 fn preferredBackendOverride() ?BackendType {
@@ -346,6 +386,34 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
         man.text_projection_path == null and
         man.visual_projection_path == null and
         man.audio_projection_path == null;
+}
+
+fn shouldFailClosedImportedClipclapOnnx(model_path: []const u8) bool {
+    if (!isClipclapOnnxPath(model_path)) return false;
+    return !unsafeImportedClipclapOnnxEnabled();
+}
+
+fn unsafeImportedClipclapOnnxEnabled() bool {
+    if (build_options.enable_wasm or !build_options.link_libc) return false;
+    const value = std.c.getenv("ANTFLY_UNSAFE_IMPORTED_CLIPCLAP_ONNX") orelse return false;
+    const slice = std.mem.span(value);
+    return std.mem.eql(u8, slice, "1") or std.ascii.eqlIgnoreCase(slice, "true");
+}
+
+fn isClipclapOnnxPath(model_path: []const u8) bool {
+    if (!isOnnxFilePath(model_path)) return false;
+    if (std.mem.indexOf(u8, model_path, "clipclap") == null and
+        std.mem.indexOf(u8, model_path, "clip-clap") == null)
+    {
+        return false;
+    }
+    const base = std.fs.path.basename(model_path);
+    return std.mem.eql(u8, base, "text_model.onnx") or
+        std.mem.eql(u8, base, "text_projection.onnx") or
+        std.mem.eql(u8, base, "visual_model.onnx") or
+        std.mem.eql(u8, base, "visual_projection.onnx") or
+        std.mem.eql(u8, base, "audio_model.onnx") or
+        std.mem.eql(u8, base, "audio_projection.onnx");
 }
 
 fn effectiveBackendOrder(

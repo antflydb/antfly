@@ -95,6 +95,7 @@ pub fn applyPlannedMerge(
         };
     } else |err| switch (err) {
         error.Unsupported => {},
+        error.EmptySegment => return try index.removeSegmentsIfActive(old_ids),
         else => {
             logErr(merge_error_prefix, err);
             return err;

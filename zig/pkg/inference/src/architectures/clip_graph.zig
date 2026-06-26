@@ -429,12 +429,29 @@ fn buildEosIndices(allocator: std.mem.Allocator, input_ids: []const i64, batch: 
     const indices = try allocator.alloc(i64, batch);
     for (0..batch) |b| {
         var eos_pos: usize = 0;
+        var eos_id: i64 = std.math.minInt(i64);
         for (0..seq_len) |s| {
-            if (input_ids[b * seq_len + s] != 0) eos_pos = s;
+            const token_id = input_ids[b * seq_len + s];
+            if (token_id > eos_id) {
+                eos_id = token_id;
+                eos_pos = s;
+            }
         }
         indices[b] = @intCast(b * seq_len + eos_pos);
     }
     return indices;
+}
+
+test "clip graph eos indices use first highest token id" {
+    const allocator = std.testing.allocator;
+    const ids = [_]i64{
+        49406, 111, 49407, 49407, 0,
+        49406, 222, 333,   49407, 49407,
+    };
+    const indices = try buildEosIndices(allocator, &ids, 2, 5);
+    defer allocator.free(indices);
+
+    try std.testing.expectEqualSlices(i64, &.{ 2, 8 }, indices);
 }
 
 fn extractPatches(

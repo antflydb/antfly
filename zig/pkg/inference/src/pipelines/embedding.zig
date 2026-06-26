@@ -298,6 +298,21 @@ pub const EmbeddingPipeline = struct {
 
         if (outputs.len == 0) return error.NoOutputTensors;
 
+        if (self.text_projection) |proj| {
+            if (projectionInputDim(proj)) |expected_dim| {
+                if (selectProjectedOutput(outputs, expected_dim, batch)) |selection| {
+                    logEmbedSelectedTensor(self.print_timing, "text.project_input", selection.tensor);
+                    const projected_embeddings = if (selection.use_cls_pool)
+                        try self.pool3D(selection.tensor, all_mask, batch, effective_len, false)
+                    else
+                        try self.extract2D(selection.tensor, batch, false);
+                    errdefer freeEmbeddingSlices(alloc, projected_embeddings);
+                    try self.projectEmbeddings(projected_embeddings, proj);
+                    return projected_embeddings;
+                }
+            }
+        }
+
         // Get the first output tensor (last_hidden_state for encoder models)
         const output = &outputs[0];
         const output_shape = output.shape;
@@ -2135,6 +2150,23 @@ test "resident 2d embedding extraction normalizes before host readback" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), embeddings[0][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), embeddings[0][1], 1e-6);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 0.0 }, embeddings[1]);
+}
+
+test "projected output selection prefers pooled 2D encoder output" {
+    const allocator = std.testing.allocator;
+
+    const hidden_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var hidden = try Tensor.initFloat32(allocator, "last_hidden_state", &.{ 1, 2, 2 }, &hidden_data);
+    defer hidden.deinit();
+    const pooled_data = [_]f32{ 5.0, 6.0 };
+    var pooled = try Tensor.initFloat32(allocator, "pooler_output", &.{ 1, 2 }, &pooled_data);
+    defer pooled.deinit();
+
+    var outputs = [_]Tensor{ hidden, pooled };
+    const selection = selectProjectedOutput(outputs[0..], 2, 1) orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(!selection.use_cls_pool);
+    try std.testing.expectEqualStrings("pooler_output", selection.tensor.name);
 }
 
 test "embedImages uses one vision session run for an image batch" {
