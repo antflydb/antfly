@@ -1655,6 +1655,7 @@ pub fn build(b: *std.Build) void {
     const raft_test_step = b.step("raft-test", "Run raft unit and transport tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_transport_tests.step);
+    raft_test_step.dependOn(&api_table_tests.raft_transition_runtime_docid.step);
 
     unit_test_step.dependOn(&standalone_module_tests.regex.run.step);
     unit_test_step.dependOn(&standalone_module_tests.jsonschema.run.step);

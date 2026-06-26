@@ -3517,13 +3517,9 @@ pub fn addDocIdTestStep(
     runs: APITableTestRuns,
     db_result_shape: *std.Build.Step.Run,
 ) *std.Build.Step {
-    const step = b.step("docid-test", "Run DOCID lifecycle, API, and storage focused tests");
+    const step = b.step("docid-test", "Run DOCID lifecycle, storage, and query focused tests");
     step.dependOn(&focused.run.step);
     step.dependOn(&runs.docid.step);
-    step.dependOn(&runs.serverless_docid.step);
-    step.dependOn(&runs.transactions_docid.step);
-    step.dependOn(&runs.public_table_http_docid.step);
-    step.dependOn(&runs.raft_transition_runtime_docid.step);
     step.dependOn(&db_result_shape.step);
     return step;
 }

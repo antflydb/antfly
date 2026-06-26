@@ -1451,9 +1451,10 @@ Status as of 2026-05-19:
   promotion regression, so the large-set representation and promotion counter
   remain covered alongside the query execution boundaries. `zig build
   docid-test` is the durable focused hardening target for lifecycle cutover,
-  mixed-version, distributed snapshot, cache, compaction, public table HTTP
-  boundaries, transaction/runtime DOCID coverage, and near-capacity boundary
-  coverage. `zig build docid-bench` runs the bounded ReleaseFast DOCID
+  mixed-version, distributed snapshot, cache, compaction, query projection, and
+  near-capacity boundary coverage. API boundary tests that mention DOCID remain
+  under the API aggregates, and transition-runtime coverage lives under
+  `raft-test`. `zig build docid-bench` runs the bounded ReleaseFast DOCID
   benchmark set: raw doc-set representation comparisons, write-path identity
   metadata overhead, and direct DB query shapes that exercise public-ID
   resolution versus pre-resolved ordinal doc sets. The query benchmark output
