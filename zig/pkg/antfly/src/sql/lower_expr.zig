@@ -444,6 +444,128 @@ fn validateGeneratedOptionalReadExpression(
     }
 }
 
+fn generatedGraphTableFunctionKindForAntfly(
+    kind: generated_parser.GeneratedSqlAntflyTableFunctionKind,
+) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
+    return switch (kind) {
+        .graph_traverse => .traverse,
+        .graph_neighbors => .neighbors,
+        .graph_shortest_path => .shortest_path,
+        .graph_k_shortest_paths => .k_shortest_paths,
+        .graph_match => .match,
+        .graph_metric => .metric,
+        .graph_metric_rerank => .metric_rerank,
+        else => null,
+    };
+}
+
+fn validateGeneratedNamedArgumentAst(
+    tokens: []const Token,
+    argument_tokens: generated_parser.GeneratedSqlTokenRange,
+    argument: generated_parser.GeneratedSqlNamedArgumentAst,
+) !void {
+    if (argument.tokens.start < argument_tokens.start or argument.tokens.end > argument_tokens.end or argument.tokens.start >= argument.tokens.end) return error.UnsupportedSqlShape;
+    if (argument.name_tokens.start != argument.tokens.start or argument.name_tokens.end != argument.operator_tokens.start) return error.UnsupportedSqlShape;
+    if (argument.operator_tokens.end != argument.value_tokens.start or argument.value_tokens.end != argument.tokens.end) return error.UnsupportedSqlShape;
+    if (argument.name_tokens.end != argument.name_tokens.start + 1 or argument.name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (argument.operator_tokens.start >= argument.operator_tokens.end or argument.operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[argument.operator_tokens.start].kind != .eq) return error.UnsupportedSqlShape;
+    if (argument.operator_tokens.end != argument.operator_tokens.start + 1 and
+        (argument.operator_tokens.end != argument.operator_tokens.start + 2 or tokens[argument.operator_tokens.start + 1].kind != .gt))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (argument.value_tokens.start >= argument.value_tokens.end or argument.value_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedAntflyTableFunctionAst(
+    tokens: []const Token,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) !void {
+    if (item.tokens.start < source_tokens.start or item.tokens.end > source_tokens.end or item.tokens.start >= item.tokens.end) return error.UnsupportedSqlShape;
+    if (item.name_tokens.start != item.tokens.start or item.name_tokens.end != item.name_tokens.start + 1 or item.name_tokens.end >= item.tokens.end) return error.UnsupportedSqlShape;
+    if (item.argument_tokens.start != item.name_tokens.end + 1 or item.argument_tokens.end + 1 != item.tokens.end) return error.UnsupportedSqlShape;
+    if (item.name_tokens.end >= tokens.len or tokens[item.name_tokens.end].kind != .lparen or tokens[item.tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    if (item.argument_count != item.argument_items.len) return error.UnsupportedSqlShape;
+    for (item.argument_items) |argument| try validateGeneratedNamedArgumentAst(tokens, item.argument_tokens, argument);
+}
+
+fn generatedGraphItemMatchesAntflyItem(
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) bool {
+    const expected = generatedGraphTableFunctionKindForAntfly(antfly_item.kind) orelse return false;
+    return graph_item.kind == expected and
+        generatedTokenRangeEqual(graph_item.tokens, antfly_item.tokens) and
+        generatedTokenRangeEqual(graph_item.name_tokens, antfly_item.name_tokens) and
+        generatedTokenRangeEqual(graph_item.argument_tokens, antfly_item.argument_tokens) and
+        graph_item.argument_count == antfly_item.argument_count;
+}
+
+fn validateGeneratedGraphValueRange(
+    argument_tokens: generated_parser.GeneratedSqlTokenRange,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const range = maybe_range orelse return;
+    if (range.start < argument_tokens.start or range.end > argument_tokens.end or range.start >= range.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphTableFunctionAst(
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    antfly_items: []const generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+) !void {
+    if (graph_item.tokens.start < source_tokens.start or graph_item.tokens.end > source_tokens.end or graph_item.tokens.start >= graph_item.tokens.end) return error.UnsupportedSqlShape;
+    var matched = false;
+    for (antfly_items) |antfly_item| {
+        if (generatedGraphItemMatchesAntflyItem(graph_item, antfly_item)) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) return error.UnsupportedSqlShape;
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.table_name_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.index_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.start_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.start_result_ref_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.target_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.target_result_ref_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.pattern_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.return_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.metric_value_tokens);
+    try validateGeneratedGraphValueRange(graph_item.argument_tokens, graph_item.query_value_tokens);
+}
+
+fn validateGeneratedSourceTableFunctionPayloads(
+    tokens: []const Token,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    read: generated_parser.GeneratedSqlReadAst,
+) !void {
+    if (read.source_antfly_function_count != read.source_antfly_function_items.len) return error.UnsupportedSqlShape;
+    if (read.source_graph_function_count != read.source_graph_function_items.len) return error.UnsupportedSqlShape;
+    for (read.source_antfly_function_items) |item| try validateGeneratedAntflyTableFunctionAst(tokens, source_tokens, item);
+    for (read.source_graph_function_items) |item| try validateGeneratedGraphTableFunctionAst(source_tokens, read.source_antfly_function_items, item);
+    if (read.source_graph_function_items.len == 0) {
+        if (read.source_graph_function_tokens != null or
+            read.source_graph_function_name_tokens != null or
+            read.source_graph_function_argument_tokens != null or
+            read.source_graph_function_kind != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    const first = read.source_graph_function_items[0];
+    if (!generatedTokenRangeEqual(read.source_graph_function_tokens orelse return error.UnsupportedSqlShape, first.tokens) or
+        !generatedTokenRangeEqual(read.source_graph_function_name_tokens orelse return error.UnsupportedSqlShape, first.name_tokens) or
+        !generatedTokenRangeEqual(read.source_graph_function_argument_tokens orelse return error.UnsupportedSqlShape, first.argument_tokens) or
+        read.source_graph_function_kind == null or read.source_graph_function_kind.? != first.kind)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 pub fn validateGeneratedReadAstPayloads(
     tokens: []const Token,
     read: generated_parser.GeneratedSqlReadAst,
@@ -463,6 +585,7 @@ pub fn validateGeneratedReadAstPayloads(
 
     if (read.source_tokens) |range| {
         if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+        try validateGeneratedSourceTableFunctionPayloads(tokens, range, read);
     } else if (read.source_antfly_function_count != 0 or read.source_antfly_function_items.len != 0 or read.source_graph_function_count != 0 or read.source_graph_function_items.len != 0) {
         return error.UnsupportedSqlShape;
     }
@@ -31403,6 +31526,52 @@ test "sql adapter lower expr treats direct graph table functions as relation sou
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_graph_source,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_graph_source_count = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
+    );
+    defer malformed_graph_source_count.deinit(alloc);
+    if (malformed_graph_source_count.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.source_antfly_function_count += 1,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_graph_source_count,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_graph_source_argument = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
+    );
+    defer malformed_graph_source_argument.deinit(alloc);
+    if (malformed_graph_source_argument.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.source_antfly_function_items.len == 0 or
+                    read.source_antfly_function_items[0].argument_items.len == 0 or
+                    read.projection_items.items.len == 0)
+                {
+                    return error.TestUnexpectedResult;
+                }
+                read.source_antfly_function_items[0].argument_items[0].value_tokens = read.projection_items.items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_graph_source_argument,
         schema,
         &.{},
         .{},
