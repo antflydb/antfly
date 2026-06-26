@@ -327,6 +327,17 @@ fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
 }
 
+fn testingVisibleRootGenerationSource(value: *u64) table_reads.GroupVisibleRootGenerationSource {
+    return .{
+        .ptr = value,
+        .visible_root_generation_for_group = testingVisibleRootGenerationForGroup,
+    };
+}
+
+fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
+    return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+}
+
 pub const ProvisionedTableWriteSource = struct {
     pub const StartupCatchUpResult = struct {
         had_debt: bool = false,

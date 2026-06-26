@@ -1006,7 +1006,7 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     }
     if (tokenMatchesKeyword(first, .select) and tokenMatchesKeyword(last, .distinct)) return true;
     if (last.kind == .lparen and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .on)) return true;
-    if (last.kind == .lparen or isGeneratedReadTrailingOperatorToken(last)) return true;
+    if (last.kind == .lparen or isGeneratedSqlTrailingOperatorToken(last)) return true;
     if (isGeneratedReadTrailingQuantifier(tokens, start, end)) return true;
     if (generatedReadHasCompleteSourceBefore(tokens, start, end - 1) and
         (tokenMatchesKeyword(last, .@"union") or
@@ -1068,7 +1068,7 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     return false;
 }
 
-fn isGeneratedReadTrailingOperatorToken(token: Token) bool {
+fn isGeneratedSqlTrailingOperatorToken(token: Token) bool {
     return switch (token.kind) {
         .eq,
         .neq,
@@ -1104,7 +1104,7 @@ fn isGeneratedReadTrailingQuantifier(tokens: []const Token, start: usize, end: u
     const last = tokens[end - 1];
     if (!tokenMatchesKeyword(last, .any) and !tokenMatchesKeyword(last, .some) and !tokenMatchesKeyword(last, .all)) return false;
     const previous = tokens[end - 2];
-    return isGeneratedReadTrailingOperatorToken(previous) or
+    return isGeneratedSqlTrailingOperatorToken(previous) or
         tokenMatchesKeyword(previous, .like) or
         tokenMatchesKeyword(previous, .ilike);
 }
@@ -1237,6 +1237,8 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(first, .truncate) or
             tokenMatchesKeyword(first, .merge);
     }
+    if (last.kind == .lparen or isGeneratedSqlTrailingOperatorToken(last)) return true;
+    if (isGeneratedDmlTrailingQuantifier(tokens, start, end)) return true;
     if (tokenMatchesKeyword(first, .insert)) {
         return tokenMatchesKeyword(last, .into) or
             tokenMatchesKeyword(last, .default) or
@@ -1277,6 +1279,16 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .values);
     }
     return false;
+}
+
+fn isGeneratedDmlTrailingQuantifier(tokens: []const Token, start: usize, end: usize) bool {
+    if (end <= start + 1 or end > tokens.len) return false;
+    const last = tokens[end - 1];
+    if (!tokenMatchesKeyword(last, .any) and !tokenMatchesKeyword(last, .some) and !tokenMatchesKeyword(last, .all)) return false;
+    const previous = tokens[end - 2];
+    return isGeneratedSqlTrailingOperatorToken(previous) or
+        tokenMatchesKeyword(previous, .like) or
+        tokenMatchesKeyword(previous, .ilike);
 }
 
 fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -3210,11 +3222,21 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UNLISTEN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) DO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM source_rows WHERE status ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) WHERE status ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') RETURNING id ||"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE status = ANY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE id ="));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records RETURNING id ||"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "TRUNCATE TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id ="));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status ="));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT (id) VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMP"));

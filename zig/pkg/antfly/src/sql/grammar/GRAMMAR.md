@@ -758,6 +758,11 @@ Unsupported DDL remains on the existing parser until
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
    now use generated fail-closed diagnostics instead of classifier fallback.
+   Generated-covered write statements that end on expression operators, open
+   delimiters, or quantified/pattern predicate heads in assignments,
+   predicates, conflict predicates, merge join predicates, and returning lists
+   also propagate generated syntax diagnostics instead of re-entering legacy
+   write parsing.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
    generated command-body AST-driven lowering for recursive CTE DML beyond

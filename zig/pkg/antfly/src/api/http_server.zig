@@ -1919,7 +1919,7 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                     .compare_and_swap_table_schema = compareAndSwapTableSchema,
                 },
             };
@@ -1929,16 +1929,14 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+        fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            sql: []const u8,
+            plan: *sql_adapter.LoweredDdlPlan,
             session: catalog_resources.SqlCatalogSession,
-            function_bindings: sql_adapter.SqlFunctionBindings,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
-            _ = sql;
+            _ = plan;
             _ = session;
-            _ = function_bindings;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.apply_count += 1;
 
@@ -2080,7 +2078,7 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                     .compare_and_swap_table_schema = compareAndSwapTableSchema,
                 },
             };
@@ -2090,16 +2088,14 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+        fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            sql: []const u8,
+            plan: *sql_adapter.LoweredDdlPlan,
             session: catalog_resources.SqlCatalogSession,
-            function_bindings: sql_adapter.SqlFunctionBindings,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
-            _ = sql;
+            _ = plan;
             _ = session;
-            _ = function_bindings;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.apply_count += 1;
 
@@ -6683,7 +6679,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicSqlRequest(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        var outcome = try self.handlePublicSqlRequestResult(request, authenticated_identity);
+        var outcome = try self.executePublicSqlRequestResult(request, authenticated_identity);
         switch (outcome) {
             .response => |response| return response,
             .result => |*result| {
@@ -7718,6 +7714,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicSqlRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+        return try self.executePublicSqlRequestResult(request, authenticated_identity);
+    }
+
+    pub fn executePublicSqlRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
         if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
 
         var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(request) catch |err| switch (err) {
@@ -7735,46 +7735,65 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
-        if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
-            try self.savePublicSqlSession(session);
+
+        var outcome = try self.executePublicParsedSqlRequestResult(.{
+            .parsed_sql = &parsed_sql,
+            .params = request.params,
+            .session = &session,
+            .authenticated_identity = authenticated_identity,
+        });
+        errdefer outcome.deinit(self.alloc);
+        try self.savePublicSqlSession(session);
+        return outcome;
+    }
+
+    pub const PublicParsedSqlExecutionRequest = struct {
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue = &.{},
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity = null,
+    };
+
+    pub fn executePublicParsedSqlRequestResult(self: *ApiHttpServer, request: PublicParsedSqlExecutionRequest) !PublicSqlResultOrResponse {
+        const parsed_sql = request.parsed_sql;
+        const session = request.session;
+
+        if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
             return .{ .response = try textResponse(self.alloc, 400, "current transaction is aborted") };
         }
-        if (try self.handlePublicSqlPostgresCompatibilityRead(&parsed_sql, &session)) |outcome_value| {
+        if (try self.handlePublicSqlPostgresCompatibilityRead(parsed_sql, session)) |outcome_value| {
             var outcome = outcome_value;
             errdefer outcome.deinit(self.alloc);
-            try self.savePublicSqlSession(session);
             switch (outcome) {
-                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
                 .response => {},
             }
             return outcome;
         }
-        if (sql_adapter.classifyParsedSqlForExecution(&parsed_sql)) |logical_plan| {
+        if (sql_adapter.classifyParsedSqlForExecution(parsed_sql)) |logical_plan| {
             switch (logical_plan) {
                 .write => {
-                    var outcome = try self.handlePublicSqlWrite(&parsed_sql, request.params, &session, authenticated_identity);
+                    var outcome = try self.handlePublicSqlWrite(parsed_sql, request.params, session, request.authenticated_identity);
                     errdefer outcome.deinit(self.alloc);
                     switch (outcome) {
-                        .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                        .response => self.markPublicSqlTransactionFailedIfActive(session),
                         .result => {},
                     }
-                    try self.savePublicSqlSession(session);
                     switch (outcome) {
-                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
                         .response => {},
                     }
                     return outcome;
                 },
                 .read => {
-                    var outcome = try self.handlePublicSqlRead(&parsed_sql, request.params, &session, authenticated_identity);
+                    var outcome = try self.handlePublicSqlRead(parsed_sql, request.params, session, request.authenticated_identity);
                     errdefer outcome.deinit(self.alloc);
                     switch (outcome) {
-                        .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                        .response => self.markPublicSqlTransactionFailedIfActive(session),
                         .result => {},
                     }
-                    try self.savePublicSqlSession(session);
                     switch (outcome) {
-                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
                         .response => {},
                     }
                     return outcome;
@@ -7783,25 +7802,21 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        const applied = self.applyRelationalParsedSqlDdlWithSession(&parsed_sql, &session) catch |err| switch (err) {
+        const applied = self.applyRelationalParsedSqlDdlWithSession(parsed_sql, session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
-                self.markPublicSqlTransactionFailedIfActive(&session);
-                try self.savePublicSqlSession(session);
+                self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
             },
             error.SqlReadOnlyTransaction => {
-                self.markPublicSqlTransactionFailedIfActive(&session);
-                try self.savePublicSqlSession(session);
+                self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") };
             },
             error.UnsupportedSqlShape => {
-                self.markPublicSqlTransactionFailedIfActive(&session);
-                try self.savePublicSqlSession(session);
+                self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
             },
             error.StatementTimeout => {
-                self.markPublicSqlTransactionFailedIfActive(&session);
-                try self.savePublicSqlSession(session);
+                self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") };
             },
             error.InvalidSqlSession,
@@ -7812,22 +7827,20 @@ pub const ApiHttpServer = struct {
             error.InvalidRoleSetting,
             error.RoleSettingNotFound,
             => {
-                self.markPublicSqlTransactionFailedIfActive(&session);
-                try self.savePublicSqlSession(session);
+                self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
             },
             else => return err,
         };
-        const session_id = self.ensureSqlProtocolSessionId(&session);
-        try self.savePublicSqlSession(session);
+        const session_id = self.ensureSqlProtocolSessionId(session);
 
         return .{ .result = .{
             .session_id = session_id,
             .statement_kind = "ddl",
-            .transaction_status = self.publicSqlTransactionStatus(&session),
+            .transaction_status = self.publicSqlTransactionStatus(session),
             .result = .{ .ddl = .{
                 .applied = applied,
-                .command_tag = publicSqlDdlCommandTag(&parsed_sql),
+                .command_tag = publicSqlDdlCommandTag(parsed_sql),
             } },
         } };
     }
@@ -30007,7 +30020,7 @@ test "api http server routes routine-backed SQL trigger DDL through routine runt
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
         }
@@ -30020,12 +30033,11 @@ test "api http server routes routine-backed SQL trigger DDL through routine runt
             };
         }
 
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+        fn applyRelationalSqlDdlPlanWithSession(
             _: *anyopaque,
             _: std.mem.Allocator,
-            _: []const u8,
+            _: *sql_adapter.LoweredDdlPlan,
             _: catalog_resources.SqlCatalogSession,
-            _: sql_adapter.SqlFunctionBindings,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
         }
@@ -30074,7 +30086,7 @@ test "api http server keeps updated-at trigger DDL on table source path" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
         }
@@ -30087,16 +30099,14 @@ test "api http server keeps updated-at trigger DDL on table source path" {
             };
         }
 
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+        fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            sql: []const u8,
+            plan: *sql_adapter.LoweredDdlPlan,
             session: catalog_resources.SqlCatalogSession,
-            function_bindings: sql_adapter.SqlFunctionBindings,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
-            _ = sql;
+            _ = plan;
             _ = session;
-            _ = function_bindings;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.apply_count += 1;
             var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(allocator);
@@ -30501,8 +30511,7 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
         }
@@ -30515,27 +30524,16 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             };
         }
 
-        fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
-            return error.TestUnexpectedResult;
-        }
-
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+        fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            sql: []const u8,
+            plan: *sql_adapter.LoweredDdlPlan,
             session: catalog_resources.SqlCatalogSession,
-            function_bindings: sql_adapter.SqlFunctionBindings,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.binding_aware_calls += 1;
-            try std.testing.expectEqual(@as(usize, 1), function_bindings.routine_expressions.len);
 
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(allocator, sql);
-            defer parsed_sql.deinit(allocator);
-            var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(allocator, &parsed_sql, function_bindings);
-            defer plan.deinit(allocator);
-
-            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan, session);
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan.*, session);
             defer target.deinit(allocator);
 
             var base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
@@ -30543,7 +30541,7 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
                 allocator,
                 source_table,
-                &plan,
+                plan,
                 session,
             );
             errdefer applied.deinit(allocator);
@@ -30610,8 +30608,7 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
-                    .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
-                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
         }
@@ -30653,31 +30650,22 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn applyRelationalSqlDdlWithSession(
+        fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             alloc_arg: std.mem.Allocator,
-            sql: []const u8,
+            plan: *sql_adapter.LoweredDdlPlan,
             _: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (std.mem.startsWith(u8, sql, "CREATE EXTENSION")) {
-                self.installed_ready = true;
-            } else if (std.mem.startsWith(u8, sql, "DROP EXTENSION")) {
-                self.installed_ready = false;
-            } else {
-                return error.TestUnexpectedResult;
+            switch (plan.*) {
+                .extension_catalog => |extension_plan| switch (extension_plan) {
+                    .create => self.installed_ready = true,
+                    .drop => self.installed_ready = false,
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
             }
             return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
-        }
-
-        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
-            ptr: *anyopaque,
-            alloc_arg: std.mem.Allocator,
-            sql: []const u8,
-            session: catalog_resources.SqlCatalogSession,
-            _: sql_adapter.SqlFunctionBindings,
-        ) !tables_api.AppliedRelationalSqlDdlRecord {
-            return try applyRelationalSqlDdlWithSession(ptr, alloc_arg, sql, session);
         }
     };
 

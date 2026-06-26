@@ -15,7 +15,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
+const antfly_conformance_build = @import("pkg/antfly/build/conformance.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
+const antfly_generated_build = @import("pkg/antfly/build/generated.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
@@ -34,101 +36,6 @@ const BuildEdition = enum {
     full,
     inference,
 };
-
-const snowball_languages = [_][]const u8{
-    "danish",
-    "dutch",
-    "finnish",
-    "french",
-    "german",
-    "italian",
-    "norwegian",
-    "portuguese",
-    "spanish",
-    "swedish",
-};
-
-const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
-const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
-const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
-
-const snowball_compiler_sources = [_][]const u8{
-    "compiler/analyser.c",
-    "compiler/driver.c",
-    "compiler/generator.c",
-    "compiler/generator_ada.c",
-    "compiler/generator_csharp.c",
-    "compiler/generator_dart.c",
-    "compiler/generator_go.c",
-    "compiler/generator_java.c",
-    "compiler/generator_js.c",
-    "compiler/generator_pascal.c",
-    "compiler/generator_php.c",
-    "compiler/generator_python.c",
-    "compiler/generator_rust.c",
-    "compiler/generator_zig.c",
-    "compiler/space.c",
-    "compiler/tokeniser.c",
-};
-
-fn pathExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
-fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
-}
-
-fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
-    const run = b.addSystemCommand(&.{
-        "uv",
-        "run",
-        "--project",
-        "../scripts",
-        "--locked",
-        "python",
-    });
-    run.addFileArg(b.path(script_path));
-    run.addArgs(args);
-    return run;
-}
-
-const openapi_join_input_paths = [_][]const u8{
-    "../scripts/join_openapi.py",
-    "../scripts/openapi_joiner.py",
-    "../specs/openapi/antfly/audio.yaml",
-    "../specs/openapi/antfly/chunking.yaml",
-    "../specs/openapi/antfly/config.yaml",
-    "../specs/openapi/antfly/embeddings.yaml",
-    "../specs/openapi/antfly/eval.yaml",
-    "../specs/openapi/antfly/generating.yaml",
-    "../specs/openapi/antfly/metadata.yaml",
-    "../specs/openapi/antfly/query.yaml",
-    "../specs/openapi/antfly/reranking.yaml",
-    "../specs/openapi/antfly/websearch.yaml",
-    "../specs/openapi/auth/api.yaml",
-    "../specs/openapi/extensions/api.yaml",
-    "../specs/openapi/inference/api.yaml",
-    "../specs/openapi/inference/config.yaml",
-    "../specs/openapi/shared/generating.yaml",
-    "../specs/openapi/antfly/schema.yaml",
-    "../specs/openapi/antfly/indexes.yaml",
-};
-
-fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
-    for (openapi_join_input_paths) |path| {
-        run.addFileInput(b.path(path));
-    }
-}
 
 const inference_delegated_steps = [_][]const u8{
     "run",
@@ -257,6 +164,23 @@ const FfmpegPaths = struct {
     lib_dir: []const u8,
 };
 
+fn pathExists(b: *std.Build, path: []const u8) bool {
+    const io = b.graph.io;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = b.sysroot orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
 const SpngPaths = struct {
     include_dir: []const u8,
     lib_dir: []const u8,
@@ -363,31 +287,6 @@ fn addLocalSentencePieceProtoModule(
     });
     mod.addImport("protobuf", protobuf_dep.module("protobuf"));
     return mod;
-}
-
-fn addLocalOpenApiCodegen(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Step.Compile {
-    const openapi_mod = b.createModule(.{
-        .root_source_file = b.path("lib/openapi/src/openapi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "openapi-zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/openapi/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("openapi", openapi_mod);
-    exe.root_module.addImport("httpx", httpx_mod);
-    return exe;
 }
 
 fn addLocalHttpxModule(
@@ -553,674 +452,10 @@ const AntflyRootImports = struct {
 
 fn addSnowballModule(b: *std.Build, lib_mod: *std.Build.Module) void {
     const snowball_mod = b.addModule("snowball", .{
-        .root_source_file = b.path(snowball_generated_root ++ "/root.zig"),
+        .root_source_file = b.path(antfly_generated_build.snowball_generated_root ++ "/root.zig"),
     });
 
     lib_mod.addImport("snowball", snowball_mod);
-}
-
-fn snowballGeneratedPath(b: *std.Build, comptime fmt: []const u8, args: anytype) []const u8 {
-    return b.fmt(snowball_generated_root ++ "/" ++ fmt, args);
-}
-
-fn snowballRootContents(b: *std.Build) []const u8 {
-    const fragments = b.allocator.alloc([]const u8, 1 + snowball_languages.len) catch @panic("OOM");
-    fragments[0] =
-        "pub const Env = @import(\"env.zig\").Env;\n" ++
-        "pub const Among = @import(\"env.zig\").Among;\n";
-    for (snowball_languages, 0..) |lang, idx| {
-        fragments[1 + idx] = b.fmt("pub const {s} = @import(\"{s}_stemmer.zig\");\n", .{ lang, lang });
-    }
-    return std.mem.concat(b.allocator, u8, fragments) catch @panic("OOM");
-}
-
-fn addSnowballCompiler(b: *std.Build) *std.Build.Step.Compile {
-    const snowball_dep = b.path("deps/snowball");
-
-    const snowball_compiler = b.addExecutable(.{
-        .name = "snowball",
-        .root_module = b.createModule(.{
-            .root_source_file = null,
-            .target = b.graph.host,
-        }),
-    });
-    snowball_compiler.root_module.link_libc = true;
-    for (snowball_compiler_sources) |src| {
-        snowball_compiler.root_module.addCSourceFiles(.{
-            .root = snowball_dep,
-            .files = &.{src},
-            .flags = &.{ "-O2", "-W", "-Wall" },
-        });
-    }
-
-    return snowball_compiler;
-}
-
-fn addFileCompareTool(b: *std.Build) *std.Build.Step.Compile {
-    return b.addExecutable(.{
-        .name = "check-files-equal",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/check_files_equal.zig"),
-            .target = b.graph.host,
-        }),
-    });
-}
-
-fn addLocalYaccCodegen(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Step.Compile {
-    const yacc_mod = b.createModule(.{
-        .root_source_file = b.path("lib/yacc/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "yacc-zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/yacc/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("yacc", yacc_mod);
-    return exe;
-}
-
-fn addYaccTestStep(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Step {
-    const yacc_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/yacc/src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_yacc_tests = b.addRunArtifact(yacc_tests);
-    const yacc_test_step = b.step("yacc-test", "Run standalone lib/yacc parser generator tests");
-    yacc_test_step.dependOn(&run_yacc_tests.step);
-    return yacc_test_step;
-}
-
-fn addSqlGrammarRegenStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
-    const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
-    const run = b.addRunArtifact(yacc_codegen);
-    run.addFileArg(b.path(sql_grammar_source));
-    run.addArg(sql_grammar_generated_root);
-    run.addArg(sql_grammar_source);
-    regen_step.dependOn(&run.step);
-    return regen_step;
-}
-
-fn addSqlGrammarGeneratedCheckStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
-    const check_step = b.step("sql-grammar-generated-check", "Check checked-in Antfly SQL grammar metadata is current");
-    const run = b.addRunArtifact(yacc_codegen);
-    run.addFileArg(b.path(sql_grammar_source));
-    const generated = run.addOutputFileArg("sql_grammar_root.zig");
-    run.addArg(sql_grammar_source);
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-    });
-    fmt.addFileArg(generated);
-
-    const compare_tool = addFileCompareTool(b);
-    const compare = b.addRunArtifact(compare_tool);
-    compare.step.dependOn(&fmt.step);
-    compare.addFileArg(generated);
-    compare.addFileArg(b.path(sql_grammar_generated_root));
-    check_step.dependOn(&compare.step);
-    return check_step;
-}
-
-fn addDirCompareTool(b: *std.Build) *std.Build.Step.Compile {
-    return b.addExecutable(.{
-        .name = "check-dirs-equal",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/check_dirs_equal.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-}
-
-fn addSnowballGeneratedOutputs(
-    b: *std.Build,
-    snowball_compiler: *std.Build.Step.Compile,
-) struct {
-    root: std.Build.LazyPath,
-    env: std.Build.LazyPath,
-    stemmers: [snowball_languages.len]std.Build.LazyPath,
-} {
-    const snowball_dep = b.path("deps/snowball");
-
-    const wf = b.addWriteFiles();
-    const root = wf.add("root.zig", snowballRootContents(b));
-    const env = wf.addCopyFile(snowball_dep.path(b, "zig/env.zig"), "env.zig");
-
-    var stemmers: [snowball_languages.len]std.Build.LazyPath = undefined;
-    inline for (snowball_languages, 0..) |lang, idx| {
-        const run = b.addRunArtifact(snowball_compiler);
-        run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
-        run.addArg("-zig");
-        run.addArg("-o");
-        stemmers[idx] = run.addOutputFileArg(b.fmt("{s}_stemmer.zig", .{lang}));
-    }
-
-    return .{
-        .root = root,
-        .env = env,
-        .stemmers = stemmers,
-    };
-}
-
-fn addSnowballRegenStep(b: *std.Build) *std.Build.Step {
-    const regen_step = b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers");
-    const snowball_compiler = addSnowballCompiler(b);
-    const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
-
-    const update = b.addUpdateSourceFiles();
-    update.addCopyFileToSource(generated.root, snowball_generated_root ++ "/root.zig");
-    update.addCopyFileToSource(generated.env, snowball_generated_root ++ "/env.zig");
-    for (snowball_languages, 0..) |lang, idx| {
-        update.addCopyFileToSource(generated.stemmers[idx], snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang}));
-    }
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        snowball_generated_root,
-    });
-    fmt.step.dependOn(&update.step);
-    regen_step.dependOn(&fmt.step);
-    return regen_step;
-}
-
-fn addSnowballCheckStep(b: *std.Build) *std.Build.Step {
-    const check_step = b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current");
-    const snowball_compiler = addSnowballCompiler(b);
-    const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-    });
-    fmt.addFileArg(generated.root);
-    fmt.addFileArg(generated.env);
-    for (snowball_languages, 0..) |_, idx| {
-        fmt.addFileArg(generated.stemmers[idx]);
-    }
-
-    const compare_tool = addFileCompareTool(b);
-    const compare = b.addRunArtifact(compare_tool);
-    compare.step.dependOn(&fmt.step);
-    compare.addFileArg(generated.root);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/root.zig"));
-    compare.addFileArg(generated.env);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/env.zig"));
-    for (snowball_languages, 0..) |lang, idx| {
-        compare.addFileArg(generated.stemmers[idx]);
-        compare.addFileArg(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})));
-    }
-    check_step.dependOn(&compare.step);
-
-    const snowball_check_step = b.step("snowball-check", "Check checked-in Zig Snowball stemmers are current");
-    snowball_check_step.dependOn(check_step);
-    return snowball_check_step;
-}
-
-fn addOpenApiModuleFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    _ = target;
-    _ = optimize;
-
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
-
-    return b.addModule(package_name, .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-}
-
-fn addYamlOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-    );
-}
-
-fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
-    const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
-    addOpenApiJoinInputs(b, check);
-    check.addFileArg(b.path("../openapi.yaml"));
-    return check;
-}
-
-fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
-    const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
-    addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.joined.yaml");
-}
-
-fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
-    const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
-    addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.prefixed.yaml");
-}
-
-fn addPublicOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addJoinedPublicOpenApiSpec(b),
-        "antfly_public_openapi",
-        "antfly_public_openapi",
-        "types,extractors",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-    );
-}
-
-fn addPublicClientOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addPrefixedPublicOpenApiSpec(b),
-        "antfly_client_openapi",
-        "antfly_client_openapi",
-        "types,client",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-        httpx_mod,
-    );
-}
-
-/// Like addYamlOpenApiModule but also wires in httpx for client generation.
-fn addOpenApiModuleWithHttpxFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    _ = target;
-    _ = optimize;
-
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
-
-    const mod = b.addModule(package_name, .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
-fn addYamlOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-        httpx_mod,
-    );
-}
-
-fn addCommittedOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-) *std.Build.Module {
-    return b.addModule(package_name, .{
-        .root_source_file = b.path(b.fmt("{s}/root.zig", .{generated_dir})),
-        .target = target,
-        .optimize = optimize,
-    });
-}
-
-fn addCommittedOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    const mod = addCommittedOpenApiModule(b, target, optimize, package_name, generated_dir);
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
-const antfly_openapi_generated_root = "pkg/antfly/src/openapi/generated";
-const inference_openapi_generated_root = "pkg/inference/src/api/generated";
-
-const OpenApiGeneratedMode = union(enum) {
-    regen: struct {
-        fmt: *std.Build.Step.Run,
-    },
-    check: struct {
-        fmt: *std.Build.Step.Run,
-        compare: *std.Build.Step.Run,
-    },
-};
-
-fn addOpenApiRegenRun(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Step.Run {
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{package_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{ "--output", generated_dir });
-    return codegen;
-}
-
-fn addOpenApiCheckOutput(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) std.Build.LazyPath {
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{"--output"});
-    return codegen.addOutputDirectoryArg(output_dir_name);
-}
-
-fn addOpenApiGeneratedPackage(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    mode: OpenApiGeneratedMode,
-) void {
-    switch (mode) {
-        .regen => |regen| {
-            const run = addOpenApiRegenRun(b, openapi_codegen, source_path, package_name, generated_dir, generate_what, import_mappings);
-            regen.fmt.step.dependOn(&run.step);
-        },
-        .check => |check| {
-            const generated = addOpenApiCheckOutput(b, openapi_codegen, source_path, package_name, b.fmt("check_{s}", .{package_name}), generate_what, import_mappings);
-            check.fmt.addFileArg(generated);
-            check.compare.addFileArg(generated);
-            check.compare.addFileArg(b.path(generated_dir));
-        },
-    }
-}
-
-fn addOpenApiGeneratedPackages(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-    mode: OpenApiGeneratedMode,
-) void {
-    addOpenApiGeneratedPackage(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_openapi_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-        .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-        .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-        .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-        .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-        .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-        .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_openapi_generated_root ++ "/antfly_client_openapi", "types,client", &.{
-        .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-        .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-        .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-        .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-        .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-        .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_openapi_generated_root ++ "/antfly_schema_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_openapi_generated_root ++ "/antfly_indexes_openapi", "types", &.{
-        .{ "embeddings.yaml", "antfly_embeddings_openapi" },
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "chunking.yaml", "antfly_chunking_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_openapi_generated_root ++ "/antfly_websearch_openapi", "types", &.{
-        .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/eval.yaml"), "antfly_eval_openapi", antfly_openapi_generated_root ++ "/antfly_eval_openapi", "types", &.{
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_openapi_generated_root ++ "/antfly_query_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", antfly_openapi_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", antfly_openapi_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_openapi_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_openapi_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
-        .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
-        .{ "indexes.yaml", "antfly_indexes_openapi" },
-        .{ "schema.yaml", "antfly_schema_openapi" },
-        .{ "generating.yaml", "antfly_generating_api_openapi" },
-        .{ "eval.yaml", "antfly_eval_openapi" },
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "reranking.yaml", "antfly_reranking_openapi" },
-        .{ "query.yaml", "antfly_query_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/shared/logging.yaml"), "antfly_logging_openapi", antfly_openapi_generated_root ++ "/antfly_logging_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_openapi_generated_root ++ "/antfly_audio_openapi", "types", &.{
-        .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_openapi_generated_root ++ "/antfly_middleware_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_openapi_generated_root ++ "/antfly_scraping_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_openapi_generated_root ++ "/antfly_s3_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_openapi_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
-        .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
-        .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
-        .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-        .{ "../shared/logging.yaml", "antfly_logging_openapi" },
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_openapi_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_openapi_generated_root ++ "/antfly_chunking_openapi", "types", &.{
-        .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/embeddings.yaml"), "antfly_embeddings_openapi", antfly_openapi_generated_root ++ "/antfly_embeddings_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/config.yaml"), "antfly_common_openapi", antfly_openapi_generated_root ++ "/antfly_common_openapi", "types", &.{
-        .{ "../shared/logging.yaml", "antfly_logging_openapi" },
-        .{ "audio.yaml", "antfly_audio_openapi" },
-        .{ "../../../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
-        .{ "embeddings.yaml", "antfly_embeddings_openapi" },
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "reranking.yaml", "antfly_reranking_openapi" },
-        .{ "chunking.yaml", "antfly_chunking_openapi" },
-        .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
-        .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-        .{ "../inference/config.yaml", "antfly_inference_config_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/shared/generating.yaml"), "antfly_generating_openapi", antfly_openapi_generated_root ++ "/antfly_generating_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/reranking.yaml"), "antfly_reranking_openapi", antfly_openapi_generated_root ++ "/antfly_reranking_openapi", "types", &.{}, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_openapi_generated_root ++ "/antfly_extraction_openapi", "types", &.{
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/generating.yaml"), "antfly_generating_api_openapi", antfly_openapi_generated_root ++ "/antfly_generating_api_openapi", "types", &.{
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "websearch.yaml", "antfly_websearch_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_openapi_generated_root ++ "/inference_api", "types,server", &.{
-        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
-    }, mode);
-    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_openapi_generated_root ++ "/openai_api", "types", &.{}, mode);
-}
-
-fn addOpenApiRegenStep(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-) *std.Build.Step {
-    const regen_step = b.step("regen-openapi", "Regenerate checked-in Zig OpenAPI modules");
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        antfly_openapi_generated_root,
-        inference_openapi_generated_root,
-    });
-    addOpenApiGeneratedPackages(b, openapi_codegen, .{ .regen = .{ .fmt = fmt } });
-    regen_step.dependOn(&fmt.step);
-
-    const openapi_generate_step = b.step("openapi-generate", "Regenerate checked-in Zig OpenAPI modules");
-    openapi_generate_step.dependOn(regen_step);
-    return openapi_generate_step;
-}
-
-fn addOpenApiGeneratedCheckStep(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-) *std.Build.Step {
-    const check_step = b.step("openapi-generated-check", "Check checked-in Zig OpenAPI modules are current");
-    const dir_compare_tool = addDirCompareTool(b);
-    const fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
-    const compare = b.addRunArtifact(dir_compare_tool);
-
-    addOpenApiGeneratedPackages(b, openapi_codegen, .{ .check = .{
-        .fmt = fmt,
-        .compare = compare,
-    } });
-    compare.step.dependOn(&fmt.step);
-    check_step.dependOn(&compare.step);
-    return check_step;
 }
 
 pub fn build(b: *std.Build) void {
@@ -1326,96 +561,43 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const snowball_regen_step = addSnowballRegenStep(b);
-    const snowball_check_step = addSnowballCheckStep(b);
-    const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
-    const yacc_codegen = addLocalYaccCodegen(b, target, optimize);
-    _ = addYaccTestStep(b, target, optimize);
-    const openapi_generate_step = addOpenApiRegenStep(b, openapi_codegen);
-    const openapi_generated_check_step = addOpenApiGeneratedCheckStep(b, openapi_codegen);
-    const sql_grammar_regen_step = addSqlGrammarRegenStep(b, yacc_codegen);
-    const snowball_sources_available = pathExists(b, "deps/snowball/zig/env.zig") and pathExists(b, "deps/snowball/compiler/analyser.c");
-
-    const generate_step = b.step("generate", "Regenerate checked-in Zig generated artifacts");
-    generate_step.dependOn(openapi_generate_step);
-    generate_step.dependOn(sql_grammar_regen_step);
-    if (snowball_sources_available) {
-        generate_step.dependOn(snowball_regen_step);
-    }
-    const openapi_root_check = addOpenApiRootCheckStep(b);
-    const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
-    const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
-    const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi");
-    const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
-    const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
-    const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
-    const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
-    const admin_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", httpx_mod);
-    const internal_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", httpx_mod);
-    const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
-    const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
-    const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
-    const audio_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi");
-    const middleware_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi");
-    const scraping_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi");
-    const s3_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi");
-    const inference_config_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi");
-    const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
-    const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
-    const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
-    const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
-    const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
-    const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
-    const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
-    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
-    extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
-    public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);
-    common_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    common_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
+    const generated_steps = antfly_generated_build.addGeneratedArtifactSteps(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .httpx_mod = httpx_mod,
+    });
+    const openapi_modules = antfly_generated_build.addCommittedOpenApiModules(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .httpx_mod = httpx_mod,
+    });
+    const public_openapi_mod = openapi_modules.public;
+    const client_openapi_mod = openapi_modules.client;
+    const schema_openapi_mod = openapi_modules.schema;
+    const indexes_openapi_mod = openapi_modules.indexes;
+    const eval_openapi_mod = openapi_modules.eval;
+    const query_openapi_mod = openapi_modules.query;
+    const admin_openapi_mod = openapi_modules.admin;
+    const internal_openapi_mod = openapi_modules.internal;
+    const usermgr_openapi_mod = openapi_modules.usermgr;
+    const metadata_openapi_mod = openapi_modules.metadata;
+    const logging_openapi_mod = openapi_modules.logging;
+    const audio_openapi_mod = openapi_modules.audio;
+    const middleware_openapi_mod = openapi_modules.middleware;
+    const scraping_openapi_mod = openapi_modules.scraping;
+    const s3_openapi_mod = openapi_modules.s3;
+    const inference_config_openapi_mod = openapi_modules.inference_config;
+    const chunking_api_openapi_mod = openapi_modules.chunking_api;
+    const chunking_openapi_mod = openapi_modules.chunking;
+    const embeddings_openapi_mod = openapi_modules.embeddings;
+    const common_openapi_mod = openapi_modules.common;
+    const generating_openapi_mod = openapi_modules.generating;
+    const reranking_openapi_mod = openapi_modules.reranking;
+    const generating_api_openapi_mod = openapi_modules.generating_api;
+    const extraction_openapi_mod = openapi_modules.extraction;
+    const openai_api_mod = openapi_modules.openai;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{});
@@ -1618,9 +800,6 @@ pub fn build(b: *std.Build) void {
     });
     extracting_mod.addImport("httpx", httpx_mod);
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
-
-    // Inference dependencies
-    const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
 
     // --- Inference backend detection (must precede module creation) ---
     const termite_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
@@ -2921,7 +2100,7 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_public_chaos_test_step = metadata_tests.chaos.public;
     const run_lib_metadata_sim_public_tests = metadata_tests.sim_public.run;
 
-    const api_focused_tests = antfly_tests_build.addAPIFocusedTestSteps(b, lib_test_mod, &openapi_root_check.step);
+    const api_focused_tests = antfly_tests_build.addAPIFocusedTestSteps(b, lib_test_mod, &generated_steps.openapi_root_check.step);
     const run_public_api_parity_tests = api_focused_tests.public_api_parity.run;
     const run_public_api_graph_metric_e2e_tests = api_focused_tests.public_api_graph_metric_e2e.run;
     const run_lib_api_auth_tests = api_focused_tests.auth.run;
@@ -2958,19 +2137,7 @@ pub fn build(b: *std.Build) void {
         .db_result_shape = lib_db_module_tests.result_shape,
     });
 
-    const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
-    openapi_root_check_step.dependOn(&openapi_root_check.step);
-    const openapi_check_step = b.step("openapi-check", "Check checked-in OpenAPI artifacts are current");
-    openapi_check_step.dependOn(openapi_root_check_step);
-    openapi_check_step.dependOn(openapi_generated_check_step);
-
-    const generated_check_step = b.step("generated-check", "Check checked-in Zig generated artifacts are current");
-    generated_check_step.dependOn(openapi_check_step);
-    generated_check_step.dependOn(addSqlGrammarGeneratedCheckStep(b, yacc_codegen));
-    if (snowball_sources_available) {
-        generated_check_step.dependOn(snowball_check_step);
-    }
-    antfly_tests_build.dependOnAPIGeneratedChecks(generated_check_step, api_docid_tests);
+    antfly_tests_build.dependOnAPIGeneratedChecks(generated_steps.generated_check, api_docid_tests);
 
     const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
     const run_lib_metadata_service_tests = metadata_tests.service.run;
@@ -3058,101 +2225,13 @@ pub fn build(b: *std.Build) void {
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
     lib_audio_test_step.dependOn(&run_lib_transcribing_tests.step);
 
-    const lib_audio_xiph_conformance = b.addExecutable(.{
-        .name = "lib-audio-xiph-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/audio/audio_xiph_corpora_e2e.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
+    antfly_conformance_build.addAudioConformanceSteps(.{
+        .b = b,
+        .target = target,
+        .ffmpeg_paths = termite_ffmpeg_paths,
+        .inference_build_options_mod = inference_build_options_mod,
+        .conformance_test_step = conformance_test_step,
     });
-    lib_audio_xiph_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_xiph_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-    }
-    lib_audio_xiph_conformance.root_module.link_libc = true;
-
-    const lib_audio_misc_conformance = b.addExecutable(.{
-        .name = "lib-audio-misc-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/audio/audio_misc_corpora_e2e.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    lib_audio_misc_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_misc_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-    }
-    lib_audio_misc_conformance.root_module.link_libc = true;
-
-    const fetch_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
-    fetch_lib_audio_xiph_conformance.addArg("fetch");
-    fetch_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
-
-    const fetch_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
-    fetch_lib_audio_misc_conformance.addArg("fetch");
-    fetch_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
-
-    const lib_audio_conformance_fetch_step = b.step("lib-audio-conformance-fetch", "Fetch the lib/audio external conformance fixtures");
-    lib_audio_conformance_fetch_step.dependOn(&fetch_lib_audio_xiph_conformance.step);
-    lib_audio_conformance_fetch_step.dependOn(&fetch_lib_audio_misc_conformance.step);
-
-    const fetch_lib_audio_xiph_conformance_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
-    fetch_lib_audio_xiph_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_xiph_conformance_quiet.addArg("/tmp/termite-audio-xiph-corpora");
-    const fetch_lib_audio_xiph_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_xiph_conformance_quiet);
-
-    const fetch_lib_audio_misc_conformance_quiet = b.addRunArtifact(lib_audio_misc_conformance);
-    fetch_lib_audio_misc_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_misc_conformance_quiet.addArg("/tmp/termite-audio-misc-corpora");
-    const fetch_lib_audio_misc_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_misc_conformance_quiet);
-
-    const run_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance.addArg("run");
-    run_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance.addArg("--no-fetch");
-
-    const run_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance.addArg("run");
-    run_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance.addArg("--no-fetch");
-
-    const lib_audio_conformance_run_step = b.step("lib-audio-conformance-run", "Run lib/audio conformance suites without fetching fixtures");
-    lib_audio_conformance_run_step.dependOn(&run_lib_audio_xiph_conformance.step);
-    lib_audio_conformance_run_step.dependOn(&run_lib_audio_misc_conformance.step);
-
-    const run_lib_audio_xiph_conformance_after_fetch = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance_after_fetch.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_audio_xiph_conformance_after_fetch.step.dependOn(&fetch_lib_audio_xiph_conformance.step);
-
-    const run_lib_audio_misc_conformance_after_fetch = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance_after_fetch.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_audio_misc_conformance_after_fetch.step.dependOn(&fetch_lib_audio_misc_conformance.step);
-
-    const lib_audio_conformance_step = b.step("lib-audio-conformance", "Fetch and run lib/audio conformance suites");
-    lib_audio_conformance_step.dependOn(&run_lib_audio_xiph_conformance_after_fetch.step);
-    lib_audio_conformance_step.dependOn(&run_lib_audio_misc_conformance_after_fetch.step);
-
-    const run_lib_audio_xiph_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_xiph_conformance_quiet_step);
-    const run_lib_audio_xiph_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_xiph_conformance_after_fetch_quiet);
-
-    const run_lib_audio_misc_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_audio_misc_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_misc_conformance_quiet_step);
-    const run_lib_audio_misc_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_misc_conformance_after_fetch_quiet);
-    conformance_test_step.dependOn(run_lib_audio_xiph_conformance_after_fetch_quiet_step);
-    conformance_test_step.dependOn(run_lib_audio_misc_conformance_after_fetch_quiet_step);
 
     const swarm_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/swarm_runtime_test_root.zig"),

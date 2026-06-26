@@ -835,7 +835,7 @@ const Connection = struct {
     }
 
     fn executeSql(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
-        return try self.api_server.handlePublicSqlRequestResult(.{
+        return try self.api_server.executePublicSqlRequestResult(.{
             .sql = sql,
             .session_id = self.session_id,
             .database = self.database,
