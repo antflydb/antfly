@@ -1214,6 +1214,10 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.offset_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_count_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.row_lock_tokens)) return false;
+    if (read_ast.row_lock_tokens) |row_lock_tokens| {
+        if (row_lock_tokens.start >= row_lock_tokens.end or !tokenMatchesKeyword(tokens[row_lock_tokens.start], .@"for")) return false;
+    }
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.set_operation_tokens)) return false;
     if (!generatedReadCtePayloadIsValid(tokens, end, select_index, read_ast)) return false;
 
@@ -2533,11 +2537,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .grant_not_planned_by_generated_parser,
         },
         .{
-            .sql = "SELECT id FROM usage_records FOR UPDATE",
-            .kind = .read_row_lock,
-            .reason = .read_row_lock_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "LISTEN usage_events",
             .kind = .listen,
             .reason = .listen_not_planned_by_generated_parser,
@@ -3655,6 +3654,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE status IS NOT DISTINCT FROM previous_status", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED", .generated = .query, .read = .query },
+        .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT", .generated = .cte, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE NOT deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE (status = 'open')", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE NOT (deleted_at IS NULL)", .generated = .query, .read = .query },
@@ -4577,6 +4578,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_offset_query.statement = parseStatement(generated_offset_query.raw_statement, malformed_offset_generated, &generated_offset_query.tokenized_sql);
     try std.testing.expect(generated_offset_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_offset_query.statement));
+
+    var generated_row_lock_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED");
+    defer generated_row_lock_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_row_lock_query.generatedStatementKind().?);
+
+    var malformed_row_lock_generated = generated_row_lock_query.generated_statement.?;
+    if (malformed_row_lock_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.row_lock_tokens = read_ast.source_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_row_lock_query.statement = parseStatement(generated_row_lock_query.raw_statement, malformed_row_lock_generated, &generated_row_lock_query.tokenized_sql);
+    try std.testing.expect(generated_row_lock_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_row_lock_query.statement));
 
     var malformed_command_span = generated_query.generated_statement.?;
     if (malformed_command_span.ast) |*generated_ast| {

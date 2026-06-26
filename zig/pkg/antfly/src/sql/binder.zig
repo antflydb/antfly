@@ -823,10 +823,12 @@ pub const ReadSourceTableNames = struct {
 
 pub const CatalogBoundWritePlanOptions = struct {
     options: plan_mod.LowerWritePlanOptions,
+    target_binding: ?source_binding.SqlSourceBinding = null,
     owned_insert_source_schema: ?runtime_schema.TableSchema = null,
     owned_joined_source_schema: ?runtime_schema.TableSchema = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         self.* = undefined;
@@ -1340,6 +1342,14 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
         .options = options,
     };
     errdefer out.deinit(alloc);
+
+    const target_table_name = try writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql);
+    defer alloc.free(target_table_name);
+    out.target_binding = sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, target_table_name, session) catch |err| switch (err) {
+        error.InvalidSqlCatalog, error.TableNotFound => null,
+        else => return err,
+    };
+
     var resolved_recursive_insert_source = false;
 
     if (out.options.insert_source_schema == null) {

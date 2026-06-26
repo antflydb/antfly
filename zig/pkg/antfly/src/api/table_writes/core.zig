@@ -46,6 +46,22 @@ const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryI
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 
+pub const GroupBatch = struct {
+    group_id: u64,
+    writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
+    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    relational_identity_rewrites: std.ArrayListUnmanaged(db_mod.types.RelationalIdentityRewrite) = .empty,
+    transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+
+    pub fn deinit(self: *GroupBatch, alloc: std.mem.Allocator) void {
+        self.writes.deinit(alloc);
+        self.deletes.deinit(alloc);
+        self.relational_identity_rewrites.deinit(alloc);
+        self.transforms.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

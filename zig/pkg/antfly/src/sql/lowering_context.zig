@@ -353,6 +353,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: *co
         read_ast.offset_tokens,
         read_ast.fetch_tokens,
         read_ast.fetch_count_tokens,
+        read_ast.row_lock_tokens,
         read_ast.set_operation_tokens,
     };
     for (ranges) |range| {
@@ -959,6 +960,10 @@ fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast
     if (read_ast.fetch_tokens) |fetch_tokens| {
         if (fetch_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
         try validateGeneratedReadRangePrecededByKeyword(tokens, fetch_tokens, .fetch);
+    }
+    if (read_ast.row_lock_tokens) |row_lock_tokens| {
+        if (row_lock_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (!tokens[row_lock_tokens.start].matchesKeywordTag(.@"for")) return error.UnsupportedSqlShape;
     }
     if (read_ast.set_operation_tokens) |set_operation_tokens| {
         if (set_operation_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;

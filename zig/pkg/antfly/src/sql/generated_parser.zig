@@ -1057,6 +1057,7 @@ pub const GeneratedSqlReadAst = struct {
     fetch_tokens: ?GeneratedSqlTokenRange = null,
     fetch_count_tokens: ?GeneratedSqlTokenRange = null,
     fetch_count_expression: GeneratedSqlExpressionAst = .{},
+    row_lock_tokens: ?GeneratedSqlTokenRange = null,
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
     set_operation: GeneratedSqlSetOperationAst = .{},
 
@@ -1957,9 +1958,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
-    .{ .sql = "SELECT id FROM usage_records FOR UPDATE", .kind = .unsupported },
-    .{ .sql = "SELECT id FROM usage_records FOR SHARE NOWAIT", .kind = .unsupported },
-    .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR NO KEY UPDATE SKIP LOCKED", .kind = .unsupported },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "GRANT SELECT ON TABLE usage_records TO readonly", .kind = .unsupported },
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
@@ -2392,12 +2390,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.merge)) return .{ .dml = .merge };
     if (first.matchesKeywordTag(.with)) {
         if (generatedWriteKindForWithStatement(tokens)) |kind| return .{ .dml = kind };
-        if (generatedReadRowLockStart(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .unsupported = .read_row_lock };
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.select)) {
         if (generatedSelectIntoTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .relation_population };
-        if (generatedReadRowLockStart(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .unsupported = .read_row_lock };
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
@@ -2454,9 +2450,29 @@ fn generatedReadRowLockStart(tokens: []const token_mod.Token, start: usize, end:
             else => {},
         }
         if (depth != 0 or !tokens[index].matchesKeywordTag(.@"for")) continue;
+        if (!generatedReadRowLockModeStartsAt(tokens, index + 1, end)) continue;
         if (generatedReadHasCompleteSourceBefore(tokens, start, index)) candidate = index;
     }
     return candidate;
+}
+
+fn generatedReadRowLockModeStartsAt(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    if (start >= end or end > tokens.len) return false;
+    if (tokens[start].matchesKeywordTag(.update) or tokens[start].matchesKeywordTag(.share)) return true;
+    if (start + 1 < end and
+        tokens[start].matchesKeywordTag(.key) and
+        tokens[start + 1].matchesKeywordTag(.share))
+    {
+        return true;
+    }
+    if (start + 2 < end and
+        tokens[start].matchesKeywordTag(.no) and
+        tokens[start + 1].matchesKeywordTag(.key) and
+        tokens[start + 2].matchesKeywordTag(.update))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn generatedReadHasCompleteSourceBefore(tokens: []const token_mod.Token, start: usize, end: usize) bool {
@@ -3546,8 +3562,9 @@ fn buildReadAstInPlace(
     const limit_index = findTopLevelKeyword(tokens, projection_start, body_end, .limit);
     const offset_index = findTopLevelKeyword(tokens, projection_start, body_end, .offset);
     const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
+    const row_lock_index = generatedReadRowLockStart(tokens, projection_start, body_end);
 
-    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
     if (projection_start < projection_end) {
         const projection_tokens = GeneratedSqlTokenRange{ .start = projection_start, .end = projection_end };
         ast.projection_tokens = projection_tokens;
@@ -3561,7 +3578,7 @@ fn buildReadAstInPlace(
     }
 
     if (from_index) |idx| {
-        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             ast.source_tokens = source_tokens;
@@ -3570,7 +3587,7 @@ fn buildReadAstInPlace(
         }
     }
     if (where_index) |idx| {
-        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < where_end) {
             const where_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = where_end };
             ast.where_tokens = where_tokens;
@@ -3579,7 +3596,7 @@ fn buildReadAstInPlace(
     }
     if (group_index) |idx| {
         const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
-        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (group_start < group_end) {
             const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
             ast.group_tokens = group_tokens;
@@ -3593,7 +3610,7 @@ fn buildReadAstInPlace(
         }
     }
     if (having_index) |idx| {
-        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < having_end) {
             const having_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = having_end };
             ast.having_tokens = having_tokens;
@@ -3601,7 +3618,7 @@ fn buildReadAstInPlace(
         }
     }
     if (window_index) |idx| {
-        const window_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const window_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < window_end) {
             const window_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = window_end };
             ast.window_tokens = window_tokens;
@@ -3611,7 +3628,7 @@ fn buildReadAstInPlace(
     }
     if (order_index) |idx| {
         const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
-        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (order_start < order_end) {
             const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
             ast.order_tokens = order_tokens;
@@ -3625,7 +3642,7 @@ fn buildReadAstInPlace(
         }
     }
     if (limit_index) |idx| {
-        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < limit_end) {
             const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
             ast.limit_tokens = limit_tokens;
@@ -3637,7 +3654,7 @@ fn buildReadAstInPlace(
         }
     }
     if (offset_index) |idx| {
-        const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse body_end;
+        const offset_end = firstOptionalIndex(&[_]?usize{ fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < offset_end) {
             const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
             ast.offset_tokens = offset_tokens;
@@ -3647,14 +3664,18 @@ fn buildReadAstInPlace(
         }
     }
     if (fetch_index) |idx| {
-        if (idx + 1 < body_end) {
-            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = body_end };
+        const fetch_end = row_lock_index orelse body_end;
+        if (idx + 1 < fetch_end) {
+            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = fetch_end };
             ast.fetch_tokens = fetch_tokens;
             if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
                 ast.fetch_count_tokens = count_tokens;
                 ast.fetch_count_expression = try buildGeneratedExpressionAst(alloc, tokens, count_tokens);
             }
         }
+    }
+    if (row_lock_index) |idx| {
+        if (idx + 1 < body_end) ast.row_lock_tokens = .{ .start = idx, .end = body_end };
     }
     if (ast.set_operation_tokens) |set_operation_tokens| {
         try buildGeneratedReadResultTailAst(alloc, tokens, set_operation_tokens.end, end, ast);
@@ -6734,8 +6755,8 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT count(*) AS row_count FROM docs d WHERE d.status = 'active' GROUP BY d.status LIMIT 5")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .window }, (try parseSqlAlloc(alloc, "SELECT tenant, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS any_enabled FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
@@ -10254,12 +10275,11 @@ test "generated SQL parser facade builds extended read AST spans" {
     const row_lock_sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED";
     const row_lock_result = try parseSqlAlloc(alloc, row_lock_sql);
     switch (row_lock_result.ast.?) {
-        .unsupported => |unsupported| {
-            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.read_row_lock, unsupported.kind);
-            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.read_row_lock_not_planned_by_generated_parser, unsupported.reason);
-            try std.testing.expectEqualStrings(row_lock_sql, spanText(row_lock_sql, unsupported.statement_span));
-            try std.testing.expectEqualStrings("SELECT", spanText(row_lock_sql, unsupported.command_span));
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 8 }, unsupported.subject_tokens.?);
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqualStrings(row_lock_sql, spanText(row_lock_sql, read.statement_span));
+            try std.testing.expectEqualStrings("SELECT", spanText(row_lock_sql, read.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.row_lock_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

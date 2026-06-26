@@ -44,6 +44,26 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const FakePromotionSink = support.FakePromotionSink;
+    pub const FixedVectorEmbedder = support.FixedVectorEmbedder;
+    pub const TestAssetProducer = support.TestAssetProducer;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+
+    pub fn lockApply(db: anytype) void {
+        support.lockApply(db);
+    }
+} else struct {};
+
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
 
@@ -3432,8 +3452,8 @@ test "db resolution runtime starts resolver replay workers only while resolver c
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3495,10 +3515,10 @@ test "db resolution runtime backfills a mention name embedding so ann/cosine res
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var embedder = @import("test_support.zig").FixedVectorEmbedder{};
+    var embedder = TestHelpers.FixedVectorEmbedder{};
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
     defer db.close();
 
@@ -3572,8 +3592,8 @@ test "db resolution runtime resolves extracted entities into a resolution artifa
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3630,8 +3650,8 @@ test "db resolution runtime re-resolves the corpus when upsertResolver bumps the
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3694,8 +3714,8 @@ test "db resolution runtime re-resolves existing corpus when upsertResolver inse
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3760,8 +3780,8 @@ test "db resolution runtime drains pending resolver backfill when retrying a no-
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3802,7 +3822,7 @@ test "db resolution runtime drains pending resolver backfill when retrying a no-
     };
 
     {
-        @import("test_support.zig").lockApply(&db);
+        TestHelpers.lockApply(&db);
         defer db.core.unlockApply();
         try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
     }
@@ -3824,8 +3844,8 @@ test "db resolution runtime refuses resolver removal while resolution or promoti
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3870,10 +3890,10 @@ test "db resolution runtime promotes resolved entities into entity-document upse
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var sink = @import("test_support.zig").FakePromotionSink{ .alloc = alloc };
+    var sink = TestHelpers.FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
@@ -3937,8 +3957,8 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4013,8 +4033,8 @@ test "db resolution runtime graph replay ignores resolution artifacts bound to a
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -4072,8 +4092,8 @@ test "db resolution runtime materializes doc->entity mention edges as provenance
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4167,10 +4187,10 @@ test "db resolution runtime resolver removal retires resolution artifacts and me
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var sink = @import("test_support.zig").FakePromotionSink{ .alloc = alloc };
+    var sink = TestHelpers.FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
@@ -4270,8 +4290,8 @@ test "db resolution runtime does not materialize review-band resolution as canon
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .manual },
@@ -4361,8 +4381,8 @@ test "db resolution runtime mention edge weight is fused from extractor trust an
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4415,8 +4435,8 @@ test "db resolution runtime rewriteEntityEdges repoints provenance edges to a me
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4481,8 +4501,8 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4571,8 +4591,8 @@ test "db resolution runtime resolver catalog persists across reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
@@ -4638,15 +4658,15 @@ test "db resolution runtime async asset producer mention edges come from resolut
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = @import("test_support.zig").tempPath(&path_buf);
-    defer @import("test_support.zig").cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = @import("test_support.zig").TestAssetProducer{
+    var fake = TestHelpers.TestAssetProducer{
         .extractor_output =
         \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
         ,
     };
-    var embedder = @import("test_support.zig").FixedVectorEmbedder{};
+    var embedder = TestHelpers.FixedVectorEmbedder{};
     var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",

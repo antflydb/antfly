@@ -109,6 +109,7 @@ pub const SchemaRewriteGroupRequest = table_write_schema_jobs.SchemaRewriteGroup
 pub const TableWriteSource = table_write_core.TableWriteSource;
 pub const freeForeignKeyRefChildrenPage = table_write_core.freeForeignKeyRefChildrenPage;
 
+const GroupBatch = table_write_core.GroupBatch;
 const cloneOptionalString = table_write_integrity.cloneOptionalString;
 const foreignKeyActionJobStatusFromDbRecord = table_write_integrity.foreignKeyActionJobStatusFromDbRecord;
 const cloneForeignKeyActionJobStatus = table_write_integrity.cloneForeignKeyActionJobStatus;
@@ -242,6 +243,14 @@ const shouldDrainManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainManage
 const shouldDrainCachedManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainCachedManagedDbAfterBatch;
 const autoBulkIngestBatchOps = table_write_bulk_ingest.autoBulkIngestBatchOps;
 const autoBulkIngestGroupBatchOps = table_write_bulk_ingest.autoBulkIngestGroupBatchOps;
+const WriteCoalesceQueue = table_write_bulk_ingest.WriteCoalesceQueue;
+const WriteCoalesceEntry = table_write_bulk_ingest.WriteCoalesceEntry;
+const coalesceCompatibleEntry = table_write_bulk_ingest.coalesceCompatibleEntry;
+const coalescedEntryBatchRequest = table_write_bulk_ingest.coalescedEntryBatchRequest;
+const totalCoalescedWrites = table_write_bulk_ingest.totalCoalescedWrites;
+const totalCoalescedDeletes = table_write_bulk_ingest.totalCoalescedDeletes;
+const cloneWriteCoalesceGroupBatch = table_write_bulk_ingest.cloneWriteCoalesceGroupBatch;
+const freeWriteCoalesceGroupBatch = table_write_bulk_ingest.freeWriteCoalesceGroupBatch;
 const accumulateTextMemoryAttributionStats = table_write_cache.accumulateTextMemoryAttributionStats;
 
 const moveDroppedGroupPathToTrash = table_write_backup_restore.moveDroppedGroupPathToTrash;
@@ -2718,21 +2727,6 @@ pub const ProvisionedTableWriteSource = struct {
         table_request_active: usize = 0,
         operation_active: bool = false,
         structural_active: bool = false,
-    };
-
-    const WriteCoalesceQueue = struct {
-        table_name: []u8,
-        group_id: u64,
-        draining: bool = false,
-        entries: std.ArrayListUnmanaged(*WriteCoalesceEntry) = .empty,
-    };
-
-    const WriteCoalesceEntry = struct {
-        group: GroupBatch = .{ .group_id = 0 },
-        sync_level: db_mod.types.SyncLevel = .write,
-        timestamp_ns: u64 = 0,
-        done: bool = false,
-        err: ?anyerror = null,
     };
 
     pub fn init(replica_root_dir: []const u8, catalog: table_catalog.CatalogSource) ProvisionedTableWriteSource {
@@ -5760,17 +5754,6 @@ pub const ProvisionedTableWriteSource = struct {
         return self.write_coalesce_queues.items[queue_index].entries.items.len;
     }
 
-    fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
-        return first.sync_level == candidate.sync_level and first.timestamp_ns == candidate.timestamp_ns;
-    }
-
-    fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
-        return .{
-            .sync_level = entry.sync_level,
-            .timestamp_ns = entry.timestamp_ns,
-        };
-    }
-
     fn enqueueProvisionedGroupBatchCoalesced(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -5939,18 +5922,6 @@ pub const ProvisionedTableWriteSource = struct {
             };
             self.finishCoalescedEntry(entry, apply_err);
         }
-    }
-
-    fn totalCoalescedWrites(entries: []const *WriteCoalesceEntry) usize {
-        var total: usize = 0;
-        for (entries) |entry| total += entry.group.writes.items.len;
-        return total;
-    }
-
-    fn totalCoalescedDeletes(entries: []const *WriteCoalesceEntry) usize {
-        var total: usize = 0;
-        for (entries) |entry| total += entry.group.deletes.items.len;
-        return total;
     }
 
     fn finishCoalescedEntries(self: *ProvisionedTableWriteSource, entries: []const *WriteCoalesceEntry, err: ?anyerror) void {
@@ -12289,83 +12260,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.NotFound;
     }
 };
-
-const GroupBatch = struct {
-    group_id: u64,
-    writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
-    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
-    relational_identity_rewrites: std.ArrayListUnmanaged(db_mod.types.RelationalIdentityRewrite) = .empty,
-    transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
-
-    fn deinit(self: *GroupBatch, alloc: std.mem.Allocator) void {
-        self.writes.deinit(alloc);
-        self.deletes.deinit(alloc);
-        self.relational_identity_rewrites.deinit(alloc);
-        self.transforms.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-fn cloneWriteCoalesceGroupBatch(
-    alloc: std.mem.Allocator,
-    group: GroupBatch,
-) !GroupBatch {
-    var cloned = GroupBatch{ .group_id = group.group_id };
-    errdefer freeWriteCoalesceGroupBatch(alloc, &cloned);
-
-    try cloned.writes.ensureTotalCapacity(alloc, group.writes.items.len);
-    for (group.writes.items) |write| {
-        const key = try alloc.dupe(u8, write.key);
-        const value = alloc.dupe(u8, write.value) catch |err| {
-            alloc.free(key);
-            return err;
-        };
-        cloned.writes.appendAssumeCapacity(.{ .key = key, .value = value });
-    }
-
-    try cloned.deletes.ensureTotalCapacity(alloc, group.deletes.items.len);
-    for (group.deletes.items) |key| {
-        const owned_key = try alloc.dupe(u8, key);
-        cloned.deletes.appendAssumeCapacity(owned_key);
-    }
-
-    try cloned.relational_identity_rewrites.ensureTotalCapacity(alloc, group.relational_identity_rewrites.items.len);
-    for (group.relational_identity_rewrites.items) |rewrite| {
-        const old_key = try alloc.dupe(u8, rewrite.old_key);
-        var old_key_owned = true;
-        errdefer if (old_key_owned) alloc.free(old_key);
-        const new_key = try alloc.dupe(u8, rewrite.new_key);
-        var new_key_owned = true;
-        errdefer if (new_key_owned) alloc.free(new_key);
-        const value = try alloc.dupe(u8, rewrite.value);
-        var value_owned = true;
-        errdefer if (value_owned) alloc.free(value);
-        cloned.relational_identity_rewrites.appendAssumeCapacity(.{
-            .old_key = old_key,
-            .new_key = new_key,
-            .value = value,
-        });
-        old_key_owned = false;
-        new_key_owned = false;
-        value_owned = false;
-    }
-
-    return cloned;
-}
-
-fn freeWriteCoalesceGroupBatch(alloc: std.mem.Allocator, group: *GroupBatch) void {
-    for (group.writes.items) |write| {
-        alloc.free(write.key);
-        alloc.free(write.value);
-    }
-    for (group.deletes.items) |key| alloc.free(key);
-    for (group.relational_identity_rewrites.items) |rewrite| {
-        alloc.free(@constCast(rewrite.old_key));
-        alloc.free(@constCast(rewrite.new_key));
-        alloc.free(@constCast(rewrite.value));
-    }
-    group.deinit(alloc);
-}
 
 fn ensureGroupBatch(
     alloc: std.mem.Allocator,

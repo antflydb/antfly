@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
@@ -36,6 +37,18 @@ const Allocator = std.mem.Allocator;
 const BatchProfile = write_path.BatchProfile;
 const DocumentArtifactChildRangeDispatch = write_path.DocumentArtifactChildRangeDispatch;
 const DocumentArtifactChildRangeDispatcher = write_path.DocumentArtifactChildRangeDispatcher;
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
 
 pub const AsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
@@ -176,20 +189,17 @@ pub fn readAppliedReplicationLsn(alloc: Allocator, store: *docstore_mod.DocStore
 
 test "storage.ha db mirrors appended derived replay records into HA stream" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 200,
@@ -240,29 +250,26 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
 
 test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
-    defer cleanupTempDir(primary_db_path);
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
     var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
-    defer cleanupTempDir(standby_db_path);
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 250,
@@ -342,20 +349,17 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
 
 test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 253,
@@ -405,20 +409,17 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
 
 test "storage.ha db block sync policy waits for standby acknowledgement" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 255,
@@ -482,29 +483,26 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
 
 test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
-    defer cleanupTempDir(primary_db_path);
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
     var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
-    defer cleanupTempDir(standby_db_path);
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
         .cluster_id = 257,
@@ -579,26 +577,23 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
 
 test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
-    defer cleanupTempDir(primary_db_path);
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
         .cluster_id = 258,
@@ -679,20 +674,17 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
 
 test "storage.ha db primary progress sync wait observes reported remote apply ack" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 259,
@@ -764,20 +756,17 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
 
 test "storage.ha db primary progress sync wait returns would block without reported ack" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 260,
@@ -827,20 +816,17 @@ test "storage.ha db primary progress sync wait returns would block without repor
 
 test "storage.ha db primary progress sync wait survives primary restart before ack" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     const identity = ha_primary_mod.Identity{
         .cluster_id = 261,
@@ -916,20 +902,17 @@ test "storage.ha db primary progress sync wait survives primary restart before a
 
 test "storage.ha db block sync policy surfaces wait provider errors" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 256,
@@ -987,20 +970,17 @@ test "storage.ha db block sync policy surfaces wait provider errors" {
 
 test "storage.ha db fail-closed sync policy rejects before local batch commit" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 254,
@@ -1045,29 +1025,26 @@ test "storage.ha db fail-closed sync policy rejects before local batch commit" {
 
 test "storage.ha db mirrors and applies schema metadata mutation records" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
-    defer cleanupTempDir(primary_db_path);
+    const primary_db_path = TestHelpers.tempPath(&primary_db_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_db_path);
     var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
-    defer cleanupTempDir(standby_db_path);
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
     var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
-    defer cleanupTempDir(ha_log_path);
+    const ha_log_path = TestHelpers.tempPath(&ha_log_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_log_path);
     var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
-    defer cleanupTempDir(ha_slots_path);
+    const ha_slots_path = TestHelpers.tempPath(&ha_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(ha_slots_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
         .cluster_id = 252,
@@ -1136,26 +1113,23 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
 
 test "storage.ha db applies batch mutation records through replication session callback" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
-    defer cleanupTempDir(standby_db_path);
+    const standby_db_path = TestHelpers.tempPath(&standby_db_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_db_path);
     var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
-    defer cleanupTempDir(primary_log_path);
+    const primary_log_path = TestHelpers.tempPath(&primary_log_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_log_path);
     var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
-    defer cleanupTempDir(primary_slots_path);
+    const primary_slots_path = TestHelpers.tempPath(&primary_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_slots_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
         .cluster_id = 251,
@@ -1247,20 +1221,17 @@ test "storage.ha db applies batch mutation records through replication session c
 
 test "storage.ha db persists applied replication marker across reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
-    defer cleanupTempDir(primary_log_path);
+    const primary_log_path = TestHelpers.tempPath(&primary_log_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_log_path);
     var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
-    defer cleanupTempDir(primary_slots_path);
+    const primary_slots_path = TestHelpers.tempPath(&primary_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_slots_path);
 
     const identity = ha_standby_mod.Identity{
         .cluster_id = 252,
@@ -1303,14 +1274,11 @@ test "storage.ha db persists applied replication marker across reopen" {
 
 test "storage.ha db applies timeline switch as durable replication boundary" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
 
     const switch_record = ha_replication_record_mod.RecordView{
         .kind = .timeline_switch,
@@ -1343,20 +1311,17 @@ test "storage.ha db applies timeline switch as durable replication boundary" {
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
         .cluster_id = 300,
@@ -1528,23 +1493,20 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
 
 test "storage.ha db write gate rejects fenced former primary writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
-    defer cleanupTempDir(primary_log_path);
+    const primary_log_path = TestHelpers.tempPath(&primary_log_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_log_path);
     var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
-    defer cleanupTempDir(primary_slots_path);
+    const primary_slots_path = TestHelpers.tempPath(&primary_slots_path_buf);
+    defer TestHelpers.cleanupTempDir(primary_slots_path);
     var fence_path_buf: [256]u8 = undefined;
-    const fence_path = tempPath(&fence_path_buf);
-    defer cleanupTempDir(fence_path);
+    const fence_path = TestHelpers.tempPath(&fence_path_buf);
+    defer TestHelpers.cleanupTempDir(fence_path);
 
     const identity = ha_primary_mod.Identity{
         .cluster_id = 301,
@@ -1597,20 +1559,17 @@ test "storage.ha db write gate rejects fenced former primary writes" {
 
 test "storage.ha db standby role suppresses mutating background runtimes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
-    defer cleanupTempDir(db_path);
+    const db_path = TestHelpers.tempPath(&db_path_buf);
+    defer TestHelpers.cleanupTempDir(db_path);
     var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
-    defer cleanupTempDir(standby_log_path);
+    const standby_log_path = TestHelpers.tempPath(&standby_log_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_log_path);
     var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
-    defer cleanupTempDir(standby_progress_path);
+    const standby_progress_path = TestHelpers.tempPath(&standby_progress_path_buf);
+    defer TestHelpers.cleanupTempDir(standby_progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
         .cluster_id = 301,

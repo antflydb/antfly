@@ -5676,22 +5676,6 @@ pub const ApiHttpServer = struct {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
 
-        const target_table = sql_adapter.writeTargetTableNameFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            else => return err,
-        };
-        defer self.alloc.free(target_table);
-        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
-            self.alloc,
-            self.catalogSource(),
-            target_table,
-            session.session(),
-        ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            else => return err,
-        };
-        defer runtime_schema_mod.freeSchema(self.alloc, schema);
-
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
             error.InvalidRoleSetting => return .{ .response = try textResponse(self.alloc, 400, "invalid sql setting") },
@@ -5701,18 +5685,34 @@ pub const ApiHttpServer = struct {
             else => null,
         };
         defer if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
-        var lowered = sql_adapter.lowerWritePlanWithCatalogSessionParsedSqlAlloc(
+        var bound = sql_adapter.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, .{
+            .unique_resolver = unique_resolver_ctx.resolver(),
+            .row_claim = row_claim,
+            .sync_level = sync_level,
+        }, self.catalogSource(), session.session()) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
+            else => return err,
+        };
+        defer bound.deinit(self.alloc);
+        const write_catalog = bound.writeCatalog() catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        };
+        const target_binding = write_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const target = target_binding.target();
+        const target_table = try self.alloc.dupe(u8, target.table_name);
+        defer self.alloc.free(target_table);
+        const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var lowered = sql_adapter_runtime.lowerWritePlanWithBoundStatementAlloc(
             self.alloc,
             parsed_sql,
+            &bound,
             schema,
             params,
-            .{
-                .unique_resolver = unique_resolver_ctx.resolver(),
-                .row_claim = row_claim,
-                .sync_level = sync_level,
-            },
-            self.catalogSource(),
-            session.session(),
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
             error.DocumentSqlWriteUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_write_unsupported") },
@@ -20564,7 +20564,7 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
 }
 
 pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
-    if (method == .POST and std.mem.eql(u8, path, routes.Routes.db_v1_sql)) return .{
+    if (method == .POST and std.mem.eql(u8, path, stripApiPrefix(routes.Routes.db_v1_sql))) return .{
         .resource_type = .database,
         .resource = catalog_resources.default_database_name,
         .permission_type = .admin,
@@ -28865,8 +28865,8 @@ test "api http server executes document SQL reads through typed document plan in
         .body = "{\"sql\":\"SELECT _id FROM docs WHERE _id = 'doc:a' FOR UPDATE;\"}",
     });
     defer locking_tail_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), locking_tail_resp.status);
-    try std.testing.expectEqualStrings("unsupported sql statement", locking_tail_resp.body);
+    try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
+    try std.testing.expectEqualStrings("document_sql_locking_unsupported", locking_tail_resp.body);
 
     var native_search_predicate_resp = try server.handle(.{
         .method = .POST,
@@ -30445,6 +30445,7 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
+                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
                 },
             };
         }
@@ -30501,6 +30502,16 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
                 return error.TestUnexpectedResult;
             }
             return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+        }
+
+        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            sql: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+            _: sql_adapter.SqlFunctionBindings,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            return try applyRelationalSqlDdlWithSession(ptr, alloc_arg, sql, session);
         }
     };
 

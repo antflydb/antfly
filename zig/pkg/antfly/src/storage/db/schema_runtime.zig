@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const algebraic_ir = @import("algebraic/ir.zig");
 const db_internal = @import("internal.zig");
@@ -30,6 +31,18 @@ const schema_mod = @import("../schema.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
+
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+} else struct {};
 
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 pub const local_lite_sql_table_record_json_key = "\x00\x00__metadata__:lite_sql_table_record_json";
@@ -1709,15 +1722,12 @@ fn relationalRowsExpressionEqual(
 
 test "db schema checks execute json row expressions in storage" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1749,15 +1759,12 @@ test "db schema checks execute json row expressions in storage" {
 
 test "db schema checks execute temporal and case row expressions in storage" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1789,15 +1796,12 @@ test "db schema checks execute temporal and case row expressions in storage" {
 
 test "db schema apply validates added check constraints against existing rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1839,15 +1843,12 @@ test "db schema apply validates added check constraints against existing rows" {
 
 test "db schema apply validates unvalidated check promotion" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1892,15 +1893,12 @@ test "db schema apply validates unvalidated check promotion" {
 
 test "db direct schema apply rejects storage mode switches" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1922,15 +1920,12 @@ test "db direct schema apply rejects storage mode switches" {
 
 test "db direct schema apply rejects relational base column changes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -1953,15 +1948,12 @@ test "db direct schema apply rejects relational base column changes" {
 
 test "db direct schema apply appends literal default and generated columns through row rewrite" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2019,15 +2011,12 @@ test "db direct schema apply appends literal default and generated columns throu
 
 test "db direct schema apply rejects generated columns without deterministic backfill sources" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2049,15 +2038,12 @@ test "db direct schema apply rejects generated columns without deterministic bac
 
 test "db first relational schema apply rejects existing document rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2078,15 +2064,12 @@ test "db first relational schema apply rejects existing document rows" {
 
 test "db executes claimed schema rewrite job expressions over relational rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2156,15 +2139,12 @@ test "db executes claimed schema rewrite job expressions over relational rows" {
 
 test "db executes claimed schema validation jobs over relational rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2212,15 +2192,12 @@ test "db executes claimed schema validation jobs over relational rows" {
 
 test "db executes claimed full schema rewrite jobs over relational rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2281,15 +2258,12 @@ test "db executes claimed full schema rewrite jobs over relational rows" {
 
 test "db executes claimed schema rewrite row plans over relational rows" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2347,15 +2321,12 @@ test "db executes claimed schema rewrite row plans over relational rows" {
 
 test "db drains metadata schema rewrite jobs through claim and finish lifecycle" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2457,15 +2428,12 @@ test "db drains metadata schema rewrite jobs through claim and finish lifecycle"
 
 test "db schema rewrite drain skips stale claim races and continues" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2587,15 +2555,12 @@ test "db schema rewrite drain skips stale claim races and continues" {
 test "db table schema apply stages algebraic pending before durable schema swap" {
     const DB = @import("mod.zig").DB;
     const algebraic_mod = @import("algebraic/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_v1 =
         \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
@@ -2684,15 +2649,12 @@ test "db table schema apply stages algebraic pending before durable schema swap"
 test "db staged algebraic pending waits for first durable schema" {
     const DB = @import("mod.zig").DB;
     const algebraic_mod = @import("algebraic/mod.zig");
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const schema_v1 =
         \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
@@ -2756,14 +2718,11 @@ test "db staged algebraic pending waits for first durable schema" {
 
 test "db schema runtime algebraic adaptive stats report engine-owned observation status" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const cfg =
         \\{
@@ -2879,14 +2838,11 @@ test "db schema runtime algebraic adaptive stats report engine-owned observation
 
 test "db schema runtime algebraic evaluates policy-gated adaptive candidates" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
@@ -2980,13 +2936,10 @@ test "db schema runtime algebraic evaluates policy-gated adaptive candidates" {
 test "db schema runtime enrichment catalog delete rejects referenced definitions" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3010,13 +2963,10 @@ test "db schema runtime enrichment catalog delete rejects referenced definitions
 test "db schema runtime enrichment catalog delete rejects asset referenced by chunk enrichment" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3041,13 +2991,10 @@ test "db schema runtime enrichment catalog delete rejects asset referenced by ch
 test "db schema runtime enrichment catalog upsert rejects replacing referenced asset with chunk" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3082,13 +3029,10 @@ test "db schema runtime enrichment catalog upsert rejects replacing referenced a
 test "db schema runtime enrichment catalog upsert rejects replacing referenced chunk with asset" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3122,13 +3066,10 @@ test "db schema runtime enrichment catalog upsert rejects replacing referenced c
 test "db schema runtime enrichment catalog upsert rejects replacing indexed chunk with asset" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3160,13 +3101,10 @@ test "db schema runtime enrichment catalog upsert rejects replacing indexed chun
 test "db schema runtime enrichment catalog add rejects duplicate names across enrichment kinds" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3188,13 +3126,10 @@ test "db schema runtime enrichment catalog add rejects duplicate names across en
 test "db schema runtime enrichment catalog add allows unrelated definitions after field sparse index" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3215,13 +3150,10 @@ test "db schema runtime enrichment catalog add allows unrelated definitions afte
 test "db schema runtime index inspection lists graph indexes" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();

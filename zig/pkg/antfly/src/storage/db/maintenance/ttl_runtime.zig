@@ -31,6 +31,22 @@ const platform = @import("antfly_platform");
 const platform_clock = @import("../../../platform/clock.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("../test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+
+    pub fn waitForRawDelete(alloc: Allocator, db: anytype, key: []const u8, max_attempts: usize) !void {
+        return support.waitForRawDelete(alloc, db, key, max_attempts);
+    }
+} else struct {};
+
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
     lease_owned: bool = false,
@@ -499,14 +515,11 @@ test "ttl runtime runOnce works with lsm backend store" {
 test "db lookup hides expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -536,14 +549,11 @@ test "db lookup hides expired documents when ttl schema is configured" {
 test "db search filters expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -595,14 +605,11 @@ test "db search filters expired documents when ttl schema is configured" {
 test "db ttl falls back to write timestamp when ttl field is missing" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -656,13 +663,10 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
 test "db ttl cleanup reclaims expired documents through normal delete semantics" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{
@@ -691,7 +695,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db_test_support.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
     {
@@ -723,14 +727,11 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
 test "db ttl cleanup deletes relational base rows" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const table_schema_api = @import("../../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{
@@ -758,7 +759,7 @@ test "db ttl cleanup deletes relational base rows" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db_test_support.waitForRawDelete(alloc, &db, "row:expired", 200);
+    try TestHelpers.waitForRawDelete(alloc, &db, "row:expired", 200);
     try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:expired")) == null);
 
     const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:expired");
@@ -776,13 +777,10 @@ test "db ttl cleanup deletes relational base rows" {
 test "db stats expose ttl cleanup activity" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{
@@ -806,7 +804,7 @@ test "db stats expose ttl cleanup activity" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db_test_support.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
@@ -825,13 +823,10 @@ test "db stats expose ttl cleanup activity" {
 test "db ttl cleanup can run under lease ownership" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{
@@ -858,7 +853,7 @@ test "db ttl cleanup can run under lease ownership" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db_test_support.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
@@ -877,13 +872,10 @@ test "db ttl cleanup can run under lease ownership" {
 test "db ttl cleanup can run under lease ownership with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -913,7 +905,7 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db_test_support.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
@@ -932,13 +924,10 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
 test "db ttl cleanup can run with manual clock" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const db_test_support = @import("../test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var clock = platform_clock.ManualClock{
         .now_realtime_ns = 10 * std.time.ns_per_s,
