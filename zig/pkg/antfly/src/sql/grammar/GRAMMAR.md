@@ -1106,8 +1106,9 @@ Important performance requirements:
 `zig build sql-parser-bench -- <iterations>` runs the first parser-only
 microbenchmark over the generated SQL compatibility corpus. It pre-tokenizes the
 corpus and measures generated parse throughput, token throughput, latency
-percentiles, gross allocated bytes per statement, peak live parser bytes, and
-generated table counts. Track generated Zig compile time and binary size impact
+percentiles, gross allocated bytes per statement, peak live parser bytes,
+generated table counts, generated RHS/state item counts, and generated parse
+table byte estimates. Track generated Zig compile time and binary size impact
 with build-system metrics around that target. Add larger end-to-end SQL
 benchmarks only after a statement family actually switches to the generated
 parser.
@@ -1389,7 +1390,7 @@ Generated grammar work needs evidence at multiple levels:
   size, generated-code compile time, and binary size. The initial
   `sql-parser-bench` target now reports generated parser corpus throughput,
   latency percentiles, allocation totals, peak live parser bytes, and generated
-  table counts.
+  table counts plus generated parse-table byte estimates.
 
 The migration is complete only when production SQL ingress no longer depends on
 hand-written statement parsing for the migrated families and compatibility debt

@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
         \\latency_ns avg={d:.2} p50={} p95={} p99={} max={}
         \\throughput tokens_per_second={d:.2} statements_per_second={d:.2}
         \\allocation bytes_per_statement={d:.2} peak_live_bytes={}
-        \\generated_table states={} actions={} gotos={} rules={} productions={}
+        \\generated_table states={} actions={} gotos={} rules={} productions={} rhs={} state_items={} static_bytes={} symbol_name_bytes={} estimated_bytes={}
         \\
     , .{
         cases.len,
@@ -182,6 +182,11 @@ pub fn main(init: std.process.Init) !void {
         generated.goto_count,
         generated.rule_count,
         generated.production_count,
+        generated.production_rhs_count,
+        generated.state_item_count,
+        generated.parse_table_static_bytes,
+        generated.symbol_name_bytes,
+        generated.parse_table_estimated_bytes,
     });
     try stdout.flush();
 }

@@ -180616,6 +180616,19 @@ pub const Rule = enum {
 };
 pub const production_rhs_count = 1885;
 pub const state_item_count = 46009;
+pub const symbol_name_bytes = 5895;
+pub const parse_table_static_bytes =
+    @sizeOf(@TypeOf(symbols)) +
+    @sizeOf(@TypeOf(production_rhs)) +
+    @sizeOf(@TypeOf(productions)) +
+    @sizeOf(@TypeOf(state_items)) +
+    @sizeOf(@TypeOf(states)) +
+    @sizeOf(@TypeOf(actions)) +
+    @sizeOf(@TypeOf(action_ranges)) +
+    @sizeOf(@TypeOf(gotos)) +
+    @sizeOf(@TypeOf(goto_ranges)) +
+    @sizeOf(@TypeOf(conflicts));
+pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;
 
 pub const ParseError = error{
     InvalidGoto,
