@@ -3868,6 +3868,230 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     };
 }
 
+pub fn logicalDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !binder.LogicalSqlPlan {
+    try validateGeneratedDdlAstSpans(tokens, ast);
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return switch (ast.kind) {
+        .create_table => blk: {
+            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
+                if (identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options)) |identity| {
+                    break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = identity } };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => pos = 0,
+                    else => return err,
+                }
+            }
+            break :blk .{ .table_ddl = .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) } };
+        },
+        .create_view,
+        .alter_view,
+        .drop_view,
+        => blk: {
+            try validateGeneratedViewDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .table = .view_catalog });
+        },
+        .create_materialized_view,
+        .drop_materialized_view,
+        .refresh_materialized_view,
+        => blk: {
+            try validateGeneratedMaterializedViewDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .table = .materialized_view_catalog });
+        },
+        .create_domain,
+        .alter_domain,
+        .drop_domain,
+        => blk: {
+            try validateGeneratedDomainDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .domain_catalog });
+        },
+        .create_sequence,
+        .alter_sequence,
+        .drop_sequence,
+        => blk: {
+            try validateGeneratedSequenceDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .sequence_catalog });
+        },
+        .create_enum_type,
+        .alter_enum_type,
+        .drop_enum_type,
+        => blk: {
+            try validateGeneratedEnumTypeDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .enum_type_catalog });
+        },
+        .create_tablespace,
+        .alter_tablespace,
+        .drop_tablespace,
+        => blk: {
+            try validateGeneratedTablespaceDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .tablespace_catalog });
+        },
+        .create_publication,
+        .alter_publication,
+        .drop_publication,
+        .create_subscription,
+        .alter_subscription,
+        .drop_subscription,
+        => blk: {
+            try validateGeneratedLogicalReplicationDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .logical_replication });
+        },
+        .create_policy,
+        .alter_policy,
+        .drop_policy,
+        => blk: {
+            try validateGeneratedRowSecurityPolicyDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .row_security_catalog });
+        },
+        .create_function,
+        .create_procedure,
+        .drop_function,
+        .drop_procedure,
+        => blk: {
+            try validateGeneratedRoutineDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .routine = .function_catalog });
+        },
+        .create_role,
+        .alter_role,
+        .drop_role,
+        => blk: {
+            try validateGeneratedRoleDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog });
+        },
+        .create_collation,
+        .alter_collation,
+        .drop_collation,
+        .create_operator,
+        .drop_operator,
+        .create_aggregate,
+        .drop_aggregate,
+        .create_cast,
+        .drop_cast,
+        => blk: {
+            try validateGeneratedTypeSystemDdlAst(tokens, ast);
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .type_system_catalog });
+        },
+        .create_index => .{ .table_ddl = .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) } },
+        .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
+            .{ .auth = .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } }
+        else
+            .{ .table_ddl = .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) } },
+        .drop_table => .{ .table_ddl = .{ .drop_table = try dropTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .drop_index => .{ .table_ddl = .{ .drop_index = try dropIndexPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .create_database,
+        .create_schema,
+        .create_extension,
+        .alter_database,
+        .alter_extension,
+        .alter_schema,
+        .drop_database,
+        .drop_schema,
+        .drop_extension,
+        => try simpleLogicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+const GeneratedLogicalPlanExpectation = union(enum) {
+    table: std.meta.Tag(binder.TableDdlLogicalPlan),
+    catalog: std.meta.Tag(binder.CatalogDdlLogicalPlan),
+    routine: std.meta.Tag(binder.RoutineLogicalPlan),
+    auth: std.meta.Tag(binder.AuthorizationLogicalPlan),
+    transaction: std.meta.Tag(binder.TransactionLogicalPlan),
+    maintenance: std.meta.Tag(MaintenanceJobPlan),
+    notification: std.meta.Tag(NotificationChannelPlan),
+    bulk_io,
+    other: std.meta.Tag(binder.OtherDdlLogicalPlan),
+    extension,
+};
+
+fn parseGeneratedLogicalDdlPlanExpectAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    options: DdlPlanParserOptions,
+    expectation: GeneratedLogicalPlanExpectation,
+) !binder.LogicalSqlPlan {
+    var pos: usize = 0;
+    var plan = try parseLogicalDdlPlanTokensAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedLogicalPlanExpectation(plan, expectation);
+    return plan;
+}
+
+fn validateGeneratedLogicalPlanExpectation(
+    plan: binder.LogicalSqlPlan,
+    expectation: GeneratedLogicalPlanExpectation,
+) !void {
+    switch (expectation) {
+        .table => |tag| switch (plan) {
+            .table_ddl => |table| if (std.meta.activeTag(table) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .catalog => |tag| switch (plan) {
+            .catalog_ddl => |catalog| if (std.meta.activeTag(catalog) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .routine => |tag| switch (plan) {
+            .routine => |routine| if (std.meta.activeTag(routine) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .auth => |tag| switch (plan) {
+            .auth => |auth| if (std.meta.activeTag(auth) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .transaction => |tag| switch (plan) {
+            .transaction => |transaction| if (std.meta.activeTag(transaction) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .maintenance => |tag| switch (plan) {
+            .maintenance => |maintenance| if (std.meta.activeTag(maintenance) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .notification => |tag| switch (plan) {
+            .notification => |notification| if (std.meta.activeTag(notification) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .bulk_io => switch (plan) {
+            .bulk_io => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        .other => |tag| switch (plan) {
+            .other_ddl => |other| if (std.meta.activeTag(other) != tag) return error.UnsupportedSqlShape,
+            else => return error.UnsupportedSqlShape,
+        },
+        .extension => switch (plan) {
+            .extension => {},
+            else => return error.UnsupportedSqlShape,
+        },
+    }
+}
+
+fn simpleLogicalDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !binder.LogicalSqlPlan {
+    try validateGeneratedDdlAstSpans(tokens, ast);
+    return switch (ast.kind) {
+        .create_database => .{ .catalog_ddl = .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .create_schema => .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .create_extension => .{ .extension = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .alter_database => .{ .catalog_ddl = .{ .database_catalog = .{ .alter = try alterDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .alter_extension => .{ .extension = .{ .update = try updateExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .alter_schema => .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .rename = try renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .drop_database => .{ .catalog_ddl = .{ .database_catalog = .{ .drop = try dropDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .drop_schema => .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .drop = try dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
+        .drop_extension => .{ .extension = .{ .drop = try dropExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
 fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
     return switch (ast.kind) {
         .create_database,
@@ -5025,6 +5249,27 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     return plan;
 }
 
+pub fn graphLogicalDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !binder.LogicalSqlPlan {
+    try validateGeneratedGraphAstSpans(tokens, ast);
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    var create_index: CreateIndexPlan = switch (ast.kind) {
+        .create_index => if (ast.edge_tokens != null or ast.extraction_enrichment_tokens != null)
+            try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
+        else
+            try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos),
+        .create_metric => try createGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast),
+        .alter_metric => try alterGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast),
+    };
+    errdefer create_index.deinit(alloc);
+    try validateGeneratedGraphCreateIndexPlanMatchesAstAlloc(alloc, tokens, ast, create_index);
+    return .{ .table_ddl = .{ .create_index = create_index } };
+}
+
 fn validateGeneratedGraphAstSpans(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlGraphAst,
@@ -5474,6 +5719,15 @@ fn validateGeneratedGraphPlanMatchesAstAlloc(
         .create_index => |create_index| create_index,
         else => return error.UnsupportedSqlShape,
     };
+    return try validateGeneratedGraphCreateIndexPlanMatchesAstAlloc(alloc, tokens, ast, create_index);
+}
+
+fn validateGeneratedGraphCreateIndexPlanMatchesAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+    create_index: CreateIndexPlan,
+) !void {
     switch (ast.kind) {
         .create_index => {
             if (create_index.method != .antfly_graph) return error.UnsupportedSqlShape;
@@ -12037,6 +12291,183 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     return plan;
 }
 
+fn logicalDdlPlanFromGeneratedUnsupportedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+    boundary: GeneratedUnsupportedCatalogBoundary,
+    options: DdlPlanParserOptions,
+) !binder.LogicalSqlPlan {
+    try validateGeneratedUnsupportedCatalogAst(tokens, ast, boundary);
+    const start_pos = pos.*;
+    var plan = parseLogicalDdlPlanTokensAlloc(alloc, tokens, pos, options) catch |err| {
+        pos.* = start_pos;
+        return err;
+    };
+    errdefer {
+        plan.deinit(alloc);
+        pos.* = start_pos;
+    }
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedUnsupportedLogicalPlan(plan, boundary);
+    return plan;
+}
+
+fn validateGeneratedUnsupportedLogicalPlan(
+    plan: binder.LogicalSqlPlan,
+    boundary: GeneratedUnsupportedCatalogBoundary,
+) !void {
+    switch (boundary.family) {
+        .authorization => switch (boundary.kind) {
+            .grant => switch (plan) {
+                .auth => |auth| switch (auth) {
+                    .authorization_catalog => |catalog| switch (catalog) {
+                        .grant_privilege => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .revoke => switch (plan) {
+                .auth => |auth| switch (auth) {
+                    .authorization_catalog => |catalog| switch (catalog) {
+                        .revoke_privilege => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .bulk_io => switch (boundary.kind) {
+            .copy => switch (plan) {
+                .bulk_io => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .comment => switch (boundary.kind) {
+            .comment => switch (plan) {
+                .catalog_ddl => |catalog| switch (catalog) {
+                    .comment_metadata => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .logical_replication => switch (boundary.kind) {
+            .alter_publication => try validateLogicalReplicationPlanKind(plan, .publication, .alter),
+            .alter_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .alter),
+            .create_publication => try validateLogicalReplicationPlanKind(plan, .publication, .create),
+            .create_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .create),
+            .drop_publication => try validateLogicalReplicationPlanKind(plan, .publication, .drop),
+            .drop_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .drop),
+            else => return error.UnsupportedSqlShape,
+        },
+        .maintenance => switch (boundary.kind) {
+            .analyze => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .analyze }),
+            .cluster => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .cluster }),
+            .reindex => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .reindex }),
+            .vacuum => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .vacuum }),
+            else => return error.UnsupportedSqlShape,
+        },
+        .notification => switch (boundary.kind) {
+            .listen => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .listen }),
+            .notify => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .notify }),
+            .unlisten => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .unlisten }),
+            else => return error.UnsupportedSqlShape,
+        },
+        .procedure_call => switch (boundary.kind) {
+            .call => try validateGeneratedLogicalPlanExpectation(plan, .{ .routine = .procedure_call }),
+            else => return error.UnsupportedSqlShape,
+        },
+        .transaction_control => switch (boundary.kind) {
+            .lock => switch (plan) {
+                .transaction => |transaction| switch (transaction) {
+                    .control => |control| switch (control) {
+                        .table_lock => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .update_policy_trigger => switch (boundary.kind) {
+            .create_trigger => try validateGeneratedLogicalPlanExpectation(plan, .{ .table = .create_update_policy }),
+            .drop_trigger => switch (plan) {
+                .table_ddl => |table| switch (table) {
+                    .alter_table => |alter| {
+                        if (alter.operations.len != 1) return error.UnsupportedSqlShape;
+                        switch (alter.operations[0]) {
+                            .drop_update_policy => {},
+                            else => return error.UnsupportedSqlShape,
+                        }
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+    }
+}
+
+fn validateLogicalReplicationPlanKind(
+    plan: binder.LogicalSqlPlan,
+    expected_family: enum { publication, subscription },
+    expected_action: enum { create, alter, drop },
+) !void {
+    const logical_replication = switch (plan) {
+        .catalog_ddl => |catalog| switch (catalog) {
+            .logical_replication => |logical| logical,
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    };
+    switch (expected_family) {
+        .publication => switch (logical_replication) {
+            .publication => |publication| switch (expected_action) {
+                .create => switch (publication) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                .alter => switch (publication) {
+                    .alter => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                .drop => switch (publication) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .subscription => switch (logical_replication) {
+            .subscription => |subscription| switch (expected_action) {
+                .create => switch (subscription) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                .alter => switch (subscription) {
+                    .alter => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                .drop => switch (subscription) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+    }
+}
+
 pub fn lowerDdlPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -12132,185 +12563,27 @@ pub fn planGeneratedLogicalDdlAstAlloc(
         .cursor => |cursor_ast| return .{ .cursor = try cursorPortalLogicalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast) },
         .ddl, .extension_index => |ddl_ast| {
             if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
-                var lowered = try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
-                return logicalPlanFromLoweredDdlPlan(&lowered);
+                return try logicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
             }
         },
-        .graph => |graph_ast| {
-            var lowered = try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast);
-            return logicalPlanFromLoweredDdlPlan(&lowered);
-        },
+        .graph => |graph_ast| return try graphLogicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
         .unsupported => |unsupported_ast| {
             if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
                 if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
                     return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } };
                 }
-                var lowered = catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
+                return logicalDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
                     error.UnsupportedSqlShape => switch (boundary.family) {
                         .update_policy_trigger => return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } },
                         else => return err,
                     },
                     else => return err,
                 };
-                return logicalPlanFromLoweredDdlPlan(&lowered);
             }
         },
         .dml, .read => {},
     }
     return null;
-}
-
-fn logicalPlanFromLoweredDdlPlan(plan: *LoweredDdlPlan) binder.LogicalSqlPlan {
-    return switch (plan.*) {
-        .adapter_noop => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .other_ddl = .{ .adapter_noop = payload } };
-        },
-        .session_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .session = payload };
-        },
-        .transaction_control => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .transaction = .{ .control = payload } };
-        },
-        .prepared_transaction => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .transaction = .{ .prepared = payload } };
-        },
-        .savepoint_transaction => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .transaction = .{ .savepoint = payload } };
-        },
-        .prepared_statement => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .prepared_statement = payload };
-        },
-        .cursor_portal => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .cursor = payload };
-        },
-        .notification_channel => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .notification = payload };
-        },
-        .function_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .routine = .{ .function_catalog = payload } };
-        },
-        .trigger_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .routine = .{ .trigger_catalog = payload } };
-        },
-        .procedure_call => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .routine = .{ .procedure_call = payload } };
-        },
-        .authorization_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .auth = .{ .authorization_catalog = payload } };
-        },
-        .row_security_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .auth = .{ .row_security_catalog = payload } };
-        },
-        .extension_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .extension = payload };
-        },
-        .maintenance_job => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .maintenance = payload };
-        },
-        .bulk_io => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .bulk_io = payload };
-        },
-        .create_table => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .create_table = payload } };
-        },
-        .table_clone => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .table_clone = payload } };
-        },
-        .view_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .view_catalog = payload } };
-        },
-        .materialized_view_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .materialized_view_catalog = payload } };
-        },
-        .relation_lifetime => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .relation_lifetime = payload } };
-        },
-        .table_partition_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .table_partition_catalog = payload } };
-        },
-        .create_index => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .create_index = payload } };
-        },
-        .drop_index => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .drop_index = payload } };
-        },
-        .drop_table => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .drop_table = payload } };
-        },
-        .alter_table => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .alter_table = payload } };
-        },
-        .create_update_policy => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .table_ddl = .{ .create_update_policy = payload } };
-        },
-        .enum_type_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .enum_type_catalog = payload } };
-        },
-        .domain_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .domain_catalog = payload } };
-        },
-        .sequence_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .sequence_catalog = payload } };
-        },
-        .identity_allocator_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = payload } };
-        },
-        .schema_namespace_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .schema_namespace_catalog = payload } };
-        },
-        .database_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .database_catalog = payload } };
-        },
-        .tablespace_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .tablespace_catalog = payload } };
-        },
-        .logical_replication => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .logical_replication = payload } };
-        },
-        .type_system_catalog => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .type_system_catalog = payload } };
-        },
-        .comment_metadata => |payload| blk: {
-            plan.* = undefined;
-            break :blk .{ .catalog_ddl = .{ .comment_metadata = payload } };
-        },
-    };
 }
 
 const RoutineTriggerParser = struct {

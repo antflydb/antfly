@@ -4204,8 +4204,9 @@ pub fn parseArrayOverlapIntoAccessBranchesAlloc(
         pos.* = saved_pos;
         return false;
     };
+    const operator_token_index = pos.*;
     _ = parser.matchToken(tokens, pos, .range_overlap);
-    try validateGeneratedExpressionPredicateKind(generated_expression_ast, .overlaps);
+    try validateGeneratedSingleOperatorPredicateExpression(generated_expression_ast, .overlaps, tokens, operator_token_index);
     const values_json = try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params);
     defer alloc.free(values_json);
     try value_mod.validateSqlArrayValueJson(alloc, column, values_json);
@@ -25464,6 +25465,33 @@ fn betweenModifierTokenIndex(tokens: []const Token, index: usize) ?usize {
     return null;
 }
 
+fn validateGeneratedSingleOperatorPredicateExpression(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+    tokens: []const Token,
+    operator_token_index: usize,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
+    if (expression.negation_tokens != null or
+        expression.quantifier_tokens != null or
+        expression.between_modifier_tokens != null or
+        expression.between_modifier != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedSetOrBetweenPredicateExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
     expected_kind: generated_parser.GeneratedSqlExpressionKind,
@@ -25653,7 +25681,7 @@ pub fn parseWhereAtomAlloc(
         defer alloc.free(period_field);
         if (binder.relationalPeriodForDdl(schema.periods, period_field)) |period| {
             if (parser.matchToken(tokens, pos, .at_contains) != null) {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, .contains);
+                try validateGeneratedSingleOperatorPredicateExpression(generated_expression_ast, .contains, tokens, pos.* - 1);
                 if (negated) return error.UnsupportedSqlShape;
                 const start_column = binder.relationalColumnForField(schema, period.start_column, null) orelse return error.InvalidSqlCatalog;
                 const end_column = binder.relationalColumnForField(schema, period.end_column, null) orelse return error.InvalidSqlCatalog;
@@ -25665,7 +25693,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             }
             if (parser.matchToken(tokens, pos, .range_overlap) != null) {
-                try validateGeneratedExpressionPredicateKind(generated_expression_ast, .overlaps);
+                try validateGeneratedSingleOperatorPredicateExpression(generated_expression_ast, .overlaps, tokens, pos.* - 1);
                 if (negated) return error.UnsupportedSqlShape;
                 const range = try parseSqlPeriodRangeValuePairAlloc(alloc, tokens, pos, params, schema, period, realtime_ns);
                 defer freePeriodRangeValuePair(alloc, range);
@@ -25708,7 +25736,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .at_contains) != null) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .contains);
+        try validateGeneratedSingleOperatorPredicateExpression(generated_expression_ast, .contains, tokens, pos.* - 1);
         const column = maybe_column orelse return error.InvalidSqlCatalog;
         const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
         var value_transferred = false;
@@ -25733,7 +25761,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .question) != null) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .json_key_exists);
+        try validateGeneratedSingleOperatorPredicateExpression(generated_expression_ast, .json_key_exists, tokens, pos.* - 1);
         if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
         const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
         var path_transferred = false;
@@ -26044,7 +26072,7 @@ pub fn parseJoinWhereAlloc(
         const target_expression_or_predicates = if (side == .left) targets.left_expression_or_predicates else targets.right_expression_or_predicates;
 
         if (parser.matchToken(tokens, pos, .at_contains) != null) {
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .contains);
+            try validateGeneratedSingleOperatorPredicateExpression(generated_atom_expression, .contains, tokens, pos.* - 1);
             const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
@@ -26064,7 +26092,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
-            try validateGeneratedExpressionPredicateKind(generated_atom_expression, .json_key_exists);
+            try validateGeneratedSingleOperatorPredicateExpression(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
             if (column.field_type != .json) return error.InvalidSqlCatalog;
             const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
             var path_transferred = false;
@@ -38981,6 +39009,26 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedSetOrBetweenPredicateExpression(&between_expression, .between, &between_tokens, 1, null, null),
+    );
+    const contains_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .at_contains, .text = "@>" },
+        .{ .kind = .string, .text = "{\"status\":\"active\"}" },
+    };
+    const contains_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .contains,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+        .right_tokens = .{ .start = 2, .end = 3 },
+    };
+    try validateGeneratedSingleOperatorPredicateExpression(&contains_expression, .contains, &contains_tokens, 1);
+    const stale_contains_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .range_overlap, .text = "&&" },
+        .{ .kind = .string, .text = "{\"status\":\"active\"}" },
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedSingleOperatorPredicateExpression(&contains_expression, .contains, &stale_contains_tokens, 1),
     );
     const json_key_set_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },

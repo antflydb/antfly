@@ -1037,6 +1037,8 @@ contract until storage and API row plans grow those outer-join semantics.
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates; generated
    `IN`/`BETWEEN` predicate metadata must now agree with exact operator,
    optional `NOT`, and optional `SYMMETRIC`/`ASYMMETRIC` token payloads;
+   direct generated containment, overlap, and JSON-key predicate metadata
+   must now agree with exact `@>`, `&&`, and `?` operator tokens;
    generated regex
    predicate metadata must now agree with the exact `~`/`~*`/`!~`/`!~*`
    operator token, and generated pattern predicate metadata must agree with
