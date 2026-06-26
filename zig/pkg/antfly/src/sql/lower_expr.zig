@@ -466,6 +466,159 @@ fn generatedExpressionKindUsesOperatorPayload(kind: generated_parser.GeneratedSq
     };
 }
 
+fn generatedTokenKindIsComparisonOperator(kind: TokenKind) bool {
+    return switch (kind) {
+        .eq, .neq, .lt, .lte, .gt, .gte => true,
+        else => false,
+    };
+}
+
+fn validateGeneratedExpressionOperatorTokens(
+    tokens: []const Token,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const first = tokens[operator_tokens.start];
+    switch (kind) {
+        .comparison, .quantified_comparison => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !generatedTokenKindIsComparisonOperator(first.kind)) return error.UnsupportedSqlShape;
+        },
+        .like, .not_like => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.like)) return error.UnsupportedSqlShape;
+        },
+        .ilike, .not_ilike => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.ilike)) return error.UnsupportedSqlShape;
+        },
+        .in_list, .not_in_list => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.in)) return error.UnsupportedSqlShape;
+        },
+        .between, .not_between => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.between)) return error.UnsupportedSqlShape;
+        },
+        .exists_subquery, .not_exists_subquery => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.exists)) return error.UnsupportedSqlShape;
+        },
+        .is_null, .is_not_null, .is_true, .is_false, .is_unknown, .is_not_true, .is_not_false, .is_not_unknown => {
+            if (operator_tokens.end == operator_tokens.start + 1) {
+                if (kind == .is_null) {
+                    if (!first.matchesKeywordTag(.isnull)) return error.UnsupportedSqlShape;
+                } else if (kind == .is_not_null) {
+                    if (!first.matchesKeywordTag(.notnull)) return error.UnsupportedSqlShape;
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            } else if (operator_tokens.end == operator_tokens.start + 2) {
+                if (!first.matchesKeywordTag(.is)) return error.UnsupportedSqlShape;
+                switch (kind) {
+                    .is_null => if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.null)) return error.UnsupportedSqlShape,
+                    .is_true => if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.true)) return error.UnsupportedSqlShape,
+                    .is_false => if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.false)) return error.UnsupportedSqlShape,
+                    .is_unknown => if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.unknown)) return error.UnsupportedSqlShape,
+                    else => return error.UnsupportedSqlShape,
+                }
+            } else if (operator_tokens.end == operator_tokens.start + 3) {
+                if (!first.matchesKeywordTag(.is) or !tokens[operator_tokens.start + 1].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+                switch (kind) {
+                    .is_not_null => if (!tokens[operator_tokens.start + 2].matchesKeywordTag(.null)) return error.UnsupportedSqlShape,
+                    .is_not_true => if (!tokens[operator_tokens.start + 2].matchesKeywordTag(.true)) return error.UnsupportedSqlShape,
+                    .is_not_false => if (!tokens[operator_tokens.start + 2].matchesKeywordTag(.false)) return error.UnsupportedSqlShape,
+                    .is_not_unknown => if (!tokens[operator_tokens.start + 2].matchesKeywordTag(.unknown)) return error.UnsupportedSqlShape,
+                    else => return error.UnsupportedSqlShape,
+                }
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .is_distinct_from => {
+            if (operator_tokens.end != operator_tokens.start + 3 or
+                !first.matchesKeywordTag(.is) or
+                !tokens[operator_tokens.start + 1].matchesKeywordTag(.distinct) or
+                !tokens[operator_tokens.start + 2].matchesKeywordTag(.from))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .is_not_distinct_from => {
+            if (operator_tokens.end != operator_tokens.start + 4 or
+                !first.matchesKeywordTag(.is) or
+                !tokens[operator_tokens.start + 1].matchesKeywordTag(.not) or
+                !tokens[operator_tokens.start + 2].matchesKeywordTag(.distinct) or
+                !tokens[operator_tokens.start + 3].matchesKeywordTag(.from))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .logical_or => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.@"or")) return error.UnsupportedSqlShape;
+        },
+        .logical_and => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.@"and")) return error.UnsupportedSqlShape;
+        },
+        .logical_not => {
+            if (operator_tokens.end != operator_tokens.start + 1 or !first.matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+        },
+        .unary_positive, .additive => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .plus) return error.UnsupportedSqlShape;
+        },
+        .unary_negative, .subtractive => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .minus) return error.UnsupportedSqlShape;
+        },
+        .multiplicative => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .star) return error.UnsupportedSqlShape;
+        },
+        .divisive => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .slash) return error.UnsupportedSqlShape;
+        },
+        .modulo => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .percent) return error.UnsupportedSqlShape;
+        },
+        .contains => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .at_contains) return error.UnsupportedSqlShape;
+        },
+        .overlaps => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .range_overlap) return error.UnsupportedSqlShape;
+        },
+        .json_key_exists => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .question) return error.UnsupportedSqlShape;
+        },
+        .json_key_any => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .question_any) return error.UnsupportedSqlShape;
+        },
+        .json_key_all => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .question_all) return error.UnsupportedSqlShape;
+        },
+        .regex_match => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .regex_match) return error.UnsupportedSqlShape;
+        },
+        .regex_imatch => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .regex_imatch) return error.UnsupportedSqlShape;
+        },
+        .regex_not_match => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .regex_not_match) return error.UnsupportedSqlShape;
+        },
+        .regex_not_imatch => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .regex_not_imatch) return error.UnsupportedSqlShape;
+        },
+        .string_concat => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .pipe_concat) return error.UnsupportedSqlShape;
+        },
+        .json_access => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .arrow_json) return error.UnsupportedSqlShape;
+        },
+        .json_text_access => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .arrow_text) return error.UnsupportedSqlShape;
+        },
+        .json_path_access => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .path_arrow_json) return error.UnsupportedSqlShape;
+        },
+        .json_path_text_access => {
+            if (operator_tokens.end != operator_tokens.start + 1 or first.kind != .path_arrow_text) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 fn validateGeneratedExpressionFamilyPayloads(
     tokens: []const Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
@@ -622,6 +775,7 @@ fn validateGeneratedExpressionFamilyPayloads(
     if (generatedExpressionKindUsesOperatorPayload(expression.kind)) {
         const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
         if (operator_tokens.start < expression_tokens.start or operator_tokens.end > expression_tokens.end or operator_tokens.start >= operator_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionOperatorTokens(tokens, expression.kind, operator_tokens);
         if (expression.negation_tokens) |negation_tokens| {
             if (negation_tokens.start < expression_tokens.start or negation_tokens.end > expression_tokens.end or negation_tokens.start >= negation_tokens.end) return error.UnsupportedSqlShape;
         }
@@ -28804,6 +28958,20 @@ test "sql adapter lower expr lowers numeric function projections" {
     try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ceil, lowered.plan.query.order_by[0].expression.?.kind);
 
+    var malformed_generated_operator = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT amount - floor AS amount_distance FROM invoices WHERE floor(amount - floor) > $1",
+    );
+    defer malformed_generated_operator.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionOperatorToLeftOperand(&malformed_generated_operator);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_operator,
+        schema,
+        &.{.{ .integer = 10 }},
+        .{},
+    ));
+
     var null_first = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT greatest(NULL, amount, 0) AS max_amount FROM invoices WHERE id = $1",
@@ -31377,6 +31545,25 @@ fn corruptGeneratedReadFirstProjectionStaleOperatorTokens(parsed_sql: *tokenized
                     if (read.projection_items.expressions[0].operator_tokens != null) return error.TestUnexpectedResult;
                     read.projection_items.expressions[0].operator_tokens = tokens;
                     return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionOperatorToLeftOperand(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.operator_tokens == null or expression.left_tokens == null) continue;
+                        expression.operator_tokens = expression.left_tokens;
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
                 },
                 else => return error.TestUnexpectedResult,
             }
