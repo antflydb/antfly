@@ -1256,6 +1256,7 @@ fn parseStatement(
                 return .{ .unknown = raw_statement },
             .cursor => |kind| return .{ .unsupported = .{ .kind = generatedCursorUnsupportedKind(kind), .raw = raw_statement } },
             .unsupported => |kind| {
+                if (!generatedUnsupportedAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind)) return .{ .unknown = raw_statement };
                 if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
                 if (kind == .explain) return .{ .explain = parseGeneratedExplainStatement(raw_statement, tokenized_sql.items(), generated_raw) };
                 return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } };
@@ -1429,6 +1430,45 @@ fn generatedGraphStatementEnd(tokens: []const Token, statement_span: SourceSpan)
     if (tokens[0].sourceSpan().start != statement_span.start) return null;
     if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
     return end;
+}
+
+fn generatedUnsupportedAstHasValidClassificationPayload(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+    expected_kind: generated_parser.GeneratedSqlUnsupportedKind,
+) bool {
+    const ast_value = generated_raw.ast orelse return false;
+    const unsupported_ast = switch (ast_value) {
+        .unsupported => |unsupported| unsupported,
+        else => return false,
+    };
+    if (unsupported_ast.kind != expected_kind) return false;
+    const end = generatedUnsupportedStatementEnd(tokens, unsupported_ast.statement_span) orelse return false;
+    if (!std.meta.eql(unsupported_ast.command_span, tokens[0].sourceSpan())) return false;
+    if (!generatedUnsupportedOptionalTokenRangeIsValid(tokens, end, unsupported_ast.subject_tokens)) return false;
+    if (!generatedUnsupportedOptionalTokenRangeIsValid(tokens, end, unsupported_ast.explain_options_tokens)) return false;
+    return true;
+}
+
+fn generatedUnsupportedStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) {
+        end -= 1;
+    }
+    if (end == 0) return null;
+    if (tokens[0].sourceSpan().start != statement_span.start) return null;
+    if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
+    return end;
+}
+
+fn generatedUnsupportedOptionalTokenRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
+    return true;
 }
 
 fn generatedCursorUnsupportedKind(kind: generated_parser.GeneratedSqlCursorKind) generated_parser.GeneratedSqlUnsupportedKind {
@@ -4434,6 +4474,34 @@ test "sql adapter parsed sql rejects malformed generated DDL classification payl
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(graph_metric.raw_statement, malformed_graph_span, &graph_metric.tokenized_sql)),
+    );
+
+    var unsupported_copy = try ParsedSql.initAlloc(alloc, "COPY usage_records FROM STDIN");
+    defer unsupported_copy.deinit(alloc);
+    var mismatched_unsupported_kind = unsupported_copy.generated_statement.?;
+    if (mismatched_unsupported_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.kind = .vacuum,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, mismatched_unsupported_kind, &unsupported_copy.tokenized_sql)),
+    );
+
+    var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN (FORMAT JSON) SELECT id FROM usage_records");
+    defer explain.deinit(alloc);
+    var malformed_explain_options = explain.generated_statement.?;
+    if (malformed_explain_options.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.explain_options_tokens = .{ .start = 1, .end = explain.items().len + 1 },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(explain.raw_statement, malformed_explain_options, &explain.tokenized_sql)),
     );
 }
 

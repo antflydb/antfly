@@ -531,7 +531,10 @@ statements and fail closed before legacy DDL probing. Generated unsupported
 heads that already have typed catalog/runtime support now enter the parsed DDL
 family directly and are accepted only through the validated generated
 unsupported boundary. Recognized generated-owned unsupported heads now require
-generated parser success at SQL ingress, including incomplete routine,
+retained unsupported AST kind, statement/command span, subject-range, and
+`EXPLAIN` option-range validation before publishing unsupported, explain, or
+DDL-family parsed statements, and generated parser success at SQL ingress,
+including incomplete routine,
 transform, text-search, and foreign-schema forms, so grammar regressions cannot
 silently re-enter the legacy DDL classifier. Generated trigger DDL uses a tighter subject span that
 starts after the `TRIGGER` command keyword, so `CREATE TRIGGER` and
