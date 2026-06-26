@@ -1537,6 +1537,11 @@ fn generatedGraphAstHasValidClassificationPayload(
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.source_name_tokens)) return false;
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.algorithm_tokens)) return false;
     if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.option_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_source_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_target_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_type_tokens)) return false;
+    if (!generatedGraphOptionalTokenRangeIsValid(tokens, end, graph_ast.edge_weight_tokens)) return false;
     return generatedGraphRequiredPayloadIsValid(tokens, end, graph_ast);
 }
 
@@ -1575,8 +1580,13 @@ fn generatedGraphRequiredPayloadIsValid(
             if (!std.meta.eql(graph_ast.object_name_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 })) return false;
             const source = graph_ast.source_name_tokens orelse return false;
             if (source.start == 0 or source.end > end or !tokens[source.start - 1].matchesKeywordTag(.on)) return false;
-            if (!generatedGraphOptionsFollow(end, source.end, graph_ast.option_tokens)) return false;
-            return true;
+            if (graph_ast.kind == .create_metric) return generatedGraphOptionsFollow(end, source.end, graph_ast.option_tokens) and
+                graph_ast.edge_tokens == null and
+                graph_ast.edge_source_tokens == null and
+                graph_ast.edge_target_tokens == null and
+                graph_ast.edge_type_tokens == null and
+                graph_ast.edge_weight_tokens == null;
+            return generatedGraphIndexEdgePayloadIsValid(tokens, end, source.end, graph_ast);
         },
         .alter_metric => {
             if (end < 8) return false;
@@ -1591,6 +1601,58 @@ fn generatedGraphRequiredPayloadIsValid(
             return true;
         },
     };
+}
+
+fn generatedGraphIndexEdgePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    source_end: usize,
+    graph_ast: generated_parser.GeneratedSqlGraphAst,
+) bool {
+    const edge = graph_ast.edge_tokens orelse {
+        return graph_ast.edge_source_tokens == null and
+            graph_ast.edge_target_tokens == null and
+            graph_ast.edge_type_tokens == null and
+            graph_ast.edge_weight_tokens == null;
+    };
+    if (edge.start != source_end or edge.end > end or edge.start + 4 > edge.end) return false;
+    if (!tokens[edge.start].matchesKeyword("edge") or tokens[edge.start + 1].kind != .lparen or tokens[edge.end - 1].kind != .rparen) return false;
+    const source = graph_ast.edge_source_tokens orelse return false;
+    const target = graph_ast.edge_target_tokens orelse return false;
+    if (source.start != edge.start + 2 or source.end >= target.start) return false;
+    if (target.end != edge.end - 1 or target.start == 0 or tokens[target.start - 1].kind != .arrow_json) return false;
+    if (!generatedGraphNestedRangeIsValid(edge, source) or !generatedGraphNestedRangeIsValid(edge, target)) return false;
+    if (!generatedGraphOptionalTailFieldIsValid(edge.end, end, graph_ast.edge_type_tokens)) return false;
+    if (!generatedGraphOptionalTailFieldIsValid(edge.end, end, graph_ast.edge_weight_tokens)) return false;
+    const tail_end = generatedGraphIndexTailEnd(edge.end, graph_ast.edge_type_tokens, graph_ast.edge_weight_tokens);
+    return generatedGraphOptionsFollow(end, tail_end, graph_ast.option_tokens);
+}
+
+fn generatedGraphNestedRangeIsValid(
+    outer: generated_parser.GeneratedSqlTokenRange,
+    inner: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return inner.start >= outer.start and inner.start < inner.end and inner.end <= outer.end;
+}
+
+fn generatedGraphOptionalTailFieldIsValid(
+    min_start: usize,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return value.start >= min_start and value.start < value.end and value.end <= end;
+    return true;
+}
+
+fn generatedGraphIndexTailEnd(
+    edge_end: usize,
+    type_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    weight_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) usize {
+    var tail_end = edge_end;
+    if (type_tokens) |value| tail_end = @max(tail_end, value.end);
+    if (weight_tokens) |value| tail_end = @max(tail_end, value.end);
+    return tail_end;
 }
 
 fn generatedGraphOptionsFollow(
@@ -6276,7 +6338,15 @@ test "sql adapter parsed sql retains generated graph nodes as DDL" {
                 try std.testing.expectEqual(case.generated, graph_ast.kind);
                 try std.testing.expect(graph_ast.object_name_tokens != null);
                 switch (case.generated) {
-                    .create_index, .create_metric => try std.testing.expect(graph_ast.source_name_tokens != null),
+                    .create_index => {
+                        try std.testing.expect(graph_ast.source_name_tokens != null);
+                        if (std.mem.indexOf(u8, case.sql, " EDGE ") != null) {
+                            try std.testing.expect(graph_ast.edge_tokens != null);
+                            try std.testing.expect(graph_ast.edge_source_tokens != null);
+                            try std.testing.expect(graph_ast.edge_target_tokens != null);
+                        }
+                    },
+                    .create_metric => try std.testing.expect(graph_ast.source_name_tokens != null),
                     .alter_metric => {
                         try std.testing.expect(graph_ast.source_name_tokens != null);
                         try std.testing.expect(graph_ast.algorithm_tokens != null);

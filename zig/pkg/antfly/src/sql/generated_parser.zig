@@ -1770,6 +1770,11 @@ pub const GeneratedSqlGraphAst = struct {
     source_name_tokens: ?GeneratedSqlTokenRange = null,
     algorithm_tokens: ?GeneratedSqlTokenRange = null,
     option_tokens: ?GeneratedSqlTokenRange = null,
+    edge_tokens: ?GeneratedSqlTokenRange = null,
+    edge_source_tokens: ?GeneratedSqlTokenRange = null,
+    edge_target_tokens: ?GeneratedSqlTokenRange = null,
+    edge_type_tokens: ?GeneratedSqlTokenRange = null,
+    edge_weight_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlUnsupportedAst = struct {
@@ -3456,7 +3461,11 @@ fn buildGraphAst(
             if (findKeyword(tokens, 4, end, .on)) |on_index| {
                 ast.source_name_tokens = generatedQualifiedNameRange(tokens, on_index + 1, end);
                 if (ast.source_name_tokens) |source| {
-                    if (source.end < end) ast.option_tokens = .{ .start = source.end, .end = end };
+                    if (kind == .create_index) {
+                        buildGraphIndexEdgeAst(tokens, end, &ast, source.end);
+                    } else if (source.end < end) {
+                        ast.option_tokens = .{ .start = source.end, .end = end };
+                    }
                 }
             }
         },
@@ -3474,6 +3483,88 @@ fn buildGraphAst(
         },
     }
     return ast;
+}
+
+fn buildGraphIndexEdgeAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    ast: *GeneratedSqlGraphAst,
+    start: usize,
+) void {
+    if (start >= end or !tokens[start].matchesKeyword("edge")) return;
+    if (start + 1 >= end or tokens[start + 1].kind != .lparen) return;
+    const close = findMatchingParen(tokens, start + 1, end) orelse return;
+    const arrow = findGraphEdgeArrow(tokens, start + 2, close) orelse return;
+    ast.edge_tokens = .{ .start = start, .end = close + 1 };
+    ast.edge_source_tokens = .{ .start = start + 2, .end = arrow };
+    ast.edge_target_tokens = .{ .start = arrow + 1, .end = close };
+
+    var index = close + 1;
+    while (index < end) {
+        if (tokens[index].matchesKeywordTag(.with)) {
+            ast.option_tokens = .{ .start = index, .end = end };
+            break;
+        }
+        if (tokens[index].matchesKeywordTag(.type)) {
+            if (index + 1 < end) {
+                const value_end = graphIndexFieldTailEnd(tokens, index + 1, end);
+                if (value_end > index + 1) ast.edge_type_tokens = .{ .start = index + 1, .end = value_end };
+                index = value_end;
+                continue;
+            }
+            break;
+        }
+        if (tokens[index].matchesKeywordTag(.weight)) {
+            if (index + 1 < end) {
+                const value_end = graphIndexFieldTailEnd(tokens, index + 1, end);
+                if (value_end > index + 1) ast.edge_weight_tokens = .{ .start = index + 1, .end = value_end };
+                index = value_end;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+}
+
+fn findGraphEdgeArrow(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .arrow_json => if (depth == 0 and index > start) return index,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn graphIndexFieldTailEnd(tokens: []const token_mod.Token, start: usize, end: usize) usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return index;
+                depth -= 1;
+            },
+            .comma, .semicolon => if (depth == 0) return index,
+            else => if (depth == 0 and
+                (tokens[index].matchesKeywordTag(.type) or
+                    tokens[index].matchesKeywordTag(.weight) or
+                    tokens[index].matchesKeywordTag(.with)))
+            {
+                return index;
+            },
+        }
+    }
+    return end;
 }
 
 fn generatedBeginHasModeTail(tokens: []const token_mod.Token, end: usize) bool {
@@ -11313,6 +11404,23 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, graph.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, graph.source_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 12 }, graph.option_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_index_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all')";
+    const graph_index_result = try parseSqlAlloc(alloc, graph_index_sql);
+    switch (graph_index_result.ast.?) {
+        .graph => |graph| {
+            try std.testing.expectEqual(GeneratedSqlGraphKind.create_index, graph.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, graph.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, graph.source_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 12 }, graph.edge_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, graph.edge_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, graph.edge_target_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, graph.edge_type_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, graph.edge_weight_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 22 }, graph.option_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

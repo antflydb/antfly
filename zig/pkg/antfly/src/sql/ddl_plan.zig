@@ -4613,7 +4613,10 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     var plan: LoweredDdlPlan = switch (ast.kind) {
-        .create_index => .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
+        .create_index => .{ .create_index = if (ast.edge_tokens != null)
+            try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
+        else
+            try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
         .create_metric => .{ .create_index = try createGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .alter_metric => .{ .create_index = try alterGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
@@ -4650,7 +4653,12 @@ fn validateGeneratedGraphAstRanges(
             if (!generatedRangeWithinStatement(source_range, end) or source_range.start == 0 or !tokens[source_range.start - 1].matchesKeywordTag(.on)) {
                 return error.UnsupportedSqlShape;
             }
-            try validateGeneratedGraphOptions(end, source_range.end, ast.option_tokens);
+            if (ast.kind == .create_metric) {
+                try validateGeneratedGraphNoEdgePayload(ast);
+                try validateGeneratedGraphOptions(end, source_range.end, ast.option_tokens);
+            } else {
+                try validateGeneratedGraphIndexEdgePayload(tokens, end, source_range.end, ast);
+            }
         },
         .alter_metric => {
             if (end < 8) return error.UnsupportedSqlShape;
@@ -4682,6 +4690,146 @@ fn validateGeneratedGraphOptions(
     } else if (required_end != end) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedGraphNoEdgePayload(ast: generated_parser.GeneratedSqlGraphAst) !void {
+    if (ast.edge_tokens != null or
+        ast.edge_source_tokens != null or
+        ast.edge_target_tokens != null or
+        ast.edge_type_tokens != null or
+        ast.edge_weight_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedGraphIndexEdgePayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    source_end: usize,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !void {
+    const edge = ast.edge_tokens orelse {
+        if (ast.edge_source_tokens != null or
+            ast.edge_target_tokens != null or
+            ast.edge_type_tokens != null or
+            ast.edge_weight_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    };
+    if (edge.start != source_end or edge.end > end or edge.start + 4 > edge.end) return error.UnsupportedSqlShape;
+    if (!tokens[edge.start].matchesKeyword("edge") or tokens[edge.start + 1].kind != .lparen or tokens[edge.end - 1].kind != .rparen) {
+        return error.UnsupportedSqlShape;
+    }
+    const source = ast.edge_source_tokens orelse return error.UnsupportedSqlShape;
+    const target = ast.edge_target_tokens orelse return error.UnsupportedSqlShape;
+    if (source.start != edge.start + 2 or source.end >= target.start) return error.UnsupportedSqlShape;
+    if (target.end != edge.end - 1 or target.start == 0 or tokens[target.start - 1].kind != .arrow_json) return error.UnsupportedSqlShape;
+    try validateGeneratedGraphNestedRange(edge, source);
+    try validateGeneratedGraphNestedRange(edge, target);
+    try validateGeneratedGraphOptionalTailField(edge.end, end, ast.edge_type_tokens);
+    try validateGeneratedGraphOptionalTailField(edge.end, end, ast.edge_weight_tokens);
+    try validateGeneratedGraphOptions(end, generatedGraphIndexTailEnd(edge.end, ast.edge_type_tokens, ast.edge_weight_tokens), ast.option_tokens);
+}
+
+fn validateGeneratedGraphNestedRange(
+    outer: generated_parser.GeneratedSqlTokenRange,
+    inner: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (inner.start < outer.start or inner.start >= inner.end or inner.end > outer.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphOptionalTailField(
+    min_start: usize,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range) |value| {
+        if (value.start < min_start or value.start >= value.end or value.end > end) return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedGraphIndexTailEnd(
+    edge_end: usize,
+    type_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    weight_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) usize {
+    var tail_end = edge_end;
+    if (type_tokens) |value| tail_end = @max(tail_end, value.end);
+    if (weight_tokens) |value| tail_end = @max(tail_end, value.end);
+    return tail_end;
+}
+
+fn createGraphIndexPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !CreateIndexPlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedGraphIndexEdgePayload(tokens, end, (ast.source_name_tokens orelse return error.UnsupportedSqlShape).end, ast);
+
+    const index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var index_transferred = false;
+    errdefer if (!index_transferred) alloc.free(index_name);
+
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.source_name_tokens orelse return error.UnsupportedSqlShape);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    const source_field = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, ast.edge_source_tokens orelse return error.UnsupportedSqlShape);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_field);
+
+    const target_field = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, ast.edge_target_tokens orelse return error.UnsupportedSqlShape);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_field);
+
+    const type_field = if (ast.edge_type_tokens) |range| try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, range) else null;
+    defer if (type_field) |field| alloc.free(field);
+    const weight_field = if (ast.edge_weight_tokens) |range| try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, range) else null;
+    defer if (weight_field) |field| alloc.free(field);
+
+    var pos = if (ast.option_tokens) |range| range.start else generatedGraphIndexTailEnd((ast.edge_tokens orelse return error.UnsupportedSqlShape).end, ast.edge_type_tokens, ast.edge_weight_tokens);
+    const config_json = try graphIndexConfigJsonAlloc(alloc, tokens, &pos, source_field, target_field, type_field, weight_field);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, &pos);
+
+    const columns = try alloc.alloc([]const u8, 2);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) alloc.free(columns);
+    columns[0] = source_field;
+    columns[1] = target_field;
+
+    index_transferred = true;
+    table_transferred = true;
+    source_transferred = true;
+    target_transferred = true;
+    config_transferred = true;
+    columns_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph,
+        .columns = columns,
+        .derived_index_config_json = config_json,
+    };
+}
+
+fn parseGeneratedDerivedIndexFieldPathRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    var pos = range.start;
+    const value = try parseDerivedIndexFieldPathAlloc(alloc, tokens, &pos);
+    errdefer alloc.free(value);
+    if (pos != range.end) return error.UnsupportedSqlShape;
+    return value;
 }
 
 fn createGraphMetricPlanFromGeneratedAstAlloc(
@@ -4782,6 +4930,14 @@ fn validateGeneratedGraphPlanMatchesAstAlloc(
             if (create_index.method != .antfly_graph) return error.UnsupportedSqlShape;
             try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.object_name_tokens, create_index.index_name);
             try validateGeneratedGraphPlanIdentifierAlloc(alloc, tokens, ast.source_name_tokens, create_index.table_name);
+            if (ast.edge_tokens != null) {
+                try validateGeneratedGraphPlanFieldAlloc(alloc, tokens, ast.edge_source_tokens, create_index.columns, 0);
+                try validateGeneratedGraphPlanFieldAlloc(alloc, tokens, ast.edge_target_tokens, create_index.columns, 1);
+                try validateGeneratedGraphConfigFieldAlloc(alloc, tokens, ast.edge_source_tokens, create_index.derived_index_config_json, "source_field");
+                try validateGeneratedGraphConfigFieldAlloc(alloc, tokens, ast.edge_target_tokens, create_index.derived_index_config_json, "target_field");
+                try validateGeneratedGraphOptionalConfigFieldAlloc(alloc, tokens, ast.edge_type_tokens, create_index.derived_index_config_json, "type_field");
+                try validateGeneratedGraphOptionalConfigFieldAlloc(alloc, tokens, ast.edge_weight_tokens, create_index.derived_index_config_json, "weight_field");
+            }
         },
         .create_metric => {
             if (create_index.method != .antfly_graph_metric) return error.UnsupportedSqlShape;
@@ -4808,6 +4964,19 @@ fn validateGeneratedGraphPlanIdentifierAlloc(
     if (!std.mem.eql(u8, expected, actual)) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedGraphPlanFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    columns: []const []const u8,
+    index: usize,
+) !void {
+    if (index >= columns.len) return error.UnsupportedSqlShape;
+    const expected = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, maybe_range orelse return error.UnsupportedSqlShape);
+    defer alloc.free(expected);
+    if (!std.mem.eql(u8, expected, columns[index])) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedGraphConfigIdentifierAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -4821,6 +4990,32 @@ fn validateGeneratedGraphConfigIdentifierAlloc(
     const pattern = try std.fmt.allocPrint(alloc, "\"{s}\":\"{s}\"", .{ field_name, expected });
     defer alloc.free(pattern);
     if (std.mem.indexOf(u8, config_json, pattern) == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphConfigFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_config_json: ?[]const u8,
+    field_name: []const u8,
+) !void {
+    const config_json = maybe_config_json orelse return error.UnsupportedSqlShape;
+    const expected = try parseGeneratedDerivedIndexFieldPathRangeAlloc(alloc, tokens, maybe_range orelse return error.UnsupportedSqlShape);
+    defer alloc.free(expected);
+    const pattern = try std.fmt.allocPrint(alloc, "\"{s}\":\"{s}\"", .{ field_name, expected });
+    defer alloc.free(pattern);
+    if (std.mem.indexOf(u8, config_json, pattern) == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphOptionalConfigFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_config_json: ?[]const u8,
+    field_name: []const u8,
+) !void {
+    if (maybe_range == null) return;
+    try validateGeneratedGraphConfigFieldAlloc(alloc, tokens, maybe_range, maybe_config_json, field_name);
 }
 
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
@@ -17151,6 +17346,19 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_range.items(), malformed_graph_range_ast),
+    );
+
+    var malformed_graph_edge = try tokenized.ParsedSql.initAlloc(alloc, graph_index_sql);
+    defer malformed_graph_edge.deinit(alloc);
+    const malformed_graph_edge_raw = malformed_graph_edge.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_graph_edge_ast = switch (malformed_graph_edge_raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_graph_edge_ast.edge_target_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_edge.items(), malformed_graph_edge_ast),
     );
 }
 
