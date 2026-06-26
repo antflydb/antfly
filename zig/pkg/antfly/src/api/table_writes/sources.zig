@@ -125,6 +125,7 @@ const validateProvisionedDbIdentityNamespace = table_write_managed_db.validatePr
 const validateTableBatchAgainstSchemaJson = table_write_managed_db.validateTableBatchAgainstSchemaJson;
 const validateTableBatchAgainstCatalogSchema = table_write_managed_db.validateTableBatchAgainstCatalogSchema;
 const validateTransactionAgainstCatalogSchema = table_write_managed_db.validateTransactionAgainstCatalogSchema;
+const openManagedDbWithIndexesJson = table_write_managed_db.openManagedDbWithIndexesJson;
 const openManagedDbForTableGroupWithRuntime = table_write_managed_db.openManagedDbForTableGroupWithRuntime;
 const openManagedDbForTableGroupWithRuntimeAndHAWriteGate = table_write_managed_db.openManagedDbForTableGroupWithRuntimeAndHAWriteGate;
 const openManagedDbForTableGroupWithCacheAndRuntime = table_write_managed_db.openManagedDbForTableGroupWithCacheAndRuntime;
@@ -11725,6 +11726,332 @@ test "provisioned table write source runtime status stays cache-only without sha
     source.local_db_mutex.unlock();
     defer cached.deinit(alloc);
 
+    try std.testing.expect((try source.source().localRuntimeStatuses(alloc, "docs")) == null);
+}
+
+test "provisioned table write source runtime status prefers shared snapshot cache" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-write-runtime-prefers-snapshot";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(group_path);
+    var db = try db_mod.DB.open(alloc, group_path, .{});
+    defer db.close();
+
+    const WarmCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"cached_handle_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var cached = try write_cache.getOrOpenLocked(path, WarmCatalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, "snapshot_idx"),
+        .kind = .dense_vector,
+        .doc_count = 42,
+    };
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = .{
+            .doc_count = 42,
+            .index_count = 1,
+            .indexes = indexes,
+        },
+    };
+    defer status.deinit(alloc);
+    try snapshot_cache.upsertGroupStatus("docs", status);
+
+    var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 42), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqualStrings("snapshot_idx", statuses.items[0].stats.indexes[0].name);
+}
+
+test "provisioned table write source structural mutation invalidates shared runtime status cache" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    try snapshot_cache.upsertGroupStatus("docs", .{
+        .group_id = 7001,
+        .stats = .{},
+    });
+    {
+        var before = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer before.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), before.items.len);
+    }
+
+    var source = ProvisionedTableWriteSource.init("/tmp/antfly-runtime-status-structural-invalidation", NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    source.beginLocalStructuralMutation("docs");
+    source.finishLocalStructuralMutation("docs");
+
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+}
+
+test "provisioned table write source runtime status falls back to shared snapshot cache" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    items[0] = .{
+        .group_id = 7001,
+        .stats = .{
+            .doc_count = 9,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    items[0].stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 9,
+    };
+
+    const snapshots = try alloc.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer alloc.free(snapshots);
+    snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = items },
+    };
+    snapshot_cache.replaceOwned(snapshots);
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-snapshot", NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
+}
+
+test "provisioned table write source cached runtime status does not fetch catalog coverage" {
+    const alloc = std.testing.allocator;
+
+    const CountingCatalog = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var cached_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = .{
+            .doc_count = 25_000,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    defer cached_status.deinit(alloc);
+    cached_status.stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "dense_idx"),
+        .kind = .dense_vector,
+        .doc_count = 25_000,
+        .replay_applied_sequence = 100,
+        .replay_target_sequence = 101,
+        .replay_catch_up_required = true,
+        .backfill_active = true,
+    };
+    try snapshot_cache.upsertGroupStatus("docs", cached_status);
+
+    var catalog = CountingCatalog{};
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-status-no-catalog-coverage", catalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 25_000), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqualStrings("dense_idx", statuses.items[0].stats.indexes[0].name);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].replay_catch_up_required);
+}
+
+test "provisioned table write source runtime status does not cold-open uncached db" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-uncached-fallback", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    {
+        var db = try openManagedDbWithIndexesJson(
+            alloc,
+            path,
+            "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+        );
+        defer db.close();
+        _ = try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     try std.testing.expect((try source.source().localRuntimeStatuses(alloc, "docs")) == null);
 }
 

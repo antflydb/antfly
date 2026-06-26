@@ -2653,6 +2653,7 @@ pub const JoinWherePredicateTargets = struct {
 pub const JoinedMutationExpressionWhereConditionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     joined_source_schema: ?runtime_schema.TableSchema = null,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
     alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
@@ -3926,38 +3927,6 @@ pub fn whereTopLevelOrHasAccessPredicate(tokens: []const Token, pos: usize) bool
         }
     }
     return false;
-}
-
-fn whereHasTopLevelAndBeforeTailToken(tokens: []const Token, pos: usize) bool {
-    var depth: usize = 0;
-    var index = pos;
-    while (index < tokens.len) : (index += 1) {
-        const token = tokens[index];
-        switch (token.kind) {
-            .lparen => depth += 1,
-            .rparen => if (depth > 0) {
-                depth -= 1;
-            },
-            .semicolon => if (depth == 0) return false,
-            .identifier => if (depth == 0) {
-                if (sqlWhereTailClauseKeywordToken(token)) return false;
-                if (token.matchesKeywordTag(.@"and")) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn generatedSingleWhereAtomExpression(
-    tokens: []const Token,
-    pos: usize,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    const expression = generated_expression_ast orelse return null;
-    const expression_tokens = expression.tokens orelse return null;
-    if (expression_tokens.start != pos or whereHasTopLevelAndBeforeTailToken(tokens, pos)) return null;
-    return expression;
 }
 
 fn generatedPredicateExpressionAtStart(
@@ -9074,7 +9043,7 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
     expression_type_context.defer_row_expression_field_validation = true;
 
     if (canParseExpressionNotWhere(tokens, pos.*)) {
-        try parseExpressionNotWhereAlloc(
+        try parseExpressionNotWhereWithGeneratedAlloc(
             alloc,
             tokens,
             pos,
@@ -9083,11 +9052,13 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
             true,
             expression_not_predicates,
             options.alternatives_hooks,
+            options.generated_expression_ast,
         );
         return;
     }
 
     if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
+        try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, .contains);
         const predicate = try parseExpressionArrayContainsPredicateAlloc(alloc, tokens, pos, options.params, expression_type_context, options.fixed_binary_hooks);
         var predicate_transferred = false;
         errdefer if (!predicate_transferred) freeExpressionArrayContainsOne(alloc, predicate);
@@ -9097,7 +9068,7 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
     }
 
     if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, sqlWhereTailClauseKeywordToken) or parenthesizedExpressionOrWhereCanStartAt(tokens, pos.*)) {
-        try parseExpressionOrWhereAlloc(
+        try parseExpressionOrWhereWithGeneratedAlloc(
             alloc,
             tokens,
             pos,
@@ -9106,6 +9077,7 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
             true,
             expression_or_predicates,
             options.alternatives_hooks,
+            options.generated_expression_ast,
         );
         return;
     }
@@ -9126,7 +9098,11 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
         expression_predicates,
         expression_or_predicates,
         expression_not_predicates,
-        options.expression_condition_hooks,
+        blk: {
+            var expression_condition_hooks = options.expression_condition_hooks;
+            expression_condition_hooks.generated_expression_ast = options.generated_expression_ast;
+            break :blk expression_condition_hooks;
+        },
     );
 }
 
@@ -25781,6 +25757,10 @@ pub fn parseJoinWhereAlloc(
         const generated_atom_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
 
         if (try joinedMutationExpressionSideAt(tokens, pos.*, left_alias, right_alias, string_to_array_predicate_is_containment)) |expression_side| {
+            var expression_where_options_with_generated = expression_where_options;
+            expression_where_options_with_generated.generated_expression_ast = generated_atom_expression;
+            expression_where_options_with_generated.alternatives_hooks.generated_expression_ast = generated_atom_expression;
+            expression_where_options_with_generated.expression_condition_hooks.generated_expression_ast = generated_atom_expression;
             try parseJoinedMutationExpressionWhereConditionWithContextAlloc(
                 alloc,
                 tokens,
@@ -25789,7 +25769,7 @@ pub fn parseJoinWhereAlloc(
                 targets,
                 left_alias,
                 right_alias,
-                expression_where_options,
+                expression_where_options_with_generated,
             );
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -39595,6 +39575,19 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression_side_filter.join.right.expression_predicates[0].op);
     try std.testing.expectEqualStrings("\"ada\"", expression_side_filter.join.right.expression_predicates[0].rhs[0].value_json);
 
+    var malformed_generated_join_expression_filter = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) = 'ada' ORDER BY 1 ASC LIMIT 5",
+    );
+    defer malformed_generated_join_expression_filter.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_join_expression_filter, .contains);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_expression_filter,
+        schema,
+        &.{},
+    ));
+
     var computed_pattern_side_filter = try lowerJoinForLowerExprTestAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5",
@@ -39641,6 +39634,19 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].expression.kind);
     try std.testing.expectEqualStrings("scope", expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].expression.operands[0].field);
     try std.testing.expectEqualStrings("[\"read\"]", expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].value_json);
+
+    var malformed_generated_join_expression_array_contains = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE string_to_array(c.scope, ' ') @> ARRAY['read'] ORDER BY 1 ASC LIMIT 5",
+    );
+    defer malformed_generated_join_expression_array_contains.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_generated_join_expression_array_contains, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_expression_array_contains,
+        schema,
+        &.{},
+    ));
 
     var mixed_expression_filter = try lowerJoinForLowerExprTestAlloc(
         alloc,
