@@ -6888,19 +6888,6 @@ pub fn parseRoutineExpressionRowExpressionOrNullAlloc(
     return try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
 }
 
-pub fn parseRoutineExpressionWithDeferredFieldValidationOrNullAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    bindings: []const RoutineExpressionBinding,
-    options: RoutineExpressionRowExpressionParserOptions,
-    context_hooks: SelectParserContextHooks,
-) !?db_mod.types.RelationalRowsExpression {
-    const previous_context = setDeferredRowExpressionFieldValidation(context_hooks);
-    defer context_hooks.set_context(context_hooks.ptr, previous_context);
-    return try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, bindings, options);
-}
-
 pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRowsExpression) bool {
     return value.kind == .value and std.mem.eql(u8, value.value_json, "null");
 }
