@@ -990,7 +990,9 @@ Unsupported DDL remains on the existing parser until
    metadata for comparison, null/boolean/distinct `IS` predicates,
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates so stale operator
    kinds or quantifier payloads cannot be accepted by the legacy expression
-   lowering paths;
+   lowering paths; generated logical `OR`/`AND` condition-list items are now
+   threaded into expression alternative lowering so child predicate metadata is
+   validated while boolean expression groups are expanded;
    aggregate `HAVING` clauses apply the same clause-span guard.
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
