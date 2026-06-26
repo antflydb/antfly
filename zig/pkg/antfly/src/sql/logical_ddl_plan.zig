@@ -1,0 +1,31 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+
+const binder = @import("binder.zig");
+const ddl_plan = @import("ddl_plan.zig");
+const lower_expr = @import("lower_expr.zig");
+const tokenized = @import("tokenized.zig");
+
+pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !binder.LogicalSqlPlan {
+    return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
+}
+
+pub const parseLogicalDdlPlanAlloc = ddl_plan.parseLogicalDdlPlanAlloc;
+pub const planGeneratedLogicalDdlAstAlloc = ddl_plan.planGeneratedLogicalDdlAstAlloc;

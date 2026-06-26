@@ -4791,9 +4791,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
-        const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-        try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
-        const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
+        const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+        try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+        const condition = if (generated_quantifier_token_index != null)
             try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
             try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
@@ -4807,9 +4807,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
-            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-            try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
-            const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
+            const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+            try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            const condition = if (generated_quantifier_token_index != null)
                 try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
                 try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
@@ -5079,9 +5079,9 @@ pub fn parseExpressionWhereConditionsAlloc(
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
-        const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-        try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
-        const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
+        const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+        try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+        const condition = if (generated_quantifier_token_index != null)
             try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
             try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
@@ -5106,9 +5106,9 @@ pub fn parseExpressionWhereConditionsAlloc(
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
-            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-            try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, generated_requires_quantifier);
-            const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
+            const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+            try validateGeneratedPatternPredicateExpression(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            const condition = if (generated_quantifier_token_index != null)
                 try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
                 try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
@@ -25400,12 +25400,40 @@ fn validateGeneratedQuantifiedPredicateExpression(
 fn validateGeneratedPatternPredicateExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
     expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    requires_quantifier: bool,
+    tokens: []const Token,
+    operator_token_index: usize,
+    quantifier_token_index: ?usize,
 ) !void {
     const expression = generated_expression_ast orelse return;
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
-    if (requires_quantifier and expression.quantifier_tokens == null) return error.UnsupportedSqlShape;
-    if (!requires_quantifier and expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    switch (expected_kind) {
+        .like, .not_like => if (!tokens[operator_token_index].matchesKeywordTag(.like)) return error.UnsupportedSqlShape,
+        .ilike, .not_ilike => if (!tokens[operator_token_index].matchesKeywordTag(.ilike)) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
+    if (quantifier_token_index) |index| {
+        const quantifier_tokens = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
+        if (index >= tokens.len or
+            quantifier_tokens.start != index or
+            quantifier_tokens.end != index + 1 or
+            !tokenAtIsAnySomeOrAll(tokens, index))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+        if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    } else {
+        if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
+        const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+        if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedExpressionPredicateKind(
@@ -25679,8 +25707,8 @@ pub fn parseWhereAtomAlloc(
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
-        const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-        try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, generated_requires_quantifier);
+        const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+        try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
         return;
     }
@@ -25710,8 +25738,8 @@ pub fn parseWhereAtomAlloc(
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
-            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-            try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, generated_requires_quantifier);
+            const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+            try validateGeneratedPatternPredicateExpression(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
             return;
         }
@@ -25929,8 +25957,8 @@ pub fn parseJoinWhereAlloc(
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
-            const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-            try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, generated_requires_quantifier);
+            const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+            try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -25939,8 +25967,8 @@ pub fn parseJoinWhereAlloc(
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
-                const generated_requires_quantifier = tokenAtIsAnySomeOrAll(tokens, pos.*);
-                try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, generated_requires_quantifier);
+                const generated_quantifier_token_index: ?usize = if (tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+                try validateGeneratedPatternPredicateExpression(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
                 try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;

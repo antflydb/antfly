@@ -3602,7 +3602,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (group_auto_bulk_ops > 0) auto_bulk_now_ns else null,
             );
             defer cached.deinit(alloc);
-            try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req);
+            try table_write_bulk_ingest.applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, runTestBeforeBatchExecutionHook);
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             if (group_auto_bulk_ops > 0) {
@@ -3633,7 +3633,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
-            try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req);
+            try table_write_bulk_ingest.applyGroupBatch(alloc, self.catalog, &db, table_name, group, req, runTestBeforeBatchExecutionHook);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
         }
     }
@@ -9867,35 +9867,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.NotFound;
     }
 };
-
-fn applyGroupBatch(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group: GroupBatch,
-    req: db_mod.types.BatchRequest,
-) !void {
-    try table_write_bulk_ingest.applyGroupBatch(alloc, catalog, db, table_name, group, req, runTestBeforeBatchExecutionHook);
-}
-
-fn applyGroupBatchWithSchemaJson(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    schema_json: ?[]const u8,
-    group: GroupBatch,
-    req: db_mod.types.BatchRequest,
-) !void {
-    try table_write_bulk_ingest.applyGroupBatchWithSchemaJson(alloc, db, schema_json, group, req, runTestBeforeBatchExecutionHook);
-}
-
-fn applyGroupBatchUnchecked(
-    db: *db_mod.DB,
-    group: GroupBatch,
-    req: db_mod.types.BatchRequest,
-) !void {
-    try table_write_bulk_ingest.applyGroupBatchUnchecked(db, group, req, runTestBeforeBatchExecutionHook);
-}
 
 const parseIndexKind = table_write_index_config.parseIndexKind;
 const isReservedTableIndexMetadataEntry = table_write_index_config.isReservedTableIndexMetadataEntry;

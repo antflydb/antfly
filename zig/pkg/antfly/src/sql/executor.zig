@@ -18,7 +18,7 @@ const catalog_resources = @import("../api/catalog_resources.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
-const ddl_plan = @import("ddl_plan.zig");
+const logical_ddl_plan = @import("logical_ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const tokenized = @import("tokenized.zig");
@@ -47,7 +47,7 @@ pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !SqlExecutionPlan {
-    return try ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    return try logical_ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
 }
 
 pub fn planParsedSqlWithSessionAlloc(

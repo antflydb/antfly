@@ -23,6 +23,7 @@ const antfly_inference_build = @import("pkg/antfly/build/inference.zig");
 const antfly_lite_build = @import("pkg/antfly/build/lite.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
+const antfly_tools_build = @import("pkg/antfly/build/tools.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
@@ -2053,29 +2054,9 @@ pub fn build(b: *std.Build) void {
         delegated_inference_steps.inference_test,
     });
 
-    const hbc_trace_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
+    antfly_tools_build.addToolSteps(.{
+        .b = b,
         .target = target,
-        .optimize = .ReleaseFast,
+        .lib_mod = lib_mod,
     });
-    hbc_trace_mod.addImport("antfly-zig", lib_mod);
-    const recall_common_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/recall_common.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    recall_common_mod.addImport("antfly-zig", lib_mod);
-    hbc_trace_mod.addImport("recall_common", recall_common_mod);
-
-    const hbc_trace = b.addExecutable(.{
-        .name = "hbc_trace",
-        .root_module = hbc_trace_mod,
-    });
-
-    const run_hbc_trace = b.addRunArtifact(hbc_trace);
-    if (b.args) |args| {
-        run_hbc_trace.addArgs(args);
-    }
-    const hbc_trace_step = b.step("hbc-trace", "Trace one Zig HBC query against an exported vector dataset");
-    hbc_trace_step.dependOn(&run_hbc_trace.step);
 }
