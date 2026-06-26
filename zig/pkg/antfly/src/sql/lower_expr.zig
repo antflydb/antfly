@@ -3724,7 +3724,7 @@ pub fn parseWhereAlloc(
         if (canParseScalarNotWhere(tokens, pos.*)) {
             try parseScalarNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, not_predicates, realtime_ns);
         } else if (canParseExpressionNotWhere(tokens, pos.*)) {
-            try parseExpressionNotWhereAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_not_predicates, expression_alternatives_hooks);
+            try parseExpressionNotWhereWithGeneratedAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_not_predicates, expression_alternatives_hooks, generated_expression_ast);
         } else if (canParseAccessNotWhere(tokens, pos.*)) {
             try parseAccessNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_not_predicates, realtime_ns);
         } else if (peekStringToArrayFunctionCall(tokens, pos.*)) {
@@ -3981,6 +3981,7 @@ fn generatedPredicateExpressionAtStart(
             return null;
         },
         .grouped => return try generatedPredicateExpressionAtStart(pos, expression.inner_expression),
+        .logical_not => return try generatedPredicateExpressionAtStart(pos, expression.right_expression),
         else => return null,
     }
 }
@@ -4533,6 +4534,33 @@ pub fn parseExpressionNotWhereAlloc(
     expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     hooks: ExpressionWhereConditionAlternativesParserOptions,
 ) !void {
+    return try parseExpressionNotWhereWithGeneratedAlloc(
+        alloc,
+        tokens,
+        pos,
+        params,
+        type_context,
+        defer_row_expression_field_validation,
+        expression_not_predicates,
+        hooks,
+        null,
+    );
+}
+
+pub fn parseExpressionNotWhereWithGeneratedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    type_context: RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    hooks: ExpressionWhereConditionAlternativesParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (generated_expression_ast) |expression| {
+        if (expression.kind != .logical_not) return error.UnsupportedSqlShape;
+    }
     try parser.expectKeyword(tokens, pos, "not");
     try parser.expectToken(tokens, pos, .lparen);
     while (true) {
@@ -4548,6 +4576,10 @@ pub fn parseExpressionNotWhereAlloc(
             var alternatives = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
             defer alternatives.deinit(alloc);
             errdefer freeExpressionPredicateGroups(alloc, alternatives.items);
+            var hooks_with_generated = hooks;
+            if (generated_expression_ast != null) {
+                hooks_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            }
             try parseExpressionWhereConditionAlternativesAlloc(
                 alloc,
                 tokens,
@@ -4556,7 +4588,7 @@ pub fn parseExpressionNotWhereAlloc(
                 type_context,
                 defer_row_expression_field_validation,
                 &alternatives,
-                hooks,
+                hooks_with_generated,
             );
             try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -30086,6 +30118,31 @@ test "sql adapter lower expr lowers coalesce predicates" {
         &.{},
         .{},
     ));
+
+    var expression_not_or = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (lower(status) = 'active' OR lower(status) = 'pending') ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer expression_not_or.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), expression_not_or.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression_not_or.plan.query.expression_not_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_not_or.plan.query.expression_not_predicates[0].conditions[0].lhs.kind);
+
+    var malformed_generated_expression_not_or = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (lower(status) = 'active' OR lower(status) = 'pending') ORDER BY id",
+    );
+    defer malformed_generated_expression_not_or.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_expression_not_or, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_expression_not_or,
+        schema,
+        &.{},
+        .{},
+    ));
 }
 
 test "sql adapter lower expr lowers array length predicates" {
@@ -32097,9 +32154,7 @@ fn setGeneratedReadWhereFirstBooleanConditionKind(
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .read => |read| {
-                    if (read.where_expression.kind != .logical_or and read.where_expression.kind != .logical_and) return error.TestUnexpectedResult;
-                    if (read.where_expression.boolean_condition_items.expressions.len == 0) return error.TestUnexpectedResult;
-                    read.where_expression.boolean_condition_items.expressions[0].kind = kind;
+                    if (!setGeneratedExpressionFirstBooleanConditionKind(&read.where_expression, kind)) return error.TestUnexpectedResult;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
@@ -32107,6 +32162,28 @@ fn setGeneratedReadWhereFirstBooleanConditionKind(
         }
     }
     return error.TestUnexpectedResult;
+}
+
+fn setGeneratedExpressionFirstBooleanConditionKind(
+    expression: *generated_parser.GeneratedSqlExpressionAst,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) bool {
+    switch (expression.kind) {
+        .logical_or, .logical_and => {
+            if (expression.boolean_condition_items.expressions.len == 0) return false;
+            expression.boolean_condition_items.expressions[0].kind = kind;
+            return true;
+        },
+        .logical_not => {
+            const right = expression.right_expression orelse return false;
+            return setGeneratedExpressionFirstBooleanConditionKind(right, kind);
+        },
+        .grouped => {
+            const inner = expression.inner_expression orelse return false;
+            return setGeneratedExpressionFirstBooleanConditionKind(inner, kind);
+        },
+        else => return false,
+    }
 }
 
 fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql) !void {
