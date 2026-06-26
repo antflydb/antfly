@@ -1790,6 +1790,18 @@ fn generatedGroupExpressionAtItemStart(
     return null;
 }
 
+fn generatedOrderExpressionAtItemStart(
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const read = generated_read_ast orelse return null;
+    if (read.order_items.items.len != read.order_items.count or read.order_items.expressions.len != read.order_items.count) return error.UnsupportedSqlShape;
+    for (read.order_items.items, 0..) |item, index| {
+        if (item.start == pos) return &read.order_items.expressions[index];
+    }
+    return null;
+}
+
 fn generatedSelectItemStartAllowsExpressionKind(
     start: SelectItemStart,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -1869,6 +1881,42 @@ fn validateGeneratedSelectItemStartForExpression(
 }
 
 fn validateGeneratedSimpleGroupExpression(
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (expression.kind != .token_range) return error.UnsupportedSqlShape;
+}
+
+fn generatedOrderExpressionStartAllowsExpressionKind(
+    start: OrderExpressionStart,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) bool {
+    return switch (start) {
+        .parenthesized_null_test,
+        .parenthesized,
+        => kind == .grouped,
+        .pipe_concat => kind == .string_concat,
+        .json_extract_field => kind == .json_access or kind == .json_text_access or kind == .json_path_access or kind == .json_path_text_access,
+        .generated_or_case_fold,
+        .generated_or_md5,
+        .generated_or_concat,
+        => kind == .function_call,
+        .unary_negative => kind == .unary_negative,
+        .general,
+        .field,
+        => true,
+    };
+}
+
+fn validateGeneratedOrderExpressionStartForExpression(
+    start: OrderExpressionStart,
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (!generatedOrderExpressionStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedSimpleOrderExpression(
     generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const expression = generated_expression orelse return;
@@ -2399,6 +2447,7 @@ pub const OrderByParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     type_context: RowExpressionTypeContext,
     order_expression_hooks: OrderExpressionParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
 };
 
 pub const OrderExpressionParserOptions = struct {
@@ -2409,6 +2458,7 @@ pub const OrderExpressionParserOptions = struct {
     parenthesized: ParenthesizedRowExpressionParserOptions,
     case_fold_hooks: CaseFoldRowExpressionParserOptions,
     fixed_unary: FixedUnaryRowExpressionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const WindowDefinitionParserOptions = struct {
@@ -10444,6 +10494,7 @@ pub fn parseAggregateSpecAlloc(
             defer_row_expression_field_validation,
             type_context,
             options.order_expression_hooks,
+            null,
         );
     }
     if (!isSqlPercentileAggregateOp(op) and op != .mode) {
@@ -13358,6 +13409,7 @@ pub fn parseOrderByAlloc(
         options.defer_row_expression_field_validation,
         options.type_context,
         options.order_expression_hooks,
+        options.generated_read_ast,
     );
 }
 
@@ -13373,8 +13425,14 @@ pub fn parseOrderByWithExpressionHooksAlloc(
     defer_row_expression_field_validation: bool,
     type_context: RowExpressionTypeContext,
     hooks: OrderExpressionParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, generated_read_ast);
+        if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        var item_hooks = hooks;
+        item_hooks.generated_expression_ast = generated_expression;
         var order = try parseOrderExpressionAlloc(
             alloc,
             tokens,
@@ -13385,7 +13443,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            hooks,
+            item_hooks,
         );
         var order_transferred = false;
         errdefer if (!order_transferred) {
@@ -13408,10 +13466,17 @@ pub fn parseSelectOutputOrderByAlloc(
     options: OrderByParserOptions,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        var order_expression_hooks = options.order_expression_hooks;
+        order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             break :blk try selectOutputOrderByOrdinalAlloc(alloc, options.schema, select, ordinal);
         } else if (try parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, select)) |named_order| blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             break :blk named_order;
         } else try parseOrderExpressionAlloc(
             alloc,
@@ -13423,7 +13488,7 @@ pub fn parseSelectOutputOrderByAlloc(
             options.returning_expression_qualifiers,
             options.defer_row_expression_field_validation,
             options.type_context,
-            options.order_expression_hooks,
+            order_expression_hooks,
         );
         var order_transferred = false;
         errdefer if (!order_transferred) {
@@ -18049,6 +18114,7 @@ pub fn parseSelectAlloc(
                     .defer_row_expression_field_validation = order_context.defer_row_expression_field_validation,
                     .type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
                     .order_expression_hooks = options.order_expression_hooks,
+                    .generated_read_ast = options.generated_read_ast,
                 },
             );
             if (generated_order_end) |end| {
@@ -22510,6 +22576,9 @@ pub fn parseOrderExpressionAlloc(
     if (peekExtensionFunctionCall(tokens, pos.*, function_bindings.extension_functions) or
         peekRoutineExpressionCall(tokens, pos.*, function_bindings.routine_expressions))
     {
+        if (options.generated_expression_ast) |generated_expression| {
+            if (generated_expression.kind != .function_call) return error.UnsupportedSqlShape;
+        }
         const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
@@ -22518,7 +22587,9 @@ pub fn parseOrderExpressionAlloc(
         return .{ .expression = expression };
     }
 
-    switch (orderExpressionStartAt(tokens, pos.*)) {
+    const start = orderExpressionStartAt(tokens, pos.*);
+    try validateGeneratedOrderExpressionStartForExpression(start, options.generated_expression_ast);
+    switch (start) {
         .parenthesized_null_test => {
             _ = parser.matchToken(tokens, pos, .lparen) orelse unreachable;
             const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
@@ -31526,6 +31597,25 @@ fn corruptGeneratedReadFirstOrderExpressionItem(parsed_sql: *tokenized.ParsedSql
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstOrderExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.order_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    read.order_items.expressions[0].kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -32239,6 +32329,20 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_query,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_query_order_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY id DESC NULLS LAST LIMIT 5",
+    );
+    defer malformed_query_order_kind.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionKind(&malformed_query_order_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_query_order_kind,
         schema,
         &.{},
         .{},

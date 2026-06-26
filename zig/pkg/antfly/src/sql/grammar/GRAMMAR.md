@@ -1011,7 +1011,11 @@ Unsupported DDL remains on the existing parser until
    closed before fallback projection parsing can accept it. Aggregate
    `GROUP BY` lowering now applies the same generated item lookup for simple
    group fields, ordinals, and expression group keys, so corrupted group item
-   expression kinds also fail closed during typed group planning.
+   expression kinds also fail closed during typed group planning. Top-level
+   query `ORDER BY` lowering now threads generated order item expressions into
+   output-name/ordinal and concrete order-expression parsing, so corrupted
+   simple order item kinds and unambiguous order expression starts fail closed
+   during typed order planning.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
