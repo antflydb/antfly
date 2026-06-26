@@ -636,6 +636,18 @@ pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![
                     .{ routineKindName(drop.kind), drop.routine_name, drop.argument_count, drop.if_exists },
                 ),
         },
+        .trigger_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_trigger:name={s}:table={s}:function={s}:event={s}:replace={}",
+                .{ create.trigger_name, create.table_name, create.function_name, @tagName(create.event), create.replace_existing },
+            ),
+            .drop => |drop| try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_trigger:name={s}:table={s}:if_exists={}:cascade={}",
+                .{ drop.trigger_name, drop.table_name, drop.if_exists, drop.cascade },
+            ),
+        },
         .procedure_call => |call| try std.fmt.allocPrint(
             alloc,
             "ddl:call_procedure:name={s}:args={d}",

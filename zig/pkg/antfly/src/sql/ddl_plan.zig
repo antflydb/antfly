@@ -13952,16 +13952,14 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
     );
     defer drop_trigger.deinit(alloc);
     switch (drop_trigger) {
-        .alter_table => |plan| {
-            try std.testing.expectEqualStrings("usage_records", plan.table_name);
-            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
-            switch (plan.operations[0]) {
-                .drop_update_policy => |drop_update_policy| {
-                    try std.testing.expectEqualStrings("update_timestamp", drop_update_policy.trigger_name);
-                    try std.testing.expect(drop_update_policy.if_exists);
-                },
-                else => return error.TestUnexpectedResult,
-            }
+        .trigger_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("update_timestamp", drop.trigger_name);
+                try std.testing.expectEqualStrings("public.usage_records", drop.table_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(!drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
         },
         .create_table => return error.TestUnexpectedResult,
         .create_index => return error.TestUnexpectedResult,
@@ -13971,14 +13969,41 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    var insert_trigger = try lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE INSERT ON usage_records EXECUTE FUNCTION touch_updated_at()",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+    );
+    defer insert_trigger.deinit(alloc);
+    switch (insert_trigger) {
+        .trigger_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("update_timestamp", create.trigger_name);
+                try std.testing.expectEqualStrings("usage_records", create.table_name);
+                try std.testing.expectEqualStrings("touch_updated_at", create.function_name);
+                try std.testing.expectEqual(RoutineTriggerEvent.insert, create.event);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var arbitrary_trigger = try lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
-    ));
+    );
+    defer arbitrary_trigger.deinit(alloc);
+    switch (arbitrary_trigger) {
+        .trigger_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("update_timestamp", create.trigger_name);
+                try std.testing.expectEqualStrings("usage_records", create.table_name);
+                try std.testing.expectEqualStrings("arbitrary_trigger", create.function_name);
+                try std.testing.expectEqual(RoutineTriggerEvent.update, create.event);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter ddl plan lowers catalog-only ddl plans" {

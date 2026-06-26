@@ -790,6 +790,7 @@ pub fn applyDdlPlanToRuntimeSchemaAlloc(
         .schema_namespace_catalog => error.UnsupportedSqlShape,
         .extension_catalog => error.UnsupportedSqlShape,
         .function_catalog => error.UnsupportedSqlShape,
+        .trigger_catalog => error.UnsupportedSqlShape,
         .procedure_call => error.UnsupportedSqlShape,
         .authorization_catalog => error.UnsupportedSqlShape,
         .bulk_io => error.UnsupportedSqlShape,

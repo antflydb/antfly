@@ -16292,3 +16292,201 @@ test "api.table_writes.docid provisioned table write source rejects stale doc id
     defer cached_db.close();
     try std.testing.expect((try cached_db.lookup(alloc, "doc:b", .{})) == null);
 }
+
+test "provisioned table write source backs up and restores a local table" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-out");
+    defer alloc.free(backup_root);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    defer {
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    }
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    const shards = (try source.source().backupTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "snap1",
+    })).?;
+    defer freeBackupShards(alloc, shards);
+
+    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+        .table_id = 7,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer manifest.deinit(alloc);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }},
+        .timestamp_ns = 2,
+    });
+
+    _ = try source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+    });
+
+    db.close();
+    db = try db_mod.DB.open(alloc, db_path, .{});
+
+    var restored = (try db.lookup(alloc, "doc:a", .{})).?;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+}
+
+test "api.table_writes.docid provisioned table write source backs up a portable local table" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup-out");
+    defer alloc.free(backup_root);
+    const restore_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup-restore");
+    defer alloc.free(restore_path);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_path) catch {};
+    defer {
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_path) catch {};
+    }
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    const shards = (try source.source().backupTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "portable-snap",
+        .format = .portable,
+    })).?;
+    defer freeBackupShards(alloc, shards);
+    try std.testing.expectEqual(@as(usize, 1), shards.len);
+    try std.testing.expectEqualStrings("portable-snap.afb", shards[0].snapshot_path);
+
+    const afb_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, shards[0].snapshot_path });
+    defer alloc.free(afb_path);
+    const afb = try readBackupFileAlloc(alloc, afb_path);
+    defer alloc.free(afb);
+
+    var restored_db = try db_mod.DB.open(alloc, restore_path, .{});
+    defer restored_db.close();
+    try portable_backup.importPortable(alloc, restored_db.core.store, afb);
+    var restored = (try restored_db.lookup(alloc, "doc:a", .{})).?;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+}

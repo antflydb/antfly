@@ -2311,6 +2311,10 @@ fn validateGeneratedJoinExecutableContract(
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
     if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
+    switch (join.kind) {
+        .inner, .left => {},
+        .right, .full => return error.UnsupportedSqlShape,
+    }
     switch (join.condition_kind) {
         .on => if (join.predicate_tokens == null) return error.UnsupportedSqlShape,
         .using => if (join.using_tokens == null or join.using_column_tokens == null or join.using_columns.count == 0) return error.UnsupportedSqlShape,
@@ -39227,6 +39231,37 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("amount", lowered.join.order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.join.order_by[0].direction);
     try std.testing.expectEqual(@as(u32, 5), lowered.join.limit.?);
+
+    const unsupported_generated_join_kinds = [_]struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlJoinKind,
+    }{
+        .{
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN usage_records AS c ON o.customer_id = c.id",
+            .kind = .right,
+        },
+        .{
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id",
+            .kind = .full,
+        },
+    };
+    for (unsupported_generated_join_kinds) |case| {
+        var parsed = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        const read_ast = if (parsed.generated_statement) |generated_statement| switch (generated_statement.ast.?) {
+            .read => |read| read,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.join, read_ast.kind);
+        try std.testing.expectEqual(case.kind, read_ast.join_kind.?);
+        try std.testing.expectEqual(case.kind, read_ast.join_items[0].kind);
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+            alloc,
+            &parsed,
+            schema,
+            &.{},
+        ));
+    }
 
     var malformed_generated_join = try tokenized.ParsedSql.initAlloc(
         alloc,
