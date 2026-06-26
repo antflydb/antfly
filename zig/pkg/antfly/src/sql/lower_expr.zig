@@ -3706,7 +3706,7 @@ pub fn parseWhereAlloc(
         } else if (whereTopLevelOrHasAccessPredicate(tokens, pos.*)) {
             try parseAccessOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, access_or_predicates, realtime_ns);
         } else {
-            try parseScalarOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, or_predicates, realtime_ns);
+            try parseScalarOrWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, or_predicates, realtime_ns, generated_expression_ast);
         }
         return;
     }
@@ -3724,7 +3724,8 @@ pub fn parseWhereAlloc(
     }
     while (true) {
         if (canParseScalarNotWhere(tokens, pos.*)) {
-            try parseScalarNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, not_predicates, realtime_ns);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            try parseScalarNotWhereAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, not_predicates, realtime_ns, generated_condition_expression);
         } else if (canParseExpressionNotWhere(tokens, pos.*)) {
             try parseExpressionNotWhereWithGeneratedAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_not_predicates, expression_alternatives_hooks, generated_expression_ast);
         } else if (canParseAccessNotWhere(tokens, pos.*)) {
@@ -4272,7 +4273,11 @@ pub fn parseScalarNotWhereAlloc(
     defer_row_expression_field_validation: bool,
     not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
+    if (generated_expression_ast) |expression| {
+        if (expression.kind != .logical_not) return error.UnsupportedSqlShape;
+    }
     try parser.expectKeyword(tokens, pos, "not");
     try parser.expectToken(tokens, pos, .lparen);
     while (true) {
@@ -4282,6 +4287,7 @@ pub fn parseScalarNotWhereAlloc(
             branch.deinit(alloc);
         }
         while (true) {
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
             const predicate = try parseScalarWherePredicateAlloc(
                 alloc,
                 tokens,
@@ -4292,7 +4298,7 @@ pub fn parseScalarNotWhereAlloc(
                 defer_row_expression_field_validation,
                 params,
                 realtime_ns,
-                null,
+                generated_condition_expression,
             );
             var predicate_transferred = false;
             errdefer if (!predicate_transferred) plan_mod.freeRelationalCheck(alloc, predicate);
@@ -4329,6 +4335,7 @@ pub fn parseScalarOrWhereAlloc(
     defer_row_expression_field_validation: bool,
     or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
         const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
@@ -4337,6 +4344,7 @@ pub fn parseScalarOrWhereAlloc(
         try branches.append(alloc, .empty);
 
         while (true) {
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
             if (try parseScalarBooleanIsNotIntoOrBranchesAlloc(
                 alloc,
                 tokens,
@@ -4346,6 +4354,7 @@ pub fn parseScalarOrWhereAlloc(
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
                 &branches,
+                generated_condition_expression,
             )) {
                 // Expanded as native OR branches.
             } else if (!(try parseScalarWhereSetIntoOrBranchesAlloc(
@@ -4358,6 +4367,7 @@ pub fn parseScalarOrWhereAlloc(
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
                 &branches,
+                generated_condition_expression,
             ))) {
                 const predicate = try parseScalarWherePredicateAlloc(
                     alloc,
@@ -4369,7 +4379,7 @@ pub fn parseScalarOrWhereAlloc(
                     defer_row_expression_field_validation,
                     params,
                     realtime_ns,
-                    null,
+                    generated_condition_expression,
                 );
                 defer plan_mod.freeRelationalCheck(alloc, predicate);
                 try appendRelationalCheckCloneToScalarOrBranches(alloc, &branches, predicate);
@@ -4406,6 +4416,7 @@ pub fn parseScalarBooleanIsNotIntoOrBranchesAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     branches: *std.ArrayListUnmanaged(ScalarOrCheckBranch),
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
     const parsed_field = parseRowExpressionFieldOwnedAlloc(
@@ -4448,6 +4459,8 @@ pub fn parseScalarBooleanIsNotIntoOrBranchesAlloc(
     defer alloc.free(field);
     const column = binder.relationalColumnForField(schema, field, .boolean) orelse return error.InvalidSqlCatalog;
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
+    const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
+    try validateGeneratedExpressionPredicateKind(generated_expression_ast, expected_kind);
     try expandBooleanIsNotIntoOrBranches(alloc, branches, field, value);
     return true;
 }
@@ -4462,6 +4475,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     branches: *std.ArrayListUnmanaged(ScalarOrCheckBranch),
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     if (!peekSimpleScalarSetPredicate(tokens, pos.*)) return false;
 
@@ -4480,12 +4494,14 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
 
     if (parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectKeyword(tokens, pos, "in");
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .not_in_list);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne);
         return true;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .in_list);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq);
@@ -4494,6 +4510,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
 
     const op = try parseComparisonOp(tokens, pos);
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4502,6 +4519,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4510,6 +4528,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4518,6 +4537,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -35583,6 +35603,20 @@ test "sql adapter lower expr lowers scalar or predicates" {
     try std.testing.expectEqual(@as(usize, 2), any_lowered.plan.query.or_predicates[2].predicates.len);
     try std.testing.expectEqualStrings("amount", any_lowered.plan.query.or_predicates[2].predicates[1].field);
 
+    var malformed_generated_scalar_or = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'closed' OR amount > 20 ORDER BY created_at DESC",
+    );
+    defer malformed_generated_scalar_or.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_scalar_or, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_scalar_or,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var inequality_any_lowered = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status != ANY($1::text[]) AND amount > 20 OR status = 'open' ORDER BY created_at DESC",
@@ -35628,6 +35662,20 @@ test "sql adapter lower expr lowers scalar or predicates" {
     try std.testing.expectEqual(@as(usize, 2), all_lowered.plan.query.or_predicates[1].predicates.len);
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, all_lowered.plan.query.or_predicates[1].predicates[0].op);
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, all_lowered.plan.query.or_predicates[1].predicates[1].op);
+
+    var malformed_generated_scalar_quantified_or = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY($1::text[]) OR status = 'open' ORDER BY created_at DESC",
+    );
+    defer malformed_generated_scalar_quantified_or.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_scalar_quantified_or, .comparison);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_scalar_quantified_or,
+        schema,
+        &.{.{ .json = "[\"closed\",\"pending\"]" }},
+        .{},
+    ));
 
     var not_in_lowered = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -35676,6 +35724,20 @@ test "sql adapter lower expr lowers scalar not predicate groups" {
     try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.not_predicates[0].predicates.len);
     try std.testing.expectEqualStrings("status", lowered.plan.query.not_predicates[0].predicates[0].field);
     try std.testing.expectEqualStrings("amount", lowered.plan.query.not_predicates[0].predicates[1].field);
+
+    var malformed_generated_scalar_not = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (status = 'closed' AND amount > 20) AND created_at >= 10",
+    );
+    defer malformed_generated_scalar_not.deinit(alloc);
+    try setGeneratedReadWhereFirstBooleanConditionKind(&malformed_generated_scalar_not, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_scalar_not,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var not_or = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,

@@ -990,7 +990,10 @@ Unsupported DDL remains on the existing parser until
    metadata for comparison, null/boolean/distinct `IS` predicates,
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates so stale operator
    kinds or quantifier payloads cannot be accepted by the legacy expression
-   lowering paths; generated logical `OR`/`AND` condition-list items are now
+   lowering paths; generated scalar `OR`/`NOT` predicate groups now thread the
+   same child metadata into scalar comparison, boolean-test, `IN`, and
+   quantified-list expansion branches; generated logical `OR`/`AND`
+   condition-list items are now
    threaded into expression alternative lowering, including inside generated
    logical `NOT` groups, so child predicate metadata is validated while
    boolean expression groups are expanded;
