@@ -1884,6 +1884,16 @@ fn generatedSelectItemStartAllowsExpressionKind(
     };
 }
 
+fn generatedExpressionFunctionNameToken(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !Token {
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    return tokens[name_tokens.start];
+}
+
 fn validateGeneratedSelectItemStartFunctionName(
     tokens: []const Token,
     start: SelectItemStart,
@@ -1928,10 +1938,7 @@ fn validateGeneratedSelectItemStartFunctionName(
         else => return,
     }
 
-    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
-    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
-    if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
-    const token = tokens[name_tokens.start];
+    const token = try generatedExpressionFunctionNameToken(tokens, expression);
     const valid = switch (start) {
         .uuid_v4 => sqlTokenIsUuidV4Function(token),
         .json_extract_path => sqlTokenIsJsonExtractPathFunction(token),
@@ -2019,6 +2026,28 @@ fn validateGeneratedOrderExpressionStartForExpression(
     const expression = generated_expression orelse return;
     try validateGeneratedExpressionPayloads(tokens, expression.*);
     if (!generatedOrderExpressionStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
+    switch (start) {
+        .generated_or_case_fold => {
+            const token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+            if (!token.matchesKeywordTag(.lower) and
+                !token.matchesKeywordTag(.upper) and
+                !sqlTokenIsInitcapFunction(token) and
+                !token.matchesKeywordTag(.trim) and
+                !sqlTokenIsTrimVariantFunction(token))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .generated_or_md5 => {
+            const token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+            if (!sqlTokenIsMd5Function(token)) return error.UnsupportedSqlShape;
+        },
+        .generated_or_concat => {
+            const token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+            if (!token.matchesKeywordTag(.concat) and !token.matchesKeywordTag(.concat_ws)) return error.UnsupportedSqlShape;
+        },
+        else => {},
+    }
 }
 
 fn validateGeneratedSimpleOrderExpression(
@@ -32673,6 +32702,24 @@ fn corruptGeneratedReadFirstOrderExpressionOperatorToTokens(parsed_sql: *tokeniz
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstOrderFunctionNameToFirstProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.order_items.expressions.len == 0 or read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    _ = read.order_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
+                    const projection_name_tokens = read.projection_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
+                    read.order_items.expressions[0].function_name_tokens = projection_name_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -33714,6 +33761,20 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_query_order_operator,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_query_order_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT to_jsonb(id) AS id_json FROM usage_records WHERE status = 'open' ORDER BY md5(id) DESC LIMIT 5",
+    );
+    defer malformed_query_order_function_name.deinit(alloc);
+    try corruptGeneratedReadFirstOrderFunctionNameToFirstProjection(&malformed_query_order_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_query_order_function_name,
         schema,
         &.{},
         .{},

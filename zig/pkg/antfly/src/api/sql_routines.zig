@@ -18,7 +18,6 @@ const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const ddl_plan = @import("../sql/ddl.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -1276,9 +1275,25 @@ fn hashLowerIdentifier(alloc: std.mem.Allocator, hasher: anytype, value: []const
     }
 }
 
+fn routineLogicalPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !sql_adapter.LogicalSqlPlan {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+}
+
+fn functionCatalogPlanForTest(plan: sql_adapter.LogicalSqlPlan) !sql_adapter.FunctionCatalogPlan {
+    return switch (plan) {
+        .routine => |routine| switch (routine) {
+            .function_catalog => |function_plan| function_plan,
+            else => error.TestUnexpectedResult,
+        },
+        else => error.TestUnexpectedResult,
+    };
+}
+
 test "sql routine runtime stores and executes safe expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try ddl_plan.lowerDdlPlanAlloc(
+    var plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
     );
@@ -1286,10 +1301,7 @@ test "sql routine runtime stores and executes safe expression bodies" {
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    try runtime.apply(switch (plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(plan));
     try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
 
     const out = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
@@ -1312,25 +1324,19 @@ test "sql routine runtime persists catalog routines across reopen" {
         defer runtime.deinit();
         try runtime.attachOpenedStore(opened);
 
-        var plan = try ddl_plan.lowerDdlPlanAlloc(
+        var plan = try routineLogicalPlanForTestAlloc(
             alloc,
             "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
         );
         defer plan.deinit(alloc);
-        try runtime.apply(switch (plan) {
-            .function_catalog => |function_plan| function_plan,
-            else => return error.TestUnexpectedResult,
-        });
+        try runtime.apply(try functionCatalogPlanForTest(plan));
 
-        var procedure_plan = try ddl_plan.lowerDdlPlanAlloc(
+        var procedure_plan = try routineLogicalPlanForTestAlloc(
             alloc,
             "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
         );
         defer procedure_plan.deinit(alloc);
-        try runtime.apply(switch (procedure_plan) {
-            .function_catalog => |function_plan| function_plan,
-            else => return error.TestUnexpectedResult,
-        });
+        try runtime.apply(try functionCatalogPlanForTest(procedure_plan));
 
         const bindings = [_]extension_domain.QueryFunctionBinding{.{
             .extension_name = "pgcrypto",
@@ -1360,20 +1366,14 @@ test "sql routine runtime persists catalog routines across reopen" {
         try runtime.executeProcedureRoutineArgs("rotate_usage", 0);
         try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("rotate_usage", 1));
 
-        var drop_plan = try ddl_plan.lowerDdlPlanAlloc(alloc, "DROP FUNCTION normalize_status(text);");
+        var drop_plan = try routineLogicalPlanForTestAlloc(alloc, "DROP FUNCTION normalize_status(text);");
         defer drop_plan.deinit(alloc);
-        try runtime.apply(switch (drop_plan) {
-            .function_catalog => |function_plan| function_plan,
-            else => return error.TestUnexpectedResult,
-        });
+        try runtime.apply(try functionCatalogPlanForTest(drop_plan));
         try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
 
-        var drop_procedure_plan = try ddl_plan.lowerDdlPlanAlloc(alloc, "DROP PROCEDURE rotate_usage();");
+        var drop_procedure_plan = try routineLogicalPlanForTestAlloc(alloc, "DROP PROCEDURE rotate_usage();");
         defer drop_procedure_plan.deinit(alloc);
-        try runtime.apply(switch (drop_procedure_plan) {
-            .function_catalog => |function_plan| function_plan,
-            else => return error.TestUnexpectedResult,
-        });
+        try runtime.apply(try functionCatalogPlanForTest(drop_procedure_plan));
         try std.testing.expectEqual(@as(usize, 0), runtime.routineCountForTest());
     }
 
@@ -1416,12 +1416,9 @@ test "sql routine runtime validates perform dependencies during durable recovery
     const alloc = std.testing.allocator;
     const Helper = struct {
         fn applyDdl(allocator: std.mem.Allocator, runtime: *Runtime, sql: []const u8) !void {
-            var plan = try ddl_plan.lowerDdlPlanAlloc(allocator, sql);
+            var plan = try routineLogicalPlanForTestAlloc(allocator, sql);
             defer plan.deinit(allocator);
-            try runtime.apply(switch (plan) {
-                .function_catalog => |function_plan| function_plan,
-                else => return error.TestUnexpectedResult,
-            });
+            try runtime.apply(try functionCatalogPlanForTest(plan));
         }
 
         fn createCatalogWithSafePerform(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -1485,16 +1482,13 @@ test "sql routine runtime validates perform dependencies during durable recovery
             opened.deinit();
             alloc.destroy(opened);
         }
-        var unsafe_plan = try ddl_plan.lowerDdlPlanAlloc(
+        var unsafe_plan = try routineLogicalPlanForTestAlloc(
             alloc,
             "CREATE FUNCTION audit_log() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
         );
         defer unsafe_plan.deinit(alloc);
-        const create_plan = switch (unsafe_plan) {
-            .function_catalog => |function_plan| switch (function_plan) {
-                .create => |create| create,
-                else => return error.TestUnexpectedResult,
-            },
+        const create_plan = switch (try functionCatalogPlanForTest(unsafe_plan)) {
+            .create => |create| create,
             else => return error.TestUnexpectedResult,
         };
         var unsafe_record = try cloneCreateRoutineRecordAlloc(alloc, create_plan);
@@ -1510,7 +1504,7 @@ test "sql routine runtime validates perform dependencies during durable recovery
 
 test "sql routine runtime executes bounded multi argument expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try ddl_plan.lowerDdlPlanAlloc(
+    var plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION add_amounts(numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + $2';",
     );
@@ -1518,24 +1512,18 @@ test "sql routine runtime executes bounded multi argument expression bodies" {
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    try runtime.apply(switch (plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(plan));
 
     const out = try runtime.executeExpressionRoutineArgsAlloc(alloc, "add_amounts", &.{ "2", "3.5" });
     defer alloc.free(out);
     try std.testing.expectEqualStrings("5.5", out);
 
-    var concat_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var concat_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
     );
     defer concat_plan.deinit(alloc);
-    try runtime.apply(switch (concat_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(concat_plan));
     const label = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label", &.{ "\"tenant\"", "\"active\"" });
     defer alloc.free(label);
     try std.testing.expectEqualStrings("\"tenant active\"", label);
@@ -1546,35 +1534,26 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    var normalize_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var normalize_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
     );
     defer normalize_plan.deinit(alloc);
-    try runtime.apply(switch (normalize_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(normalize_plan));
 
-    var label_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var label_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
     );
     defer label_plan.deinit(alloc);
-    try runtime.apply(switch (label_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(label_plan));
 
-    var strict_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var strict_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
     );
     defer strict_plan.deinit(alloc);
-    try runtime.apply(switch (strict_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(strict_plan));
 
     const bindings = try runtime.listExpressionRoutineBindingsAlloc(alloc);
     defer freeExpressionRoutineBindings(alloc, bindings);
@@ -1606,7 +1585,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
 
 test "sql routine runtime executes nested safe expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try ddl_plan.lowerDdlPlanAlloc(
+    var plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('':'', lower($1), coalesce($2, ''missing''))';",
     );
@@ -1614,10 +1593,7 @@ test "sql routine runtime executes nested safe expression bodies" {
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    try runtime.apply(switch (plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(plan));
 
     const missing = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label_nested", &.{ "\"TENANT\"", "null" });
     defer alloc.free(missing);
@@ -1627,15 +1603,12 @@ test "sql routine runtime executes nested safe expression bodies" {
     defer alloc.free(active);
     try std.testing.expectEqualStrings("\"tenant:active\"", active);
 
-    var clamp_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var clamp_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT least(greatest($1, $2), $3)';",
     );
     defer clamp_plan.deinit(alloc);
-    try runtime.apply(switch (clamp_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(clamp_plan));
 
     const clamped = try runtime.executeExpressionRoutineArgsAlloc(alloc, "clamp_amount", &.{ "5", "10", "8" });
     defer alloc.free(clamped);
@@ -1647,43 +1620,34 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    var redact_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var redact_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION redact_digits(text) RETURNS text LANGUAGE sql AS 'SELECT regexp_replace($1, ''[0-9]'', ''#'', ''g'')';",
     );
     defer redact_plan.deinit(alloc);
-    try runtime.apply(switch (redact_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(redact_plan));
 
     const redacted = try runtime.executeExpressionRoutineAlloc(alloc, "redact_digits", "\"acct-123\"");
     defer alloc.free(redacted);
     try std.testing.expectEqualStrings("\"acct-###\"", redacted);
 
-    var replace_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var replace_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION normalize_dash(text) RETURNS text LANGUAGE sql AS 'SELECT replace($1::text, ''-'', ''_'')';",
     );
     defer replace_plan.deinit(alloc);
-    try runtime.apply(switch (replace_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(replace_plan));
 
     const normalized = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_dash", "\"a-b-c\"");
     defer alloc.free(normalized);
     try std.testing.expectEqualStrings("\"a_b_c\"", normalized);
 
-    var cast_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var cast_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION cast_amount(text) RETURNS numeric LANGUAGE sql AS 'SELECT cast($1 AS numeric) + 1';",
     );
     defer cast_plan.deinit(alloc);
-    try runtime.apply(switch (cast_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(cast_plan));
 
     const casted = try runtime.executeExpressionRoutineAlloc(alloc, "cast_amount", "\"41\"");
     defer alloc.free(casted);
@@ -1691,22 +1655,19 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        ddl_plan.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';"),
+        routineLogicalPlanForTestAlloc(alloc, "CREATE FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';"),
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        ddl_plan.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
+        routineLogicalPlanForTestAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
     );
 
-    var trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
     );
     defer trigger_plan.deinit(alloc);
-    try runtime.apply(switch (trigger_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(trigger_plan));
     try std.testing.expectEqual(@as(usize, 4), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "audit_body", &.{}));
     const trigger_new = try runtime.executeTriggerRoutineAlloc(
@@ -1722,15 +1683,12 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         runtime.executeTriggerRoutineAlloc(alloc, "audit_body", null, "{\"id\":\"u1\"}"),
     );
 
-    var old_trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var old_trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
     );
     defer old_trigger_plan.deinit(alloc);
-    try runtime.apply(switch (old_trigger_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(old_trigger_plan));
     try std.testing.expectEqual(@as(usize, 5), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "old_audit_body", &.{}));
     const trigger_old = try runtime.executeTriggerRoutineAlloc(
@@ -1746,15 +1704,12 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         runtime.executeTriggerRoutineAlloc(alloc, "old_audit_body", "{\"id\":\"u1\"}", "null"),
     );
 
-    var null_trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var null_trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION skip_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
     );
     defer null_trigger_plan.deinit(alloc);
-    try runtime.apply(switch (null_trigger_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(null_trigger_plan));
     try std.testing.expectEqual(@as(usize, 6), runtime.routineCountForTest());
     const trigger_null = try runtime.executeTriggerRoutineAlloc(
         alloc,
@@ -1765,30 +1720,24 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_null);
     try std.testing.expectEqualStrings("null", trigger_null);
 
-    var noop_procedure_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var noop_procedure_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
     );
     defer noop_procedure_plan.deinit(alloc);
-    try runtime.apply(switch (noop_procedure_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(noop_procedure_plan));
     try std.testing.expectEqual(@as(usize, 7), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "rotate_usage", &.{}));
     try runtime.executeProcedureRoutineArgs("rotate_usage", 0);
     try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("rotate_usage", 1));
     try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("audit_body", 0));
 
-    var notice_trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var notice_trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';",
     );
     defer notice_trigger_plan.deinit(alloc);
-    try runtime.apply(switch (notice_trigger_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(notice_trigger_plan));
     try std.testing.expectEqual(@as(usize, 8), runtime.routineCountForTest());
     const trigger_notice_new = try runtime.executeTriggerRoutineAlloc(
         alloc,
@@ -1799,45 +1748,33 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_notice_new);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_notice_new);
 
-    var missing_perform_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var missing_perform_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_missing_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_missing(); RETURN NEW; END';",
     );
     defer missing_perform_plan.deinit(alloc);
-    try std.testing.expectError(error.RoutineNotFound, runtime.apply(switch (missing_perform_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    }));
+    try std.testing.expectError(error.RoutineNotFound, runtime.apply(try functionCatalogPlanForTest(missing_perform_plan)));
 
-    var unsafe_perform_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var unsafe_perform_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_unsafe_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_notice_body(); RETURN NEW; END';",
     );
     defer unsafe_perform_plan.deinit(alloc);
-    try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.apply(switch (unsafe_perform_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    }));
+    try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.apply(try functionCatalogPlanForTest(unsafe_perform_plan)));
 
-    var audit_log_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var audit_log_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_log() RETURNS text LANGUAGE sql AS 'SELECT ''ok''';",
     );
     defer audit_log_plan.deinit(alloc);
-    try runtime.apply(switch (audit_log_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(audit_log_plan));
     try std.testing.expectEqual(@as(usize, 9), runtime.routineCountForTest());
-    var perform_trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var perform_trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';",
     );
     defer perform_trigger_plan.deinit(alloc);
-    try runtime.apply(switch (perform_trigger_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(perform_trigger_plan));
     try std.testing.expectEqual(@as(usize, 10), runtime.routineCountForTest());
     const trigger_perform_new = try runtime.executeTriggerRoutineAlloc(
         alloc,
@@ -1848,47 +1785,35 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_perform_new);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_perform_new);
 
-    var rotate_usage_now_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var rotate_usage_now_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION rotate_usage_now() RETURNS text LANGUAGE sql AS 'SELECT ''ok''';",
     );
     defer rotate_usage_now_plan.deinit(alloc);
-    try runtime.apply(switch (rotate_usage_now_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(rotate_usage_now_plan));
     try std.testing.expectEqual(@as(usize, 11), runtime.routineCountForTest());
-    var perform_procedure_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var perform_procedure_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(); END';",
     );
     defer perform_procedure_plan.deinit(alloc);
-    try runtime.apply(switch (perform_procedure_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(perform_procedure_plan));
     try std.testing.expectEqual(@as(usize, 12), runtime.routineCountForTest());
     try runtime.executeProcedureRoutineArgs("rotate_usage_perform", 0);
 
-    var rotate_usage_now_arg_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var rotate_usage_now_arg_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION rotate_usage_now(n numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + 1';",
     );
     defer rotate_usage_now_arg_plan.deinit(alloc);
-    try runtime.apply(switch (rotate_usage_now_arg_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(rotate_usage_now_arg_plan));
     try std.testing.expectEqual(@as(usize, 13), runtime.routineCountForTest());
-    var perform_procedure_arg_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var perform_procedure_arg_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(1); END';",
     );
     defer perform_procedure_arg_plan.deinit(alloc);
-    try runtime.apply(switch (perform_procedure_arg_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(perform_procedure_arg_plan));
     try std.testing.expectEqual(@as(usize, 14), runtime.routineCountForTest());
     try runtime.executeProcedureRoutineArgs("rotate_usage_perform_arg", 0);
 
@@ -1899,33 +1824,21 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectEqual(@as(usize, 1), stored_perform_arg_body.perform_calls[0].argument_json.len);
     try std.testing.expectEqualStrings("1", stored_perform_arg_body.perform_calls[0].argument_json[0]);
 
-    var drop_audit_log_plan = try ddl_plan.lowerDdlPlanAlloc(alloc, "DROP FUNCTION audit_log();");
+    var drop_audit_log_plan = try routineLogicalPlanForTestAlloc(alloc, "DROP FUNCTION audit_log();");
     defer drop_audit_log_plan.deinit(alloc);
-    try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_audit_log_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    }));
+    try std.testing.expectError(error.RoutineInUse, runtime.apply(try functionCatalogPlanForTest(drop_audit_log_plan)));
 
-    var drop_rotate_usage_now_plan = try ddl_plan.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now();");
+    var drop_rotate_usage_now_plan = try routineLogicalPlanForTestAlloc(alloc, "DROP FUNCTION rotate_usage_now();");
     defer drop_rotate_usage_now_plan.deinit(alloc);
-    try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_rotate_usage_now_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    }));
+    try std.testing.expectError(error.RoutineInUse, runtime.apply(try functionCatalogPlanForTest(drop_rotate_usage_now_plan)));
 
-    var drop_rotate_usage_now_arg_plan = try ddl_plan.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now(numeric);");
+    var drop_rotate_usage_now_arg_plan = try routineLogicalPlanForTestAlloc(alloc, "DROP FUNCTION rotate_usage_now(numeric);");
     defer drop_rotate_usage_now_arg_plan.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), switch (drop_rotate_usage_now_arg_plan) {
-        .function_catalog => |function_plan| switch (function_plan) {
-            .drop => |drop| drop.argument_count,
-            else => return error.TestUnexpectedResult,
-        },
+    try std.testing.expectEqual(@as(usize, 1), switch (try functionCatalogPlanForTest(drop_rotate_usage_now_arg_plan)) {
+        .drop => |drop| drop.argument_count,
         else => return error.TestUnexpectedResult,
     });
-    try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_rotate_usage_now_arg_plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    }));
+    try std.testing.expectError(error.RoutineInUse, runtime.apply(try functionCatalogPlanForTest(drop_rotate_usage_now_arg_plan)));
 }
 
 test "sql routine runtime persists safe row trigger catalog records" {
@@ -1944,15 +1857,12 @@ test "sql routine runtime persists safe row trigger catalog records" {
         defer runtime.deinit();
         try runtime.attachOpenedStore(opened);
 
-        var trigger_fn_plan = try ddl_plan.lowerDdlPlanAlloc(
+        var trigger_fn_plan = try routineLogicalPlanForTestAlloc(
             alloc,
             "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
         );
         defer trigger_fn_plan.deinit(alloc);
-        try runtime.apply(switch (trigger_fn_plan) {
-            .function_catalog => |function| function,
-            else => return error.TestUnexpectedResult,
-        });
+        try runtime.apply(try functionCatalogPlanForTest(trigger_fn_plan));
 
         var parsed_trigger_sql = try sql_adapter.ParsedSql.initAlloc(
             alloc,
@@ -1964,11 +1874,12 @@ test "sql routine runtime persists safe row trigger catalog records" {
         const function_name = (try runtime.triggerFunctionForTableEventAlloc(alloc, "usage_records", .insert)) orelse return error.TestUnexpectedResult;
         defer alloc.free(function_name);
         try std.testing.expectEqualStrings("audit_body", function_name);
-        try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (trigger_fn_plan) {
-            .function_catalog => |function| .{ .drop = .{
-                .kind = function.create.kind,
-                .routine_name = function.create.routine_name,
-                .argument_count = function.create.argument_count,
+        const trigger_function = try functionCatalogPlanForTest(trigger_fn_plan);
+        try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (trigger_function) {
+            .create => |function| .{ .drop = .{
+                .kind = function.kind,
+                .routine_name = function.routine_name,
+                .argument_count = function.argument_count,
                 .if_exists = false,
                 .cascade = false,
             } },
@@ -2016,15 +1927,12 @@ test "sql routine runtime validates trigger ddl against executable trigger bodie
         "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records EXECUTE FUNCTION missing_trigger();",
     ));
 
-    var old_trigger_plan = try ddl_plan.lowerDdlPlanAlloc(
+    var old_trigger_plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
     );
     defer old_trigger_plan.deinit(alloc);
-    try runtime.apply(switch (old_trigger_plan) {
-        .function_catalog => |function| function,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(old_trigger_plan));
     try std.testing.expectError(error.UnsupportedSqlShape, runtime.applyTriggerDdlAlloc(
         alloc,
         "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records EXECUTE FUNCTION old_audit_body();",
@@ -2084,7 +1992,7 @@ test "sql routine runtime replaces ready extension query function bindings" {
 
 test "sql routine runtime applies returns-null null-input policy before execution" {
     const alloc = std.testing.allocator;
-    var plan = try ddl_plan.lowerDdlPlanAlloc(
+    var plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
     );
@@ -2092,10 +2000,7 @@ test "sql routine runtime applies returns-null null-input policy before executio
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    try runtime.apply(switch (plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(plan));
 
     const out = try runtime.executeExpressionRoutineAlloc(alloc, "strict_normalize_status", "null");
     defer alloc.free(out);
@@ -2104,7 +2009,7 @@ test "sql routine runtime applies returns-null null-input policy before executio
 
 test "sql routine runtime preserves typed catalog metadata" {
     const alloc = std.testing.allocator;
-    var plan = try ddl_plan.lowerDdlPlanAlloc(
+    var plan = try routineLogicalPlanForTestAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE SECURITY DEFINER PARALLEL SAFE LEAKPROOF COST 3 SET search_path TO public AS 'SELECT lower($1)';",
     );
@@ -2112,10 +2017,7 @@ test "sql routine runtime preserves typed catalog metadata" {
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    try runtime.apply(switch (plan) {
-        .function_catalog => |function_plan| function_plan,
-        else => return error.TestUnexpectedResult,
-    });
+    try runtime.apply(try functionCatalogPlanForTest(plan));
 
     try std.testing.expectEqual(@as(usize, 1), runtime.routines.items.len);
     const routine = runtime.routines.items[0];

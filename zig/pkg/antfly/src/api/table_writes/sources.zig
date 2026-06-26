@@ -21594,7 +21594,7 @@ test "provisioned table read source survives many external write-sync batches be
     };
 
     var ready = false;
-    for (0..200) |_| {
+    for (0..1000) |_| {
         var detail = try server.handlePublicTableGetIndex("docs", "semantic_idx");
         defer detail.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), detail.status);
