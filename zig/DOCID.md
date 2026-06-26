@@ -1501,30 +1501,10 @@ Status as of 2026-05-19:
   timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
   defaults to smoke-sized query evidence and can be expanded with
   `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
-  `zig build docid-operational-hardening-test` is the broader operational
-  evidence target: it chains the focused lifecycle gate with metadata
-  split/merge restart/partition chaos, public split/merge traffic chaos, and
-  LSM backend compaction chaos. `scripts/run_docid_operational_hardening_matrix.sh`
-  wraps the same work into timestamped logs under
-  `bench/results/docid-operational-hardening/`; set
-  `DOCID_OPERATIONAL_MATRIX_RUN_SCALE=1` to add the large public-query
-  performance matrix, and set `DOCID_OPERATIONAL_MATRIX_RUN_FULL_TARGET=1` when
-  a single build-step invocation is preferred over per-bucket logs. A local
-  operational pass at
-  `bench/results/docid-operational-hardening/20260525T173023Z/` completed all
-  four buckets: focused DOCID lifecycle, metadata split/merge transition chaos,
-  public split/merge traffic chaos, and LSM backend compaction chaos.
-  `scripts/run_docid_production_readiness_matrix.sh` is the release-evidence
-  wrapper for the remaining production-readiness questions. It always runs the
-  focused lifecycle and operational hardening gates, can add a 300k-scale DOCID
-  performance matrix with `DOCID_PRODUCTION_MATRIX_RUN_SCALE=1`, can run the
-  current auth e2e guard with `DOCID_PRODUCTION_MATRIX_RUN_E2E=1`, and can run
-  old/new binary compatibility smoke checks with
-  `DOCID_PRODUCTION_MATRIX_RUN_OLD_NEW=1` plus explicit
-  `DOCID_PRODUCTION_MATRIX_OLD_ANTFLY_BIN` and
-  `DOCID_PRODUCTION_MATRIX_NEW_ANTFLY_BIN` paths. It records environment,
-  commands, status, and per-case logs under
-  `bench/results/docid-production-readiness/`.
+  Release-evidence runs should compose the focused lifecycle target, the
+  operational chaos buckets, the DOCID query matrix, current auth e2e checks,
+  and old/new binary compatibility smokes directly instead of adding another
+  one-off umbrella build step or wrapper script.
   The scripted cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three

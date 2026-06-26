@@ -68,9 +68,6 @@ pub fn addCliSteps(ctx: anytype) void {
     run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
     const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
     run_lite_full_cli_smoke.addArtifactArg(antfly_main);
-    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
-    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
     const lite_core_main_tests = b.addTest(.{
         .root_module = lite_core_main_mod,
         .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_core_main),
@@ -80,16 +77,6 @@ pub fn addCliSteps(ctx: anytype) void {
         },
     });
     const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
-    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
-    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cli_tests.step);
-    lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_example.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
-    lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
 
     const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
@@ -146,9 +133,21 @@ pub fn addCliSteps(ctx: anytype) void {
     });
     lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
     const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
-    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
-    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
+
+    const lite_test_step = b.step("lite-test", "Run Antfly Lite CLI, native, C ABI, Go binding, packaging, and WASM profile checks");
+    lite_test_step.dependOn(&run_lite_core_main_tests.step);
+    lite_test_step.dependOn(&run_lite_cli_tests.step);
+    lite_test_step.dependOn(&run_lite_native_tests.step);
+    lite_test_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
+    lite_test_step.dependOn(&capi_steps.run_lite_go_tests.step);
+    lite_test_step.dependOn(&capi_steps.run_lite_go_example.step);
+    lite_test_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
+    lite_test_step.dependOn(&run_lite_core_cli_smoke.step);
+    lite_test_step.dependOn(&run_lite_full_cli_smoke.step);
+    lite_test_step.dependOn(&install_lite_wasm_profile.step);
+    lite_test_step.dependOn(&run_lite_wasm_profile_tests.step);
+    lite_test_step.dependOn(&capi_steps.run_cabi_packaging_tests.step);
+    lite_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
     lite_dev_step.dependOn(&install_antfly.step);

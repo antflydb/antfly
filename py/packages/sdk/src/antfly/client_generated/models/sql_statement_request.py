@@ -21,15 +21,15 @@ class SqlStatementRequest:
             session_id (int | None | Unset): Logical SQL session id returned by an earlier SQL response.
             database (None | str | Unset): Optional current database override for this request.
             namespace (None | str | Unset): Optional single search-path namespace override for this request.
-            read_only (bool | Unset): Execute this statement under a server-enforced PostgreSQL-style read-only
-                transaction guard.
+            read_only (bool | Unset): Execute this statement under a server-enforced PostgreSQL-style read-only transaction
+                guard. Default: False.
     """
 
     sql: str
     session_id: int | None | Unset = UNSET
     database: None | str | Unset = UNSET
     namespace: None | str | Unset = UNSET
-    read_only: bool | Unset = UNSET
+    read_only: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         sql = self.sql

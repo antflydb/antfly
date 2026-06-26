@@ -802,9 +802,12 @@ pub const GeneratedSqlJoinKind = enum {
     left,
     right,
     full,
+    cross,
+    natural,
 };
 
 pub const GeneratedSqlJoinConditionKind = enum {
+    none,
     on,
     using,
 };
@@ -5790,15 +5793,18 @@ fn buildGeneratedJoinItemsAst(
 
     var scan = source_tokens.start;
     while (findTopLevelKeyword(tokens, scan, source_tokens.end, .join)) |join_index| {
-        const condition = generatedJoinCondition(tokens, join_index + 1, source_tokens.end) orelse return &.{};
         const operator = generatedJoinOperator(tokens, source_tokens, join_index) orelse return &.{};
-        if (source_tokens.start >= operator.tokens.start or join_index + 1 >= condition.keyword_index) return &.{};
+        const conditionless = operator.kind == .cross or operator.kind == .natural;
+        const condition = if (conditionless) null else generatedJoinCondition(tokens, join_index + 1, source_tokens.end);
+        if (condition == null and !conditionless) return &.{};
 
-        const next_join_index = findTopLevelKeyword(tokens, condition.end, source_tokens.end, .join);
+        const next_join_scan = if (condition) |matched_condition| matched_condition.end else join_index + 1;
+        const next_join_index = findTopLevelKeyword(tokens, next_join_scan, source_tokens.end, .join);
         const item_end = if (next_join_index) |next_join|
             (generatedJoinOperator(tokens, source_tokens, next_join) orelse return &.{}).tokens.start
-        else
-            condition.end;
+        else if (condition) |matched_condition| matched_condition.end else source_tokens.end;
+        const right_end = if (condition) |matched_condition| matched_condition.keyword_index else item_end;
+        if (source_tokens.start >= operator.tokens.start or join_index + 1 >= right_end) return &.{};
 
         try items.ensureUnusedCapacity(alloc, 1);
         const tree_index = items.items.len;
@@ -5810,19 +5816,22 @@ fn buildGeneratedJoinItemsAst(
             .tree_depth = tree_index + 1,
             .left_child_index = if (tree_index == 0) null else tree_index - 1,
             .left_tokens = .{ .start = source_tokens.start, .end = operator.tokens.start },
-            .right_tokens = .{ .start = join_index + 1, .end = condition.keyword_index },
-            .condition_kind = condition.kind,
-            .condition_tokens = condition.tokens,
+            .right_tokens = .{ .start = join_index + 1, .end = right_end },
+            .condition_kind = if (condition) |matched_condition| matched_condition.kind else .none,
+            .condition_tokens = if (condition) |matched_condition| matched_condition.tokens else .{ .start = item_end, .end = item_end },
         };
-        switch (condition.kind) {
+        switch (item.condition_kind) {
+            .none => {},
             .on => {
-                item.predicate_tokens = condition.body_tokens;
-                try buildGeneratedExpressionAstInto(alloc, tokens, condition.body_tokens, &item.predicate_expression);
+                const matched_condition = condition.?;
+                item.predicate_tokens = matched_condition.body_tokens;
+                try buildGeneratedExpressionAstInto(alloc, tokens, matched_condition.body_tokens, &item.predicate_expression);
             },
             .using => {
-                item.using_tokens = condition.tokens;
-                item.using_column_tokens = condition.body_tokens;
-                item.using_columns = try buildTopLevelListAst(alloc, tokens, condition.body_tokens, .{});
+                const matched_condition = condition.?;
+                item.using_tokens = matched_condition.tokens;
+                item.using_column_tokens = matched_condition.body_tokens;
+                item.using_columns = try buildTopLevelListAst(alloc, tokens, matched_condition.body_tokens, .{});
             },
         }
         items.appendAssumeCapacity(item);
@@ -5886,6 +5895,16 @@ const GeneratedJoinOperator = struct {
 
 fn generatedJoinOperator(tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, join_index: usize) ?GeneratedJoinOperator {
     if (join_index >= source_tokens.end or !tokens[join_index].matchesKeywordTag(.join)) return null;
+    if (join_index >= source_tokens.start + 1) {
+        if (tokens[join_index - 1].matchesKeywordTag(.cross)) return .{
+            .tokens = .{ .start = join_index - 1, .end = join_index + 1 },
+            .kind = .cross,
+        };
+        if (tokens[join_index - 1].matchesKeywordTag(.natural)) return .{
+            .tokens = .{ .start = join_index - 1, .end = join_index + 1 },
+            .kind = .natural,
+        };
+    }
     if (join_index >= source_tokens.start + 2 and tokens[join_index - 1].matchesKeywordTag(.outer)) {
         if (tokens[join_index - 2].matchesKeywordTag(.left)) return .{
             .tokens = .{ .start = join_index - 2, .end = join_index + 1 },
@@ -10917,6 +10936,42 @@ test "generated SQL parser facade builds null logical and join AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.join_predicate_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
+    }
+
+    const conditionless_join_cases = [_]struct {
+        sql: []const u8,
+        kind: GeneratedSqlJoinKind,
+    }{
+        .{
+            .sql = "SELECT usage_records.id FROM usage_records CROSS JOIN accounts",
+            .kind = .cross,
+        },
+        .{
+            .sql = "SELECT usage_records.id FROM usage_records NATURAL JOIN accounts",
+            .kind = .natural,
+        },
+    };
+    for (conditionless_join_cases) |case| {
+        const result = try parseSqlAlloc(alloc, case.sql);
+        switch (result.ast.?) {
+            .read => |read| {
+                try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.source_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.join_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, read.join_operator_tokens.?);
+                try std.testing.expectEqual(case.kind, read.join_kind.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_left_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.join_right_tokens.?);
+                try std.testing.expect(read.join_predicate_tokens == null);
+                try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+                try std.testing.expectEqual(case.kind, read.join_items[0].kind);
+                try std.testing.expectEqual(GeneratedSqlJoinConditionKind.none, read.join_items[0].condition_kind);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 9 }, read.join_items[0].condition_tokens);
+                try std.testing.expect(read.join_items[0].predicate_tokens == null);
+                try std.testing.expect(read.join_items[0].using_tokens == null);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     const distinct_read_sql = "SELECT DISTINCT status FROM usage_records ORDER BY status";

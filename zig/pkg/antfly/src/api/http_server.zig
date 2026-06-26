@@ -4313,11 +4313,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer logical_plan.deinit(self.alloc);
-        const plan = switch (logical_plan) {
-            .ddl => |*ddl| ddl,
-            .read, .write => unreachable,
-        };
-        return try self.applyRelationalDdlPlanWithSession(plan, session, .{
+        return try self.applyLogicalSqlPlanWithSession(&logical_plan, session, .{
             .parsed_sql = parsed_sql,
             .function_bindings = function_bindings,
             .statement_timing = .{
@@ -4325,6 +4321,95 @@ pub const ApiHttpServer = struct {
                 .start_ns = statement_start_ns,
             },
         });
+    }
+
+    fn applyLogicalSqlPlanWithSession(
+        self: *ApiHttpServer,
+        logical_plan: *sql_adapter.LogicalSqlPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        switch (logical_plan.*) {
+            .ddl => |*plan| return try self.applyRelationalDdlPlanWithSession(plan, session, context),
+            .session => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .session_catalog = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .transaction => |transaction_plan| switch (transaction_plan) {
+                .control => |plan| {
+                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .transaction_control = plan };
+                    return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                },
+                .prepared => |plan| {
+                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .prepared_transaction = plan };
+                    return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                },
+                .savepoint => |plan| {
+                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .savepoint_transaction = plan };
+                    return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                },
+            },
+            .prepared_statement => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .prepared_statement = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .cursor => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .cursor_portal = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .notification => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .notification_channel = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .routine => |*routine_plan| {
+                const timing = context.statement_timing orelse SqlStatementExecutionTiming{
+                    .timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session()),
+                    .start_ns = platform_time.monotonicNs(),
+                };
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+
+                switch (routine_plan.*) {
+                    .function_catalog => |*function_plan| {
+                        try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
+                        try self.sql_routine_runtime.apply(function_plan.*);
+                    },
+                    .trigger_catalog => |trigger_plan| {
+                        return try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(trigger_plan, session, context, timing);
+                    },
+                    .procedure_call => |procedure_call| {
+                        try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
+                    },
+                }
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
+            },
+            .auth => |auth_plan| switch (auth_plan) {
+                .authorization_catalog => |plan| {
+                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .authorization_catalog = plan };
+                    return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                },
+                .row_security_catalog => |plan| {
+                    var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .row_security_catalog = plan };
+                    return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+                },
+            },
+            .extension => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .extension_catalog = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .maintenance => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .maintenance_job = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .bulk_io => |plan| {
+                var ddl_plan: sql_adapter.LoweredDdlPlan = .{ .bulk_io = plan };
+                return try self.applyRelationalDdlPlanWithSession(&ddl_plan, session, context);
+            },
+            .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
+        }
     }
 
     pub fn applyRelationalDdlPlanWithSession(
@@ -5612,7 +5697,14 @@ pub const ApiHttpServer = struct {
         return .{ .batch = batch };
     }
 
-    fn handlePublicSqlWrite(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+    fn handlePublicSqlWrite(
+        self: *ApiHttpServer,
+        logical_plan: *sql_adapter.LogicalSqlPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5625,32 +5717,9 @@ pub const ApiHttpServer = struct {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
 
-        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
-        const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
-            error.InvalidRoleSetting => return .{ .response = try textResponse(self.alloc, 400, "invalid sql setting") },
-        };
-        const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
-            .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
-            else => null,
-        };
-        defer if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
-        var bound = sql_adapter.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, .{
-            .unique_resolver = unique_resolver_ctx.resolver(),
-            .row_claim = row_claim,
-            .sync_level = sync_level,
-        }, self.catalogSource(), session.session()) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => {
-                std.log.err("public sql write bind not found err={}", .{err});
-                return .{ .response = try textResponse(self.alloc, 404, "not found") };
-            },
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
-            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
-            else => return err,
-        };
-        defer bound.deinit(self.alloc);
-        const write_catalog = bound.writeCatalog() catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        const write_catalog = switch (logical_plan.*) {
+            .catalog_write => |*catalog_write| catalog_write,
+            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
         };
         const target_binding = write_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
         const target = target_binding.target();
@@ -5665,10 +5734,10 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
+        var lowered = sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
-            &bound,
+            logical_plan,
             schema,
             params,
             function_bindings,
@@ -5931,7 +6000,14 @@ pub const ApiHttpServer = struct {
         } };
     }
 
-    fn handlePublicSqlRead(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+    fn handlePublicSqlRead(
+        self: *ApiHttpServer,
+        logical_plan: *sql_adapter.LogicalSqlPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5940,14 +6016,9 @@ pub const ApiHttpServer = struct {
         if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
         const read_source = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
 
-        var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            else => return err,
-        };
-        defer bound.deinit(self.alloc);
-        const read_catalog = bound.readCatalog() catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+        const read_catalog = switch (logical_plan.*) {
+            .catalog_read => |*catalog_read| catalog_read,
+            else => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
         };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
         const target = target_binding.target();
@@ -5967,10 +6038,10 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
-            &bound,
+            logical_plan,
             schema,
             params,
             function_bindings,
@@ -7768,6 +7839,109 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity = null,
     };
 
+    const PublicSqlPlannedExecution = struct {
+        logical_plan: sql_adapter.LogicalSqlPlan,
+        row_claim_owner_id: ?[]const u8 = null,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.logical_plan.deinit(alloc);
+            if (self.row_claim_owner_id) |owner_id| alloc.free(@constCast(owner_id));
+            self.* = undefined;
+        }
+    };
+
+    const PublicSqlPlannedExecutionOrResponse = union(enum) {
+        planned: PublicSqlPlannedExecution,
+        response: http_common.HttpResponse,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .planned => |*planned| planned.deinit(alloc),
+                .response => |*response| response.deinit(alloc),
+            }
+            self.* = undefined;
+        }
+    };
+
+    fn planPublicParsedSqlExecutionAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+    ) !PublicSqlPlannedExecutionOrResponse {
+        if (parsed_sql.writeStatementKind()) |statement_kind| {
+            if (try self.publicSqlReadOnlyActive(session)) {
+                return .{ .response = try textResponse(self.alloc, 400, "cannot execute write statement in a read-only transaction") };
+            }
+            switch (statement_kind) {
+                .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
+            }
+
+            var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+            const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
+                error.InvalidRoleSetting => return .{ .response = try textResponse(self.alloc, 400, "invalid sql setting") },
+            };
+            const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
+                .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
+                else => null,
+            };
+            var row_claim_owner_id: ?[]const u8 = if (row_claim) |claim| claim.owner_id else null;
+            defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
+
+            var bound = sql_adapter.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, .{
+                .unique_resolver = unique_resolver_ctx.resolver(),
+                .row_claim = row_claim,
+                .sync_level = sync_level,
+            }, self.catalogSource(), session.session()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => {
+                    std.log.err("public sql write bind not found err={}", .{err});
+                    return .{ .response = try textResponse(self.alloc, 404, "not found") };
+                },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try textResponse(self.alloc, 503, "unique owner unavailable") },
+                else => return err,
+            };
+            defer bound.deinit(self.alloc);
+
+            var logical_plan = try sql_adapter.logicalWritePlanFromBoundStatement(&bound);
+            errdefer logical_plan.deinit(self.alloc);
+            const owner_id = row_claim_owner_id;
+            row_claim_owner_id = null;
+            return .{ .planned = .{
+                .logical_plan = logical_plan,
+                .row_claim_owner_id = owner_id,
+            } };
+        }
+
+        if (parsed_sql.readStatementKind() != null) {
+            var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                else => return err,
+            };
+            defer bound.deinit(self.alloc);
+
+            var logical_plan = try sql_adapter.logicalReadPlanFromBoundStatement(&bound);
+            errdefer logical_plan.deinit(self.alloc);
+            return .{ .planned = .{ .logical_plan = logical_plan } };
+        }
+
+        const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
+        defer sql_routines.freeExpressionRoutineBindings(self.alloc, routine_bindings);
+        const function_bindings: sql_adapter.SqlFunctionBindings = .{
+            .routine_expressions = routine_bindings,
+        };
+        var logical_plan = sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
+            error.UnsupportedSqlShape => {
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                return err;
+            },
+            else => return err,
+        };
+        errdefer logical_plan.deinit(self.alloc);
+        return .{ .planned = .{ .logical_plan = logical_plan } };
+    }
+
     pub fn executePublicParsedSqlRequestResult(self: *ApiHttpServer, request: PublicParsedSqlExecutionRequest) !PublicSqlResultOrResponse {
         const parsed_sql = request.parsed_sql;
         const session = request.session;
@@ -7784,39 +7958,18 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        if (sql_adapter.classifyParsedSqlForExecution(parsed_sql)) |logical_plan| {
-            switch (logical_plan) {
-                .write => {
-                    var outcome = try self.handlePublicSqlWrite(parsed_sql, request.params, session, request.authenticated_identity);
-                    errdefer outcome.deinit(self.alloc);
-                    switch (outcome) {
-                        .response => self.markPublicSqlTransactionFailedIfActive(session),
-                        .result => {},
-                    }
-                    switch (outcome) {
-                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
-                        .response => {},
-                    }
-                    return outcome;
-                },
-                .read => {
-                    var outcome = try self.handlePublicSqlRead(parsed_sql, request.params, session, request.authenticated_identity);
-                    errdefer outcome.deinit(self.alloc);
-                    switch (outcome) {
-                        .response => self.markPublicSqlTransactionFailedIfActive(session),
-                        .result => {},
-                    }
-                    switch (outcome) {
-                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
-                        .response => {},
-                    }
-                    return outcome;
-                },
-                .ddl => unreachable,
+        if (parsed_sql.readStatementKind()) |statement_kind| {
+            if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, statement_kind)) |outcome_value| {
+                var outcome = outcome_value;
+                errdefer outcome.deinit(self.alloc);
+                switch (outcome) {
+                    .response => self.markPublicSqlTransactionFailedIfActive(session),
+                    .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
+                }
+                return outcome;
             }
         }
-
-        const applied = self.applyRelationalParsedSqlDdlWithSession(parsed_sql, session) catch |err| switch (err) {
+        var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
                 self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
@@ -7846,17 +7999,72 @@ pub const ApiHttpServer = struct {
             },
             else => return err,
         };
-        const session_id = self.ensureSqlProtocolSessionId(session);
+        var planned_or_response_owned = true;
+        defer if (planned_or_response_owned) planned_or_response.deinit(self.alloc);
 
-        return .{ .result = .{
-            .session_id = session_id,
-            .statement_kind = "ddl",
-            .transaction_status = self.publicSqlTransactionStatus(session),
-            .result = .{ .ddl = .{
-                .applied = applied,
-                .command_tag = publicSqlDdlCommandTag(parsed_sql),
-            } },
-        } };
+        switch (planned_or_response) {
+            .response => |*response| {
+                self.markPublicSqlTransactionFailedIfActive(session);
+                const out = response.*;
+                planned_or_response_owned = false;
+                return .{ .response = out };
+            },
+            .planned => |*planned| {
+                var outcome: PublicSqlResultOrResponse = switch (planned.logical_plan) {
+                    .catalog_write => try self.handlePublicSqlWrite(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
+                    .catalog_read => try self.handlePublicSqlRead(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
+                    .read, .write => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                    else => ddl_blk: {
+                        const applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, &planned.logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
+                            error.DocumentSqlViewMappingUnsupported => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
+                            },
+                            error.SqlReadOnlyTransaction => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") };
+                            },
+                            error.UnsupportedSqlShape => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+                            },
+                            error.StatementTimeout => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") };
+                            },
+                            error.InvalidSqlSession,
+                            error.PreparedStatementAlreadyExists,
+                            error.PreparedStatementNotFound,
+                            error.PreparedStatementArgumentMismatch,
+                            error.InvalidSqlCatalog,
+                            error.InvalidRoleSetting,
+                            error.RoleSettingNotFound,
+                            => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+                            },
+                            else => return err,
+                        };
+                        const session_id = self.ensureSqlProtocolSessionId(session);
+                        break :ddl_blk .{ .result = .{
+                            .session_id = session_id,
+                            .statement_kind = "ddl",
+                            .transaction_status = self.publicSqlTransactionStatus(session),
+                            .result = .{ .ddl = .{
+                                .applied = applied,
+                                .command_tag = publicSqlDdlCommandTag(parsed_sql),
+                            } },
+                        } };
+                    },
+                };
+                errdefer outcome.deinit(self.alloc);
+                switch (outcome) {
+                    .response => self.markPublicSqlTransactionFailedIfActive(session),
+                    .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
+                }
+                return outcome;
+            },
+        }
     }
 
     pub fn handlePublicSqlDescribeRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {

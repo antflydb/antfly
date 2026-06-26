@@ -19,6 +19,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
@@ -976,10 +977,12 @@ pub const CatalogLogicalWritePlan = struct {
     statement: tokenized.ParsedStatement,
     session: BoundSqlSession,
     options: plan_mod.LowerWritePlanOptions,
+    target_binding: ?source_binding.SqlSourceBinding = null,
     owned_insert_source_schema: ?runtime_schema.TableSchema = null,
     owned_joined_source_schema: ?runtime_schema.TableSchema = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         self.session.deinit(alloc);
@@ -987,18 +990,176 @@ pub const CatalogLogicalWritePlan = struct {
     }
 };
 
-pub const LogicalSqlPlan = union(enum) {
-    catalog_read: CatalogLogicalReadPlan,
-    catalog_write: CatalogLogicalWritePlan,
+pub const TransactionLogicalPlan = union(enum) {
+    control: ddl_plan.TransactionControlPlan,
+    prepared: ddl_plan.PreparedTransactionPlan,
+    savepoint: ddl_plan.SavepointTransactionPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .catalog_read => |*read| read.deinit(alloc),
-            .catalog_write => |*write| write.deinit(alloc),
+            .control => |*plan| plan.deinit(alloc),
+            .prepared => |*plan| plan.deinit(alloc),
+            .savepoint => |*plan| plan.deinit(alloc),
         }
         self.* = undefined;
     }
 };
+
+pub const RoutineLogicalPlan = union(enum) {
+    function_catalog: ddl_plan.FunctionCatalogPlan,
+    trigger_catalog: ddl_plan.TriggerCatalogPlan,
+    procedure_call: ddl_plan.ProcedureCallPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .function_catalog => |*plan| plan.deinit(alloc),
+            .trigger_catalog => |*plan| plan.deinit(alloc),
+            .procedure_call => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AuthorizationLogicalPlan = union(enum) {
+    authorization_catalog: ddl_plan.AuthorizationCatalogPlan,
+    row_security_catalog: ddl_plan.RowSecurityCatalogPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .authorization_catalog => |*plan| plan.deinit(alloc),
+            .row_security_catalog => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LogicalSqlPlan = union(enum) {
+    read: classifier.SqlReadStatementKind,
+    write: classifier.SqlWriteStatementKind,
+    catalog_read: CatalogLogicalReadPlan,
+    catalog_write: CatalogLogicalWritePlan,
+    ddl: ddl_plan.LoweredDdlPlan,
+    session: ddl_plan.SessionCatalogPlan,
+    transaction: TransactionLogicalPlan,
+    prepared_statement: ddl_plan.PreparedStatementPlan,
+    cursor: ddl_plan.CursorPortalPlan,
+    notification: ddl_plan.NotificationChannelPlan,
+    routine: RoutineLogicalPlan,
+    auth: AuthorizationLogicalPlan,
+    extension: ddl_plan.ExtensionCatalogPlan,
+    maintenance: ddl_plan.MaintenanceJobPlan,
+    bulk_io: ddl_plan.BulkIoPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .read, .write => {},
+            .catalog_read => |*read| read.deinit(alloc),
+            .catalog_write => |*write| write.deinit(alloc),
+            .ddl => |*plan| plan.deinit(alloc),
+            .session => |*plan| plan.deinit(alloc),
+            .transaction => |*plan| plan.deinit(alloc),
+            .prepared_statement => |*plan| plan.deinit(alloc),
+            .cursor => |*plan| plan.deinit(alloc),
+            .notification => |*plan| plan.deinit(alloc),
+            .routine => |*plan| plan.deinit(alloc),
+            .auth => |*plan| plan.deinit(alloc),
+            .extension => |*plan| plan.deinit(alloc),
+            .maintenance => |*plan| plan.deinit(alloc),
+            .bulk_io => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+
+    pub fn statementKindName(self: LogicalSqlPlan) []const u8 {
+        return switch (self) {
+            .read => |kind| @tagName(kind),
+            .write => |kind| @tagName(kind),
+            .catalog_read => "read",
+            .catalog_write => "write",
+            .ddl => "ddl",
+            .session => "session",
+            .transaction => "transaction",
+            .prepared_statement => "prepared_statement",
+            .cursor => "cursor",
+            .notification => "notification",
+            .routine => "routine",
+            .auth => "auth",
+            .extension => "extension",
+            .maintenance => "maintenance",
+            .bulk_io => "bulk_io",
+        };
+    }
+};
+
+pub fn logicalPlanFromLoweredDdlPlan(plan: *ddl_plan.LoweredDdlPlan) LogicalSqlPlan {
+    return switch (plan.*) {
+        .session_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .session = payload };
+        },
+        .transaction_control => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .control = payload } };
+        },
+        .prepared_transaction => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .prepared = payload } };
+        },
+        .savepoint_transaction => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .savepoint = payload } };
+        },
+        .prepared_statement => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .prepared_statement = payload };
+        },
+        .cursor_portal => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .cursor = payload };
+        },
+        .notification_channel => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .notification = payload };
+        },
+        .function_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .function_catalog = payload } };
+        },
+        .trigger_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .trigger_catalog = payload } };
+        },
+        .procedure_call => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .procedure_call = payload } };
+        },
+        .authorization_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .auth = .{ .authorization_catalog = payload } };
+        },
+        .row_security_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .auth = .{ .row_security_catalog = payload } };
+        },
+        .extension_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .extension = payload };
+        },
+        .maintenance_job => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .maintenance = payload };
+        },
+        .bulk_io => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .bulk_io = payload };
+        },
+        else => blk: {
+            const payload = plan.*;
+            plan.* = undefined;
+            break :blk .{ .ddl = payload };
+        },
+    };
+}
 
 pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const read = try bound.readCatalog();
@@ -1021,6 +1182,8 @@ pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlP
 
 pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const write = try bound.writeCatalog();
+    const target_binding = write.target_binding;
+    write.target_binding = null;
     const owned_insert_source_schema = write.owned_insert_source_schema;
     const owned_joined_source_schema = write.owned_joined_source_schema;
     write.owned_insert_source_schema = null;
@@ -1031,6 +1194,7 @@ pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSql
         .statement = bound.statement,
         .session = session,
         .options = write.options,
+        .target_binding = target_binding,
         .owned_insert_source_schema = owned_insert_source_schema,
         .owned_joined_source_schema = owned_joined_source_schema,
     } };

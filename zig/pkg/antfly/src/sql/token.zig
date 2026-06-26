@@ -116,6 +116,7 @@ pub const TokenKeyword = enum {
     count,
     costs,
     create,
+    cross,
     current_date,
     current_timestamp,
     data,
@@ -233,6 +234,7 @@ pub const TokenKeyword = enum {
     mod,
     move,
     name,
+    natural,
     no,
     not,
     notnull,
@@ -506,6 +508,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.execute, keywordFromIdentifier("EXECUTE").?);
     try std.testing.expectEqual(TokenKeyword.buffers, keywordFromIdentifier("BUFFERS").?);
     try std.testing.expectEqual(TokenKeyword.costs, keywordFromIdentifier("COSTS").?);
+    try std.testing.expectEqual(TokenKeyword.cross, keywordFromIdentifier("CROSS").?);
     try std.testing.expectEqual(TokenKeyword.format, keywordFromIdentifier("FORMAT").?);
     try std.testing.expectEqual(TokenKeyword.grant, keywordFromIdentifier("GRANT").?);
     try std.testing.expectEqual(TokenKeyword.label, keywordFromIdentifier("LABEL").?);
@@ -540,6 +543,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
     try std.testing.expectEqual(TokenKeyword.method, keywordFromIdentifier("METHOD").?);
     try std.testing.expectEqual(TokenKeyword.move, keywordFromIdentifier("MOVE").?);
+    try std.testing.expectEqual(TokenKeyword.natural, keywordFromIdentifier("NATURAL").?);
     try std.testing.expectEqual(TokenKeyword.not, keywordFromIdentifier("NOT").?);
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);

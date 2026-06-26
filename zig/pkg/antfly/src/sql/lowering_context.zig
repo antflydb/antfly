@@ -801,6 +801,18 @@ fn validateGeneratedJoinTreeMetadataForSource(
             return error.UnsupportedSqlShape;
         }
         switch (join.condition_kind) {
+            .none => {
+                if (join.kind != .cross and join.kind != .natural) return error.UnsupportedSqlShape;
+                if (join.condition_tokens.start != join.tokens.end or join.condition_tokens.end != join.tokens.end) {
+                    return error.UnsupportedSqlShape;
+                }
+                if (join.predicate_tokens != null or generatedExpressionAstHasMetadata(join.predicate_expression)) {
+                    return error.UnsupportedSqlShape;
+                }
+                if (join.using_tokens != null or join.using_column_tokens != null or join.using_columns.count != 0) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
             .on => {
                 const predicate = join.predicate_tokens orelse return error.UnsupportedSqlShape;
                 if (!tokens[join.condition_tokens.start].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
@@ -3741,6 +3753,17 @@ pub const CatalogReadPlanLoweringContext = struct {
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
         return try binder.lowerReadPlanWithBoundStatementAlloc(self.alloc, bound, self.hooks());
+    }
+
+    pub fn lowerLogicalParsed(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        logical: *binder.LogicalSqlPlan,
+    ) !plan.LoweredReadPlan {
+        const old_parsed_sql = self.parsed_sql;
+        self.parsed_sql = parsed_sql;
+        defer self.parsed_sql = old_parsed_sql;
+        return try binder.lowerReadCatalogLogicalPlan(logical, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.ReadPlanCatalogLoweringHooks {
@@ -6814,6 +6837,17 @@ pub const CatalogWritePlanLoweringContext = struct {
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
         return try binder.lowerWritePlanWithBoundStatementAlloc(self.alloc, bound, self.hooks());
+    }
+
+    pub fn lowerLogicalParsed(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        logical: *binder.LogicalSqlPlan,
+    ) !plan.LoweredWritePlan {
+        const old_parsed_sql = self.parsed_sql;
+        self.parsed_sql = parsed_sql;
+        defer self.parsed_sql = old_parsed_sql;
+        return try binder.lowerWriteCatalogLogicalPlan(logical, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.WritePlanCatalogLoweringHooks {

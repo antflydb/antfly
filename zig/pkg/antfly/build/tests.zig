@@ -1947,6 +1947,7 @@ pub const HATestFilters = struct {
         "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
         "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
         "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
+        "storage.ha chaos rejects out-of-order WAL without poisoning receive cursor",
         "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
         "storage.ha chaos crash after apply before ack reports durable progress on resume",
         "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
@@ -1967,6 +1968,8 @@ pub const HATestFilters = struct {
         "storage.ha compat keeps v1 record kind tags stable",
     };
 };
+
+const ha_storage_default_skip_filters = HATestFilters.chaos ++ HATestFilters.compat;
 
 pub const PackageTestFilters = struct {
     pub const image_conformance = [_][]const u8{
@@ -3388,7 +3391,7 @@ pub fn addStorageTestSteps(
 ) StorageTestSteps {
     return .{
         .root = addStorageTestRun(b, root_module, "lib-storage-test", "Run root-module storage tests only", &StorageTestFilters.root, true, &.{}),
-        .ha = addStorageTestRun(b, root_module, "ha-test", "Run hot-standby HA storage tests", &StorageTestFilters.ha, false, &.{}),
+        .ha = addStorageTestRun(b, root_module, null, "Run hot-standby HA storage tests", &StorageTestFilters.ha, false, &ha_storage_default_skip_filters),
         .progress = addStorageTestRun(b, root_module, null, "Run root-module storage tests with progress skips", &StorageTestFilters.root, true, progress_skip_filters),
         .lsm_backend = addStorageTestRun(b, root_module, "lsm-backend-test", "Run LSM backend unit tests only", &StorageTestFilters.lsm_backend, false, &.{}),
         .resource_budget = addStorageTestRun(b, root_module, "resource-budget-test", "Run storage resource-manager accounting tests", &StorageTestFilters.resource_budget, false, &.{}),

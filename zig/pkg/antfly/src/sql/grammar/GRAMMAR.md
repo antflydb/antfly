@@ -293,9 +293,10 @@ projection expression/alias token splits for explicit `AS` aliases and
 PostgreSQL-style bare aliases, generated projection metadata for PostgreSQL
 qualified-star projections such as `d.*`, generated ordering direction,
 `USING` operator, and `NULLS` ordering token splits, and first-join generated metadata for
-join operator/type, left input, right input, `ON` predicate ranges, and
-`USING` column-list ranges, explicit generated join-tree root/depth metadata
-for left-associative generated join nodes, plus simple top-level
+join operator/type, left input, right input, `ON` predicate ranges,
+`USING` column-list ranges, and conditionless `CROSS JOIN`/`NATURAL JOIN`
+metadata, explicit generated join-tree root/depth metadata for
+left-associative generated join nodes, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Generated top-level read validation now verifies statement/command
 source spans, clause keyword layout, and generated payload consistency for
@@ -356,10 +357,12 @@ typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
 compatibility metadata, and `ON`/`USING` condition payloads. The executable
 join contract is intentionally limited to one generated binary inner/left join
-until the row-plan API grows N-way and right/full outer-join semantics;
+until the row-plan API grows N-way, right/full outer-join, cross-join, and
+natural-join semantics;
 generated binary `JOIN ... USING (...)` lowers through schema-checked equality
-keys, while generated right/full joins and generated join/lateral multi-join
-ASTs still fail closed before the typed lowerers can partially parse them;
+keys, while generated right/full joins, conditionless cross/natural joins, and
+generated join/lateral multi-join ASTs still fail closed before the typed
+lowerers can partially parse them;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, inline function-call `OVER` clauses carry generated
 name/definition, partition-list, order-list, and frame-tail expression
@@ -1114,8 +1117,9 @@ Unsupported DDL remains on the existing parser until
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
-   validated binary inner/left join nodes with retained `ON`/`USING` condition
-   payload layout and fail-closed right/full join metadata, expression AST
+  validated binary inner/left join nodes with retained `ON`/`USING` condition
+  payload layout and fail-closed right/full plus conditionless `CROSS JOIN` and
+  `NATURAL JOIN` metadata, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,

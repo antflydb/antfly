@@ -94,8 +94,6 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     });
     lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
     const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
-    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantfly");
-    lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
 
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
@@ -110,8 +108,6 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
     run_lite_go_tests.step.dependOn(&install_antfly_capi_lib.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
-    const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
-    lite_go_test_step.dependOn(&run_lite_go_tests.step);
 
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
@@ -128,8 +124,6 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
     run_lite_go_example.step.dependOn(&install_antfly_capi_lib.step);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
-    lite_go_example_step.dependOn(&run_lite_go_example.step);
 
     const run_lite_go_retrieval_template = b.addSystemCommand(&.{
         "env",
@@ -146,8 +140,6 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
     run_lite_go_retrieval_template.step.dependOn(&install_antfly_capi_lib.step);
     run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
     const run_cabi_packaging_tests = b.addSystemCommand(&.{
         "env",
@@ -156,13 +148,12 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
         "scripts/packaging/test_cabi_packaging.py",
     });
     run_cabi_packaging_tests.setCwd(b.path(".."));
-    const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
-    lite_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_test = antfly_tests_build.addModuleTestStep(b, capi_mod, "capi-test", "Run C API tests", .{
         .filters = &antfly_tests_build.capi_default_filters,
         .simple_runner = true,
     });
+    capi_test.step.dependOn(&run_lite_capi_smoke.step);
 
     return .{
         .install_capi_lib = install_capi_lib,

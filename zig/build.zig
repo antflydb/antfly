@@ -1549,7 +1549,7 @@ pub fn build(b: *std.Build) void {
         .{ .filters = &antfly_tests_build.PackageTestFilters.lsm_backend_chaos },
     );
     const lib_lsm_backend_chaos_tests = lib_lsm_backend_chaos_test_run.tests;
-    const lib_lsm_backend_chaos_test_step = lib_lsm_backend_chaos_test_run.step;
+    _ = lib_lsm_backend_chaos_test_run.step;
     const ha_chaos_test_run = antfly_tests_build.addModuleTestStep(
         b,
         lib_test_mod,
@@ -1558,13 +1558,11 @@ pub fn build(b: *std.Build) void {
         .{ .filters = &antfly_tests_build.HATestFilters.chaos },
     );
     const lib_ha_chaos_tests = ha_chaos_test_run.tests;
-    const run_lib_ha_compat_tests = antfly_tests_build.addModuleTestStep(
-        b,
-        lib_test_mod,
-        "ha-compat-test",
-        "Run HA replication format compatibility tests",
-        .{ .filters = &antfly_tests_build.HATestFilters.compat },
-    ).run;
+    const lib_ha_compat_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &antfly_tests_build.HATestFilters.compat,
+    });
+    const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
@@ -1637,7 +1635,7 @@ pub fn build(b: *std.Build) void {
     const run_lib_metadata_vopr_tests = metadata_tests.vopr.run;
     const lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.tests;
     const run_lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.run;
-    const lib_metadata_transition_chaos_test_step = metadata_tests.chaos.transition;
+    _ = metadata_tests.chaos.transition;
     const lib_metadata_public_chaos_test_step = metadata_tests.chaos.public;
     const run_lib_metadata_sim_public_tests = metadata_tests.sim_public.run;
 
@@ -1655,17 +1653,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }, antfly_imports);
-    const docid_lifecycle_test_step = antfly_tests_build.addDocIdLifecycleDependencies(
+    _ = antfly_tests_build.addDocIdLifecycleDependencies(
         api_focused_tests.docid_lifecycle,
         api_table_tests,
         lib_db_module_tests.result_shape,
     );
-
-    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
-    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
 
     _ = antfly_tests_build.addAPITableAggregateTestStep(b, api_table_tests, .{
         .data_storage = run_lib_data_storage_tests,
@@ -1690,6 +1682,10 @@ pub fn build(b: *std.Build) void {
     const lib_storage_progress_tests = storage_tests.progress.tests;
     const run_lsm_backend_tests = storage_tests.lsm_backend.run;
     const run_resource_budget_tests = storage_tests.resource_budget.run;
+
+    const ha_test_step = b.step("ha-test", "Run HA hot-standby storage and replication compatibility tests");
+    ha_test_step.dependOn(&run_ha_tests.step);
+    ha_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -1981,7 +1977,7 @@ pub fn build(b: *std.Build) void {
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // Focused aliases stay available as separate steps; broader module suites
+    // Focused local test steps stay available separately; broader module suites
     // are wired here once.
     dependOnAll(unit_test_step, &.{
         &standalone_module_tests.json.run.step,
@@ -2232,24 +2228,4 @@ pub fn build(b: *std.Build) void {
     }
     const hbc_trace_step = b.step("hbc-trace", "Trace one Zig HBC query against an exported vector dataset");
     hbc_trace_step.dependOn(&run_hbc_trace.step);
-
-    const hbc_leaf_debug_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_leaf_debug.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_leaf_debug_mod.addImport("antfly-zig", lib_mod);
-    hbc_leaf_debug_mod.addImport("recall_common", recall_common_mod);
-
-    const hbc_leaf_debug = b.addExecutable(.{
-        .name = "hbc_leaf_debug",
-        .root_module = hbc_leaf_debug_mod,
-    });
-
-    const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
-    if (b.args) |args| {
-        run_hbc_leaf_debug.addArgs(args);
-    }
-    const hbc_leaf_debug_step = b.step("hbc-leaf-debug", "Inspect cached versus fresh quantized HBC leaf scoring");
-    hbc_leaf_debug_step.dependOn(&run_hbc_leaf_debug.step);
 }

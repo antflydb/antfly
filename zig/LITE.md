@@ -605,7 +605,8 @@ Build profiles:
 - `lite-core`: embedded database, indexes, CLI, and narrow `/lite/v1` local
   serve mode, with no heavyweight inference runtime.
 - `lite-full`: embedded database plus local inference runtime.
-- `lite-wasm`: hosted/manual maintenance profile.
+- `lite-test`: Lite CLI, native, C ABI, Go binding, packaging, and WASM profile
+  checks.
 - `lite-dev`: debug/status tooling and compatibility experiments.
 
 ## Testing

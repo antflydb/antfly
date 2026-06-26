@@ -14,47 +14,20 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const tokenized = @import("tokenized.zig");
 
-pub const SqlExecutionPlan = union(enum) {
-    read: ReadStatement,
-    write: WriteStatement,
-    ddl: ddl_plan.LoweredDdlPlan,
-
-    pub const ReadStatement = struct {
-        kind: classifier.SqlReadStatementKind,
-    };
-
-    pub const WriteStatement = struct {
-        kind: classifier.SqlWriteStatementKind,
-    };
-
-    pub fn deinit(self: *SqlExecutionPlan, alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .ddl => |*plan| plan.deinit(alloc),
-            .read, .write => {},
-        }
-        self.* = undefined;
-    }
-
-    pub fn statementKindName(self: SqlExecutionPlan) []const u8 {
-        return switch (self) {
-            .read => |statement| @tagName(statement.kind),
-            .write => |statement| @tagName(statement.kind),
-            .ddl => "ddl",
-        };
-    }
-};
+pub const SqlExecutionPlan = binder.LogicalSqlPlan;
 
 pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPlan {
     if (parsed_sql.writeStatementKind()) |kind| {
-        return .{ .write = .{ .kind = kind } };
+        return .{ .write = kind };
     }
     if (parsed_sql.readStatementKind()) |kind| {
-        return .{ .read = .{ .kind = kind } };
+        return .{ .read = kind };
     }
     return null;
 }
@@ -64,7 +37,8 @@ pub fn lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !SqlExecutionPlan {
-    return .{ .ddl = try ddl_plan.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings) };
+    var lowered = try ddl_plan.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    return binder.logicalPlanFromLoweredDdlPlan(&lowered);
 }
 
 test "sql executor classifies statement families and owns ddl plans" {
@@ -73,12 +47,12 @@ test "sql executor classifies statement families and owns ddl plans" {
     var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
     defer read_sql.deinit(alloc);
     const read_plan = classifyParsedSql(&read_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, read_plan.read.kind);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, read_plan.read);
 
     var write_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('evt-1')");
     defer write_sql.deinit(alloc);
     const write_plan = classifyParsedSql(&write_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, write_plan.write.kind);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, write_plan.write);
 
     var ddl_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
     defer ddl_sql.deinit(alloc);

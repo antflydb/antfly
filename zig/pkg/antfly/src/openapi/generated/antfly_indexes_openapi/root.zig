@@ -3,6 +3,9 @@
 
 pub const types = @import("types.zig");
 
+pub const EmbedderConfig = types.EmbedderConfig;
+pub const GeneratorConfig = types.GeneratorConfig;
+pub const ChunkerConfig = types.ChunkerConfig;
 pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const IndexType = types.IndexType;

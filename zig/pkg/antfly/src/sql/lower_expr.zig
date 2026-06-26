@@ -2231,7 +2231,7 @@ fn validateGeneratedJoinKindForOperator(tokens: []const Token, operator_tokens: 
                 .left => .left,
                 .right => .right,
                 .full => .full,
-                .inner => unreachable,
+                else => unreachable,
             };
             if (!tokens[operator_tokens.start].matchesKeywordTag(expected_keyword)) return error.UnsupportedSqlShape;
             if (operator_tokens.end == operator_tokens.start + 2) {
@@ -2241,6 +2241,15 @@ fn validateGeneratedJoinKindForOperator(tokens: []const Token, operator_tokens: 
             } else {
                 return error.UnsupportedSqlShape;
             }
+        },
+        .cross, .natural => {
+            const expected_keyword: TokenKeyword = switch (kind) {
+                .cross => .cross,
+                .natural => .natural,
+                else => unreachable,
+            };
+            if (operator_tokens.end != operator_tokens.start + 2) return error.UnsupportedSqlShape;
+            if (!tokens[operator_tokens.start].matchesKeywordTag(expected_keyword) or !tokens[operator_tokens.start + 1].matchesKeywordTag(.join)) return error.UnsupportedSqlShape;
         },
     }
 }
@@ -2266,6 +2275,12 @@ fn validateGeneratedJoinItemsMetadata(tokens: []const Token, read: generated_par
         if (join.right_tokens.start < join.operator_tokens.end or join.right_tokens.end > join.condition_tokens.start or join.right_tokens.start >= join.right_tokens.end) return error.UnsupportedSqlShape;
         try validateGeneratedJoinKindForOperator(tokens, join.operator_tokens, join.kind);
         switch (join.condition_kind) {
+            .none => {
+                if (join.predicate_tokens != null or join.predicate_expression.tokens != null) return error.UnsupportedSqlShape;
+                if (join.using_tokens != null or join.using_column_tokens != null or join.using_columns.count != 0) return error.UnsupportedSqlShape;
+                if (join.kind != .cross and join.kind != .natural) return error.UnsupportedSqlShape;
+                if (join.condition_tokens.start != join.tokens.end or join.condition_tokens.end != join.tokens.end) return error.UnsupportedSqlShape;
+            },
             .on => {
                 if (join.using_tokens != null or join.using_column_tokens != null or join.using_columns.count != 0) return error.UnsupportedSqlShape;
                 const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
@@ -2313,9 +2328,10 @@ fn validateGeneratedJoinExecutableContract(
     if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
     switch (join.kind) {
         .inner, .left => {},
-        .right, .full => return error.UnsupportedSqlShape,
+        .right, .full, .cross, .natural => return error.UnsupportedSqlShape,
     }
     switch (join.condition_kind) {
+        .none => return error.UnsupportedSqlShape,
         .on => if (join.predicate_tokens == null) return error.UnsupportedSqlShape,
         .using => if (join.using_tokens == null or join.using_column_tokens == null or join.using_columns.count == 0) return error.UnsupportedSqlShape,
     }
@@ -39243,6 +39259,14 @@ test "sql adapter lower expr lowers equality join queries" {
         .{
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id",
             .kind = .full,
+        },
+        .{
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o CROSS JOIN usage_records AS c",
+            .kind = .cross,
+        },
+        .{
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o NATURAL JOIN usage_records AS c",
+            .kind = .natural,
         },
     };
     for (unsupported_generated_join_kinds) |case| {

@@ -11428,6 +11428,345 @@ test "provisioned table write source serializes same-table same-group operations
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 }
 
+test "api.table_writes.query_visibility read preparation invalidates readers without closing dirty writer cache" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+
+    source.readPreparation().prepareForRead("other", .general);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+
+    source.readPreparation().prepareForRead("docs", .dense_query);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default, null, null);
+        defer cached.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+
+    const large_writes = try alloc.alloc(db_mod.types.BatchWrite, auto_bulk_ingest_min_batch_ops);
+    defer {
+        for (large_writes) |write| alloc.free(@constCast(write.key));
+        alloc.free(large_writes);
+    }
+    for (large_writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:bulk:{d}", .{i}),
+            .value = "{\"title\":\"bulk\"}",
+        };
+    }
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = large_writes,
+        .timestamp_ns = 2,
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].*.auto_bulk_ingest_ops);
+
+    const next_writes = try alloc.alloc(db_mod.types.BatchWrite, auto_bulk_ingest_min_batch_ops);
+    defer {
+        for (next_writes) |write| alloc.free(@constCast(write.key));
+        alloc.free(next_writes);
+    }
+    for (next_writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:bulk-next:{d}", .{i}),
+            .value = "{\"title\":\"bulk next\"}",
+        };
+    }
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = next_writes,
+        .timestamp_ns = 3,
+        .sync_level = .write,
+    });
+
+    try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
+    try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_finish_requested);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].*.auto_bulk_ingest_ops);
+
+    source.readPreparation().prepareForRead("docs", .general);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+}
+
+test "weak-sync group writes publish all docs after background dense catch-up" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/auto-bulk-threshold-visible", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    const batch_size = 250;
+    const expected_docs = 1000;
+    const writes = try alloc.alloc(db_mod.types.BatchWrite, batch_size);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"dense_idx\":[1.0,0.0]}}}}", .{}),
+        };
+    }
+
+    var offset: usize = 0;
+    while (offset < expected_docs) : (offset += batch_size) {
+        for (writes, 0..) |*write, i| {
+            alloc.free(@constCast(write.key));
+            write.key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{offset + i});
+        }
+
+        _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
+            .writes = writes,
+            .timestamp_ns = @intCast(offset + 1),
+            .sync_level = .write,
+        });
+
+        try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
+    }
+
+    try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
+    try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_finish_requested);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].auto_bulk_ingest_ops);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
+
+    const replay_target = write_cache.entries.items[0].db.core.nextDerivedSequence();
+    try write_cache.entries.items[0].db.executor.waitForAll(replay_target);
+    const stats = try write_cache.entries.items[0].db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, expected_docs), stats.indexes[0].doc_count);
+    try std.testing.expectEqual(replay_target, stats.indexes[0].replay_applied_sequence);
+
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, expected_docs), statuses.items[0].stats.indexes[0].doc_count);
+    try std.testing.expectEqual(replay_target, statuses.items[0].stats.indexes[0].replay_applied_sequence);
+}
+
+test "dirty auto bulk writer publishes runtime status before read invalidation closes it" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-cache-publish-before-invalidate", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    const writes = try alloc.alloc(db_mod.types.BatchWrite, auto_bulk_ingest_min_batch_ops);
+    defer {
+        for (writes) |write| alloc.free(@constCast(write.key));
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:bulk-status:{d}", .{i}),
+            .value = "{\"title\":\"bulk status\"}",
+        };
+    }
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = writes,
+        .timestamp_ns = 1,
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
+    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+
+    source.readPreparation().prepareForRead("docs", .general);
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(runtime_status.statusHasRuntimeFacts(statuses.items[0]));
+    try std.testing.expect(statuses.items[0].stats.index_count > 0);
+}
+
 test "provisioned table write source structural activity waits for table request lease" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -16356,6 +16695,7 @@ test "provisioned table write source backs up and restores a local table" {
     };
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     _ = try source.source().createTable(alloc, "docs", .{});
 
     _ = try source.source().batch(alloc, "docs", .{
@@ -16464,6 +16804,7 @@ test "api.table_writes.docid provisioned table write source backs up a portable 
     };
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     _ = try source.source().createTable(alloc, "docs", .{});
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -16591,8 +16932,138 @@ test "api.table_writes.docid provisioned table restore rejects mismatched doc id
     };
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     try std.testing.expectError(error.IdentityNamespaceMismatch, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
     }));
+}
+
+test "provisioned table write source backs up and restores full_text writes from the write cache" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-cache-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-cache-backup-restore-out");
+    defer alloc.free(backup_root);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    defer {
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    }
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"content\":\"distributed consensus\"}" }},
+        .timestamp_ns = 1,
+        .sync_level = .full_text,
+    });
+
+    const shards = (try source.source().backupTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "snap1",
+    })).?;
+    defer freeBackupShards(alloc, shards);
+
+    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+        .table_id = 7,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer manifest.deinit(alloc);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\",\"content\":\"vector search\"}" }},
+        .timestamp_ns = 2,
+        .sync_level = .full_text,
+    });
+
+    _ = try source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+    });
+
+    var read_source = table_reads.ProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+
+    var restored_lookup = (try read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
+    defer restored_lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored_lookup.json, "\"alpha\"") != null);
+
+    var restored_scan = (try read_source.source().scan(alloc, "docs", "", "", .{
+        .limit = 10,
+        .include_documents = true,
+    }, .read_index)).?;
+    defer restored_scan.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored_scan.ndjson, "\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored_scan.ndjson, "\"alpha\"") != null);
+
+    db.close();
+    db = try db_mod.DB.open(alloc, db_path, .{});
+
+    var restored = (try db.lookup(alloc, "doc:a", .{})).?;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }

@@ -1142,6 +1142,28 @@ pub fn lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
     return try context.lowerBoundParsed(parsed_sql, bound);
 }
 
+pub fn lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    logical: *sql_adapter.LogicalSqlPlan,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredReadPlan {
+    var context = sql_adapter.CatalogReadPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_document_target = lowerDocumentReadPlanFromBindingParsedSqlAlloc,
+            .lower_with_source_schema = lowerReadPlanWithSchemasAndFunctionBindingsParsedSqlAlloc,
+            .lower_without_source_schema = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
+        },
+    };
+    return try context.lowerLogicalParsed(parsed_sql, logical);
+}
+
 fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
@@ -2677,6 +2699,27 @@ pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
         },
     };
     return try context.lowerBoundParsed(parsed_sql, bound);
+}
+
+pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    logical: *sql_adapter.LogicalSqlPlan,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredWritePlan {
+    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+    var context = sql_adapter.CatalogWritePlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_with_options = lowerWritePlanWithFunctionBindingsParsedSqlAlloc,
+        },
+    };
+    return try context.lowerLogicalParsed(parsed_sql, logical);
 }
 
 pub fn lowerAggregateAlloc(

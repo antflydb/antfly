@@ -3084,7 +3084,10 @@ export interface components {
             database?: string | null;
             /** @description Optional single search-path namespace override for this request. */
             namespace?: string | null;
-            /** @description Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard. */
+            /**
+             * @description Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+             * @default false
+             */
             read_only?: boolean;
         };
         /**
@@ -5367,7 +5370,6 @@ export interface components {
             percentile_max_items?: number;
             /**
              * @description Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
-             * @default asc
              * @enum {string}
              */
             percentile_order?: "asc" | "desc";
