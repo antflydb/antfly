@@ -356,13 +356,14 @@ single binary join reads also validate generated join-tree metadata against the
 typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
 compatibility metadata, and `ON`/`USING` condition payloads. The executable
-join contract is intentionally limited to one generated binary inner/left join
-until the row-plan API grows N-way, right/full outer-join, cross-join, and
+join contract is intentionally limited to one generated binary inner/left/cross
+join until the row-plan API grows N-way, right/full outer-join, and
 natural-join semantics;
 generated binary `JOIN ... USING (...)` lowers through schema-checked equality
-keys, while generated right/full joins, conditionless cross/natural joins, and
-generated join/lateral multi-join ASTs still fail closed before the typed
-lowerers can partially parse them;
+keys, generated `CROSS JOIN` lowers through a cartesian row-engine path, while
+generated right/full joins, conditionless natural joins, and generated
+join/lateral multi-join ASTs still fail closed before the typed lowerers can
+partially parse them;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, inline function-call `OVER` clauses carry generated
 name/definition, partition-list, order-list, and frame-tail expression
@@ -908,15 +909,18 @@ Unsupported DDL remains on the existing parser until
    recognize aggregate-function projections such as global `COUNT(*)` reads
    and aggregate CTE bodies without requiring `GROUP BY` or `HAVING` side
    effects.
-   Single binary join reads now validate generated join-tree metadata against
-   the typed join lowerer before producing a join plan, and generated join
-   reads reject malformed left-associative tree root/depth/index/child
-   metadata, first-join compatibility fields, and `ON`/`USING` condition
-   payloads before invoking typed join lowering. Binary `JOIN ... USING (...)`
-   now lowers generated column-list metadata into schema-checked equality join
-   keys. Generated `RIGHT` and `FULL` joins remain parsed PostgreSQL-compatible
-   join ASTs but fail closed at the executable join contract until storage and
-   API row plans grow those outer-join semantics.
+Single binary join reads now validate generated join-tree metadata against
+the typed join lowerer before producing a join plan, and generated join
+reads reject malformed left-associative tree root/depth/index/child
+metadata, first-join compatibility fields, and `ON`/`USING` condition
+payloads before invoking typed join lowering. Binary `JOIN ... USING (...)`
+now lowers generated column-list metadata into schema-checked equality join
+keys. Generated `CROSS JOIN` lowers through an explicit cartesian row-engine
+path represented as an inner join with no equality keys; generated
+`NATURAL JOIN` still fails closed because it requires schema-derived common
+column expansion. Generated `RIGHT` and `FULL` joins remain parsed
+PostgreSQL-compatible join ASTs but fail closed at the executable join
+contract until storage and API row plans grow those outer-join semantics.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
    generated window reads, inline function-call `OVER` clauses carry generated
@@ -1117,9 +1121,9 @@ Unsupported DDL remains on the existing parser until
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
-  validated binary inner/left join nodes with retained `ON`/`USING` condition
-  payload layout and fail-closed right/full plus conditionless `CROSS JOIN` and
-  `NATURAL JOIN` metadata, expression AST
+  validated binary inner/left/cross join nodes with retained `ON`/`USING` or
+  conditionless cartesian payload layout and fail-closed right/full plus
+  conditionless `NATURAL JOIN` metadata, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,

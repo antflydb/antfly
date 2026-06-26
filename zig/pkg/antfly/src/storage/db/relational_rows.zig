@@ -5304,7 +5304,7 @@ pub fn validateJoinPlanCteReferences(plan: types.RelationalRowsJoinPlan) !void {
 }
 
 pub fn validateJoinRequest(req: types.RelationalRowsJoinRequest) !void {
-    if (req.on.len == 0) return error.InvalidArgument;
+    if (req.on.len == 0 and req.join_type != .inner) return error.InvalidArgument;
     if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
     if (req.left.doc_key_range != null and req.left.source_cte.len != 0) return error.InvalidQueryRequest;
     if (req.right.doc_key_range != null and req.right.source_cte.len != 0) return error.InvalidQueryRequest;
@@ -5819,11 +5819,42 @@ pub fn joinFromSourceRowsAlloc(
         right_rows.len,
         types.relationalRowsJoinInputsSortedOnJoinKeys(req),
     ) orelse return error.UnsupportedQueryRequest;
+    if (req.on.len == 0) return try joinFromSourceRowsCrossAlloc(alloc, req, left_rows, right_rows, selection, now_ns);
     return switch (selection.selected) {
         .lookup, .hash => try joinFromSourceRowsHashAlloc(alloc, req, left_rows, right_rows, selection, now_ns),
         .merge => try joinFromSourceRowsMergeAlloc(alloc, req, left_rows, right_rows, selection, now_ns),
         .auto => unreachable,
     };
+}
+
+fn joinFromSourceRowsCrossAlloc(
+    alloc: Allocator,
+    req: types.RelationalRowsJoinRequest,
+    left_rows: []const []const u8,
+    right_rows: []const []const u8,
+    strategy_selection: types.RelationalRowsJoinStrategySelection,
+    now_ns: u64,
+) !types.RelationalRowsJoinResult {
+    if (req.join_type != .inner) return error.UnsupportedQueryRequest;
+    var joined = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (joined.items) |row| alloc.free(@constCast(row));
+        joined.deinit(alloc);
+    }
+
+    for (left_rows) |left_row| {
+        var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_left.deinit();
+        if (parsed_left.value != .object) return error.InvalidQueryRequest;
+
+        for (right_rows) |right_row| {
+            if (!(try joinOnExpressionPredicatesPass(alloc, parsed_left.value, right_row, req, now_ns))) continue;
+            if (!(try joinMatchPredicatesPass(alloc, parsed_left.value, right_row, req, now_ns))) continue;
+            try appendJoinedRowAlloc(alloc, &joined, left_row, right_row, req.select);
+        }
+    }
+
+    return try finalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset, strategy_selection, now_ns);
 }
 
 fn joinFromSourceRowsHashAlloc(

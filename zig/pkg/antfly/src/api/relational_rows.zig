@@ -8455,7 +8455,8 @@ fn parseRowsJoinOnAllocWithSchemas(
     maybe_on: ?std.json.Value,
 ) ![]const db_mod.types.RelationalRowsJoinOn {
     const on_value = maybe_on orelse return error.InvalidRowsRequest;
-    if (on_value != .array or on_value.array.items.len == 0) return error.InvalidRowsRequest;
+    if (on_value != .array) return error.InvalidRowsRequest;
+    if (on_value.array.items.len == 0) return &.{};
     const out = try alloc.alloc(db_mod.types.RelationalRowsJoinOn, on_value.array.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -24346,6 +24347,20 @@ test "relational rows cross-table join and lateral plans execute with side schem
     defer join_result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), join_result.total_rows);
     try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", join_result.rows[0]);
+
+    var cross_join_plan = try parseRowsJoinPlanRequestWithSchemas(
+        alloc,
+        "{\"left_table\":\"orders\",\"right_table\":\"customers\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}},\"right\":{\"where\":{\"field\":\"enabled\",\"op\":\"eq\",\"value\":true}},\"on\":[],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"}],\"order_by\":[{\"field\":\"order_id\"}]}}",
+        orders_schema,
+        orders_schema,
+        customers_schema,
+    );
+    defer cross_join_plan.deinit(alloc);
+    var cross_join_result = try executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(alloc, orders_schema, orders_schema, customers_schema, cross_join_plan, &.{}, order_rows[0..], customer_rows[0..]);
+    defer cross_join_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), cross_join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", cross_join_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Ada\"}", cross_join_result.rows[1]);
 
     var lateral_plan = try parseRowsLateralPlanRequestWithSchemas(
         alloc,

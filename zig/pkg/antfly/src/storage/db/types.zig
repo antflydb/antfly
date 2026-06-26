@@ -2366,7 +2366,17 @@ pub fn relationalRowsSelectJoinStrategy(
     right_rows: usize,
     inputs_sorted_on_join_keys: bool,
 ) ?RelationalRowsJoinStrategySelection {
-    if (req.on.len == 0) return null;
+    if (req.on.len == 0) {
+        const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
+            .merge => return null,
+            .lookup => .lookup,
+            .hash, .auto => .hash,
+        };
+        return .{
+            .requested = req.strategy,
+            .selected = selected,
+        };
+    }
     const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
         .lookup => .lookup,
         .hash => .hash,
