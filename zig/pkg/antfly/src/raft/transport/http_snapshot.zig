@@ -99,15 +99,45 @@ pub const HttpSnapshotTransport = struct {
 
     fn sendSnapshot(ptr: *anyopaque, req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
-        const uri = try self.resolveUploadUri(req);
+        const snapshot_id = if (req.locator) |locator|
+            try self.alloc.dupe(u8, locator.snapshot_id)
+        else
+            try std.fmt.allocPrint(self.alloc, "{d}-{d}-{d}-{d}-{d}", .{
+                req.group_id,
+                req.from,
+                req.to,
+                req.snapshot.metadata.index,
+                req.snapshot.metadata.term,
+            });
+        defer self.alloc.free(snapshot_id);
+
+        const uri = try self.resolveUploadUri(req, snapshot_id);
         defer self.alloc.free(uri);
 
         const body = try encodeSnapshotEnvelope(self.alloc, req.snapshot);
         defer self.alloc.free(body);
 
+        var group_id_buf: [32]u8 = undefined;
+        var from_buf: [32]u8 = undefined;
+        var to_buf: [32]u8 = undefined;
+        var term_buf: [32]u8 = undefined;
+        const group_id = try std.fmt.bufPrint(&group_id_buf, "{d}", .{req.group_id});
+        const from = try std.fmt.bufPrint(&from_buf, "{d}", .{req.from});
+        const to = try std.fmt.bufPrint(&to_buf, "{d}", .{req.to});
+        const term = try std.fmt.bufPrint(&term_buf, "{d}", .{req.term});
+        const live_headers = [_]common.RequestHeader{
+            .{ .name = "x-antfly-raft-group-id", .value = group_id },
+            .{ .name = "x-antfly-raft-from-node-id", .value = from },
+            .{ .name = "x-antfly-raft-to-node-id", .value = to },
+            .{ .name = "x-antfly-raft-term", .value = term },
+        };
+        const headers: []const common.RequestHeader = if (req.from == 0) &.{} else live_headers[0..];
+
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = headers,
+            .source_node_id = if (req.from == 0) null else req.from,
             .content_type = "application/x-antflydb-raft-snapshot",
             .body = body,
         });
@@ -134,17 +164,18 @@ pub const HttpSnapshotTransport = struct {
     fn resolveUploadUri(
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+        snapshot_id: []const u8,
     ) ![]u8 {
         if (req.locator) |locator| {
             if (locator.uri.len > 0) return try self.alloc.dupe(u8, locator.uri);
-            if (self.resolver) |resolver| {
-                return try resolver.resolveUploadUri(self.alloc, req.group_id, req.to, locator.snapshot_id);
-            }
+        }
+        if (self.resolver) |resolver| {
+            return try resolver.resolveUploadUri(self.alloc, req.group_id, req.to, snapshot_id);
         }
         return error.MissingSnapshotUploadUri;
     }
 
-    fn encodeSnapshotEnvelope(alloc: std.mem.Allocator, snapshot: raft_engine.core.types.Snapshot) ![]u8 {
+    pub fn encodeSnapshotEnvelope(alloc: std.mem.Allocator, snapshot: raft_engine.core.types.Snapshot) ![]u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(alloc);
 
@@ -159,7 +190,7 @@ pub const HttpSnapshotTransport = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    fn decodeSnapshotEnvelope(alloc: std.mem.Allocator, bytes: []const u8) !raft_engine.core.types.Snapshot {
+    pub fn decodeSnapshotEnvelope(alloc: std.mem.Allocator, bytes: []const u8) !raft_engine.core.types.Snapshot {
         var cursor: usize = 0;
         const index = try readInt(u64, bytes, &cursor);
         const term = try readInt(u64, bytes, &cursor);
@@ -334,6 +365,7 @@ test "http snapshot transport posts and fetches serialized snapshots" {
         raft_engine.runtime.BinaryCodec.codec(),
         noop.iface(),
         store_impl.iface(),
+        null,
     );
     var executor = RecordingExecutor{ .server = &server };
     var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
@@ -368,4 +400,172 @@ test "http snapshot transport posts and fetches serialized snapshots" {
     }, receiver.iface());
     try std.testing.expectEqual(@as(usize, 1), receiver.seen);
     try std.testing.expectEqual(@as(u64, 12), receiver.index);
+}
+
+test "http snapshot transport resolves upload uri when locator is absent" {
+    const Resolver = struct {
+        seen: usize = 0,
+        group_id: u64 = 0,
+        node_id: u64 = 0,
+        snapshot_id: ?[]u8 = null,
+
+        fn iface(self: *@This()) SnapshotTargetResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .resolve_upload_uri = resolveUploadUri,
+                },
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.snapshot_id) |snapshot_id| std.testing.allocator.free(snapshot_id);
+            self.* = undefined;
+        }
+
+        fn resolveUploadUri(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, snapshot_id: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            self.group_id = group_id;
+            self.node_id = node_id;
+            if (self.snapshot_id) |existing| std.testing.allocator.free(existing);
+            self.snapshot_id = try std.testing.allocator.dupe(u8, snapshot_id);
+            return try alloc.dupe(u8, "/raft/v1/snapshot/upload/resolved");
+        }
+    };
+
+    const Executor = struct {
+        seen: usize = 0,
+        uri: ?[]u8 = null,
+        group_id: ?[]u8 = null,
+        from: ?[]u8 = null,
+        to: ?[]u8 = null,
+        term: ?[]u8 = null,
+        source_node_id: ?u64 = null,
+        body_len: usize = 0,
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.uri) |value| std.testing.allocator.free(value);
+            if (self.group_id) |value| std.testing.allocator.free(value);
+            if (self.from) |value| std.testing.allocator.free(value);
+            if (self.to) |value| std.testing.allocator.free(value);
+            if (self.term) |value| std.testing.allocator.free(value);
+            self.* = undefined;
+        }
+
+        fn capture(dst: *?[]u8, value: ?[]const u8) !void {
+            if (dst.*) |existing| std.testing.allocator.free(existing);
+            dst.* = if (value) |present| try std.testing.allocator.dupe(u8, present) else null;
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            try capture(&self.uri, req.uri);
+            try capture(&self.group_id, req.header("x-antfly-raft-group-id"));
+            try capture(&self.from, req.header("x-antfly-raft-from-node-id"));
+            try capture(&self.to, req.header("x-antfly-raft-to-node-id"));
+            try capture(&self.term, req.header("x-antfly-raft-term"));
+            self.source_node_id = req.source_node_id;
+            self.body_len = req.body.len;
+            return .{ .status = 201 };
+        }
+    };
+
+    var resolver = Resolver{};
+    defer resolver.deinit();
+    var executor = Executor{};
+    defer executor.deinit();
+    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+        .root_dir = "/tmp",
+    }, executor.iface(), resolver.iface());
+
+    var voters = [_]u64{ 1, 2, 3 };
+    try transport.transport().sendSnapshot(.{
+        .group_id = 91,
+        .from = 1,
+        .to = 2,
+        .term = 8,
+        .snapshot = .{
+            .metadata = .{
+                .index = 42,
+                .term = 7,
+                .conf_state = .{ .voters = voters[0..] },
+            },
+            .data = @constCast("live-snapshot"),
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver.seen);
+    try std.testing.expectEqual(@as(u64, 91), resolver.group_id);
+    try std.testing.expectEqual(@as(u64, 2), resolver.node_id);
+    try std.testing.expectEqualStrings("91-1-2-42-7", resolver.snapshot_id.?);
+    try std.testing.expectEqual(@as(usize, 1), executor.seen);
+    try std.testing.expectEqualStrings("/raft/v1/snapshot/upload/resolved", executor.uri.?);
+    try std.testing.expectEqualStrings("91", executor.group_id.?);
+    try std.testing.expectEqualStrings("1", executor.from.?);
+    try std.testing.expectEqualStrings("2", executor.to.?);
+    try std.testing.expectEqualStrings("8", executor.term.?);
+    try std.testing.expectEqual(@as(?u64, 1), executor.source_node_id);
+    try std.testing.expect(executor.body_len > 0);
+}
+
+test "http snapshot transport omits live upload headers for store-only locator uploads" {
+    const Executor = struct {
+        seen: usize = 0,
+        headers_len: usize = 0,
+        source_node_id: ?u64 = 99,
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            self.headers_len = req.headers.len;
+            self.source_node_id = req.source_node_id;
+            try std.testing.expect(req.header("x-antfly-raft-group-id") == null);
+            try std.testing.expect(req.body.len > 0);
+            return .{ .status = 201 };
+        }
+    };
+
+    var executor = Executor{};
+    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+        .root_dir = "/tmp",
+    }, executor.iface(), null);
+
+    var voters = [_]u64{ 1, 2 };
+    try transport.transport().sendSnapshot(.{
+        .group_id = 91,
+        .to = 2,
+        .snapshot = .{
+            .metadata = .{
+                .index = 12,
+                .term = 4,
+                .conf_state = .{ .voters = voters[0..] },
+            },
+            .data = @constCast("store-only-snapshot"),
+        },
+        .locator = .{ .snapshot_id = "snap-1", .uri = "/raft/v1/snapshot/upload/snap-1" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), executor.seen);
+    try std.testing.expectEqual(@as(usize, 0), executor.headers_len);
+    try std.testing.expectEqual(@as(?u64, null), executor.source_node_id);
 }

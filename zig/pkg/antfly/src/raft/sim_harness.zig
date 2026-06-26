@@ -1623,6 +1623,25 @@ fn waitForLastIndexInCluster(
     return (try store.storage().lastIndex()) >= target_index;
 }
 
+fn waitForSnapshotIndexInCluster(
+    cluster: *ManagedHttpClusterSimulation,
+    store: *raft_engine.core.MemoryStorage,
+    target_index: u64,
+    max_rounds: usize,
+) !bool {
+    var i: usize = 0;
+    while (i < max_rounds) : (i += 1) {
+        var snapshot = try store.storage().snapshot(std.testing.allocator);
+        const reached = snapshot.metadata.index >= target_index;
+        snapshot.deinit(std.testing.allocator);
+        if (reached) return true;
+        try cluster.stepAll();
+    }
+    var snapshot = try store.storage().snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    return snapshot.metadata.index >= target_index;
+}
+
 fn waitForCommitIndex(
     sim: *ManagedHostSimulation,
     group_id: u64,
@@ -1655,6 +1674,24 @@ fn waitForCommitIndexInCluster(
         try cluster.stepAll();
     }
     if (cluster.node(node_index).raftStatus(group_id)) |status| return status.hard.commit_index >= target_index;
+    return false;
+}
+
+fn waitForAppliedIndexInCluster(
+    cluster: *ManagedHttpClusterSimulation,
+    node_index: usize,
+    group_id: u64,
+    target_index: u64,
+    max_rounds: usize,
+) !bool {
+    var i: usize = 0;
+    while (i < max_rounds) : (i += 1) {
+        if (cluster.node(node_index).raftStatus(group_id)) |status| {
+            if (status.applied_index >= target_index) return true;
+        }
+        try cluster.stepAll();
+    }
+    if (cluster.node(node_index).raftStatus(group_id)) |status| return status.applied_index >= target_index;
     return false;
 }
 
@@ -3427,6 +3464,129 @@ test "managed http cluster simulation restarts a node with WAL-backed raft state
     try std.testing.expectEqual(@as(?u64, 1), try cluster.waitForLeader(3004, 64));
     try cluster.node(0).propose(3004, "after-restart");
     try std.testing.expect(try waitForCommitIndexInCluster(&cluster, 0, 3004, leader_baseline_commit + 1, 128));
+}
+
+test "managed http cluster simulation catches up lagging follower from live HTTP snapshot" {
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var tmp_c = std.testing.tmpDir(.{});
+    defer tmp_c.cleanup();
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-live-snap-a", .{tmp_a.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-live-snap-b", .{tmp_b.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-live-snap-c", .{tmp_c.sub_path});
+    defer std.testing.allocator.free(root_c);
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var persist_a = StorageRecorder{ .alloc = std.testing.allocator };
+    defer persist_a.deinit();
+    var persist_b = StorageRecorder{ .alloc = std.testing.allocator };
+    defer persist_b.deinit();
+    var persist_c = StorageRecorder{ .alloc = std.testing.allocator };
+    defer persist_c.deinit();
+    try persist_a.registerStore(3006, &store_a);
+    try persist_b.registerStore(3006, &store_b);
+    try persist_c.registerStore(3006, &store_c);
+
+    var factory_a = SimulationDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = SimulationDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = SimulationDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const compacting_runtime: raft_engine.runtime.RuntimeConfig = .{
+        .applied_log_retained_entries = 1,
+        .applied_log_compaction_min_interval_entries = 1,
+        .applied_log_compaction_single_node_only = false,
+    };
+    const configs = [_]ManagedHttpHostSimulationConfig{
+        .{ .host = .{ .http = .{ .host = .{ .local_node_id = 1, .runtime = compacting_runtime }, .transport = .{ .snapshot = .{ .root_dir = root_a } } } } },
+        .{ .host = .{ .http = .{ .host = .{ .local_node_id = 2, .runtime = compacting_runtime }, .transport = .{ .snapshot = .{ .root_dir = root_b } } } } },
+        .{ .host = .{ .http = .{ .host = .{ .local_node_id = 3, .runtime = compacting_runtime }, .transport = .{ .snapshot = .{ .root_dir = root_c } } } } },
+    };
+    const deps = [_]ManagedHttpHostSimulationDeps{
+        .{ .host = .{ .http = .{ .host = .{ .descriptor_factory = factory_a.iface(), .runtime_hooks = .{ .group_storage = persist_a.iface() } } } } },
+        .{ .host = .{ .http = .{ .host = .{ .descriptor_factory = factory_b.iface(), .runtime_hooks = .{ .group_storage = persist_b.iface() } } } } },
+        .{ .host = .{ .http = .{ .host = .{ .descriptor_factory = factory_c.iface(), .runtime_hooks = .{ .group_storage = persist_c.iface() } } } } },
+    };
+
+    var cluster = try ManagedHttpClusterSimulation.init(std.testing.allocator, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+
+    const base_a = try cluster.node(0).baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_a);
+    const base_b = try cluster.node(1).baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_b);
+    const base_c = try cluster.node(2).baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_c);
+
+    try cluster.node(0).applyBatch(&.{
+        .{ .upsert_replica_intent = .{ .record = .{ .group_id = 3006, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 2, 3 } } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 2, .endpoints = &.{.{ .protocol = .http, .address = base_b, .metadata = "" }} } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 3, .endpoints = &.{.{ .protocol = .http, .address = base_c, .metadata = "" }} } },
+    });
+    try cluster.node(1).applyBatch(&.{
+        .{ .upsert_replica_intent = .{ .record = .{ .group_id = 3006, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 3 } } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 1, .endpoints = &.{.{ .protocol = .http, .address = base_a, .metadata = "" }} } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 3, .endpoints = &.{.{ .protocol = .http, .address = base_c, .metadata = "" }} } },
+    });
+    try cluster.node(2).applyBatch(&.{
+        .{ .upsert_replica_intent = .{ .record = .{ .group_id = 3006, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2 } } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 1, .endpoints = &.{.{ .protocol = .http, .address = base_a, .metadata = "" }} } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 2, .endpoints = &.{.{ .protocol = .http, .address = base_b, .metadata = "" }} } },
+    });
+    try cluster.stepAll();
+    try cluster.node(0).campaignGroup(3006);
+    try std.testing.expectEqual(@as(?u64, 1), try cluster.waitForLeader(3006, 64));
+
+    try cluster.node(0).propose(3006, "live-snapshot-warmup");
+    try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, 2, 64));
+    try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_c, 2, 64));
+
+    try cluster.inject(.{ .partition_node = 2 });
+    try cluster.node(0).propose(3006, "live-snapshot-1");
+    try cluster.node(0).propose(3006, "live-snapshot-2");
+    try cluster.node(0).propose(3006, "live-snapshot-3");
+    try cluster.node(0).propose(3006, "live-snapshot-4");
+    try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_c, 6, 128));
+    try std.testing.expect(try waitForCommitIndexInCluster(&cluster, 0, 3006, 6, 128));
+    try std.testing.expect(try waitForAppliedIndexInCluster(&cluster, 0, 3006, 6, 128));
+    try std.testing.expect((try store_b.storage().lastIndex()) < 6);
+
+    const leader_status = cluster.node(0).raftStatus(3006) orelse return error.MissingRaftStatus;
+    const compact_index = leader_status.hard.commit_index;
+    try std.testing.expect(compact_index > try store_b.storage().lastIndex());
+    try store_a.compactTo(compact_index, leader_status.conf_state);
+    const leader_group = cluster.node(0).runtime.svc.host.http_host.host.runtime_host.group(3006) orelse return error.MissingRaftStatus;
+    try leader_group.compactAppliedLogTo(compact_index);
+
+    try cluster.restartNode(1);
+    try cluster.node(1).applyBatch(&.{
+        .{ .upsert_replica_intent = .{ .record = .{ .group_id = 3006, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .peer_node_ids = &.{ 1, 3 } } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 1, .endpoints = &.{.{ .protocol = .http, .address = base_a, .metadata = "" }} } },
+        .{ .upsert_peer_route = .{ .group_id = 3006, .node_id = 3, .endpoints = &.{.{ .protocol = .http, .address = base_c, .metadata = "" }} } },
+    });
+    try cluster.stepAll();
+    try std.testing.expect((try store_b.storage().lastIndex()) < compact_index);
+
+    cluster.heal(.{ .partition_node = 2 });
+    try std.testing.expect(try waitForSnapshotIndexInCluster(&cluster, &store_b, compact_index, 256));
+    try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, compact_index, 128));
+
+    var follower_snapshot = try store_b.storage().snapshot(std.testing.allocator);
+    defer follower_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(compact_index, follower_snapshot.metadata.index);
+    try std.testing.expect(std.mem.indexOfScalar(u64, follower_snapshot.metadata.conf_state.voters, 2) != null);
 }
 
 test "managed http cluster simulation can remove and rejoin a node from HTTP snapshot fetch" {
