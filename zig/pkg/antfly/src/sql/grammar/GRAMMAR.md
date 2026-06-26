@@ -868,11 +868,14 @@ Unsupported DDL remains on the existing parser until
    AST kind owns parsed-statement read-family classification for
    generated-covered reads, failing closed when retained generated kind
    metadata disagrees with the legacy classifier. Generated read
-   ASTs have a validated wrapper into the current typed read lowerer for
-   representative covered read plans
-   that rejects malformed generated range payloads, including owned
-   projection/group/order list item metadata and nested generated expression
-   range metadata, and malformed structural metadata for covered generated
+   ASTs now have a generated-first lowering boundary for covered simple query,
+   aggregate, join, lateral, window, set-operation, non-recursive CTE, and
+   recursive CTE plans, reusing the current typed read lowerers only after
+   validating retained generated statement, command, clause, list, expression,
+   join-tree, CTE, row-lock, and result-tail metadata. This rejects malformed
+   generated range payloads, including owned projection/group/order list item
+   metadata and nested generated expression range metadata, and malformed
+   structural metadata for covered generated
    expression kinds such as function calls, binary and logical predicates,
    casts, `CASE` expressions, temporal literals, `EXTRACT`, arrays, subqueries,
    and grouped expressions; it also verifies that child expression AST spans
@@ -1115,10 +1118,9 @@ Unsupported DDL remains on the existing parser until
    subquery semantic planning/lowering beyond retained generated payload
    validation, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
-   clause span validation,
-   recursive full CTE body planning beyond the current body
-   clause/list/expression/join/window and pagination metadata, direct
-   generated read-plan lowering, and
+   clause span validation, broader recursive CTE semantic planning beyond the
+   current generated-first lowering boundary and validated body
+   clause/list/expression/join/window/pagination/row-lock metadata, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
