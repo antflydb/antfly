@@ -721,29 +721,29 @@ test "table workflow can reconcile foreign key reference owner ranges" {
         pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
             const records = try alloc.alloc(table_manager.TableRecord, 2);
             errdefer alloc.free(records);
-            records[0] = .{
+            records[0] = try table_manager.cloneTable(alloc, .{
                 .table_id = 10,
-                .name = try alloc.dupe(u8, "orders"),
-                .description = try alloc.dupe(u8, ""),
-                .schema_json = try alloc.dupe(u8, child_schema),
-                .read_schema_json = try alloc.dupe(u8, ""),
-                .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
-                .indexes_json = try alloc.dupe(u8, ""),
-                .replication_sources_json = try alloc.dupe(u8, ""),
-                .placement_role = try alloc.dupe(u8, "data"),
-            };
+                .name = "orders",
+                .description = "",
+                .schema_json = child_schema,
+                .read_schema_json = "",
+                .foreign_key_validation_json = "{}",
+                .indexes_json = "",
+                .replication_sources_json = "",
+                .placement_role = "data",
+            });
             errdefer table_manager.freeTable(alloc, records[0]);
-            records[1] = .{
+            records[1] = try table_manager.cloneTable(alloc, .{
                 .table_id = 20,
-                .name = try alloc.dupe(u8, "customers"),
-                .description = try alloc.dupe(u8, ""),
-                .schema_json = try alloc.dupe(u8, parent_schema),
-                .read_schema_json = try alloc.dupe(u8, ""),
-                .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
-                .indexes_json = try alloc.dupe(u8, ""),
-                .replication_sources_json = try alloc.dupe(u8, ""),
-                .placement_role = try alloc.dupe(u8, "data"),
-            };
+                .name = "customers",
+                .description = "",
+                .schema_json = parent_schema,
+                .read_schema_json = "",
+                .foreign_key_validation_json = "{}",
+                .indexes_json = "",
+                .replication_sources_json = "",
+                .placement_role = "data",
+            });
             return records;
         }
 

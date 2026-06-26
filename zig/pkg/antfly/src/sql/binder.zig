@@ -1033,12 +1033,140 @@ pub const AuthorizationLogicalPlan = union(enum) {
     }
 };
 
+pub const TableDdlLogicalPlan = union(enum) {
+    moved: void,
+    create_table: ddl_plan.CreateTablePlan,
+    table_clone: ddl_plan.TableClonePlan,
+    view_catalog: ddl_plan.ViewCatalogPlan,
+    materialized_view_catalog: ddl_plan.MaterializedViewCatalogPlan,
+    relation_lifetime: ddl_plan.RelationLifetimePlan,
+    table_partition_catalog: ddl_plan.TablePartitionCatalogPlan,
+    create_index: ddl_plan.CreateIndexPlan,
+    drop_index: ddl_plan.DropIndexPlan,
+    drop_table: ddl_plan.DropTablePlan,
+    alter_table: ddl_plan.AlterTablePlan,
+    create_update_policy: ddl_plan.CreateUpdatePolicyPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .moved => {},
+            .create_table => |*plan| plan.deinit(alloc),
+            .table_clone => |*plan| plan.deinit(alloc),
+            .view_catalog => |*plan| plan.deinit(alloc),
+            .materialized_view_catalog => |*plan| plan.deinit(alloc),
+            .relation_lifetime => |*plan| plan.deinit(alloc),
+            .table_partition_catalog => |*plan| plan.deinit(alloc),
+            .create_index => |*plan| plan.deinit(alloc),
+            .drop_index => |*plan| plan.deinit(alloc),
+            .drop_table => |*plan| plan.deinit(alloc),
+            .alter_table => |*plan| plan.deinit(alloc),
+            .create_update_policy => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+
+    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
+        return switch (self.*) {
+            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
+            .create_table => |payload| moveTableDdl(self, .{ .create_table = payload }),
+            .table_clone => |payload| moveTableDdl(self, .{ .table_clone = payload }),
+            .view_catalog => |payload| moveTableDdl(self, .{ .view_catalog = payload }),
+            .materialized_view_catalog => |payload| moveTableDdl(self, .{ .materialized_view_catalog = payload }),
+            .relation_lifetime => |payload| moveTableDdl(self, .{ .relation_lifetime = payload }),
+            .table_partition_catalog => |payload| moveTableDdl(self, .{ .table_partition_catalog = payload }),
+            .create_index => |payload| moveTableDdl(self, .{ .create_index = payload }),
+            .drop_index => |payload| moveTableDdl(self, .{ .drop_index = payload }),
+            .drop_table => |payload| moveTableDdl(self, .{ .drop_table = payload }),
+            .alter_table => |payload| moveTableDdl(self, .{ .alter_table = payload }),
+            .create_update_policy => |payload| moveTableDdl(self, .{ .create_update_policy = payload }),
+        };
+    }
+};
+
+fn moveTableDdl(plan: *TableDdlLogicalPlan, lowered: ddl_plan.LoweredDdlPlan) ddl_plan.LoweredDdlPlan {
+    plan.* = .{ .moved = {} };
+    return lowered;
+}
+
+pub const CatalogDdlLogicalPlan = union(enum) {
+    moved: void,
+    enum_type_catalog: ddl_plan.EnumTypeCatalogPlan,
+    domain_catalog: ddl_plan.DomainCatalogPlan,
+    sequence_catalog: ddl_plan.SequenceCatalogPlan,
+    identity_allocator_catalog: ddl_plan.IdentityAllocatorPlan,
+    schema_namespace_catalog: ddl_plan.SchemaNamespaceCatalogPlan,
+    database_catalog: ddl_plan.DatabaseCatalogPlan,
+    tablespace_catalog: ddl_plan.TablespaceCatalogPlan,
+    logical_replication: ddl_plan.LogicalReplicationPlan,
+    type_system_catalog: ddl_plan.TypeSystemCatalogPlan,
+    comment_metadata: ddl_plan.CommentMetadataPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .moved => {},
+            .enum_type_catalog => |*plan| plan.deinit(alloc),
+            .domain_catalog => |*plan| plan.deinit(alloc),
+            .sequence_catalog => |*plan| plan.deinit(alloc),
+            .identity_allocator_catalog => |*plan| plan.deinit(alloc),
+            .schema_namespace_catalog => |*plan| plan.deinit(alloc),
+            .database_catalog => |*plan| plan.deinit(alloc),
+            .tablespace_catalog => |*plan| plan.deinit(alloc),
+            .logical_replication => |*plan| plan.deinit(alloc),
+            .type_system_catalog => |*plan| plan.deinit(alloc),
+            .comment_metadata => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+
+    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
+        return switch (self.*) {
+            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
+            .enum_type_catalog => |payload| moveCatalogDdl(self, .{ .enum_type_catalog = payload }),
+            .domain_catalog => |payload| moveCatalogDdl(self, .{ .domain_catalog = payload }),
+            .sequence_catalog => |payload| moveCatalogDdl(self, .{ .sequence_catalog = payload }),
+            .identity_allocator_catalog => |payload| moveCatalogDdl(self, .{ .identity_allocator_catalog = payload }),
+            .schema_namespace_catalog => |payload| moveCatalogDdl(self, .{ .schema_namespace_catalog = payload }),
+            .database_catalog => |payload| moveCatalogDdl(self, .{ .database_catalog = payload }),
+            .tablespace_catalog => |payload| moveCatalogDdl(self, .{ .tablespace_catalog = payload }),
+            .logical_replication => |payload| moveCatalogDdl(self, .{ .logical_replication = payload }),
+            .type_system_catalog => |payload| moveCatalogDdl(self, .{ .type_system_catalog = payload }),
+            .comment_metadata => |payload| moveCatalogDdl(self, .{ .comment_metadata = payload }),
+        };
+    }
+};
+
+fn moveCatalogDdl(plan: *CatalogDdlLogicalPlan, lowered: ddl_plan.LoweredDdlPlan) ddl_plan.LoweredDdlPlan {
+    plan.* = .{ .moved = {} };
+    return lowered;
+}
+
+pub const OtherDdlLogicalPlan = union(enum) {
+    moved: void,
+    adapter_noop: ddl_plan.AdapterNoopDdlPlan,
+
+    pub fn deinit(self: *@This(), _: std.mem.Allocator) void {
+        self.* = undefined;
+    }
+
+    pub fn intoLoweredDdlPlan(self: *@This()) ddl_plan.LoweredDdlPlan {
+        return switch (self.*) {
+            .moved => .{ .adapter_noop = .{ .reason = .transaction_control } },
+            .adapter_noop => |payload| blk: {
+                self.* = .{ .moved = {} };
+                break :blk .{ .adapter_noop = payload };
+            },
+        };
+    }
+};
+
 pub const LogicalSqlPlan = union(enum) {
     read: classifier.SqlReadStatementKind,
     write: classifier.SqlWriteStatementKind,
     catalog_read: CatalogLogicalReadPlan,
     catalog_write: CatalogLogicalWritePlan,
-    ddl: ddl_plan.LoweredDdlPlan,
+    table_ddl: TableDdlLogicalPlan,
+    catalog_ddl: CatalogDdlLogicalPlan,
+    other_ddl: OtherDdlLogicalPlan,
     session: ddl_plan.SessionCatalogPlan,
     transaction: TransactionLogicalPlan,
     prepared_statement: ddl_plan.PreparedStatementPlan,
@@ -1055,7 +1183,9 @@ pub const LogicalSqlPlan = union(enum) {
             .read, .write => {},
             .catalog_read => |*read| read.deinit(alloc),
             .catalog_write => |*write| write.deinit(alloc),
-            .ddl => |*plan| plan.deinit(alloc),
+            .table_ddl => |*plan| plan.deinit(alloc),
+            .catalog_ddl => |*plan| plan.deinit(alloc),
+            .other_ddl => |*plan| plan.deinit(alloc),
             .session => |*plan| plan.deinit(alloc),
             .transaction => |*plan| plan.deinit(alloc),
             .prepared_statement => |*plan| plan.deinit(alloc),
@@ -1076,7 +1206,9 @@ pub const LogicalSqlPlan = union(enum) {
             .write => |kind| @tagName(kind),
             .catalog_read => "read",
             .catalog_write => "write",
-            .ddl => "ddl",
+            .table_ddl => "table_ddl",
+            .catalog_ddl => "catalog_ddl",
+            .other_ddl => "other_ddl",
             .session => "session",
             .transaction => "transaction",
             .prepared_statement => "prepared_statement",
@@ -1093,6 +1225,10 @@ pub const LogicalSqlPlan = union(enum) {
 
 pub fn logicalPlanFromLoweredDdlPlan(plan: *ddl_plan.LoweredDdlPlan) LogicalSqlPlan {
     return switch (plan.*) {
+        .adapter_noop => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .other_ddl = .{ .adapter_noop = payload } };
+        },
         .session_catalog => |payload| blk: {
             plan.* = undefined;
             break :blk .{ .session = payload };
@@ -1153,10 +1289,89 @@ pub fn logicalPlanFromLoweredDdlPlan(plan: *ddl_plan.LoweredDdlPlan) LogicalSqlP
             plan.* = undefined;
             break :blk .{ .bulk_io = payload };
         },
-        else => blk: {
-            const payload = plan.*;
+        .create_table => |payload| blk: {
             plan.* = undefined;
-            break :blk .{ .ddl = payload };
+            break :blk .{ .table_ddl = .{ .create_table = payload } };
+        },
+        .table_clone => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .table_clone = payload } };
+        },
+        .view_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .view_catalog = payload } };
+        },
+        .materialized_view_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .materialized_view_catalog = payload } };
+        },
+        .relation_lifetime => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .relation_lifetime = payload } };
+        },
+        .table_partition_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .table_partition_catalog = payload } };
+        },
+        .create_index => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .create_index = payload } };
+        },
+        .drop_index => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .drop_index = payload } };
+        },
+        .drop_table => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .drop_table = payload } };
+        },
+        .alter_table => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .alter_table = payload } };
+        },
+        .create_update_policy => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .create_update_policy = payload } };
+        },
+        .enum_type_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .enum_type_catalog = payload } };
+        },
+        .domain_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .domain_catalog = payload } };
+        },
+        .sequence_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .sequence_catalog = payload } };
+        },
+        .identity_allocator_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = payload } };
+        },
+        .schema_namespace_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .schema_namespace_catalog = payload } };
+        },
+        .database_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .database_catalog = payload } };
+        },
+        .tablespace_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .tablespace_catalog = payload } };
+        },
+        .logical_replication => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .logical_replication = payload } };
+        },
+        .type_system_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .type_system_catalog = payload } };
+        },
+        .comment_metadata => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .comment_metadata = payload } };
         },
     };
 }

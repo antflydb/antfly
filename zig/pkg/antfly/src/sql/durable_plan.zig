@@ -17,7 +17,10 @@ const classifier = @import("classifier.zig");
 const ddl_plan = @import("ddl_plan.zig");
 
 pub const DurableSqlPlan = union(enum) {
-    ddl: ddl_plan.LoweredDdlPlan,
+    moved: void,
+    table_ddl: binder.TableDdlLogicalPlan,
+    catalog_ddl: binder.CatalogDdlLogicalPlan,
+    other_ddl: binder.OtherDdlLogicalPlan,
     session: ddl_plan.SessionCatalogPlan,
     transaction: binder.TransactionLogicalPlan,
     prepared_statement: ddl_plan.PreparedStatementPlan,
@@ -31,7 +34,10 @@ pub const DurableSqlPlan = union(enum) {
 
     pub fn deinit(self: *@This(), alloc: @import("std").mem.Allocator) void {
         switch (self.*) {
-            .ddl => |*plan| plan.deinit(alloc),
+            .moved => {},
+            .table_ddl => |*plan| plan.deinit(alloc),
+            .catalog_ddl => |*plan| plan.deinit(alloc),
+            .other_ddl => |*plan| plan.deinit(alloc),
             .session => |*plan| plan.deinit(alloc),
             .transaction => |*plan| plan.deinit(alloc),
             .prepared_statement => |*plan| plan.deinit(alloc),
@@ -48,7 +54,9 @@ pub const DurableSqlPlan = union(enum) {
 
     pub fn fromLogical(logical: *binder.LogicalSqlPlan) !DurableSqlPlan {
         return switch (logical.*) {
-            .ddl => |plan| moveLogical(logical, .{ .ddl = plan }),
+            .table_ddl => |plan| moveLogical(logical, .{ .table_ddl = plan }),
+            .catalog_ddl => |plan| moveLogical(logical, .{ .catalog_ddl = plan }),
+            .other_ddl => |plan| moveLogical(logical, .{ .other_ddl = plan }),
             .session => |plan| moveLogical(logical, .{ .session = plan }),
             .transaction => |plan| moveLogical(logical, .{ .transaction = plan }),
             .prepared_statement => |plan| moveLogical(logical, .{ .prepared_statement = plan }),
@@ -64,9 +72,30 @@ pub const DurableSqlPlan = union(enum) {
     }
 
     pub fn fromDdlPayload(plan: *ddl_plan.LoweredDdlPlan) DurableSqlPlan {
-        const durable: DurableSqlPlan = .{ .ddl = plan.* };
+        var logical = binder.logicalPlanFromLoweredDdlPlan(plan);
         plan.* = .{ .adapter_noop = .{ .reason = .transaction_control } };
-        return durable;
+        return fromLogical(&logical) catch unreachable;
+    }
+
+    pub fn takeLoweredDdlPayload(self: *@This()) ?ddl_plan.LoweredDdlPlan {
+        return switch (self.*) {
+            .table_ddl => |*plan| blk: {
+                const lowered = plan.intoLoweredDdlPlan();
+                self.* = .{ .moved = {} };
+                break :blk lowered;
+            },
+            .catalog_ddl => |*plan| blk: {
+                const lowered = plan.intoLoweredDdlPlan();
+                self.* = .{ .moved = {} };
+                break :blk lowered;
+            },
+            .other_ddl => |*plan| blk: {
+                const lowered = plan.intoLoweredDdlPlan();
+                self.* = .{ .moved = {} };
+                break :blk lowered;
+            },
+            else => null,
+        };
     }
 
     fn moveLogical(logical: *binder.LogicalSqlPlan, durable: DurableSqlPlan) DurableSqlPlan {

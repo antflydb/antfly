@@ -12142,6 +12142,392 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
 }
 
+test "api.table_writes.query_visibility table write source invalidates cached query db after managed dense replay becomes visible" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-managed-dense-query-visibility");
+    defer alloc.free(path);
+
+    const FakeEmbeddingProvider = struct {
+        var request_count: std.atomic.Value(u32) = .init(0);
+        var rate_limited_count: std.atomic.Value(u32) = .init(0);
+        var allow_all: std.atomic.Value(bool) = .init(false);
+
+        fn vectorForInput(input: std.json.Value) []const u8 {
+            if (jsonValueContainsText(input, "alpha")) return "[1,0,0]";
+            if (jsonValueContainsText(input, "beta")) return "[0,1,0]";
+            return "[0,0,1]";
+        }
+
+        fn appendEmbedding(
+            arena: std.mem.Allocator,
+            out: *std.ArrayListUnmanaged(u8),
+            index: usize,
+            input: std.json.Value,
+        ) !void {
+            if (index != 0) try out.append(arena, ',');
+            const entry = try std.fmt.allocPrint(
+                arena,
+                "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":{s}}}",
+                .{ index, vectorForInput(input) },
+            );
+            defer arena.free(entry);
+            try out.appendSlice(arena, entry);
+        }
+
+        fn responseBody(arena: std.mem.Allocator, input: std.json.Value) ![]u8 {
+            var out = std.ArrayListUnmanaged(u8).empty;
+            try out.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
+            switch (input) {
+                .array => |items| {
+                    for (items.items, 0..) |item, index| {
+                        try appendEmbedding(arena, &out, index, item);
+                    }
+                },
+                else => try appendEmbedding(arena, &out, 0, input),
+            }
+            try out.appendSlice(arena, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+            return try out.toOwnedSlice(arena);
+        }
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+
+            const request_index = request_count.fetchAdd(1, .monotonic);
+            if (request_index != 0 and !allow_all.load(.acquire)) {
+                _ = rate_limited_count.fetchAdd(1, .monotonic);
+                const body = try arena.dupe(u8,
+                    \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
+                );
+                return .{
+                    .status = 429,
+                    .content_type = try arena.dupe(u8, "application/json"),
+                    .body = body,
+                };
+            }
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try responseBody(arena, parsed_req.value.input),
+            };
+        }
+
+        fn allowAll() void {
+            allow_all.store(true, .release);
+        }
+    };
+
+    const FakeCatalog = struct {
+        var indexes_json_buf: []const u8 = "";
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            table_records[0].indexes_json = indexes_json_buf;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const managed_indexes_json_buf = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(managed_indexes_json_buf);
+    FakeCatalog.indexes_json_buf = managed_indexes_json_buf;
+
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+    FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
+    FakeEmbeddingProvider.allow_all.store(false, .monotonic);
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.read_cache = &read_cache;
+    source.write_cache = &write_cache;
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
+        .sync_level = .write,
+    });
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"body\":\"beta body\"}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma body\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < 100 and FakeEmbeddingProvider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
+        sleepNs(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    FakeCatalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}";
+    {
+        var read_lease = try read_cache.getOrOpen(db_path, FakeCatalog.iface(), 7001, 0, "docs");
+        defer read_lease.release();
+
+        var initial = read_lease.db.search(alloc, .{
+            .index_name = "semantic_idx",
+            .dense = .{
+                .vector = &.{ 1.0, 0.0, 0.0 },
+                .k = 3,
+            },
+            .limit = 3,
+        }) catch |err| switch (err) {
+            error.StoredDocMissing => null,
+            else => return err,
+        };
+        if (initial) |*result| {
+            defer result.deinit();
+            try std.testing.expect(result.total_hits < 3);
+        }
+    }
+
+    FakeEmbeddingProvider.allowAll();
+
+    var ready = false;
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        {
+            var read_lease = try read_cache.getOrOpen(db_path, FakeCatalog.iface(), 7001, 0, "docs");
+            defer read_lease.release();
+
+            var result = read_lease.db.search(alloc, .{
+                .index_name = "semantic_idx",
+                .dense = .{
+                    .vector = &.{ 1.0, 0.0, 0.0 },
+                    .k = 3,
+                },
+                .limit = 3,
+            }) catch |err| switch (err) {
+                error.StoredDocMissing => {
+                    sleepNs(25 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            defer result.deinit();
+            if (result.total_hits == 3 and result.hits.len == 3) {
+                try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+                ready = true;
+                break;
+            }
+        }
+
+        sleepNs(25 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(ready);
+}
+
+test "provisioned table write source persists chunk artifacts when chunker enables full text indexing" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-managed-chunk-full-text");
+    defer alloc.free(path);
+
+    const FakeEmbeddingProvider = struct {
+        fn vectorForInput(input: std.json.Value) []const u8 {
+            return if (jsonValueContainsText(input, "alpha")) "[1,0,0]" else "[0,0,1]";
+        }
+
+        fn appendEmbedding(
+            arena: std.mem.Allocator,
+            out: *std.ArrayListUnmanaged(u8),
+            index: usize,
+            input: std.json.Value,
+        ) !void {
+            if (index != 0) try out.append(arena, ',');
+            const entry = try std.fmt.allocPrint(
+                arena,
+                "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":{s}}}",
+                .{ index, vectorForInput(input) },
+            );
+            defer arena.free(entry);
+            try out.appendSlice(arena, entry);
+        }
+
+        fn responseBody(arena: std.mem.Allocator, input: std.json.Value) ![]u8 {
+            var out = std.ArrayListUnmanaged(u8).empty;
+            try out.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
+            switch (input) {
+                .array => |items| {
+                    for (items.items, 0..) |item, index| {
+                        try appendEmbedding(arena, &out, index, item);
+                    }
+                },
+                else => try appendEmbedding(arena, &out, 0, input),
+            }
+            try out.appendSlice(arena, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+            return try out.toOwnedSlice(arena);
+        }
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try responseBody(arena, parsed_req.value.input),
+            };
+        }
+    };
+
+    const FakeCatalog = struct {
+        var indexes_json_buf: []const u8 = "";
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            table_records[0].indexes_json = indexes_json_buf;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    FakeCatalog.indexes_json_buf = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_chunked_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}},"chunker":{{"provider":"mock","store_chunks":false,"full_text_index":{{}},"text":{{"target_tokens":4,"overlap_tokens":1,"separator":" "}}}}}}}}
+    , .{base_uri});
+    defer alloc.free(FakeCatalog.indexes_json_buf);
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"Alpha with full text chunks\",\"body\":\"alpha alpha alpha alpha beta beta beta beta beta beta\"}" }},
+        .sync_level = .full_text,
+    });
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var reopened = try db_mod.DB.open(alloc, db_path, .{});
+    defer reopened.close();
+
+    const chunk_prefix = try db_mod.internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_chunked_idx_chunks");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try reopened.core.store.scanPrefix(alloc, chunk_prefix);
+    defer db_mod.docstore.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (db_mod.internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+
+    try std.testing.expect(chunk_count >= 2);
+}
+
 test "api.table_writes.query_visibility read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";

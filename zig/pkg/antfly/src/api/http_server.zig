@@ -4330,7 +4330,7 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         switch (logical_plan.*) {
-            .ddl, .cursor, .extension, .maintenance, .bulk_io => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .table_ddl, .catalog_ddl, .other_ddl, .cursor, .extension, .maintenance, .bulk_io => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
             .session => |plan| return try self.applySessionLogicalPlanWithSession(plan, session, context),
             .transaction => |plan| return try self.applyTransactionLogicalPlanWithSession(plan, logical_plan, session, context),
             .prepared_statement => |plan| return try self.applyPreparedStatementLogicalPlanWithSession(plan, session, context),
@@ -4542,7 +4542,7 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         if (try self.publicSqlReadOnlyActive(session)) {
             const allowed = switch (logical_plan.*) {
-                .ddl => true,
+                .table_ddl, .catalog_ddl, .other_ddl => true,
                 .cursor => |cursor| switch (cursor) {
                     .declare => |declare| declare.statement_kind == .read,
                     .fetch,
@@ -4563,7 +4563,11 @@ pub const ApiHttpServer = struct {
         var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
         defer durable_plan.deinit(self.alloc);
         switch (durable_plan) {
-            .ddl => |*ddl| return try self.applyRelationalDdlPlanWithSession(ddl, session, context),
+            .table_ddl, .catalog_ddl, .other_ddl => {
+                var ddl = durable_plan.takeLoweredDdlPayload() orelse return error.UnsupportedSqlShape;
+                defer ddl.deinit(self.alloc);
+                return try self.applyRelationalDdlPlanWithSession(&ddl, session, context);
+            },
             .extension => {
                 var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
                 errdefer applied.deinit(self.alloc);
@@ -27238,11 +27242,9 @@ test "api http server applies SQL DDL with explicit catalog session" {
             session: catalog_resources.SqlCatalogSession,
         ) !tables_api.AppliedRelationalSqlDdlRecord {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const ddl_plan: *sql_adapter.LoweredDdlPlan = switch (plan.*) {
-                .ddl => |*ddl| ddl,
-                else => return error.TestUnexpectedResult,
-            };
-            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc_arg, ddl_plan.*, session);
+            var ddl_plan = plan.takeLoweredDdlPayload() orelse return error.TestUnexpectedResult;
+            defer ddl_plan.deinit(alloc_arg);
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc_arg, ddl_plan, session);
             defer target.deinit(alloc_arg);
             try std.testing.expect(target.createsTable());
             try std.testing.expectEqualStrings("tenant_ops", target.database_name);
@@ -30944,11 +30946,9 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.binding_aware_calls += 1;
 
-            const ddl_plan: *sql_adapter.LoweredDdlPlan = switch (plan.*) {
-                .ddl => |*ddl| ddl,
-                else => return error.TestUnexpectedResult,
-            };
-            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, ddl_plan.*, session);
+            var ddl_plan = plan.takeLoweredDdlPayload() orelse return error.TestUnexpectedResult;
+            defer ddl_plan.deinit(allocator);
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, ddl_plan, session);
             defer target.deinit(allocator);
 
             var base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
@@ -30956,7 +30956,7 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
                 allocator,
                 source_table,
-                ddl_plan,
+                &ddl_plan,
                 session,
             );
             errdefer applied.deinit(allocator);

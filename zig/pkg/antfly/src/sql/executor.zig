@@ -94,5 +94,5 @@ test "sql executor classifies statement families and owns ddl plans" {
     defer ddl_sql.deinit(alloc);
     var ddl_logical = try lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &ddl_sql, .{});
     defer ddl_logical.deinit(alloc);
-    try std.testing.expectEqualStrings("ddl", ddl_logical.statementKindName());
+    try std.testing.expectEqualStrings("table_ddl", ddl_logical.statementKindName());
 }

@@ -29,8 +29,14 @@ pub fn applyDurablePlanOnServiceWithSessionAlloc(
     plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (plan.takeLoweredDdlPayload()) |lowered| {
+        var ddl = lowered;
+        defer ddl.deinit(alloc);
+        return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
+    }
+
     switch (plan.*) {
-        .ddl => |*ddl| return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, ddl, session),
+        .moved, .table_ddl, .catalog_ddl, .other_ddl => return error.UnsupportedSqlShape,
         .session => |session_plan| {
             var ddl: sql_adapter.LoweredDdlPlan = .{ .session_catalog = session_plan };
             return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
