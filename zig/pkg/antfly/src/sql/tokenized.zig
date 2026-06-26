@@ -334,6 +334,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
     if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return true;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
@@ -348,6 +349,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
@@ -451,6 +453,30 @@ fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSq
     consumeRelationLifetime(tokens, &index, end);
     if (index >= end or !tokenMatchesKeyword(tokens[index], .table)) return false;
     return findTopLevelKeyword(tokens, index + 1, end, .as) != null;
+}
+
+fn isGeneratedTableOrIndexDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start + 1 >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    const second = tokens[start + 1];
+    if (tokenMatchesKeyword(first, .create)) {
+        var object_index = start + 1;
+        consumeRelationLifetime(tokens, &object_index, end);
+        if (object_index >= end) return false;
+        const object = tokens[object_index];
+        return tokenMatchesKeyword(object, .table) or
+            tokenMatchesKeyword(object, .index) or
+            (tokenMatchesKeyword(object, .unique) and object_index + 1 < end and tokenMatchesKeyword(tokens[object_index + 1], .index));
+    }
+    if (tokenMatchesKeyword(first, .alter)) {
+        return tokenMatchesKeyword(second, .table);
+    }
+    if (tokenMatchesKeyword(first, .drop)) {
+        return tokenMatchesKeyword(second, .table) or tokenMatchesKeyword(second, .index);
+    }
+    return false;
 }
 
 fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -3371,7 +3397,15 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
 
     var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer complex_ddl.deinit(alloc);
-    try std.testing.expect(complex_ddl.generated_statement == null);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, complex_ddl.generatedStatementKind().?);
+    switch (complex_ddl.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 11 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(complex_ddl.statement));
 
     var generated_catalog_ddl = try ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops");

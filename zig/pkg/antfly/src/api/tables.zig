@@ -1587,6 +1587,17 @@ pub fn applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
     };
 }
 
+pub fn applyTableDdlPlanToTableRecordWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    plan: *sql_adapter.TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
+    var lowered = plan.intoLoweredDdlPlan();
+    defer lowered.deinit(alloc);
+    return try applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, &lowered, session);
+}
+
 pub fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
@@ -1605,6 +1616,34 @@ pub fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
     const table = (try findTableContainingIndexConfigAlloc(alloc, snapshot, graph_index_name)) orelse return error.TableNotFound;
 
     var applied = try applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
+        alloc,
+        table,
+        plan,
+        session,
+    );
+    errdefer applied.deinit(alloc);
+    try svc.upsertTable(applied.table);
+    return applied;
+}
+
+pub fn applyUntargetedRelationalDerivedIndexTablePlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: *sql_adapter.TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !?AppliedRelationalSqlDdlRecord {
+    const create_index = switch (plan.*) {
+        .create_index => |value| value,
+        else => return null,
+    };
+    if (create_index.table_name.len != 0) return null;
+    const index_json = create_index.derived_index_config_json orelse return null;
+    const graph_index_name = try graphMetricGraphIndexNameFromConfigAlloc(alloc, index_json) orelse return null;
+    defer alloc.free(graph_index_name);
+    const table = (try findTableContainingIndexConfigAlloc(alloc, snapshot, graph_index_name)) orelse return error.TableNotFound;
+
+    var applied = try applyTableDdlPlanToTableRecordWithSessionAlloc(
         alloc,
         table,
         plan,
@@ -1650,6 +1689,42 @@ pub fn applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
     table: *const metadata_table_manager.TableRecord,
     target: RelationalSqlDdlTarget,
     plan: sql_adapter.LoweredDdlPlan,
+) !?AppliedRelationalSqlDdlRecord {
+    _ = target;
+    const create_index = switch (plan) {
+        .create_index => |value| value,
+        else => return null,
+    };
+    const index_json = create_index.derived_index_config_json orelse return null;
+    if (try indexes_api.hasIndexConfig(alloc, table.indexes_json, create_index.index_name)) {
+        if (!create_index.if_not_exists) return error.InvalidTableIndexMetadata;
+        return .{
+            .table = try metadata_table_manager.cloneTable(alloc, table.*),
+            .noop = true,
+        };
+    }
+
+    try validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
+    const expanded_index_json = try expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, index_json, table.schema_json);
+    defer alloc.free(expanded_index_json);
+
+    var updated_record = table.*;
+    updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, create_index.index_name, expanded_index_json);
+    defer alloc.free(updated_record.indexes_json);
+    try svc.upsertTable(updated_record);
+
+    return .{
+        .table = try metadata_table_manager.cloneTable(alloc, updated_record),
+        .requires_rebuild = true,
+    };
+}
+
+pub fn applyRelationalDerivedIndexTablePlanOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    table: *const metadata_table_manager.TableRecord,
+    target: RelationalSqlDdlTarget,
+    plan: sql_adapter.TableDdlLogicalPlan,
 ) !?AppliedRelationalSqlDdlRecord {
     _ = target;
     const create_index = switch (plan) {
@@ -1935,6 +2010,34 @@ pub fn relationalSqlDdlTargetForPlanWithSessionAlloc(
     };
 }
 
+pub fn relationalSqlDdlTargetForTablePlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlDdlTarget {
+    var table_ref = (try relationalSqlTableDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) orelse return error.UnsupportedSqlShape;
+    errdefer table_ref.deinit(alloc);
+    return .{
+        .database_name = table_ref.database_name,
+        .namespace_name = table_ref.namespace_name,
+        .table_name = table_ref.table_name,
+        .action = switch (plan) {
+            .create_table => .create_table,
+            .drop_table => .drop_table,
+            .create_index, .drop_index, .alter_table, .create_update_policy => .update_table,
+            else => return error.UnsupportedSqlShape,
+        },
+        .if_exists = switch (plan) {
+            .drop_table => |drop_table| drop_table.if_exists,
+            else => false,
+        },
+        .cascade = switch (plan) {
+            .drop_table => |drop_table| drop_table.cascade,
+            else => false,
+        },
+    };
+}
+
 fn relationalSqlDdlPlanTableRefAlloc(
     alloc: std.mem.Allocator,
     plan: sql_adapter.LoweredDdlPlan,
@@ -1951,7 +2054,28 @@ fn relationalSqlDdlPlanTableRefWithSessionAlloc(
     return try parseRelationalSqlDdlTableRefWithSessionAlloc(alloc, table_name, session);
 }
 
+fn relationalSqlTableDdlPlanTableRefWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !?RelationalSqlDdlTableRef {
+    const table_name = relationalSqlTableDdlPlanTableName(plan) orelse return null;
+    return try parseRelationalSqlDdlTableRefWithSessionAlloc(alloc, table_name, session);
+}
+
 fn relationalSqlDdlPlanTableName(plan: sql_adapter.LoweredDdlPlan) ?[]const u8 {
+    return switch (plan) {
+        .create_table => |create_table| create_table.table_name,
+        .create_index => |create_index| if (create_index.table_name.len == 0) null else create_index.table_name,
+        .drop_index => null,
+        .drop_table => |drop_table| drop_table.table_name,
+        .alter_table => |alter_table| alter_table.table_name,
+        .create_update_policy => |update_policy| update_policy.table_name,
+        else => null,
+    };
+}
+
+fn relationalSqlTableDdlPlanTableName(plan: sql_adapter.TableDdlLogicalPlan) ?[]const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
         .create_index => |create_index| if (create_index.table_name.len == 0) null else create_index.table_name,
@@ -3994,6 +4118,36 @@ pub fn applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
     plan: sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !?AppliedRelationalSqlDdlRecord {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+        @hasDecl(ServiceDeclType, "removeDatabase") and
+        @hasDecl(ServiceDeclType, "upsertNamespace") and
+        @hasDecl(ServiceDeclType, "removeNamespace") and
+        @hasDecl(ServiceDeclType, "upsertTablespace") and
+        @hasDecl(ServiceDeclType, "removeTablespace")))
+    {
+        return null;
+    }
+
+    switch (plan) {
+        .database_catalog => |database_plan| return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan),
+        .schema_namespace_catalog => |namespace_plan| return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan, session),
+        .tablespace_catalog => |tablespace_plan| return try applyTablespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, tablespace_plan),
+        else => return null,
+    }
+}
+
+pub fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: sql_adapter.CatalogDdlLogicalPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !?AppliedRelationalSqlDdlRecord {
     const ServiceType = @TypeOf(svc);

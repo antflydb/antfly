@@ -495,11 +495,25 @@ const LocalSwarmMetadata = struct {
     fn applyRelationalSqlDdlPlanWithSession(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        plan: *sql_adapter.LoweredDdlPlan,
+        plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
     ) !antfly.public_api.tables.AppliedRelationalSqlDdlRecord {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        if (plan.takeLoweredDdlPayload()) |lowered_payload| {
+            var lowered_plan = lowered_payload;
+            defer lowered_plan.deinit(alloc);
+            return try self.applyLoweredRelationalSqlDdlPlanWithSession(alloc, &lowered_plan, session);
+        }
 
+        return error.UnsupportedSqlShape;
+    }
+
+    fn applyLoweredRelationalSqlDdlPlanWithSession(
+        self: *LocalSwarmMetadata,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !antfly.public_api.tables.AppliedRelationalSqlDdlRecord {
         var target = try antfly.public_api.tables.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan.*, session);
         defer target.deinit(alloc);
 
@@ -507,7 +521,7 @@ const LocalSwarmMetadata = struct {
         defer self.mutex.unlock();
 
         var snapshot = try self.catalogAdminSnapshotLocked();
-        defer catalogFreeAdminSnapshot(ptr, &snapshot);
+        defer catalogFreeAdminSnapshot(self, &snapshot);
 
         if (target.createsTable()) {
             try antfly.public_api.tables.validateRelationalSqlDdlNamespace(&snapshot, target);

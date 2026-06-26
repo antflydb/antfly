@@ -2,14 +2,9 @@
 // Package: antfly_indexes_openapi
 
 const std = @import("std");
-
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
-
-pub const EmbedderConfig = antfly_embeddings_openapi.EmbedderConfig;
-pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
-pub const ChunkerConfig = antfly_chunking_openapi.ChunkerConfig;
 
 /// Sort direction for a single field. true = descending, false = ascending.
 pub const SortDirection = bool;
@@ -723,11 +718,11 @@ pub const EmbeddingsIndexConfig = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
-    chunker: ?ChunkerConfig = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
     /// Minimum weight threshold for sparse vector entries (sparse only)
@@ -739,7 +734,7 @@ pub const EmbeddingsIndexConfig = struct {
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
-    summarizer: ?GeneratorConfig = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
     template: ?[]const u8 = null,
     /// List of edge types with their configurations
@@ -1009,11 +1004,11 @@ pub const IndexConfig = struct {
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
-    chunker: ?ChunkerConfig = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
     /// Minimum weight threshold for sparse vector entries (sparse only)

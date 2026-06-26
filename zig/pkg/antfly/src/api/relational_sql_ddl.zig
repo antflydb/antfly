@@ -29,14 +29,11 @@ pub fn applyDurablePlanOnServiceWithSessionAlloc(
     plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (plan.takeLoweredDdlPayload()) |lowered| {
-        var ddl = lowered;
-        defer ddl.deinit(alloc);
-        return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
-    }
-
     switch (plan.*) {
-        .moved, .table_ddl, .catalog_ddl, .other_ddl => return error.UnsupportedSqlShape,
+        .moved => return error.UnsupportedSqlShape,
+        .table_ddl => |*table_plan| return try applyTableDdlPlanOnServiceWithSessionAlloc(alloc, svc, table_plan, session),
+        .catalog_ddl => |catalog_plan| return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, catalog_plan, session),
+        .other_ddl => |*other_plan| return try applyOtherDdlPlanOnServiceWithSessionAlloc(alloc, svc, other_plan, session),
         .session => |session_plan| {
             var ddl: sql_adapter.LoweredDdlPlan = .{ .session_catalog = session_plan };
             return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &ddl, session);
@@ -115,6 +112,110 @@ pub fn applyPlanOnServiceWithSessionAlloc(
     var durable = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
     defer durable.deinit(alloc);
     return try applyDurablePlanOnServiceWithSessionAlloc(alloc, svc, &durable, session);
+}
+
+fn applyTableDdlPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: *sql_adapter.TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+
+    if (try tables_api.applyUntargetedRelationalDerivedIndexTablePlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
+        return applied;
+    }
+
+    var target = try tables_api.relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, plan.*, session);
+    defer target.deinit(alloc);
+
+    if (target.createsTable()) {
+        try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
+        if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
+
+        const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
+        var policy_table: ?metadata_table_manager.TableRecord = null;
+        defer if (policy_table) |record| metadata_table_manager.freeTable(alloc, record);
+        const resolved_table = if (tables_api.effectiveTablespaceForTarget(&snapshot, target.database_name, target.namespace_name, null)) |tablespace| blk: {
+            policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
+            break :blk policy_table.?;
+        } else base_table;
+
+        var applied = try tables_api.applyTableDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, plan, session);
+        errdefer applied.deinit(alloc);
+        applied.created_table = true;
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+
+        const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
+        defer {
+            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
+            alloc.free(ranges);
+        }
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(svc, applied.table, ranges);
+        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
+        return applied;
+    }
+
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
+        if (target.dropsTable() and target.if_exists) {
+            return try tables_api.missingQualifiedDropTableIfExistsNoopAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+        }
+        return error.TableNotFound;
+    };
+
+    if (target.dropsTable()) {
+        if (target.cascade) {
+            try applyDropTableCascadeReferences(svc, alloc, &snapshot, table.*);
+        } else {
+            try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        }
+        var dropped = try droppedTableRecordAlloc(alloc, table.*);
+        errdefer dropped.deinit(alloc);
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.dropTable(svc, table.table_id);
+        return dropped;
+    }
+
+    if (try tables_api.applyRelationalDerivedIndexTablePlanOnServiceAlloc(alloc, svc, table, target, plan.*)) |derived_applied| {
+        return derived_applied;
+    }
+
+    var applied = try tables_api.applyTableDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
+    errdefer applied.deinit(alloc);
+    try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+    try svc.upsertTable(applied.table);
+    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
+    return applied;
+}
+
+fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: sql_adapter.CatalogDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    if (try tables_api.applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
+        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
+        return applied;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn applyOtherDdlPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: *sql_adapter.OtherDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var lowered = plan.intoLoweredDdlPlan();
+    defer lowered.deinit(alloc);
+    return try applyDdlPayloadOnServiceWithSessionAlloc(alloc, svc, &lowered, session);
 }
 
 fn applyDdlPayloadOnServiceWithSessionAlloc(

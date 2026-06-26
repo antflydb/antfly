@@ -690,6 +690,9 @@ fn addOpenApiGeneratedPackages(
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_openapi_generated_root ++ "/antfly_schema_openapi", "types", &.{}, mode);
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_openapi_generated_root ++ "/antfly_indexes_openapi", "types", &.{
         .{ "schema.yaml", "antfly_schema_openapi" },
+        .{ "embeddings.yaml", "antfly_embeddings_openapi" },
+        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+        .{ "chunking.yaml", "antfly_chunking_openapi" },
     }, mode);
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_openapi_generated_root ++ "/antfly_websearch_openapi", "types", &.{
         .{ "../shared/s3.yaml", "antfly_s3_openapi" },
