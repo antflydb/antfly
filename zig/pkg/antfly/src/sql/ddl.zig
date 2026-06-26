@@ -12468,14 +12468,14 @@ fn validateLogicalReplicationPlanKind(
     }
 }
 
-pub fn lowerDdlPlanAlloc(
+fn lowerDdlPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
     return try lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, .{});
 }
 
-pub fn lowerDdlPlanWithFunctionBindingsAlloc(
+fn lowerDdlPlanWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
     function_bindings: lower_expr.SqlFunctionBindings,
@@ -12486,7 +12486,7 @@ pub fn lowerDdlPlanWithFunctionBindingsAlloc(
     return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
 }
 
-pub fn lowerDdlPlanParsedSqlAlloc(
+fn lowerDdlPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
 ) !LoweredDdlPlan {
@@ -12746,7 +12746,7 @@ pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
     return try routine_trigger_parser.parse();
 }
 
-pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
+fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,

@@ -2128,6 +2128,73 @@ fn validateGeneratedWindowOverClauseForSpec(
     }
 }
 
+fn generatedWindowFunctionArgumentCountBounds(function: db_mod.types.RelationalRowsWindowFunction) struct { min: usize, max: usize } {
+    return switch (function) {
+        .row_number, .rank, .dense_rank, .percent_rank, .cume_dist => .{ .min = 0, .max = 0 },
+        .ntile, .first_value, .last_value, .sum, .avg, .min, .max, .bool_or, .bool_and => .{ .min = 1, .max = 1 },
+        .nth_value => .{ .min = 2, .max = 2 },
+        .lag, .lead => .{ .min = 1, .max = 3 },
+        .count => .{ .min = 0, .max = 1 },
+    };
+}
+
+fn validateGeneratedWindowFunctionArgumentPayloads(
+    tokens: []const Token,
+    function: db_mod.types.RelationalRowsWindowFunction,
+    function_start: usize,
+    argument_start: usize,
+    argument_end: usize,
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start != function_start or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.start != function_start or name_tokens.end >= expression_tokens.end) return error.UnsupportedSqlShape;
+    const function_token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+    if (!std.ascii.eqlIgnoreCase(function_token.text, windowFunctionName(function))) return error.UnsupportedSqlShape;
+    if (expression.argument_distinct_tokens != null or
+        expression.argument_order_tokens != null or
+        expression.argument_order_items.count != 0 or
+        expression.within_group_tokens != null or
+        expression.within_group_order_tokens != null or
+        expression.within_group_order_items.count != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const bounds = generatedWindowFunctionArgumentCountBounds(function);
+    if (argument_start == argument_end) {
+        if (bounds.min != 0) return error.UnsupportedSqlShape;
+        if (expression.argument_tokens != null or
+            expression.argument_value_tokens != null or
+            expression.argument_items.count != 0 or
+            expression.argument_items.items.len != 0)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+
+    const argument_tokens = expression.argument_tokens orelse return error.UnsupportedSqlShape;
+    const value_tokens = expression.argument_value_tokens orelse return error.UnsupportedSqlShape;
+    if (argument_tokens.start != argument_start or argument_tokens.end != argument_end) return error.UnsupportedSqlShape;
+    if (value_tokens.start != argument_start or value_tokens.end != argument_end) return error.UnsupportedSqlShape;
+
+    if (function == .count and argument_start + 1 == argument_end and tokens[argument_start].kind == .star) {
+        if (expression.argument_items.count > 1) return error.UnsupportedSqlShape;
+        if (expression.argument_items.count == 1 and !generatedTokenRangeEqual(expression.argument_items.items[0], value_tokens)) return error.UnsupportedSqlShape;
+        return;
+    }
+
+    if (expression.argument_items.count < bounds.min or expression.argument_items.count > bounds.max) return error.UnsupportedSqlShape;
+    if (expression.argument_items.count == 0) return error.UnsupportedSqlShape;
+    if (expression.argument_items.items.len != expression.argument_items.count or expression.argument_items.expressions.len != expression.argument_items.count) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(expression.argument_items.first_tokens orelse return error.UnsupportedSqlShape, expression.argument_items.items[0])) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(expression.argument_items.last_tokens orelse return error.UnsupportedSqlShape, expression.argument_items.items[expression.argument_items.count - 1])) return error.UnsupportedSqlShape;
+}
+
 fn generatedWhereClauseEnd(
     tokens: []const Token,
     keyword_index: usize,
@@ -14672,8 +14739,10 @@ pub fn parseWindowSpecAlloc(
     window_definition_options: WindowDefinitionParserOptions,
     options: WindowSpecParserOptions,
 ) !db_mod.types.RelationalRowsWindowSpec {
+    const function_start = pos.*;
     const function = try parseWindowFunction(tokens, pos);
     try parser.expectToken(tokens, pos, .lparen);
+    const argument_start = pos.*;
     const value_expression: ?db_mod.types.RelationalRowsExpression = switch (function) {
         .row_number, .rank, .dense_rank, .percent_rank, .cume_dist, .ntile => null,
         .lag, .lead, .first_value, .last_value, .nth_value => try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
@@ -14721,7 +14790,16 @@ pub fn parseWindowSpecAlloc(
     };
     var default_transferred = false;
     errdefer if (!default_transferred) if (default_json.len > 0) alloc.free(default_json);
+    const argument_end = pos.*;
     try parser.expectToken(tokens, pos, .rparen);
+    try validateGeneratedWindowFunctionArgumentPayloads(
+        tokens,
+        function,
+        function_start,
+        argument_start,
+        argument_end,
+        options.generated_expression_ast,
+    );
     const generated_filter_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (parser.peekKeyword(tokens, pos.*, "filter")) blk: {
         const generated_expression = options.generated_expression_ast orelse break :blk null;
         break :blk generated_expression.filter_expression;
@@ -41579,6 +41657,19 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
         alloc,
         &malformed_inline_function_name,
+        schema,
+        &.{},
+    ));
+
+    var malformed_inline_argument_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, lag(amount, 2, 0) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS previous_amount FROM usage_records WHERE status = 'open' ORDER BY previous_amount ASC LIMIT 5",
+    );
+    defer malformed_inline_argument_range.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionArgumentRange(&malformed_inline_argument_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_inline_argument_range,
         schema,
         &.{},
     ));
