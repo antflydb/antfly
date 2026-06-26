@@ -19460,6 +19460,7 @@ pub fn parseJoinAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
+            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &right_predicates,
@@ -19501,6 +19502,7 @@ pub fn parseJoinAlloc(
                 &where_targets,
                 options.expression_where_options,
                 options.realtime_ns,
+                generated_where_expression,
             );
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -20132,6 +20134,7 @@ pub fn parseLateralAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
+            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &unsupported_right_predicates,
@@ -20173,6 +20176,7 @@ pub fn parseLateralAlloc(
                 &where_targets,
                 options.expression_where_options,
                 options.realtime_ns,
+                generated_where_expression,
             );
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -25442,8 +25446,15 @@ pub fn parseJoinWhereAlloc(
     targets: *JoinWherePredicateTargets,
     expression_where_options: JoinedMutationExpressionWhereConditionParserOptions,
     realtime_ns: u64,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
+        const generated_atom_expression = if (generated_expression_ast) |expression| blk: {
+            const expression_tokens = expression.tokens orelse break :blk null;
+            if (expression_tokens.start != pos.* or whereHasTopLevelAndBeforeTailToken(tokens, pos.*)) break :blk null;
+            break :blk expression;
+        } else null;
+
         if (try joinedMutationExpressionSideAt(tokens, pos.*, left_alias, right_alias, string_to_array_predicate_is_containment)) |expression_side| {
             try parseJoinedMutationExpressionWhereConditionWithContextAlloc(
                 alloc,
@@ -25587,6 +25598,7 @@ pub fn parseJoinWhereAlloc(
             break :blk is_tail.op;
         } else try parseComparisonOp(tokens, pos);
         if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
+            try validateGeneratedQuantifiedPredicateExpression(generated_atom_expression);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
