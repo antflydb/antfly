@@ -330,6 +330,8 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedExtendedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCursorStatementHead(tokens, raw_statement)) return false;
+    if (isGeneratedSessionStatementHead(tokens, raw_statement)) return false;
+    if (isGeneratedPreparedStatementHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -574,6 +576,27 @@ fn isGeneratedCursorStatementHead(tokens: []const Token, raw_statement: RawSqlSt
     return tokenMatchesText(first, "declare") or
         tokenMatchesKeyword(first, .fetch) or
         tokenMatchesKeyword(first, .close);
+}
+
+fn isGeneratedSessionStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    return tokenMatchesKeyword(first, .set) or
+        tokenMatchesKeyword(first, .reset) or
+        tokenMatchesKeyword(first, .show) or
+        tokenMatchesKeyword(first, .discard);
+}
+
+fn isGeneratedPreparedStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    return tokenMatchesKeyword(first, .prepare) or
+        tokenMatchesKeyword(first, .execute) or
+        tokenMatchesKeyword(first, .deallocate);
 }
 
 fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
@@ -2538,7 +2561,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO public extra"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "RESET search_path TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SHOW search_path EXTRA"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DISCARD TEMP"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt(text AS SELECT id FROM usage_records"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "EXECUTE read_stmt("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DEALLOCATE read_stmt extra"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));

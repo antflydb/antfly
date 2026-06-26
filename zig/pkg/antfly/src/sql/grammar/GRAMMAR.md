@@ -57,8 +57,14 @@ now have an AST-to-plan conversion path with retained statement/command span,
 command-kind, name, parameter, argument, and nested-statement range validation
 plus parity coverage against the existing token-based lowerer, including typed
 `PREPARE name(type, ...) AS ...` parameter lists and generated `DEALLOCATE ALL`.
+Prepared-statement command heads now require generated parser success at SQL
+ingress for `PREPARE`, `EXECUTE`, and `DEALLOCATE`, including malformed
+multi-token tails.
 Session catalog commands now have generated AST-to-plan parity
 for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
+Session command heads now require generated parser success at SQL ingress, so
+malformed multi-token session commands cannot fall back to the legacy session
+adapter.
 Transaction boundary commands now dispatch through generated AST-to-plan
 lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
 adapter-noop boundaries, including retained statement/command source-span and
