@@ -1008,7 +1008,10 @@ Unsupported DDL remains on the existing parser until
    projection starts against the retained generated expression kind, so
    malformed generated `CURRENT_DATE`/`CURRENT_TIMESTAMP`, cast, case, concat,
    unary/logical, parenthesized, and function-call projection metadata fails
-   closed before fallback projection parsing can accept it.
+   closed before fallback projection parsing can accept it. Aggregate
+   `GROUP BY` lowering now applies the same generated item lookup for simple
+   group fields, ordinals, and expression group keys, so corrupted group item
+   expression kinds also fail closed during typed group planning.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning

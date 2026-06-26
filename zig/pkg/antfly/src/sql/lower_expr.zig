@@ -1778,6 +1778,18 @@ fn generatedProjectionExpressionAtItemStart(
     return null;
 }
 
+fn generatedGroupExpressionAtItemStart(
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const read = generated_read_ast orelse return null;
+    if (read.group_items.items.len != read.group_items.count or read.group_items.expressions.len != read.group_items.count) return error.UnsupportedSqlShape;
+    for (read.group_items.items, 0..) |item, index| {
+        if (item.start == pos) return &read.group_items.expressions[index];
+    }
+    return null;
+}
+
 fn generatedSelectItemStartAllowsExpressionKind(
     start: SelectItemStart,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -1854,6 +1866,13 @@ fn validateGeneratedSelectItemStartForExpression(
 ) !void {
     const expression = generated_expression orelse return;
     if (!generatedSelectItemStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedSimpleGroupExpression(
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (expression.kind != .token_range) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedWindowOverClauseForSpec(
@@ -12682,12 +12701,18 @@ pub fn parseAggregateGroupByAlloc(
     group_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection),
     select: plan_mod.AggregateSelectList,
     select_item_options: SelectItemParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedGroupExpressionAtItemStart(item_start, generated_read_ast);
+        if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
         if (parser.matchToken(tokens, pos, .number)) |token| {
+            try validateGeneratedSimpleGroupExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             try appendAggregateGroupByOrdinal(alloc, group_by, group_expressions, select, ordinal);
         } else if (peekStandaloneAggregateGroupIdentifier(tokens, pos.*)) {
+            try validateGeneratedSimpleGroupExpression(generated_expression);
             const raw_field = try parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
@@ -12709,6 +12734,8 @@ pub fn parseAggregateGroupByAlloc(
                 defer_row_expression_field_validation,
             );
         } else {
+            var item_options = select_item_options;
+            item_options.generated_expression_ast = generated_expression;
             const item = try parseSelectItemAlloc(
                 alloc,
                 tokens,
@@ -12721,7 +12748,7 @@ pub fn parseAggregateGroupByAlloc(
                 defer_row_expression_field_validation,
                 field_source,
                 type_context,
-                select_item_options,
+                item_options,
             );
             var item_transferred = false;
             errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -18410,6 +18437,7 @@ pub fn parseAggregateAlloc(
                 &group_expressions,
                 select,
                 options.select_item_options,
+                options.generated_read_ast,
             );
             if (generated_group_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -31514,6 +31542,25 @@ fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstGroupExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.group_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    read.group_items.expressions[0].kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadHavingExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -32047,6 +32094,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_group,
+        schema,
+        &.{},
+    ));
+
+    var malformed_group_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_group_kind.deinit(alloc);
+    try corruptGeneratedReadFirstGroupExpressionKind(&malformed_group_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_group_kind,
         schema,
         &.{},
     ));
