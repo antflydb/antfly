@@ -285,6 +285,7 @@ pub const LoweredDdlPlan = union(enum) {
     schema_namespace_catalog: SchemaNamespaceCatalogPlan,
     extension_catalog: ExtensionCatalogPlan,
     function_catalog: FunctionCatalogPlan,
+    trigger_catalog: TriggerCatalogPlan,
     procedure_call: ProcedureCallPlan,
     authorization_catalog: AuthorizationCatalogPlan,
     bulk_io: BulkIoPlan,
@@ -324,6 +325,7 @@ pub const LoweredDdlPlan = union(enum) {
             .schema_namespace_catalog => |*plan| plan.deinit(alloc),
             .extension_catalog => |*plan| plan.deinit(alloc),
             .function_catalog => |*plan| plan.deinit(alloc),
+            .trigger_catalog => |*plan| plan.deinit(alloc),
             .procedure_call => |*plan| plan.deinit(alloc),
             .authorization_catalog => |*plan| plan.deinit(alloc),
             .bulk_io => |*plan| plan.deinit(alloc),
@@ -1337,6 +1339,53 @@ pub const FunctionCatalogPlan = union(enum) {
             .create => |*plan| plan.deinit(alloc),
             .drop => |*plan| plan.deinit(alloc),
         }
+        self.* = undefined;
+    }
+};
+
+pub const TriggerCatalogPlan = union(enum) {
+    create: CreateRoutineTriggerPlan,
+    drop: DropRoutineTriggerPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const RoutineTriggerEvent = enum {
+    insert,
+    update,
+    delete,
+};
+
+pub const CreateRoutineTriggerPlan = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    function_name: []const u8,
+    event: RoutineTriggerEvent,
+    replace_existing: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        alloc.free(self.function_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropRoutineTriggerPlan = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
         self.* = undefined;
     }
 };
@@ -11543,6 +11592,166 @@ pub fn lowerDdlPlanParsedSqlAlloc(
     return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
+const RoutineTriggerParser = struct {
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: usize = 0,
+
+    fn parse(self: *@This()) !TriggerCatalogPlan {
+        if (self.matchKeywordTag(.create)) {
+            var replace_existing = false;
+            if (self.matchKeywordTag(.@"or")) {
+                try self.expectKeywordTag(.replace);
+                replace_existing = true;
+            }
+            if (!self.matchKeywordTag(.trigger)) return error.NotTriggerDdl;
+            return .{ .create = try self.parseCreateTriggerTail(replace_existing) };
+        }
+        if (self.matchKeywordTag(.drop)) {
+            if (!self.matchKeywordTag(.trigger)) return error.NotTriggerDdl;
+            return .{ .drop = try self.parseDropTriggerTail() };
+        }
+        return error.NotTriggerDdl;
+    }
+
+    fn parseCreateTriggerTail(self: *@This(), replace_existing: bool) !CreateRoutineTriggerPlan {
+        const trigger_name = try self.parseIdentifierOwned();
+        var trigger_transferred = false;
+        errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
+
+        try self.expectKeywordTag(.before);
+        const event = try self.parseTriggerEvent();
+        try self.expectKeywordTag(.on);
+        const table_name = try self.parseObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+
+        if (self.matchKeywordTag(.@"for")) {
+            try self.expectKeywordTag(.each);
+            try self.expectKeywordTag(.row);
+        }
+
+        try self.expectKeywordTag(.execute);
+        if (!(self.matchKeywordTag(.function) or self.matchKeywordTag(.procedure))) return error.UnsupportedSqlShape;
+        const function_name = try self.parseObjectIdentifierOwned();
+        var function_transferred = false;
+        errdefer if (!function_transferred) self.alloc.free(function_name);
+        try self.expect(.lparen);
+        try self.expect(.rparen);
+        try self.expectStatementEnd();
+
+        trigger_transferred = true;
+        table_transferred = true;
+        function_transferred = true;
+        return .{
+            .trigger_name = trigger_name,
+            .table_name = table_name,
+            .function_name = function_name,
+            .event = event,
+            .replace_existing = replace_existing,
+        };
+    }
+
+    fn parseDropTriggerTail(self: *@This()) !DropRoutineTriggerPlan {
+        var if_exists = false;
+        if (self.matchKeywordTag(.@"if")) {
+            try self.expectKeywordTag(.exists);
+            if_exists = true;
+        }
+        const trigger_name = try self.parseIdentifierOwned();
+        var trigger_transferred = false;
+        errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
+        try self.expectKeywordTag(.on);
+        _ = self.matchKeywordTag(.only);
+        const table_name = try self.parseObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+        var cascade = false;
+        if (self.matchKeywordTag(.cascade)) {
+            cascade = true;
+        } else {
+            _ = self.matchKeywordTag(.restrict);
+        }
+        try self.expectStatementEnd();
+        trigger_transferred = true;
+        table_transferred = true;
+        return .{
+            .trigger_name = trigger_name,
+            .table_name = table_name,
+            .if_exists = if_exists,
+            .cascade = cascade,
+        };
+    }
+
+    fn parseTriggerEvent(self: *@This()) !RoutineTriggerEvent {
+        if (self.matchKeywordTag(.insert)) return .insert;
+        if (self.matchKeywordTag(.update)) {
+            if (self.matchKeywordTag(.of)) return error.UnsupportedSqlShape;
+            return .update;
+        }
+        if (self.matchKeywordTag(.delete)) return .delete;
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseIdentifierOwned(self: *@This()) ![]u8 {
+        if (self.pos >= self.tokens.len) return error.UnsupportedSqlShape;
+        const token = self.tokens[self.pos];
+        if (token.kind != .identifier) return error.UnsupportedSqlShape;
+        self.pos += 1;
+        return try self.alloc.dupe(u8, token.text);
+    }
+
+    fn parseObjectIdentifierOwned(self: *@This()) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        var first = true;
+        while (true) {
+            if (self.pos >= self.tokens.len) return error.UnsupportedSqlShape;
+            const token = self.tokens[self.pos];
+            if (token.kind != .identifier) return error.UnsupportedSqlShape;
+            if (!first) try writer.writeByte('.');
+            first = false;
+            try writer.writeAll(token.text);
+            self.pos += 1;
+            if (self.pos >= self.tokens.len) break;
+            if (!std.mem.eql(u8, self.tokens[self.pos].text, ".")) break;
+            self.pos += 1;
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn expect(self: *@This(), kind: token_mod.TokenKind) !void {
+        if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != kind) return error.UnsupportedSqlShape;
+        self.pos += 1;
+    }
+
+    fn matchKeywordTag(self: *@This(), keyword: token_mod.TokenKeyword) bool {
+        if (self.pos >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        if (!token.matchesKeywordTag(keyword)) return false;
+        self.pos += 1;
+        return true;
+    }
+
+    fn expectKeywordTag(self: *@This(), keyword: token_mod.TokenKeyword) !void {
+        if (!self.matchKeywordTag(keyword)) return error.UnsupportedSqlShape;
+    }
+
+    fn expectStatementEnd(self: *@This()) !void {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .semicolon) self.pos += 1;
+        if (self.pos != self.tokens.len) return error.UnsupportedSqlShape;
+    }
+};
+
+pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !TriggerCatalogPlan {
+    var routine_trigger_parser = RoutineTriggerParser{ .alloc = alloc, .tokens = parsed_sql.items() };
+    return try routine_trigger_parser.parse();
+}
+
 pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -11584,7 +11793,16 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
                 .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
                 .unsupported => |unsupported_ast| {
                     if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
-                        return try catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options);
+                        if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
+                            return .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) };
+                        }
+                        return catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
+                            error.UnsupportedSqlShape => switch (boundary.family) {
+                                .update_policy_trigger => .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) },
+                                else => return err,
+                            },
+                            else => return err,
+                        };
                     }
                 },
                 .dml, .read => {},

@@ -71,11 +71,7 @@ pub const RoutineOrigin = enum {
     extension_query_function,
 };
 
-pub const TriggerEvent = enum {
-    insert,
-    update,
-    delete,
-};
+pub const TriggerEvent = sql_adapter.RoutineTriggerEvent;
 
 pub const TriggerRecord = struct {
     trigger_name: []u8,
@@ -193,19 +189,22 @@ pub const Runtime = struct {
     }
 
     pub fn applyTriggerDdlParsedSqlAlloc(self: *@This(), alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !bool {
-        var parsed = parseTriggerDdlParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
+        var parsed = sql_adapter.lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
             error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
             else => return err,
         };
         defer parsed.deinit(alloc);
+        try self.applyTriggerCatalogPlan(parsed);
+        return true;
+    }
 
+    pub fn applyTriggerCatalogPlan(self: *@This(), plan: sql_adapter.TriggerCatalogPlan) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        switch (parsed) {
+        switch (plan) {
             .create => |create| try self.createTriggerLocked(create),
             .drop => |drop| try self.dropTriggerLocked(drop),
         }
-        return true;
     }
 
     pub fn applyCatalogedTriggerDropDdlAlloc(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !bool {
@@ -215,7 +214,7 @@ pub const Runtime = struct {
     }
 
     pub fn applyCatalogedTriggerDropDdlParsedSqlAlloc(self: *@This(), alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !bool {
-        var parsed = parseTriggerDdlParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
+        var parsed = sql_adapter.lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
             error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
             else => return err,
         };
@@ -704,46 +703,9 @@ pub fn freeExpressionRoutineBindings(
     if (bindings.len > 0) alloc.free(@constCast(bindings));
 }
 
-const TriggerDdlPlan = union(enum) {
-    create: CreateTriggerPlan,
-    drop: DropTriggerPlan,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*create| create.deinit(alloc),
-            .drop => |*drop| drop.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-const CreateTriggerPlan = struct {
-    trigger_name: []u8,
-    table_name: []u8,
-    function_name: []u8,
-    event: TriggerEvent,
-    replace_existing: bool = false,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.trigger_name);
-        alloc.free(self.table_name);
-        alloc.free(self.function_name);
-        self.* = undefined;
-    }
-};
-
-const DropTriggerPlan = struct {
-    trigger_name: []u8,
-    table_name: []u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.trigger_name);
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
+const TriggerDdlPlan = sql_adapter.TriggerCatalogPlan;
+const CreateTriggerPlan = sql_adapter.CreateRoutineTriggerPlan;
+const DropTriggerPlan = sql_adapter.DropRoutineTriggerPlan;
 
 const TriggerParser = struct {
     alloc: std.mem.Allocator,

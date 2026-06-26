@@ -547,8 +547,11 @@ Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
-`CALL`, and `LOCK`; and update-policy trigger commands use it for
-`CREATE TRIGGER` and `DROP TRIGGER`. Maintenance commands use the same
+`CALL`, and `LOCK`; update-policy trigger commands use it for
+`CREATE TRIGGER` and `DROP TRIGGER`; and routine trigger catalog commands now
+use a typed `trigger_catalog` plan for generated-covered `CREATE TRIGGER` and
+`DROP TRIGGER` row-trigger forms before reaching the SQL routine runtime.
+Maintenance commands use the same
 validated generated unsupported boundary for `VACUUM`, `ANALYZE`, `REINDEX`,
 and `CLUSTER` before delegating to typed maintenance planning.
 Legacy-supported cursor commands use generated cursor AST nodes for `DECLARE`,
@@ -599,8 +602,8 @@ including incomplete routine,
 transform, text-search, and foreign-schema forms, so grammar regressions cannot
 silently re-enter the legacy DDL classifier. Generated trigger DDL uses a tighter subject span that
 starts after the `TRIGGER` command keyword, so `CREATE TRIGGER` and
-`DROP TRIGGER` cannot reach typed update-policy planning with a broad
-command-tail range; unsupported materialized-view variants such as
+`DROP TRIGGER` cannot reach typed update-policy or routine-trigger planning
+with a broad command-tail range; unsupported materialized-view variants such as
 `ALTER MATERIALIZED VIEW` are intentionally outside that allowlist until Antfly
 has a typed plan for them.
 
@@ -1324,6 +1327,10 @@ variants for:
   accepted only through the validated generated unsupported boundary; unsupported
   materialized-view variants such as `ALTER MATERIALIZED VIEW` are part of the
   fail-closed path rather than the materialized-view catalog boundary.
+  `CREATE TRIGGER` and `DROP TRIGGER` are now split at this boundary: supported
+  update-policy triggers lower to existing update-policy plans, supported
+  routine row triggers lower to `trigger_catalog`, and richer PostgreSQL trigger
+  variants still fail closed with unsupported diagnostics.
 
 Later statement-family cutovers should add closed variants for:
 
@@ -1410,6 +1417,9 @@ Generated grammar work needs evidence at multiple levels:
   generated routine catalog DDL for `CREATE FUNCTION`,
   `CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
   `DROP PROCEDURE`,
+  generated trigger catalog DDL for supported routine row-trigger
+  `CREATE TRIGGER` and `DROP TRIGGER` forms, with update-policy trigger
+  compatibility still lowering through the existing update-policy catalog plan,
   generated role authorization DDL for `CREATE ROLE`, `ALTER ROLE`, and
   `DROP ROLE`, including PostgreSQL-compatible `USER` and `GROUP` aliases
   where they lower to the same authorization catalog role plans while

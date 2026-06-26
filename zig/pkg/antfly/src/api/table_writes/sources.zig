@@ -15738,3 +15738,557 @@ test "bound table write source applies batch writes" {
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
 }
+
+test "api.table_writes.docid provisioned secondary index rebuild worker pass repairs projected catalog range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-secondary-index-rebuild-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 9001);
+    defer alloc.free(db_path);
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const range: metadata_table_manager.RangeRecord = .{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const namespace: doc_identity.Namespace = .{
+        .table_id = 77,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+        try db.batch(.{ .writes = &.{
+            .{ .key = "row:active", .value = "{\"id\":\"active\",\"amount\":1,\"status\":\"active\"}" },
+            .{ .key = "row:inactive", .value = "{\"id\":\"inactive\",\"amount\":2,\"status\":\"inactive\"}" },
+        } });
+        const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+        defer alloc.free(inactive_amount_key);
+        try db.core.store.put(inactive_amount_key, "");
+    }
+
+    const Catalog = struct {
+        const ready_schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "orders",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = building_schema_json,
+        },
+        range: metadata_table_manager.RangeRecord = range,
+        rebuild: metadata_table_manager.SecondaryIndexRebuildRangeRecord = .{
+            .table_id = 77,
+            .index_name = "amount",
+            .index_generation = 9,
+            .start_row_key = "",
+            .end_row_key = null,
+            .group_id = 9001,
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
+                    .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
+                    .promote_secondary_index_ready = promoteSecondaryIndexReady,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .secondary_index_rebuild_ranges = @as([*]metadata_table_manager.SecondaryIndexRebuildRangeRecord, @ptrCast(&self.rebuild))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn selectorMatches(self: *@This(), selector: metadata_table_manager.SecondaryIndexRebuildRangeSelector) bool {
+            return selector.table_id == self.rebuild.table_id and
+                selector.index_generation == self.rebuild.index_generation and
+                std.mem.eql(u8, selector.index_name, self.rebuild.index_name) and
+                std.mem.eql(u8, selector.start_row_key, self.rebuild.start_row_key);
+        }
+
+        fn beginSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            if (!std.mem.eql(u8, self.rebuild.state, metadata_table_manager.secondary_index_rebuild_declared)) return error.SecondaryIndexRebuildRangeClaimBusy;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_building;
+            self.rebuild.lease_owner = request.lease_owner;
+            self.rebuild.lease_expires_at_ms = request.lease_expires_at_ms;
+        }
+
+        fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_ready;
+            self.rebuild.completed_row_count = request.completed_row_count;
+            self.rebuild.progress_row_key = request.progress_row_key;
+        }
+
+        fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_invalid;
+            self.rebuild.last_error = request.last_error;
+        }
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, self.table.name)) return false;
+            const updated = tables_api.schemaWithSecondaryIndexReadyAlloc(
+                allocator,
+                self.table.schema_json,
+                index_name,
+                expected_generation,
+            ) catch |err| switch (err) {
+                error.SecondaryIndexNotBuilding,
+                error.SecondaryIndexGenerationMismatch,
+                error.SecondaryIndexNotFound,
+                => return false,
+                else => return err,
+            };
+            defer allocator.free(updated);
+            self.table.schema_json = ready_schema_json;
+            return true;
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+
+    var pass = (try source.source().secondaryIndexRebuildWorkerPass(alloc, "orders", "worker-a", 500, 1)).?;
+    defer pass.deinit(alloc);
+    try std.testing.expect(pass.complete);
+    try std.testing.expectEqual(@as(u64, 1), pass.ranges_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.ranges_completed);
+    try std.testing.expectEqual(@as(u64, 1), pass.indexes_promoted);
+    try std.testing.expectEqual(@as(u64, 2), pass.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), pass.report.indexed_rows);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, catalog.rebuild.state);
+    try std.testing.expectEqual(@as(u64, 2), catalog.rebuild.completed_row_count);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.table.schema_json, "\"x-antfly-index-lifecycle\":\"ready\"") != null);
+
+    var reopened = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .prefer_existing_identity_namespace = true });
+    defer reopened.close();
+    const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+    defer alloc.free(inactive_amount_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, inactive_amount_key));
+}
+
+test "api.table_writes.docid provisioned schema rewrite worker pass drains projected catalog range job" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-schema-rewrite-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 9001);
+    defer alloc.free(db_path);
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    const range: metadata_table_manager.RangeRecord = .{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const namespace: doc_identity.Namespace = .{
+        .table_id = 77,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, schema_v1, .{});
+        try db.batch(.{ .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }} });
+        try db.applyTableSchemaJson(alloc, schema_v2, .{});
+    }
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = schema_v2,
+        },
+        range: metadata_table_manager.RangeRecord = range,
+        job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 8101,
+            .table_id = 77,
+            .group_id = 9001,
+            .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
+            .target_column = "status_key",
+            .expression = .{
+                .kind = .lower,
+                .operands = &.{.{ .kind = .field, .field = "status" }},
+            },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_schema_rewrite_job = beginSchemaRewriteJob,
+                    .finish_schema_rewrite_job = finishSchemaRewriteJob,
+                    .invalidate_schema_rewrite_job = invalidateSchemaRewriteJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            if (!std.mem.eql(u8, self.job.state, metadata_table_manager.schema_rewrite_declared)) return error.SchemaRewriteJobClaimBusy;
+            self.job.state = metadata_table_manager.schema_rewrite_running;
+            self.job.lease_owner = request.lease_owner;
+            self.job.lease_expires_at_ms = request.lease_expires_at_ms;
+            self.job.attempts += 1;
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            if (!std.mem.eql(u8, self.job.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
+            self.job.state = metadata_table_manager.schema_rewrite_ready;
+            self.job.lease_owner = "";
+            self.job.lease_expires_at_ms = 0;
+            self.job.completed_row_count = request.completed_row_count;
+            self.job.progress_row_key = "";
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            self.job.state = metadata_table_manager.schema_rewrite_invalid;
+            self.job.lease_owner = "";
+            self.job.lease_expires_at_ms = 0;
+            self.job.last_error = request.last_error;
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+
+    var pass = (try source.source().schemaRewriteWorkerPass(alloc, "events", "worker-a", 500, 1)).?;
+    defer pass.deinit(alloc);
+    try std.testing.expect(pass.complete);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_completed);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, catalog.job.state);
+    try std.testing.expectEqual(@as(u64, 1), catalog.job.completed_row_count);
+
+    var reopened = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .prefer_existing_identity_namespace = true });
+    defer reopened.close();
+    const materialized = (try reopened.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+}
+
+test "provisioned table write source create table clears stale local group state" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-create-table-clears-stale-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    {
+        var stale_db = try db_mod.DB.open(alloc, db_path, .{});
+        defer stale_db.close();
+        try stale_db.batch(.{
+            .writes = &.{.{ .key = "doc:stale", .value = "{\"title\":\"stale\"}" }},
+        });
+    }
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const stale_change_journal_dir = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{db_path});
+    defer alloc.free(stale_change_journal_dir);
+    try fs_paths.createDirPathPortable(io_impl.io(), stale_change_journal_dir);
+    const stale_marker_path = try std.fmt.allocPrint(alloc, "{s}/stale.marker", .{stale_change_journal_dir});
+    defer alloc.free(stale_marker_path);
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = stale_marker_path, .data = "stale" });
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var recreated_db = try db_mod.DB.open(alloc, db_path, .{});
+    defer recreated_db.close();
+    try std.testing.expect((try recreated_db.lookup(alloc, "doc:stale", .{})) == null);
+    try std.testing.expect(recreated_db.core.index_manager.textIndex("full_text_index_v0") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), stale_marker_path, .{}));
+}
+
+test "provisioned table write source seeds doc identity namespace from table range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-identity-namespace-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+        defer source.deinit();
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        });
+    }
+
+    var db = try db_mod.DB.open(alloc, db_path, .{ .start_index_workers = false });
+    defer db.close();
+    try std.testing.expect(db.core.identity_namespace.eql(.{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7101,
+    }));
+}
+
+test "api.table_writes.docid provisioned table write source rejects stale doc identity namespace before write" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const stale_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 9999,
+    };
+
+    const setupStaleDb = struct {
+        fn run(allocator: std.mem.Allocator, path: []const u8, namespace: doc_identity.Namespace) !void {
+            var db = try db_mod.DB.open(allocator, path, .{ .identity_namespace = namespace });
+            defer db.close();
+            try db.batch(.{
+                .writes = &.{.{ .key = "doc:stale", .value = "{\"title\":\"stale\"}" }},
+            });
+        }
+    }.run;
+
+    const uncached_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-stale-identity-uncached-root", .{tmp.sub_path});
+    defer alloc.free(uncached_root);
+    const uncached_db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, uncached_root, 7001);
+    defer alloc.free(uncached_db_path);
+    try setupStaleDb(alloc, uncached_db_path, stale_namespace);
+
+    {
+        var source = ProvisionedTableWriteSource.init(uncached_root, Catalog.iface());
+        defer source.deinit();
+        try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        }));
+    }
+
+    var uncached_db = try db_mod.DB.open(alloc, uncached_db_path, .{ .start_index_workers = false });
+    defer uncached_db.close();
+    try std.testing.expect((try uncached_db.lookup(alloc, "doc:b", .{})) == null);
+
+    const cached_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-stale-identity-cached-root", .{tmp.sub_path});
+    defer alloc.free(cached_root);
+    const cached_db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, cached_root, 7001);
+    defer alloc.free(cached_db_path);
+    try setupStaleDb(alloc, cached_db_path, stale_namespace);
+
+    {
+        var source = ProvisionedTableWriteSource.init(cached_root, Catalog.iface());
+        defer source.deinit();
+        var write_cache = ProvisionedTableWriteCache.init(alloc);
+        defer write_cache.deinit();
+        source.write_cache = &write_cache;
+        try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        }));
+    }
+
+    var cached_db = try db_mod.DB.open(alloc, cached_db_path, .{ .start_index_workers = false });
+    defer cached_db.close();
+    try std.testing.expect((try cached_db.lookup(alloc, "doc:b", .{})) == null);
+}

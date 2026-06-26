@@ -4308,7 +4308,6 @@ pub const ApiHttpServer = struct {
         var logical_plan = sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
-                if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
                 return err;
             },
             else => return err,
@@ -4432,6 +4431,12 @@ pub const ApiHttpServer = struct {
                 try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
                 return applied;
             },
+            .trigger_catalog => |trigger_plan| {
+                var applied = try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(trigger_plan, session, context, timing);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
+            },
             .procedure_call => |procedure_call| {
                 try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
@@ -4450,12 +4455,6 @@ pub const ApiHttpServer = struct {
         }
         try self.rejectUnsupportedDocumentSqlViewMapping(plan.*, session.session());
 
-        if (loweredDdlPlanMayDropTrigger(plan.*)) {
-            if (context.parsed_sql) |parsed_sql| {
-                if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(parsed_sql, timing.timeout_ns, timing.start_ns)) |applied| return applied;
-            }
-        }
-
         if (self.cfg.user_manager) |manager| {
             var catalog = try self.sqlAuthCatalogForDdlPlanWithSession(plan.*, session.session());
             defer catalog.deinit(self.alloc);
@@ -4468,9 +4467,61 @@ pub const ApiHttpServer = struct {
         }
         var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, plan, session.session(), context.function_bindings);
         errdefer applied.deinit(self.alloc);
-        try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
+        try self.scheduleSchemaRewriteRuntimeHintForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         return applied;
+    }
+
+    fn applyTriggerCatalogPlanWithUpdatePolicyFallback(
+        self: *ApiHttpServer,
+        plan: sql_adapter.TriggerCatalogPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+        timing: SqlStatementExecutionTiming,
+    ) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+        self.sql_routine_runtime.applyTriggerCatalogPlan(plan) catch |err| switch (err) {
+            error.TriggerNotFound => switch (plan) {
+                .drop => |drop| return try self.applyUpdatePolicyDropTriggerPlan(drop, session, context, timing),
+                .create => return err,
+            },
+            else => return err,
+        };
+        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+        applied.noop = true;
+        return applied;
+    }
+
+    fn applyUpdatePolicyDropTriggerPlan(
+        self: *ApiHttpServer,
+        drop: sql_adapter.DropRoutineTriggerPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+        timing: SqlStatementExecutionTiming,
+    ) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+        const operations = try self.alloc.alloc(sql_adapter.AlterTableOperation, 1);
+        var operations_transferred = false;
+        errdefer if (!operations_transferred) self.alloc.free(operations);
+        operations[0] = .{ .drop_update_policy = .{
+            .trigger_name = try self.alloc.dupe(u8, drop.trigger_name),
+            .if_exists = drop.if_exists,
+        } };
+        var operation_transferred = false;
+        errdefer if (!operation_transferred) sql_adapter.freeAlterTableOperation(self.alloc, operations[0]);
+        const table_name = try self.alloc.dupe(u8, drop.table_name);
+        errdefer self.alloc.free(table_name);
+
+        var fallback: sql_adapter.LoweredDdlPlan = .{ .alter_table = .{
+            .table_name = table_name,
+            .operations = operations,
+        } };
+        operations_transferred = true;
+        operation_transferred = true;
+        defer fallback.deinit(self.alloc);
+
+        return try self.applyRelationalDdlPlanWithSession(&fallback, session, .{
+            .function_bindings = context.function_bindings,
+            .statement_timing = timing,
+        });
     }
 
     fn rejectUnsupportedDocumentSqlViewMapping(
@@ -7865,20 +7916,6 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn applySqlRoutineTriggerDdlParsedSqlAlloc(
-        self: *ApiHttpServer,
-        parsed_sql: *const sql_adapter.ParsedSql,
-        statement_timeout_ns: ?u64,
-        statement_start_ns: u64,
-    ) !?tables_api.AppliedRelationalSqlDdlRecord {
-        if (!try self.sql_routine_runtime.applyTriggerDdlParsedSqlAlloc(self.alloc, parsed_sql)) return null;
-        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
-        errdefer applied.deinit(self.alloc);
-        applied.noop = true;
-        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
-        return applied;
-    }
-
     fn resolveRoutineSettingsFromCurrentInPlace(
         self: *ApiHttpServer,
         plan: *sql_adapter.FunctionCatalogPlan,
@@ -7945,32 +7982,6 @@ pub const ApiHttpServer = struct {
         return out;
     }
 
-    fn loweredDdlPlanMayDropTrigger(plan: sql_adapter.LoweredDdlPlan) bool {
-        return switch (plan) {
-            .alter_table => |alter_table| {
-                for (alter_table.operations) |operation| {
-                    if (operation == .drop_update_policy) return true;
-                }
-                return false;
-            },
-            else => false,
-        };
-    }
-
-    fn applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(
-        self: *ApiHttpServer,
-        parsed_sql: *const sql_adapter.ParsedSql,
-        statement_timeout_ns: ?u64,
-        statement_start_ns: u64,
-    ) !?tables_api.AppliedRelationalSqlDdlRecord {
-        if (!try self.sql_routine_runtime.applyCatalogedTriggerDropDdlParsedSqlAlloc(self.alloc, parsed_sql)) return null;
-        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
-        errdefer applied.deinit(self.alloc);
-        applied.noop = true;
-        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
-        return applied;
-    }
-
     fn schemaRewriteWakeOwnerId(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
         if (self.schema_rewrite_wake_owner_id == 0) {
             self.schema_rewrite_wake_owner_id = runtime.allocOwnerId();
@@ -8001,7 +8012,7 @@ pub const ApiHttpServer = struct {
         return true;
     }
 
-    fn scheduleSchemaRewriteWakeForAppliedDdl(
+    fn scheduleSchemaRewriteRuntimeHintForAppliedDdl(
         self: *ApiHttpServer,
         applied: tables_api.AppliedRelationalSqlDdlRecord,
     ) !void {

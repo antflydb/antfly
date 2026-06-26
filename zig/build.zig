@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
+const antfly_capi_build = @import("pkg/antfly/build/capi.zig");
 const antfly_conformance_build = @import("pkg/antfly/build/conformance.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_generated_build = @import("pkg/antfly/build/generated.zig");
@@ -1264,7 +1265,7 @@ pub fn build(b: *std.Build) void {
     });
     _ = lib;
 
-    const capi_steps = antfly_lite_build.addCApiSteps(.{
+    const capi_steps = antfly_capi_build.addCApiSteps(.{
         .b = b,
         .target = target,
         .optimize = optimize,
@@ -2154,136 +2155,30 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_antfarm_assets.step);
     }
 
-    const lite_core_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
+    antfly_lite_build.addCliSteps(.{
+        .b = b,
         .target = target,
+        .wasm_target = wasm_target,
         .optimize = optimize,
+        .lib_mod = lib_mod,
+        .antfly_client_pkg_mod = antfly_client_pkg_mod,
+        .httpx_mod = httpx_mod,
+        .vellum_mod = vellum_mod,
+        .raft_engine_mod = raft_engine_mod,
+        .structlog_mod = structlog_mod,
+        .platform_mod = platform_mod,
+        .handlebars_mod = handlebars_mod,
+        .build_options = build_options,
+        .antfly_main = antfly_main,
+        .antfly_bin_name = antfly_bin_name,
+        .install_antfly = install_antfly,
+        .lite_local_inference_runtime = lite_local_inference_runtime,
+        .capi_steps = capi_steps,
+        .run_antfly_main_tests = run_antfly_main_tests,
+        .run_lite_cli_tests = run_lite_cli_tests,
+        .run_lite_native_tests = run_lite_native_tests,
+        .run_antfly_embedded_pkg_tests = run_antfly_embedded_pkg_tests,
     });
-    lite_core_main_mod.addImport("antfly-zig", lib_mod);
-    lite_core_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_core_main_mod.addImport("httpx", httpx_mod);
-    lite_core_main_mod.addImport("antfly_vellum", vellum_mod);
-    lite_core_main_mod.addImport("raft_engine", raft_engine_mod);
-    lite_core_main_mod.addImport("structlog", structlog_mod);
-    lite_core_main_mod.addImport("antfly_platform", platform_mod);
-    lite_core_main_mod.addImport("handlebars", handlebars_mod);
-    const lite_core_main = b.addExecutable(.{
-        .name = "antfly-lite-core",
-        .root_module = lite_core_main_mod,
-    });
-    const lite_cli_smoke = b.addExecutable(.{
-        .name = "antfly-lite-cli-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/antfly_lite_cli_smoke.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
-    const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
-    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
-    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
-    const lite_core_main_tests = b.addTest(.{
-        .root_module = lite_core_main_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_core_main),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
-    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
-    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cli_tests.step);
-    lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_example.step);
-    lite_core_test_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
-    lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
-
-    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
-    lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&capi_steps.install_lite_capi_lib.step);
-    lite_core_step.dependOn(&capi_steps.install_lite_capi_header.step);
-    lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
-    lite_core_step.dependOn(&capi_steps.run_lite_go_tests.step);
-    lite_core_step.dependOn(&capi_steps.run_lite_go_example.step);
-    lite_core_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
-    lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantfly C ABI");
-    if (!lite_local_inference_runtime) {
-        lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
-    }
-    lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&capi_steps.install_lite_capi_lib.step);
-    lite_full_step.dependOn(&capi_steps.install_lite_capi_header.step);
-    lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cli_tests.step);
-    lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
-    lite_full_step.dependOn(&capi_steps.run_lite_go_tests.step);
-    lite_full_step.dependOn(&capi_steps.run_lite_go_example.step);
-    lite_full_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
-    lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_wasm_profile_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    lite_wasm_profile_mod.addOptions("build_options", build_options);
-    const lite_wasm_profile = b.addExecutable(.{
-        .name = "antfly_lite_wasm_profile",
-        .root_module = lite_wasm_profile_mod,
-    });
-    lite_wasm_profile.entry = .disabled;
-    lite_wasm_profile.rdynamic = true;
-    lite_wasm_profile.export_memory = true;
-    const install_lite_wasm_profile = b.addInstallArtifact(lite_wasm_profile, .{
-        .dest_sub_path = "antfly-lite-wasm/antfly_lite_wasm_profile.wasm",
-    });
-    const lite_wasm_profile_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
-    const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
-    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
-    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
-
-    const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
-    lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&capi_steps.install_lite_capi_lib.step);
-    lite_dev_step.dependOn(&capi_steps.install_lite_capi_header.step);
-    lite_dev_step.dependOn(&run_antfly_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cli_tests.step);
-    lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
-    lite_dev_step.dependOn(&capi_steps.run_lite_go_tests.step);
-    lite_dev_step.dependOn(&capi_steps.run_lite_go_example.step);
-    lite_dev_step.dependOn(&capi_steps.run_lite_go_retrieval_template.step);
-    lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_dev_step.dependOn(&install_lite_wasm_profile.step);
-    lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
-    lite_dev_step.dependOn(&capi_steps.run_cabi_packaging_tests.step);
-    lite_dev_step.dependOn(&capi_steps.run_capi_tests.step);
-    lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
