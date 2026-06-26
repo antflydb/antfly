@@ -210,10 +210,11 @@ The facade files should contain:
 
 - imports of leaf modules
 - `pub const` re-exports for existing public names
-- tiny compatibility aliases
 - temporary compile-time imports of migrated test modules if needed
 
 They should not retain business logic after a chunk has been migrated.
+They also should not preserve local-only build target names through aliases;
+renamed focused targets can move directly to their durable suite names.
 
 During the migration, the facades may still contain unmigrated code. The end
 state should make the facades boring and small.
@@ -254,7 +255,8 @@ roots, or reference API table read/write implementation paths.
    - This is the cleanest first move because callers already use these helpers
      directly and the code is mostly independent.
 2. Extract `table_reads/core.zig`.
-   - Move `TableReadSource`, response aliases, and shared source option types.
+   - Move `TableReadSource`, stable response types, and shared source option
+     types.
    - Keep `table_reads.zig` re-exporting all public names.
 3. Extract `table_reads/cache.zig`.
    - Move `ProvisionedTableReadCache`, query DB open helpers, identity namespace
