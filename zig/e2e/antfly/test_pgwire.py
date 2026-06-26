@@ -609,7 +609,7 @@ def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
 
 
 def test_pgwire_returning_row_description_uses_relational_type_oids(pgwire_server):
-    table = _table_name("pgwire_returning_types")
+    table = _table_name("pgwire_ret_types")
 
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)

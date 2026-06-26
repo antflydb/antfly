@@ -1187,6 +1187,43 @@ fn validateGeneratedSingleJoinForClause(
     if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedSingleJoinUsingForClause(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    expected_read_kind: generated_parser.GeneratedSqlReadKind,
+    tokens: []const Token,
+    left_tokens: generated_parser.GeneratedSqlTokenRange,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+    join_type: db_mod.types.RelationalRowsJoinType,
+    right_tokens: generated_parser.GeneratedSqlTokenRange,
+    using_tokens: generated_parser.GeneratedSqlTokenRange,
+    column_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const read = generated_read_ast orelse return;
+    if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
+    try validateGeneratedJoinItemsMetadata(tokens, read.*);
+    const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
+    const join = read.join_items[0];
+    if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
+    if (join.condition_kind != .using) return error.UnsupportedSqlShape;
+    if (join.tokens.start != left_tokens.start or join.tokens.end != using_tokens.end) return error.UnsupportedSqlShape;
+    if (join.left_tokens.start != left_tokens.start or join.left_tokens.end != left_tokens.end) return error.UnsupportedSqlShape;
+    if (join.operator_tokens.start != operator_tokens.start or join.operator_tokens.end != operator_tokens.end) return error.UnsupportedSqlShape;
+    if (join.right_tokens.start != right_tokens.start or join.right_tokens.end != right_tokens.end) return error.UnsupportedSqlShape;
+    if (join.condition_tokens.start != using_tokens.start or join.condition_tokens.end != using_tokens.end) return error.UnsupportedSqlShape;
+    const generated_using_tokens = join.using_tokens orelse return error.UnsupportedSqlShape;
+    const generated_column_tokens = join.using_column_tokens orelse return error.UnsupportedSqlShape;
+    if (generated_using_tokens.start != using_tokens.start or generated_using_tokens.end != using_tokens.end) return error.UnsupportedSqlShape;
+    if (generated_column_tokens.start != column_tokens.start or generated_column_tokens.end != column_tokens.end) return error.UnsupportedSqlShape;
+    if (join.using_columns.count == 0) return error.UnsupportedSqlShape;
+    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
+        .inner => .inner,
+        .left => .left,
+    };
+    if (join.kind != expected_kind) return error.UnsupportedSqlShape;
+    if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedJoinKindForOperator(tokens: []const Token, operator_tokens: generated_parser.GeneratedSqlTokenRange, kind: generated_parser.GeneratedSqlJoinKind) !void {
     if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     switch (kind) {
@@ -1284,7 +1321,10 @@ fn validateGeneratedJoinExecutableContract(
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
     if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
-    if (join.condition_kind != .on or join.predicate_tokens == null) return error.UnsupportedSqlShape;
+    switch (join.condition_kind) {
+        .on => if (join.predicate_tokens == null) return error.UnsupportedSqlShape,
+        .using => if (join.using_tokens == null or join.using_column_tokens == null or join.using_columns.count == 0) return error.UnsupportedSqlShape,
+    }
 }
 
 pub const WindowParserOptions = struct {
@@ -18204,43 +18244,65 @@ pub fn parseJoinAlloc(
         match_expression_array_contains.deinit(alloc);
     }
 
-    try parser.expectKeyword(tokens, pos, "on");
-    const predicate_tokens_start = pos.*;
-    var on_targets = JoinOnPredicateTargets{
-        .on = &on,
-        .left_predicates = &left_predicates,
-        .right_predicates = &right_predicates,
-        .on_expression_predicates = &on_expression_predicates,
-        .on_expression_or_predicates = &on_expression_or_predicates,
-        .on_expression_not_predicates = &on_expression_not_predicates,
-        .on_expression_array_contains = &on_expression_array_contains,
-    };
-    try parseJoinOnAlloc(
-        alloc,
-        tokens,
-        pos,
-        options.params,
-        current_context.schema,
-        current_context.joined_source_schema,
-        join_type,
-        left_table.alias,
-        right_table.alias,
-        options.string_to_array_predicate_is_containment,
-        &on_targets,
-        options.expression_where_options,
-        options.realtime_ns,
-    );
-    try validateGeneratedSingleJoinForClause(
-        options.generated_read_ast,
-        .join,
-        tokens,
-        .{ .start = left_tokens_start, .end = operator_tokens_start },
-        .{ .start = operator_tokens_start, .end = right_tokens_start },
-        join_type,
-        .{ .start = right_tokens_start, .end = condition_tokens_start },
-        .{ .start = condition_tokens_start, .end = pos.* },
-        .{ .start = predicate_tokens_start, .end = pos.* },
-    );
+    if (parser.matchKeyword(tokens, pos, "on")) {
+        const predicate_tokens_start = pos.*;
+        var on_targets = JoinOnPredicateTargets{
+            .on = &on,
+            .left_predicates = &left_predicates,
+            .right_predicates = &right_predicates,
+            .on_expression_predicates = &on_expression_predicates,
+            .on_expression_or_predicates = &on_expression_or_predicates,
+            .on_expression_not_predicates = &on_expression_not_predicates,
+            .on_expression_array_contains = &on_expression_array_contains,
+        };
+        try parseJoinOnAlloc(
+            alloc,
+            tokens,
+            pos,
+            options.params,
+            current_context.schema,
+            current_context.joined_source_schema,
+            join_type,
+            left_table.alias,
+            right_table.alias,
+            options.string_to_array_predicate_is_containment,
+            &on_targets,
+            options.expression_where_options,
+            options.realtime_ns,
+        );
+        try validateGeneratedSingleJoinForClause(
+            options.generated_read_ast,
+            .join,
+            tokens,
+            .{ .start = left_tokens_start, .end = operator_tokens_start },
+            .{ .start = operator_tokens_start, .end = right_tokens_start },
+            join_type,
+            .{ .start = right_tokens_start, .end = condition_tokens_start },
+            .{ .start = condition_tokens_start, .end = pos.* },
+            .{ .start = predicate_tokens_start, .end = pos.* },
+        );
+    } else if (parser.matchKeyword(tokens, pos, "using")) {
+        try parser.expectToken(tokens, pos, .lparen);
+        const column_tokens_start = pos.*;
+        const using_columns = try grammar.parseIdentifierListAlloc(alloc, tokens, pos);
+        defer strings.freeStringSlice(alloc, using_columns);
+        const column_tokens_end = pos.*;
+        try parser.expectToken(tokens, pos, .rparen);
+        try appendJoinUsingColumnsAlloc(alloc, using_columns, current_context.schema, current_context.joined_source_schema, &on);
+        try validateGeneratedSingleJoinUsingForClause(
+            options.generated_read_ast,
+            .join,
+            tokens,
+            .{ .start = left_tokens_start, .end = operator_tokens_start },
+            .{ .start = operator_tokens_start, .end = right_tokens_start },
+            join_type,
+            .{ .start = right_tokens_start, .end = condition_tokens_start },
+            .{ .start = condition_tokens_start, .end = pos.* },
+            .{ .start = column_tokens_start, .end = column_tokens_end },
+        );
+    } else {
+        return error.UnsupportedSqlShape;
+    }
 
     var select = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection).empty;
     errdefer {
@@ -24568,6 +24630,32 @@ pub fn parseJoinOnAlloc(
     }
 }
 
+fn appendJoinUsingColumnsAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const []const u8,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    out: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn),
+) !void {
+    try grammar.validateSqlIdentifierListUnique(columns);
+    for (columns) |column| {
+        const left_column = try binder.joinColumnForSide(schema, joined_source_schema, .left, column);
+        const right_column = try binder.joinColumnForSide(schema, joined_source_schema, .right, column);
+        if (left_column.field_type != right_column.field_type) return error.UnsupportedSqlShape;
+        if (left_column.array_item_type != right_column.array_item_type) return error.UnsupportedSqlShape;
+
+        const left_field = try alloc.dupe(u8, column);
+        var left_transferred = false;
+        errdefer if (!left_transferred) alloc.free(left_field);
+        const right_field = try alloc.dupe(u8, column);
+        var right_transferred = false;
+        errdefer if (!right_transferred) alloc.free(right_field);
+        try out.append(alloc, .{ .left_field = left_field, .right_field = right_field });
+        left_transferred = true;
+        right_transferred = true;
+    }
+}
+
 pub fn parseLateralWhereAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -30395,6 +30483,23 @@ fn corruptGeneratedReadFirstJoinPredicateExpressionRange(parsed_sql: *tokenized.
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     if (read.join_items.len == 0 or read.join_items[0].predicate_expression.tokens == null) return error.TestUnexpectedResult;
                     read.join_items[0].predicate_expression.tokens = source_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstJoinUsingColumnRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    if (read.join_items.len == 0 or read.join_items[0].using_column_tokens == null) return error.TestUnexpectedResult;
+                    read.join_items[0].using_column_tokens = source_tokens;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
@@ -36597,9 +36702,41 @@ test "sql adapter lower expr lowers equality join queries" {
         schema,
         &.{},
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+
+    var using_join = try lowerJoinForLowerExprTestAlloc(
         alloc,
-        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c USING (tenant)",
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o JOIN usage_records AS c USING (tenant, scope) WHERE o.kind = 'order' AND c.kind = 'customer'",
+        schema,
+        &.{},
+    );
+    defer using_join.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, using_join.join.join_type);
+    try std.testing.expectEqual(@as(usize, 2), using_join.join.on.len);
+    try std.testing.expectEqualStrings("tenant", using_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("tenant", using_join.join.on[0].right_field);
+    try std.testing.expectEqualStrings("scope", using_join.join.on[1].left_field);
+    try std.testing.expectEqualStrings("scope", using_join.join.on[1].right_field);
+    try std.testing.expectEqual(@as(usize, 1), using_join.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", using_join.join.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"order\"", using_join.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), using_join.join.right.predicates.len);
+    try std.testing.expectEqualStrings("kind", using_join.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"customer\"", using_join.join.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), using_join.join.select.len);
+    try std.testing.expectEqualStrings("order_id", using_join.join.select[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, using_join.join.select[0].side);
+    try std.testing.expectEqualStrings("customer_name", using_join.join.select[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, using_join.join.select[1].side);
+
+    var malformed_generated_using_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o JOIN usage_records AS c USING (tenant, scope)",
+    );
+    defer malformed_generated_using_join.deinit(alloc);
+    try corruptGeneratedReadFirstJoinUsingColumnRange(&malformed_generated_using_join);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_using_join,
         schema,
         &.{},
     ));

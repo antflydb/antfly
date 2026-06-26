@@ -566,109 +566,12 @@ const DroppedTableDeleteWork = struct {
 };
 
 pub const ProvisionedTableWriteCache = table_write_cache.ProvisionedTableWriteCache;
+const HostedManagedDbCache = table_write_cache.HostedManagedDbCache;
 pub const HostedManagedDbCacheDiagnostics = table_write_cache.HostedManagedDbCacheDiagnostics;
-
-const HostedManagedDbCache = struct {
-    replica_root_dir: []u8,
-    mutex: std.atomic.Mutex = .unlocked,
-    write_cache: ProvisionedTableWriteCache,
-
-    fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !*HostedManagedDbCache {
-        const cache = try alloc.create(HostedManagedDbCache);
-        errdefer alloc.destroy(cache);
-        cache.* = .{
-            .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
-            .write_cache = ProvisionedTableWriteCache.init(alloc),
-        };
-        return cache;
-    }
-};
-
-var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
-var hosted_managed_db_cache_registry: std.ArrayListUnmanaged(*HostedManagedDbCache) = .empty;
-
-pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
-    const alloc = std.heap.page_allocator;
-    var removed: ?*HostedManagedDbCache = null;
-    lockAtomic(&hosted_managed_db_cache_registry_mutex);
-    {
-        defer hosted_managed_db_cache_registry_mutex.unlock();
-        for (hosted_managed_db_cache_registry.items, 0..) |cache, idx| {
-            if (!std.mem.eql(u8, cache.replica_root_dir, replica_root_dir)) continue;
-            removed = hosted_managed_db_cache_registry.orderedRemove(idx);
-            break;
-        }
-    }
-
-    const cache = removed orelse return;
-    lockAtomic(&cache.mutex);
-    cache.write_cache.deinit();
-    cache.mutex.unlock();
-    alloc.free(cache.replica_root_dir);
-    alloc.destroy(cache);
-}
-
-fn hostedManagedDbCacheForRoot(replica_root_dir: []const u8) !*HostedManagedDbCache {
-    const alloc = std.heap.page_allocator;
-    lockAtomic(&hosted_managed_db_cache_registry_mutex);
-    defer hosted_managed_db_cache_registry_mutex.unlock();
-
-    for (hosted_managed_db_cache_registry.items) |cache| {
-        if (std.mem.eql(u8, cache.replica_root_dir, replica_root_dir)) return cache;
-    }
-
-    const cache = try HostedManagedDbCache.init(alloc, replica_root_dir);
-    errdefer {
-        alloc.free(cache.replica_root_dir);
-        alloc.destroy(cache);
-    }
-    try hosted_managed_db_cache_registry.append(alloc, cache);
-    return cache;
-}
-
-fn hostedManagedDbCacheForRootIfPresent(replica_root_dir: []const u8) ?*HostedManagedDbCache {
-    lockAtomic(&hosted_managed_db_cache_registry_mutex);
-    defer hosted_managed_db_cache_registry_mutex.unlock();
-
-    for (hosted_managed_db_cache_registry.items) |cache| {
-        if (std.mem.eql(u8, cache.replica_root_dir, replica_root_dir)) return cache;
-    }
-    return null;
-}
-
-pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) HostedManagedDbCacheDiagnostics {
-    lockAtomic(&hosted_managed_db_cache_registry_mutex);
-    defer hosted_managed_db_cache_registry_mutex.unlock();
-    const cached_roots: u64 = @intCast(hosted_managed_db_cache_registry.items.len);
-    for (hosted_managed_db_cache_registry.items) |selected| {
-        if (!std.mem.eql(u8, selected.replica_root_dir, replica_root_dir)) continue;
-        lockAtomic(&selected.mutex);
-        defer selected.mutex.unlock();
-        const write_cache = selected.write_cache.diagnosticsLocked();
-        return .{
-            .present = true,
-            .cached_roots = cached_roots,
-            .cached_entries = write_cache.cached_entries,
-            .retired_entries = write_cache.retired_entries,
-            .table_metadata_entries = write_cache.table_metadata_entries,
-            .active_bulk_sessions = write_cache.active_bulk_sessions,
-            .active_leases = write_cache.active_leases,
-            .retired_active_leases = write_cache.retired_active_leases,
-            .bulk_ingest_open_entries = write_cache.bulk_ingest_open_entries,
-            .auto_bulk_ingest_open_entries = write_cache.auto_bulk_ingest_open_entries,
-            .auto_bulk_ingest_finish_requested_entries = write_cache.auto_bulk_ingest_finish_requested_entries,
-            .lsm_mutable_bytes = write_cache.lsm_mutable_bytes,
-            .lsm_immutable_bytes = write_cache.lsm_immutable_bytes,
-            .lsm_total_run_bytes = write_cache.lsm_total_run_bytes,
-            .lsm_wal_retained_bytes = write_cache.lsm_wal_retained_bytes,
-            .lsm_wal_retained_segments = write_cache.lsm_wal_retained_segments,
-            .lsm_active_readers = write_cache.lsm_active_readers,
-            .lsm_obsolete_paths = write_cache.lsm_obsolete_paths,
-            .lsm_bulk_ingest_current_scan_clone_active_bytes = write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes,
-        };
-    }
-    return .{ .cached_roots = cached_roots };
-}
+pub const closeHostedManagedDbCacheForRoot = table_write_cache.closeHostedManagedDbCacheForRoot;
+const hostedManagedDbCacheForRoot = table_write_cache.hostedManagedDbCacheForRoot;
+const hostedManagedDbCacheForRootIfPresent = table_write_cache.hostedManagedDbCacheForRootIfPresent;
+pub const hostedManagedDbCacheDiagnosticsForRoot = table_write_cache.hostedManagedDbCacheDiagnosticsForRoot;
 
 fn parseJsonBodyIgnoreUnknown(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });

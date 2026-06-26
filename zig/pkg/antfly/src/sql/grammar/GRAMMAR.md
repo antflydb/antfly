@@ -281,9 +281,10 @@ single binary join reads also validate generated join-tree metadata against the
 typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
 compatibility metadata, and `ON`/`USING` condition payloads. The executable
-join contract is intentionally limited to one generated binary `ON` join until
-the row-plan API grows an N-way join representation; generated join and lateral
-multi-join ASTs, plus generated `USING` join ASTs, fail closed before the typed
+join contract is intentionally limited to one generated binary join until
+the row-plan API grows an N-way join representation; generated binary
+`JOIN ... USING (...)` lowers through schema-checked equality keys, while
+generated join and lateral multi-join ASTs still fail closed before the typed
 lowerers can partially parse them;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, inline function-call `OVER` clauses carry generated
@@ -764,7 +765,9 @@ Unsupported DDL remains on the existing parser until
    the typed join lowerer before producing a join plan, and generated join
    reads reject malformed left-associative tree root/depth/index/child
    metadata, first-join compatibility fields, and `ON`/`USING` condition
-   payloads before invoking typed join lowering.
+   payloads before invoking typed join lowering. Binary `JOIN ... USING (...)`
+   now lowers generated column-list metadata into schema-checked equality join
+   keys.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
    generated window reads, inline function-call `OVER` clauses carry generated
@@ -924,7 +927,7 @@ Unsupported DDL remains on the existing parser until
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
-   validated left-associative generated join nodes and retained condition
+   validated binary join nodes with retained `ON`/`USING` condition
    payload layout, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
@@ -1239,9 +1242,10 @@ Generated grammar work needs evidence at multiple levels:
   representative query, aggregate, join, lateral, and non-recursive CTE plans,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
-  prefixes, single- and multi-join component range/tree coverage with
+  prefixes, binary `JOIN ... USING (...)` lowering through schema-checked
+  equality keys, single- and multi-join component range/tree coverage with
   fail-closed executable-contract validation for unsupported generated
-  join/lateral multi-join and `USING` join ASTs, and simple comparison plus
+  join/lateral multi-join ASTs, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata and fail-closed
   expression-owned token range containment plus operator/kind token

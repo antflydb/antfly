@@ -63,6 +63,20 @@ pub const APIDocIdTestRuns = struct {
     raft_transition_runtime_docid: *std.Build.Step.Run,
 };
 
+pub const GraphMetricTestModules = struct {
+    root: *std.Build.Module,
+    query_fan_in: *std.Build.Module,
+};
+
+pub const GraphMetricTestRuns = struct {
+    lifecycle: *std.Build.Step.Run,
+    query_fan_in: *std.Build.Step.Run,
+    operations: *std.Build.Step.Run,
+    cleanup: *std.Build.Step.Run,
+    degree_canary: *std.Build.Step.Run,
+    default_gate: *std.Build.Step.Run,
+};
+
 pub const db_root_step_name = "lib-db-test";
 pub const db_result_shape_step_name = "lib-db-result-shape-test";
 pub const db_storage_step_name = "db-test";
@@ -1090,6 +1104,111 @@ pub const APITestFilters = struct {
     };
 };
 
+pub const GraphMetricTestFilters = struct {
+    pub const lifecycle = [_][]const u8{
+        "graph degree planned build publishes scores matching local runner",
+        "graph pagerank planned build publishes scores matching local runner",
+        "graph pagerank planned build drains partitioned pages across workers",
+        "graph pagerank later iteration exhausted page fails build and preserves prior generation",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
+        "graph eigenvector planned build publishes scores matching local runner",
+        "graph eigenvector later iteration exhausted page fails build and preserves prior generation",
+        "graph eigenvector reclaimed scan page overwrites stale partial output",
+        "graph eigenvector reclaimed initialize page overwrites stale rank output",
+        "graph eigenvector reclaimed contribution and reduce pages overwrite stale output",
+        "graph eigenvector convergence page reclaim recomputes without stale partial summary",
+        "graph eigenvector cleanup page resumes after reopen with published scores visible",
+        "graph eigenvector failed planned build preserves prior published generation",
+        "graph eigenvector coordinator publish failure preserves prior published generation after reopen",
+        "graph hits planned build publishes paired scores matching local runner",
+        "graph hits active planned rebuild keeps prior published pair visible",
+        "graph hits reopened coordinators do not duplicate paired publish",
+        "graph hits later iteration exhausted page fails pair and preserves prior published pair",
+        "graph hits reclaimed scan page overwrites stale partial output",
+        "graph hits reclaimed initialize page overwrites stale rank output",
+        "graph hits reclaimed contribution and reduce pages overwrite stale output",
+        "graph hits convergence page reclaim recomputes without stale partial summary",
+        "graph hits cleanup page resumes after reopen with published pair visible",
+        "graph hits failed planned build preserves prior published pair",
+        "graph hits coordinator publish failure preserves prior published pair after reopen",
+        "graph hits planned build drains partitioned paired pages across workers",
+        "graph hits larger manifest resumes across reopen boundaries",
+        "graph metric failed planned build cleans abandoned scores and job namespace",
+        "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed hits builds bound diagnostics and cleanup abandoned namespaces",
+    };
+
+    pub const query_fan_in = [_][]const u8{
+        "query profile reports failed graph metric status across read surfaces",
+        "query merge applies deterministic graph metric top-k across shards",
+        "query merge rejects missing or unpublished graph metric shard results",
+        "query merge rejects duplicate direct graph metric score nodes",
+        "query merge rejects non-finite direct graph metric scores",
+        "query merge rejects duplicate direct graph metric shard results",
+        "query merge rejects mismatched direct graph metric shard identity",
+        "query merge rejects inconsistent graph metric fan-in status state",
+        "query merge rejects non-finite graph metric fan-in status numbers",
+        "query merge rejects out-of-range graph metric fan-in progress",
+        "query merge rejects incompatible graph metric fan-in metadata",
+        "query merge rejects unsolicited graph search metric status",
+        "query merge validates included graph search metric status list",
+        "query merge rejects malformed graph search metric payloads",
+        "query merge rejects malformed graph search traversal payloads",
+        "query merge rejects malformed graph search hit payloads",
+        "query merge preserves failed graph metric status across shard fan-in",
+        "query merge requires comparable graph search metric generations across shards",
+        "query merge allows unpublished projected graph search metric status",
+        "query merge rejects ambiguous graph search fan-in metric status",
+        "query merge preserves failed graph search metric status across shards",
+        "query merge enforces graph search order and filter metric generations across shards",
+        "query profile reports merged graph search metric generation",
+        "query merge requires comparable graph metric rerank generations across shards",
+        "query merge rejects malformed graph metric rerank score details",
+        "query merge rejects missing or unpublished graph metric rerank shard status",
+        "query encoder emits graph metric rerank score details",
+    };
+
+    pub const operations = [_][]const u8{
+        "graph metric status summarizes multiple active build pages with cap",
+        "table runtime snapshot cache preserves graph metric runtime ownership telemetry",
+        "index encoders expose graph metric runtime ownership summary",
+        "index encoders expose mixed graph metric runtime roles without aggregate role",
+        "graph metric status encoder exposes active build pages",
+        "distributed graph expand request defers worker result limit for metric post processing",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
+        "indexes openapi parses graph metric runtime summary",
+        "client openapi parses graph metric runtime summary",
+        "internal group write routes expose graph metric maintenance boundary",
+        "internal group write routes graph metric maintenance fences service runtime owners",
+        "internal group write routes graph metric maintenance releases only current service owner",
+    };
+
+    pub const cleanup = [_][]const u8{
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
+        "graph pagerank planned cleanup resumes after non-final cleanup page reopen",
+        "graph pagerank cleanup page resumes from durable cursor after reopen",
+        "graph eigenvector cleanup page resumes after reopen with published scores visible",
+        "graph hits cleanup page resumes after reopen with published pair visible",
+        "graph metric failed planned build cleans abandoned scores and job namespace",
+        "graph metric failed planned build retains bounded diagnostics",
+        "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric repeated failed hits builds bound diagnostics and cleanup abandoned namespaces",
+        "graph metric build job cleanup refuses active job namespace",
+    };
+
+    pub const degree_canary = [_][]const u8{
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime degree canary ",
+    };
+
+    pub const default_gate = [_][]const u8{
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime default gate ",
+    };
+};
+
 const db_root_module_steps = [_]DBTestStep{
     .{
         .name = "lib-db-enrichment-test",
@@ -1332,6 +1451,64 @@ fn addFocusedAPITestStep(
 ) void {
     const step = b.step(name, description);
     step.dependOn(&run.step);
+}
+
+fn addSimpleSelectedTestRun(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    default_filters: []const []const u8,
+    skip_filters: []const []const u8,
+) *std.Build.Step.Run {
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = selectTestFilters(b, default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run = b.addRunArtifact(tests);
+    for (skip_filters) |filter| {
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
+    return run;
+}
+
+fn addFocusedTestStep(
+    b: *std.Build,
+    name: []const u8,
+    description: []const u8,
+    run: *std.Build.Step.Run,
+) void {
+    const step = b.step(name, description);
+    step.dependOn(&run.step);
+}
+
+pub fn addGraphMetricTestSteps(
+    b: *std.Build,
+    modules: GraphMetricTestModules,
+    root_test_skip_filters: []const []const u8,
+) GraphMetricTestRuns {
+    const lifecycle = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.lifecycle, root_test_skip_filters);
+    const query_fan_in = addSimpleSelectedTestRun(b, modules.query_fan_in, &GraphMetricTestFilters.query_fan_in, &.{});
+    const operations = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.operations, root_test_skip_filters);
+    const cleanup = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.cleanup, root_test_skip_filters);
+    const degree_canary = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.degree_canary, root_test_skip_filters);
+    const default_gate = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.default_gate, root_test_skip_filters);
+
+    addFocusedTestStep(b, "graph-metric-lifecycle-test", "Run focused graph metric planned lifecycle tests", lifecycle);
+    addFocusedTestStep(b, "graph-metric-operations-test", "Run focused graph metric operation tests", operations);
+    addFocusedTestStep(b, "graph-metric-degree-canary-test", "Run focused graph metric degree-canary tests", degree_canary);
+    addFocusedTestStep(b, "graph-metric-default-gate-test", "Run focused graph metric default-gate tests", default_gate);
+
+    return .{
+        .lifecycle = lifecycle,
+        .query_fan_in = query_fan_in,
+        .operations = operations,
+        .cleanup = cleanup,
+        .degree_canary = degree_canary,
+        .default_gate = default_gate,
+    };
 }
 
 pub fn addAPIDocIdTestSteps(
