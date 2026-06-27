@@ -912,6 +912,113 @@ fn boundCatalogObjectForCatalogTableAlloc(
     };
 }
 
+fn boundCatalogObjectForTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    role: BoundCatalogObjectRole,
+    table: metadata_table_manager.TableRecord,
+) !BoundCatalogObject {
+    if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
+    const database_name = try alloc.dupe(u8, table.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, table.namespace_name);
+    errdefer alloc.free(namespace_name);
+    const table_name = try alloc.dupe(u8, table.name);
+    errdefer alloc.free(table_name);
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    return .{
+        .role = role,
+        .target = .{
+            .database_name = database_name,
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+        },
+        .family = source_binding.familyForRuntimeSchema(schema),
+        .schema_version = schema.version,
+        .table_id = table.table_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json),
+    };
+}
+
+fn boundCatalogObjectForCatalogIndexAlloc(
+    alloc: std.mem.Allocator,
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    index_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !BoundCatalogObject {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = try catalogTableForIndexNameAlloc(alloc, &snapshot, index_name, session);
+    return try boundCatalogObjectForTableRecordAlloc(alloc, role, table);
+}
+
+fn catalogTableForIndexNameAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    index_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !metadata_table_manager.TableRecord {
+    var found: ?metadata_table_manager.TableRecord = null;
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, session.currentDatabase())) continue;
+        if (!sqlSessionSearchPathContainsNamespace(session, table.namespace_name)) continue;
+        if (!try catalogTableRecordHasIndexNameAlloc(alloc, table, index_name)) continue;
+        if (found != null) return error.InvalidSqlCatalog;
+        found = table;
+    }
+    return found orelse error.InvalidSqlCatalog;
+}
+
+fn sqlSessionSearchPathContainsNamespace(session: catalog_resources.SqlCatalogSession, namespace_name: []const u8) bool {
+    const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+    const search_path = if (session.search_path.len == 0) default_search_path else session.search_path;
+    for (search_path) |candidate| {
+        if (std.mem.eql(u8, candidate, namespace_name)) return true;
+    }
+    return false;
+}
+
+fn catalogTableRecordHasIndexNameAlloc(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    index_name: []const u8,
+) !bool {
+    if (try catalogTableSchemaHasIndexNameAlloc(alloc, table.schema_json, index_name)) return true;
+    if (table.read_schema_json.len != 0 and try catalogTableSchemaHasIndexNameAlloc(alloc, table.read_schema_json, index_name)) return true;
+    return try catalogIndexesJsonHasIndexNameAlloc(alloc, table.indexes_json, index_name);
+}
+
+fn catalogTableSchemaHasIndexNameAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+) !bool {
+    if (schema_json.len == 0) return false;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    return relationalIndexNameExists(schema, index_name);
+}
+
+fn catalogIndexesJsonHasIndexNameAlloc(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !bool {
+    if (indexes_json.len == 0) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+    return root.get(index_name) != null;
+}
+
 fn appendBoundCatalogObjectForBindingAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
@@ -932,6 +1039,19 @@ fn appendBoundCatalogObjectForCatalogTableAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !void {
     var object = try boundCatalogObjectForCatalogTableAlloc(alloc, role, catalog, table_name, session);
+    errdefer object.deinit(alloc);
+    try objects.append(alloc, object);
+}
+
+fn appendBoundCatalogObjectForCatalogIndexAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    index_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    var object = try boundCatalogObjectForCatalogIndexAlloc(alloc, role, catalog, index_name, session);
     errdefer object.deinit(alloc);
     try objects.append(alloc, object);
 }
@@ -2169,7 +2289,8 @@ fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
         .cluster => |cluster| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, cluster.table_name, session, false),
         .reindex => |reindex| switch (reindex.target) {
             .table => try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, reindex.name, session, false),
-            .index, .schema, .database, .system => {},
+            .index => try appendBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, .target, catalog, reindex.name, session),
+            .schema, .database, .system => {},
         },
     }
 }
@@ -3112,6 +3233,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const usage_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(usage_schema_json);
     const incoming_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(incoming_schema_json);
     var catalog = MultiTableTestCatalog.init("usage_records", usage_schema_json, "incoming_usage", incoming_schema_json);
+    catalog.tables[0].indexes_json = "{\"usage_status_idx\":{}}";
 
     var parsed_read = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -3289,6 +3411,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         "ANALYZE usage_records",
         "CLUSTER usage_records USING usage_status_idx",
         "REINDEX TABLE usage_records",
+        "REINDEX INDEX usage_status_idx",
     };
     for (maintenance_cases) |maintenance_sql| {
         var parsed_maintenance = try tokenized.ParsedSql.initAlloc(alloc, maintenance_sql);
@@ -3309,6 +3432,13 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     );
     defer parsed_missing_maintenance.deinit(alloc);
     try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_maintenance, catalog.iface()));
+
+    var parsed_missing_reindex_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REINDEX INDEX missing_usage_status_idx",
+    );
+    defer parsed_missing_reindex_index.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_reindex_index, catalog.iface()));
 
     var parsed_create_table = try tokenized.ParsedSql.initAlloc(
         alloc,
