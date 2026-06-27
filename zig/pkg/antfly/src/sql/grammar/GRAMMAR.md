@@ -78,9 +78,10 @@ for the generated-covered `SET`, `SET LOCAL`, `RESET`, `RESET ALL`, `SHOW`,
 `SET LOCAL ... TO ...` session values accept comma-separated expression lists
 so generated ingress covers PostgreSQL-style `search_path` updates before the
 typed session lowerer decides whether a setting is supported.
-PostgreSQL-compatible non-`ALL` `DISCARD` forms such as `DISCARD TEMP` and
-`DISCARD PLANS` are represented as explicit generated unsupported diagnostics
-instead of syntax errors or session-parser probes.
+PostgreSQL-compatible non-`ALL` `DISCARD` forms such as `DISCARD TEMP`,
+`DISCARD TEMPORARY`, `DISCARD PLANS`, and `DISCARD SEQUENCES` are represented
+as explicit generated unsupported diagnostics instead of syntax errors or
+session-parser probes.
 PostgreSQL role session controls such as `SET ROLE` and `RESET ROLE` are also
 classified as explicit generated unsupported diagnostics instead of generic
 session setting tails.

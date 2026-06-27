@@ -5275,7 +5275,17 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .discard_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DISCARD TEMPORARY",
+            .kind = .discard,
+            .reason = .discard_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DISCARD PLANS",
+            .kind = .discard,
+            .reason = .discard_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DISCARD SEQUENCES",
             .kind = .discard,
             .reason = .discard_not_planned_by_generated_parser,
         },
