@@ -50,8 +50,11 @@ func TestSourceDocumentFromContentItemInline(t *testing.T) {
 	if record["content"] != nil {
 		t.Fatalf("source rows must not contain extracted content: %#v", record)
 	}
-	if record["_type"] != "source_document" {
-		t.Fatalf("_type = %#v", record["_type"])
+	if record["doc_type"] != "source_document" {
+		t.Fatalf("doc_type = %#v", record["doc_type"])
+	}
+	if _, exists := record["_type"]; exists {
+		t.Fatalf("source rows must not use reserved _type: %#v", record)
 	}
 }
 
