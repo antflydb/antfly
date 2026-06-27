@@ -160,7 +160,8 @@ until Antfly has a typed plan for that operation family.
 Row-security policy catalog DDL heads, including `CREATE POLICY`,
 `ALTER POLICY`, and `DROP POLICY`, now use the generated DDL boundary with
 retained policy-name, target-table, operation-tail, `IF EXISTS`, and
-drop-behavior metadata before delegating to the existing typed row-security
+drop-behavior metadata, plus exact `POLICY ... ON table` clause adjacency
+validation before delegating to the existing typed row-security
 catalog planner, including routine-backed policy predicates that require
 parser-context function bindings.
 Routine catalog DDL heads, including `CREATE FUNCTION`,
@@ -549,7 +550,7 @@ validated generated DDL AST nodes for
 `CREATE POLICY`, `ALTER POLICY`, and `DROP POLICY`, including routine-backed
 policy predicates that require parser-context function bindings, and fail
 closed if generated kind, span, policy name, target table, tail, `IF EXISTS`,
-or cascade metadata is corrupted before
+`POLICY ... ON table` layout, or cascade metadata is corrupted before
 delegating to the typed row-security catalog planner. Legacy-supported routine
 catalog operations use validated generated DDL AST nodes for `CREATE FUNCTION`,
 `CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and

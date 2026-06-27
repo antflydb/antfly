@@ -1643,6 +1643,7 @@ fn generatedDdlShapePayloadIsValid(
 ) bool {
     return switch (ddl_ast.kind) {
         .create_index => generatedDdlCreateIndexPayloadIsValid(tokens, end, ddl_ast),
+        .create_policy, .alter_policy, .drop_policy => generatedDdlPolicyPayloadIsValid(tokens, end, ddl_ast),
         else => true,
     };
 }
@@ -1712,6 +1713,74 @@ fn generatedDdlCreateIndexPayloadIsValid(
     }
 
     return cursor == end;
+}
+
+fn generatedDdlPolicyPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (end < 5) return false;
+    var cursor: usize = 0;
+    switch (ddl_ast.kind) {
+        .create_policy => {
+            if (!tokens[0].matchesKeywordTag(.create) or !tokens[1].matchesKeywordTag(.policy)) return false;
+            cursor = 2;
+        },
+        .alter_policy => {
+            if (!tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.policy)) return false;
+            cursor = 2;
+        },
+        .drop_policy => {
+            if (!tokens[0].matchesKeywordTag(.drop) or !tokens[1].matchesKeywordTag(.policy)) return false;
+            cursor = 2;
+            if (ddl_ast.if_exists) {
+                if (cursor + 2 >= end or !tokens[cursor].matchesKeywordTag(.@"if") or !tokens[cursor + 1].matchesKeywordTag(.exists)) return false;
+                cursor += 2;
+            }
+        },
+        else => return false,
+    }
+
+    const policy = ddl_ast.object_name_tokens orelse return false;
+    if (policy.start != cursor or policy.end != policy.start + 1 or policy.end > end) return false;
+    cursor = policy.end;
+    if (cursor >= end or !tokens[cursor].matchesKeywordTag(.on)) return false;
+    cursor += 1;
+
+    const table = ddl_ast.index_table_tokens orelse return false;
+    if (table.start != cursor or table.end <= table.start or table.end > end) return false;
+    cursor = table.end;
+
+    switch (ddl_ast.kind) {
+        .create_policy, .alter_policy => {
+            if (ddl_ast.if_exists or ddl_ast.if_not_exists or ddl_ast.index_elements_tokens != null or
+                ddl_ast.index_include_tokens != null or ddl_ast.index_method_tokens != null or
+                ddl_ast.index_options_tokens != null or ddl_ast.index_where_tokens != null)
+            {
+                return false;
+            }
+            if (ddl_ast.alter_table_operation_tokens) |tail| {
+                return tail.start == cursor and tail.end == end and tail.start < tail.end;
+            }
+            return cursor == end;
+        },
+        .drop_policy => {
+            if (ddl_ast.if_not_exists or ddl_ast.alter_table_operation_tokens != null or
+                ddl_ast.index_elements_tokens != null or ddl_ast.index_include_tokens != null or
+                ddl_ast.index_method_tokens != null or ddl_ast.index_options_tokens != null or
+                ddl_ast.index_where_tokens != null)
+            {
+                return false;
+            }
+            if (cursor == end) return !ddl_ast.cascade;
+            if (cursor + 1 != end) return false;
+            if (tokens[cursor].matchesKeywordTag(.cascade)) return ddl_ast.cascade;
+            if (tokens[cursor].matchesKeywordTag(.restrict)) return !ddl_ast.cascade;
+            return false;
+        },
+        else => return false,
+    }
 }
 
 fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -6614,6 +6683,32 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(policy.raw_statement, missing_policy_table, &policy.tokenized_sql)),
+    );
+
+    var malformed_policy_tail = policy.generated_statement.?;
+    if (malformed_policy_tail.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| ddl_ast.alter_table_operation_tokens.?.start += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(policy.raw_statement, malformed_policy_tail, &policy.tokenized_sql)),
+    );
+
+    var drop_policy = try ParsedSql.initAlloc(alloc, "DROP POLICY usage_policy ON usage_records CASCADE");
+    defer drop_policy.deinit(alloc);
+    var malformed_drop_policy_behavior = drop_policy.generated_statement.?;
+    if (malformed_drop_policy_behavior.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| ddl_ast.cascade = false,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(drop_policy.raw_statement, malformed_drop_policy_behavior, &drop_policy.tokenized_sql)),
     );
 
     var extension_index = try ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)");
