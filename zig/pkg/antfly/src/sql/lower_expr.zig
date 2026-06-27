@@ -3225,6 +3225,9 @@ fn generatedOperatorKindMatchesRowExpressionKind(
         .multiplicative => parsed_expression.kind == .mul,
         .divisive => parsed_expression.kind == .div,
         .modulo => parsed_expression.kind == .mod,
+        .logical_or => parsed_expression.kind == .bool_or,
+        .logical_and => parsed_expression.kind == .bool_and,
+        .logical_not => parsed_expression.kind == .bool_not,
         .string_concat => parsed_expression.kind == .concat,
         .json_access, .json_text_access, .json_path_access, .json_path_text_access => parsed_expression.kind == .json_extract,
         .json_key_exists => parsed_expression.kind == .json_path_exists,
@@ -30691,6 +30694,48 @@ test "sql adapter lower expr lowers boolean projection operators" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
     try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
 
+    var malformed_generated_boolean_and_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT enabled AND NOT verified AS active_unverified FROM users WHERE id = $1",
+    );
+    defer malformed_generated_boolean_and_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_boolean_and_kind, .logical_or);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_boolean_and_kind,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
+
+    var malformed_generated_boolean_or_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT enabled OR starts_with(status, 'op') AS eligible FROM users WHERE id = $1",
+    );
+    defer malformed_generated_boolean_or_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_boolean_or_kind, .logical_and);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_boolean_or_kind,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
+
+    var malformed_generated_boolean_not_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT NOT verified AS unverified FROM users WHERE id = $1",
+    );
+    defer malformed_generated_boolean_not_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_boolean_not_kind, .logical_and);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_boolean_not_kind,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
+
     var expression_is_true = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id FROM users WHERE starts_with(status, 'op') IS TRUE ORDER BY id",
@@ -34443,6 +34488,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
         &.{},
     ));
 
+    var malformed_group_arithmetic_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT amount + 1 AS amount_bucket, COUNT(*) AS total FROM usage_records GROUP BY amount + 1 ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_group_arithmetic_kind.deinit(alloc);
+    try corruptGeneratedReadFirstGroupExpressionKind(&malformed_group_arithmetic_kind, .subtractive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_group_arithmetic_kind,
+        schema,
+        &.{},
+    ));
+
     var malformed_projection = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
@@ -34625,6 +34683,20 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_query_order_operator,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_query_order_arithmetic_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY amount + 1 DESC LIMIT 5",
+    );
+    defer malformed_query_order_arithmetic_kind.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionKind(&malformed_query_order_arithmetic_kind, .subtractive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_query_order_arithmetic_kind,
         schema,
         &.{},
         .{},

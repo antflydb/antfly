@@ -1173,7 +1173,10 @@ contract until storage and API row plans grow those outer-join semantics.
    predicate payloads; exact-range generated arithmetic operator metadata for
    unary negative, `+`, `-`, `*`, `/`, and `%` now validates against the typed
    row-expression operator before projection, aggregate-input, window-input,
-   predicate, and order-expression handoffs accept it; generated regex predicate handoffs now also require the
+   predicate, and order-expression handoffs accept it; exact-range generated
+   logical `AND`, `OR`, and `NOT` metadata now validates against typed boolean
+   row-expression operators before boolean projection handoffs accept it;
+   generated regex predicate handoffs now also require the
    exact POSIX regex operator kind, reject stray quantifier/escape/negation
    payloads, and require the right operand range to start immediately after the
    operator before typed `regexp_match` conditions are accepted;
