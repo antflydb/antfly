@@ -1198,8 +1198,10 @@ generated read family.
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-   conditionless cartesian payload layout, exact join-item segment/tail validation,
-   operator-kind checks, and fail-closed right/full plus conditionless
+   conditionless cartesian payload layout, generated `USING (...)` column-list
+   delimiter and expression-item validation, remaining exact join-item
+   segment/tail validation, operator-kind checks, and fail-closed right/full
+   plus conditionless
    `NATURAL JOIN` metadata, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function

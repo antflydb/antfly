@@ -2523,11 +2523,92 @@ fn generatedReadJoinItemIsValid(
             if (!std.meta.eql(item.using_tokens orelse break :blk false, item.condition_tokens)) break :blk false;
             const column_tokens = item.using_column_tokens orelse break :blk false;
             if (!generatedReadNestedRangeIsValid(tokens, end, item.condition_tokens, column_tokens)) break :blk false;
+            if (!generatedReadJoinUsingColumnListIsValid(tokens, item.condition_tokens, column_tokens, item.using_columns)) break :blk false;
             if (item.predicate_tokens != null or item.predicate_expression.tokens != null) break :blk false;
-            if (item.using_columns.count == 0 or item.using_columns.items.len != item.using_columns.count) break :blk false;
             break :blk true;
         },
     };
+}
+
+fn generatedReadJoinUsingColumnListIsValid(
+    tokens: []const Token,
+    condition_tokens: generated_parser.GeneratedSqlTokenRange,
+    column_tokens: generated_parser.GeneratedSqlTokenRange,
+    columns: generated_parser.GeneratedSqlListAst,
+) bool {
+    if (condition_tokens.end > tokens.len or condition_tokens.start + 4 > condition_tokens.end) return false;
+    if (!tokens[condition_tokens.start].matchesKeywordTag(.using)) return false;
+    if (tokens[condition_tokens.start + 1].kind != .lparen or tokens[condition_tokens.end - 1].kind != .rparen) return false;
+    if (column_tokens.start != condition_tokens.start + 2 or column_tokens.end != condition_tokens.end - 1) return false;
+    return generatedReadDelimitedListIsValid(tokens, column_tokens, columns, .{
+        .single_token_items = true,
+        .reject_aliases = true,
+        .reject_order_modifiers = true,
+    });
+}
+
+const GeneratedReadDelimitedListValidationOptions = struct {
+    single_token_items: bool = false,
+    reject_aliases: bool = false,
+    reject_order_modifiers: bool = false,
+};
+
+fn generatedReadDelimitedListIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    options: GeneratedReadDelimitedListValidationOptions,
+) bool {
+    if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+    if (list.count == 0 or
+        list.items.len != list.count or
+        list.expression_items.len != list.count or
+        list.expressions.len != list.count)
+    {
+        return false;
+    }
+    if (options.reject_aliases and
+        (list.alias_items.len != list.count or list.alias_name_items.len != list.count))
+    {
+        return false;
+    }
+    if (options.reject_order_modifiers and
+        (list.direction_items.len != list.count or
+            list.directions.len != list.count or
+            list.order_using_operator_items.len != list.count or
+            list.nulls_order_items.len != list.count or
+            list.nulls_orders.len != list.count))
+    {
+        return false;
+    }
+    if (!std.meta.eql(list.first_tokens orelse return false, list.items[0])) return false;
+    if (!std.meta.eql(list.last_tokens orelse return false, list.items[list.items.len - 1])) return false;
+
+    var expected_start = range.start;
+    for (list.items, 0..) |item, index| {
+        if (!generatedReadNestedRangeIsValid(tokens, tokens.len, range, item)) return false;
+        if (item.start != expected_start or item.start >= item.end) return false;
+        if (options.single_token_items and item.end != item.start + 1) return false;
+        if (!std.meta.eql(list.expression_items[index], item)) return false;
+        if (!generatedReadExpressionTokensEqualRange(list.expressions[index], item)) return false;
+        if (options.reject_aliases and (list.alias_items[index] != null or list.alias_name_items[index] != null)) return false;
+        if (options.reject_order_modifiers and
+            (list.direction_items[index] != null or
+                list.directions[index] != null or
+                list.order_using_operator_items[index] != null or
+                list.nulls_order_items[index] != null or
+                list.nulls_orders[index] != null))
+        {
+            return false;
+        }
+
+        expected_start = item.end;
+        if (index + 1 < list.items.len) {
+            if (expected_start >= range.end or tokens[expected_start].kind != .comma) return false;
+            expected_start += 1;
+        }
+    }
+    return expected_start == range.end;
 }
 
 fn generatedReadOptionalRangesEqual(
@@ -6807,6 +6888,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
 
+    var generated_using_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)");
+    defer generated_using_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_using_join_query.generatedStatementKind().?);
+
+    var malformed_using_join_generated = generated_using_join_query.generated_statement.?;
+    if (malformed_using_join_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.join_items[0].using_columns.items[0].end += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_using_join_query.statement = parseStatement(generated_using_join_query.raw_statement, malformed_using_join_generated, &generated_using_join_query.tokenized_sql);
+    try std.testing.expect(generated_using_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_using_join_query.statement));
+
     var generated_cte_join_query = try ParsedSql.initAlloc(alloc, "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id) SELECT id FROM joined_rows");
     defer generated_cte_join_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_join_query.generatedStatementKind().?);
@@ -6823,6 +6921,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_join_query.statement = parseStatement(generated_cte_join_query.raw_statement, malformed_cte_join_tree_generated, &generated_cte_join_query.tokenized_sql);
     try std.testing.expect(generated_cte_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_join_query.statement));
+
+    var generated_cte_using_join_query = try ParsedSql.initAlloc(alloc, "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)) SELECT id FROM joined_rows");
+    defer generated_cte_using_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_using_join_query.generatedStatementKind().?);
+
+    var malformed_cte_using_join_generated = generated_cte_using_join_query.generated_statement.?;
+    if (malformed_cte_using_join_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_join_items[0].using_column_tokens.?.start -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_using_join_query.statement = parseStatement(generated_cte_using_join_query.raw_statement, malformed_cte_using_join_generated, &generated_cte_using_join_query.tokenized_sql);
+    try std.testing.expect(generated_cte_using_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_using_join_query.statement));
 
     var generated_graph_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm");
     defer generated_graph_source_query.deinit(alloc);

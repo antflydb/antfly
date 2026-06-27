@@ -1524,26 +1524,6 @@ pub const LogicalSqlPlan = union(enum) {
     }
 };
 
-pub fn takeTableDdlPlanFromLogical(logical: *LogicalSqlPlan) !TableDdlLogicalPlan {
-    return switch (logical.*) {
-        .table_ddl => |plan| blk: {
-            logical.* = .{ .other_ddl = .{ .moved = {} } };
-            break :blk plan;
-        },
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-pub fn takeCatalogDdlPlanFromLogical(logical: *LogicalSqlPlan) !CatalogDdlLogicalPlan {
-    return switch (logical.*) {
-        .catalog_ddl => |plan| blk: {
-            logical.* = .{ .other_ddl = .{ .moved = {} } };
-            break :blk plan;
-        },
-        else => error.UnsupportedSqlShape,
-    };
-}
-
 pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const read = try bound.readCatalog();
     const target_binding = read.target_binding;

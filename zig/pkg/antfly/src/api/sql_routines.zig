@@ -18,6 +18,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_adapter = @import("../sql/mod.zig");
+const table_catalog = @import("table_catalog.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -1278,7 +1279,14 @@ fn hashLowerIdentifier(alloc: std.mem.Allocator, hasher: anytype, value: []const
 fn routineLogicalPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !sql_adapter.LogicalSqlPlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+    switch (parsed_sql.statement) {
+        .read, .write => return error.UnsupportedSqlShape,
+        .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {},
+    }
+    return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
+        .catalog = table_catalog.unavailableCatalogSource(),
+        .function_bindings = .{},
+    });
 }
 
 fn functionCatalogPlanForTest(plan: sql_adapter.LogicalSqlPlan) !sql_adapter.FunctionCatalogPlan {

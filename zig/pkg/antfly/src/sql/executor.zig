@@ -52,7 +52,7 @@ pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPl
     };
 }
 
-pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
+fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
@@ -67,7 +67,7 @@ pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     });
 }
 
-pub fn planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(
+fn planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     bound: *binder.BoundSqlStatement,
     function_bindings: lower_expr.SqlFunctionBindings,

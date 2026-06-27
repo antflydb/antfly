@@ -86,6 +86,20 @@ const adapterNoopFingerprintAlloc = sql_adapter.appParityAdapterNoopFingerprintA
 const expectFailClosedUnsupported = sql_adapter.expectFailClosedUnsupported;
 const expectTypedInvalid = sql_adapter.expectTypedInvalid;
 
+fn planLogicalDdlParsedForAppParityAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !sql_adapter.LogicalSqlPlan {
+    switch (parsed_sql.statement) {
+        .read, .write => return error.UnsupportedSqlShape,
+        .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {},
+    }
+    return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = table_catalog.unavailableCatalogSource(),
+        .function_bindings = .{},
+    });
+}
+
 const appParityLimitValue = sql_adapter.appParityLimitValue;
 const appParityBoolValue = sql_adapter.appParityBoolValue;
 const sqlJoinTypeFingerprintName = sql_adapter.sqlJoinTypeFingerprintName;
@@ -117,7 +131,7 @@ fn expectAppliedDdlCorpusPlan(
     for (entry.apply_setup_sql) |setup_sql| {
         var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
         defer parsed_setup_sql.deinit(alloc);
-        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_setup_sql, .{});
+        var setup_plan = try planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -179,7 +193,7 @@ fn schemaJsonFromSetupSqlAlloc(
     for (setup_sql) |sql| {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        var setup_plan = try planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -1131,7 +1145,7 @@ fn expectAppParityUnsupportedPlanEntry(
     switch (entry.family) {
         .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
         .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
-        .unsupported_ddl => try expectFailClosedUnsupported(sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{})),
+        .unsupported_ddl => try expectFailClosedUnsupported(planLogicalDdlParsedForAppParityAlloc(alloc, parsed_sql)),
         .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql, unique_resolver, row_claim)),
         .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
         .unsupported_update => try expectFailClosedUnsupported(lowerUpdateParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
@@ -1236,7 +1250,7 @@ fn expectAppParityCorpusEntry(
 
     switch (entry.family) {
         .ddl => {
-            var logical = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+            var logical = try planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_sql);
             defer logical.deinit(alloc);
             try expectDdlSummary(entry.summary, logical);
             const fingerprint = try ddlFingerprintAlloc(alloc, logical);
@@ -1296,7 +1310,7 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{})) |logical_value| {
+            if (planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_sql)) |logical_value| {
                 var logical = logical_value;
                 defer logical.deinit(alloc);
                 switch (logical) {
@@ -1355,7 +1369,7 @@ fn appParityAppliedDdlPlanAlloc(
     for (entry.apply_setup_sql) |setup_sql| {
         var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
         defer parsed_setup_sql.deinit(alloc);
-        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_setup_sql, .{});
+        var setup_plan = try planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -1365,7 +1379,7 @@ fn appParityAppliedDdlPlanAlloc(
         current_schema_json = next_schema_json;
     }
 
-    var logical = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+    var logical = try planLogicalDdlParsedForAppParityAlloc(alloc, parsed_sql);
     defer logical.deinit(alloc);
     var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, logical);
     defer applied.deinit(alloc);
@@ -6255,7 +6269,7 @@ fn planDdlLogicalPlanParsedSqlAllocForEdgeCase(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
-    return try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+    return try planLogicalDdlParsedForAppParityAlloc(alloc, parsed_sql);
 }
 
 test "postgres sql adapter rejects data-driven application edge cases explicitly" {
