@@ -33,9 +33,9 @@ pub fn applyDurablePlanOnServiceWithSessionAlloc(
         .table_ddl => |*table_plan| return try applyTableDdlPlanOnServiceWithSessionAlloc(alloc, svc, table_plan, session),
         .catalog_ddl => |catalog_plan| return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, catalog_plan, session),
         .extension => |extension| return try applyExtensionLogicalPlanWithSessionAlloc(alloc, svc, extension, session),
-        .auth => return error.UnsupportedSqlShape,
-        .routine => return error.UnsupportedSqlShape,
-        .maintenance => return error.UnsupportedSqlShape,
+        .auth => |auth_plan| return try applyAuthorizationLogicalPlanWithSessionAlloc(alloc, svc, auth_plan, session),
+        .routine => |*routine_plan| return try applyRoutineLogicalPlanWithSessionAlloc(alloc, svc, routine_plan, session),
+        .maintenance => |maintenance| return try applyMaintenanceLogicalPlanWithSessionAlloc(alloc, svc, maintenance, session),
         .bulk_io => return error.UnsupportedSqlShape,
     }
 }
@@ -99,9 +99,6 @@ fn applyTableDdlPlanOnServiceWithSessionAlloc(
                 for (cascade_applied) |*applied| applied.deinit(alloc);
                 alloc.free(cascade_applied);
             }
-            for (cascade_applied) |applied| {
-                try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
-            }
         } else {
             try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
         }
@@ -120,9 +117,27 @@ fn applyTableDdlPlanOnServiceWithSessionAlloc(
     var applied = try tables_api.applyTableDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
     errdefer applied.deinit(alloc);
     try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
-    try svc.upsertTable(applied.table);
-    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
+    const rewrite_jobs = try catalog_jobs.schemaRewriteJobsForAppliedDdlSnapshotAlloc(alloc, snapshot.ranges, applied);
+    defer {
+        for (rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        alloc.free(rewrite_jobs);
+    }
+    try applyTableCatalogUpdateWithSchemaRewriteJobsOnService(svc, .{
+        .table = applied.table,
+        .schema_rewrite_jobs = rewrite_jobs,
+    });
     return applied;
+}
+
+fn applyTableCatalogUpdateWithSchemaRewriteJobsOnService(
+    svc: anytype,
+    request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+) !void {
+    const ServiceDeclType = serviceDeclType(@TypeOf(svc));
+    if (comptime @hasDecl(ServiceDeclType, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
+        return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+    }
+    return error.UnsupportedOperation;
 }
 
 fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
@@ -148,6 +163,156 @@ fn applyExtensionLogicalPlanWithSessionAlloc(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     _ = session;
     return try extension_domain.sql_adapter.executeRelationalSqlExtensionPlanOnService(svc, alloc, plan);
+}
+
+pub fn applyAuthorizationLogicalPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: sql_adapter.AuthorizationLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const ServiceDeclType = serviceDeclType(@TypeOf(svc));
+    if (comptime @hasDecl(ServiceDeclType, "applyAuthorizationLogicalPlanWithSessionAlloc")) {
+        return try svc.applyAuthorizationLogicalPlanWithSessionAlloc(alloc, plan, session);
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn applyRoutineLogicalPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: *sql_adapter.RoutineLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const ServiceDeclType = serviceDeclType(@TypeOf(svc));
+    if (comptime @hasDecl(ServiceDeclType, "applyRoutineLogicalPlanWithSessionAlloc")) {
+        return try svc.applyRoutineLogicalPlanWithSessionAlloc(alloc, plan, session);
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn applyMaintenanceLogicalPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: sql_adapter.MaintenanceJobPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    return switch (plan) {
+        .reindex => |reindex| try applyReindexMaintenancePlanWithSessionAlloc(alloc, svc, reindex, session),
+        .vacuum, .analyze, .cluster => error.UnsupportedSqlShape,
+    };
+}
+
+fn applyReindexMaintenancePlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    plan: sql_adapter.ReindexMaintenancePlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = switch (plan.target) {
+        .table => try reindexTableTargetWithSessionAlloc(alloc, svc, &snapshot, plan.name, session),
+        .index => try reindexIndexTargetWithSessionAlloc(alloc, svc, &snapshot, plan.name, session),
+        .schema, .database, .system => return error.UnsupportedSqlShape,
+    };
+    return table;
+}
+
+fn reindexTableTargetWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const target = try session.tableTargetFromObjectName(table_name);
+    const table = tables_api.findTableByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    const schema_json = try schemaWithAllSecondaryIndexesBuildingAlloc(alloc, table.schema_json);
+    defer alloc.free(schema_json);
+    return try applySecondaryIndexRebuildSchemaAlloc(alloc, svc, table, schema_json);
+}
+
+fn reindexIndexTargetWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    index_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const target = try session.tableTargetFromObjectName(index_name);
+    var found_table: ?*const metadata_table_manager.TableRecord = null;
+    var matched_generation: u64 = 0;
+    for (snapshot.tables) |*table| {
+        if (!std.mem.eql(u8, table.database_name, target.database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, target.namespace_name)) continue;
+        var parsed = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+        defer parsed.deinit(alloc);
+        const runtime = try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+        defer @import("../storage/schema.zig").freeSchema(alloc, runtime);
+        if (runtime.storage_mode != .relational) continue;
+        for (runtime.relational_columns) |column| {
+            if (!column.indexed) continue;
+            const identity = column.index_name orelse column.name;
+            if (!std.mem.eql(u8, identity, target.table_name)) continue;
+            if (found_table != null) return error.InvalidSqlCatalog;
+            found_table = table;
+            matched_generation = column.index_generation;
+        }
+    }
+    const table = found_table orelse return error.IndexNotFound;
+    if (matched_generation == std.math.maxInt(u64)) return error.InvalidSchemaUpdateRequest;
+    const schema_json = try tables_api.schemaWithSecondaryIndexBuildingAlloc(alloc, table.schema_json, target.table_name, matched_generation + 1);
+    defer alloc.free(schema_json);
+    return try applySecondaryIndexRebuildSchemaAlloc(alloc, svc, table, schema_json);
+}
+
+fn schemaWithAllSecondaryIndexesBuildingAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+) ![]u8 {
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("../storage/schema.zig").freeSchema(alloc, runtime);
+    if (runtime.storage_mode != .relational) return error.UnsupportedSqlShape;
+
+    var current_schema_json = try alloc.dupe(u8, schema_json);
+    errdefer alloc.free(current_schema_json);
+    var changed = false;
+    for (runtime.relational_columns) |column| {
+        if (!column.indexed) continue;
+        if (column.index_generation == std.math.maxInt(u64)) return error.InvalidSchemaUpdateRequest;
+        const identity = column.index_name orelse column.name;
+        const updated = try tables_api.schemaWithSecondaryIndexBuildingAlloc(alloc, current_schema_json, identity, column.index_generation + 1);
+        alloc.free(current_schema_json);
+        current_schema_json = updated;
+        changed = true;
+    }
+    if (!changed) return error.IndexNotFound;
+    return current_schema_json;
+}
+
+fn applySecondaryIndexRebuildSchemaAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    metadata_table_manager.freeTable(alloc, applied.table);
+    applied.table = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+    applied.requires_rebuild = true;
+    try applyTableCatalogUpdateWithSchemaRewriteJobsOnService(svc, .{ .table = applied.table });
+    return applied;
+}
+
+fn serviceDeclType(comptime ServiceType: type) type {
+    return switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
 }
 
 fn applyDropTableCascadeReferencesAlloc(
@@ -180,7 +345,15 @@ fn applyDropTableCascadeReferencesAlloc(
         var applied_transferred = false;
         errdefer if (!applied_transferred) applied.deinit(alloc);
 
-        try svc.upsertTable(updated);
+        const rewrite_jobs = try catalog_jobs.schemaRewriteJobsForAppliedDdlSnapshotAlloc(alloc, snapshot.ranges, applied);
+        defer {
+            for (rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+            alloc.free(rewrite_jobs);
+        }
+        try applyTableCatalogUpdateWithSchemaRewriteJobsOnService(svc, .{
+            .table = applied.table,
+            .schema_rewrite_jobs = rewrite_jobs,
+        });
         try applied_updates.append(alloc, applied);
         applied_transferred = true;
         updated_transferred = true;

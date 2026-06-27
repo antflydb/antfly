@@ -1794,6 +1794,13 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
+    }
+
     pub fn upsertDatabase(self: *MetadataService, record: metadata_table_manager.DatabaseRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_database = record });
     }
@@ -2019,6 +2026,10 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
     }
 
+    pub fn promoteTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
+    }
+
     pub fn promoteSecondaryIndexReady(self: *MetadataService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
         try self.proposeTransitionCommand(.{ .promote_secondary_index_ready = request });
     }
@@ -2187,7 +2198,7 @@ pub const MetadataService = struct {
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
-        for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
         for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);
@@ -3448,6 +3459,13 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
+    }
+
     pub fn upsertDatabase(self: *MetadataHttpService, record: metadata_table_manager.DatabaseRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_database = record });
     }
@@ -3671,6 +3689,10 @@ pub const MetadataHttpService = struct {
 
     pub fn invalidateTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
@@ -3939,7 +3961,7 @@ pub const MetadataHttpService = struct {
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
-        for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
         for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);

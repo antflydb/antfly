@@ -119,7 +119,9 @@ admission now comes from the grammar parse itself rather than the hand-written
 token-head classifier, so production ingress no longer decides generated
 coverage by probing legacy statement heads before running the generated parser.
 The remaining legacy classifier dependency is the detailed statement-variant
-builder used after grammar family validation. The
+builder used after grammar family validation for families that have not yet
+migrated concrete variant dispatch; generated read variants now come from the
+retained generated read AST kind directly. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
@@ -462,8 +464,9 @@ function-call child summaries, and direct function-call name and argument-list
 metadata,
 and an initial generated AST-to-plan wrapper that validates those ranges,
 rejects malformed structural payloads for covered expression kinds, verifies
-child/list expression AST spans against their parent metadata, and fails closed
-if the generated read family is incompatible with the existing read classifier.
+child/list expression AST spans against their parent metadata, and assigns the
+generated read family from the retained generated read AST instead of the
+legacy read classifier.
 Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
 single binary join reads also validate generated join-tree metadata against the
@@ -1754,9 +1757,9 @@ Generated grammar work needs evidence at multiple levels:
   dispatch with the same generated read AST handoff into simple, aggregate,
   join, lateral, window, CTE, and recursive CTE typed lowerers that production
   runtime uses; generated read AST kind now drives parsed-statement read-family
-  classification for generated-covered reads with fail-closed classifier
-  disagreement checks plus generated pagination payload consistency checks
-  before a parsed read family is assigned; generated read classification also
+  classification for generated-covered reads without re-entering the legacy
+  read classifier, while retaining generated pagination payload consistency
+  checks before a parsed read family is assigned; generated read classification also
   validates retained statement/command spans, top-level `WITH`/`SELECT`
   boundary metadata, projection/source/join/predicate/group/window/order/result-tail
   ranges, and CTE count/first/last/body range compatibility before publishing

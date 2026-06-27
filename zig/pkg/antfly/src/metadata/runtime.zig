@@ -1639,26 +1639,35 @@ test "metadata runtime memory soak diagnostic" {
         const table_id = 1000 + @as(u64, @intCast(table_idx));
         const table_name = try std.fmt.allocPrint(soak_alloc, "docs_{}", .{table_idx});
         defer soak_alloc.free(table_name);
-        try svc.upsertTable(.{
+        const table = metadata_table_manager.TableRecord{
             .table_id = table_id,
             .name = table_name,
             .desired_replica_count = 3,
             .min_ranges = @intCast(ranges_per_table),
-        });
+        };
+        const ranges = try soak_alloc.alloc(metadata_table_manager.RangeRecord, ranges_per_table);
+        defer soak_alloc.free(ranges);
+        var populated_ranges: usize = 0;
+        errdefer for (ranges[0..populated_ranges]) |record| metadata_table_manager.freeRange(soak_alloc, record);
         var range_idx: usize = 0;
         while (range_idx < ranges_per_table) : (range_idx += 1) {
             const start_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:a", .{range_idx});
-            defer soak_alloc.free(start_key);
+            errdefer soak_alloc.free(start_key);
             const end_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:z", .{range_idx});
-            defer soak_alloc.free(end_key);
-            try svc.upsertRange(.{
+            errdefer soak_alloc.free(end_key);
+            ranges[range_idx] = .{
                 .group_id = table_id * 1000 + @as(u64, @intCast(range_idx + 1)),
                 .range_id = @intCast(range_idx + 1),
                 .table_id = table_id,
                 .start_key = start_key,
                 .end_key = end_key,
-            });
+            };
+            populated_ranges += 1;
         }
+        defer for (ranges) |record| metadata_table_manager.freeRange(soak_alloc, record);
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(soak_alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(svc, table, ranges);
         try svc.upsertReplicationSourceStatus(.{
             .table_id = table_id,
             .source_ordinal = 0,
@@ -1850,10 +1859,18 @@ test "metadata runtime preserves projected tables across restart" {
         try server.start();
         try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
 
-        try server.metadataHttpService().upsertTable(.{
+        const table = metadata_table_manager.TableRecord{
             .table_id = 77,
             .name = "docs",
-        });
+        };
+        const ranges = try antfly.public_api.tables.deriveInitialRanges(std.testing.allocator, table);
+        defer {
+            for (ranges) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+            std.testing.allocator.free(ranges);
+        }
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(server.metadataHttpService(), table, ranges);
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();

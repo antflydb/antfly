@@ -334,8 +334,6 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
     if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return true;
-    if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedReadBoundary(tokens, raw_statement) or
@@ -1418,12 +1416,10 @@ fn parseStatement(
                 }
                 return .{ .write = .{ .kind = generated.defaultWriteKind(), .raw = raw_statement, .recursive = generated.recursive } };
             } else return .{ .unknown = raw_statement },
-            .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind| {
-                if (tokenized_sql.read_statement_kind) |classified_kind| {
-                    if (classified_kind != kind) return .{ .unknown = raw_statement };
-                }
-                return .{ .read = .{ .kind = kind, .raw = raw_statement } };
-            } else return .{ .unknown = raw_statement },
+            .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind|
+                return .{ .read = .{ .kind = kind, .raw = raw_statement } }
+            else
+                return .{ .unknown = raw_statement },
             .graph => |kind| if (generatedGraphAstHasValidClassificationPayload(tokenized_sql.items(), generated_raw, kind))
                 return .{ .ddl = .{ .raw = raw_statement } }
             else
@@ -3695,7 +3691,7 @@ fn generatedReadListAliasPayloadIsValid(
     maybe_alias_name: ?generated_parser.GeneratedSqlTokenRange,
     options: GeneratedReadDelimitedListValidationOptions,
 ) bool {
-    if (maybe_alias == null and maybe_alias_name == null) return expression.end == item.end;
+    if (maybe_alias == null and maybe_alias_name == null) return expression.end == item.end or options.allow_order_modifiers;
     if (!options.allow_aliases) return false;
     const alias = maybe_alias orelse return false;
     const alias_name = maybe_alias_name orelse return false;
@@ -7405,6 +7401,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE status IS NOT DISTINCT FROM previous_status", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id, amount FROM usage_records WHERE status = 'open' ORDER BY amount DESC;", .generated = .query, .read = .query },
+        .{ .sql = "SELECT _id, _doc, title, metadata->>'plan' AS plan FROM docs WHERE _id = 'doc:a';", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED", .generated = .query, .read = .query },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT", .generated = .cte, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE NOT deleted_at IS NULL", .generated = .query, .read = .query },
@@ -8301,7 +8299,7 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, generated_cte_aggregate.readStatementKind().?);
 }
 
-test "sql adapter parsed sql read statement kind fails closed on classifier disagreement" {
+test "sql adapter parsed sql read statement kind is generated-owned for covered reads" {
     const alloc = std.testing.allocator;
 
     var generated_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
@@ -8310,8 +8308,11 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
 
     generated_query.tokenized_sql.read_statement_kind = .aggregate;
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
-    try std.testing.expect(generated_query.readStatementKind() == null);
-    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.readStatementKind().?);
+    switch (generated_query.statement) {
+        .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.query, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
 
     var generated_where_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
     defer generated_where_query.deinit(alloc);
@@ -8607,7 +8608,7 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     var generated_cte_set_operation_tail_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive ORDER BY id LIMIT 5) SELECT id FROM source_rows");
     defer generated_cte_set_operation_tail_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_set_operation_tail_query.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.cte, generated_cte_set_operation_tail_query.readStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_cte_set_operation_tail_query.readStatementKind().?);
 
     var malformed_cte_set_operation_tail_generated = generated_cte_set_operation_tail_query.generated_statement.?;
     if (malformed_cte_set_operation_tail_generated.ast) |*generated_ast| {

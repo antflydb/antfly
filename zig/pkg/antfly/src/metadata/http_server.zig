@@ -607,7 +607,7 @@ pub const AdminSource = struct {
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
         try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -634,7 +634,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -649,7 +649,7 @@ pub const AdminSource = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -664,7 +664,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -680,7 +680,7 @@ pub const AdminSource = struct {
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -965,7 +965,7 @@ pub const AdminSource = struct {
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
         try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -992,7 +992,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1007,7 +1007,7 @@ pub const AdminSource = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1022,7 +1022,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1038,7 +1038,7 @@ pub const AdminSource = struct {
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -2288,6 +2288,21 @@ fn applyDurableSqlPlanOnMetadataServiceWithSession(
     return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, service_impl, plan, session);
 }
 
+fn applyTableCatalogUpdateWithoutSchemaRewriteJobs(
+    svc: anytype,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime @hasDecl(ServiceDeclType, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
+        return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = table });
+    }
+    return error.UnsupportedOperation;
+}
+
 const ParsedGroupStatus = struct {
     group_id: u64,
     doc_count: ?u64 = null,
@@ -2891,7 +2906,7 @@ fn reseedReplicationSourceExactCutoverForService(
         alloc.free(updated.publication_name);
     }
     try cleanupReplicationSourceArtifactsForService(ServiceType, svc, alloc, existing);
-    try svc.upsertTable(updated.table);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated.table);
     alloc.free(updated.table.replication_sources_json);
     try svc.removeReplicationSourceStatus(table.table_id, source_ordinal);
     try flushFn(svc);
@@ -3340,6 +3355,7 @@ test "metadata catalog validation applies sql drop table cascade through child s
     const FakeService = struct {
         alloc: std.mem.Allocator,
         manager: metadata_table_manager.TableManager,
+        apply_table_update_count: usize = 0,
 
         fn init(allocator: std.mem.Allocator) @This() {
             return .{
@@ -3370,8 +3386,16 @@ test "metadata catalog validation applies sql drop table cascade through child s
             snapshot.* = undefined;
         }
 
-        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
-            try self.manager.upsertTable(record);
+        pub fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            self.apply_table_update_count += 1;
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
         }
 
         pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -3423,7 +3447,7 @@ test "metadata catalog validation applies sql drop table cascade through child s
         }
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
-            for (plan.table_upserts) |record| try self.manager.upsertTable(record);
+            for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
             for (plan.table_removals) |table_id| _ = self.manager.removeTableTopology(table_id);
         }
 
@@ -3470,6 +3494,7 @@ test "metadata catalog validation applies sql drop table cascade through child s
     defer applied.deinit(alloc);
     try std.testing.expect(applied.dropped_table);
     try std.testing.expectEqualStrings("customers", applied.table.name);
+    try std.testing.expectEqual(@as(usize, 1), fake.apply_table_update_count);
 
     const tables = try fake.manager.listTables(alloc);
     defer fake.manager.freeTables(alloc, tables);
@@ -3509,7 +3534,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
             .placement_role = "data",
         },
         table_owned: bool = false,
-        upsert_table_count: usize = 0,
+        apply_table_update_count: usize = 0,
 
         fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             if (self.table_owned) metadata_table_manager.freeTable(allocator, self.table);
@@ -3534,12 +3559,20 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
 
         pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
-        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
-            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+        pub fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, request.table);
             if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
             self.table = cloned;
             self.table_owned = true;
-            self.upsert_table_count += 1;
+            self.apply_table_update_count += 1;
         }
 
         pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -3595,7 +3628,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
         }
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
-            for (plan.table_upserts) |record| try self.upsertTable(record);
+            for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
             if (plan.table_removals.len != 0) return error.TestUnexpectedResult;
         }
 
@@ -3610,7 +3643,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
     var graph = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &graph_plan, catalog_resources.SqlCatalogSession.default());
     defer graph.deinit(alloc);
     try std.testing.expect(graph.requires_rebuild);
-    try std.testing.expectEqual(@as(usize, 1), fake.upsert_table_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.apply_table_update_count);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"docs_edge_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"type\":\"graph\"") != null);
 
@@ -3619,7 +3652,7 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
     var metric = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(&fake, alloc, &metric_plan, catalog_resources.SqlCatalogSession.default());
     defer metric.deinit(alloc);
     try std.testing.expect(metric.requires_rebuild);
-    try std.testing.expectEqual(@as(usize, 2), fake.upsert_table_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.apply_table_update_count);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"docs_pagerank\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"type\":\"graph_metric\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"graph_index\":\"docs_edge_graph\"") != null);
@@ -3695,6 +3728,14 @@ test "metadata catalog applies SQL ALTER COLUMN USING through typed schema rewri
             try self.jobs.append(std.testing.allocator, owned);
         }
 
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try self.upsertTable(request.table);
+            for (request.schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+        }
+
         pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
             const out = try allocator.alloc(metadata_table_manager.TableRecord, 1);
             errdefer allocator.free(out);
@@ -3752,7 +3793,7 @@ test "metadata catalog applies SQL ALTER COLUMN USING through typed schema rewri
         }
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
-            for (plan.table_upserts) |record| try self.upsertTable(record);
+            for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
         }
 
         pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}

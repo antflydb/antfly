@@ -16,8 +16,11 @@ const std = @import("std");
 const metadata_mod = @import("mod.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
+const table_manager = @import("table_manager.zig");
+const table_workflow = @import("table_workflow.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
+const tables_api = @import("../api/tables.zig");
 const public_api_http_server = @import("../api/http_server.zig");
 const public_api_http_routes = @import("../api/http_routes.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
@@ -933,7 +936,16 @@ test "metadata server can expose admin listener endpoints" {
     });
     try server.svc.campaignMetadataGroup();
     try server.runRound();
-    try server.svc.upsertTable(.{ .table_id = 77, .name = "docs" });
+
+    const table = table_manager.TableRecord{ .table_id = 77, .name = "docs" };
+    const ranges = try tables_api.deriveInitialRanges(std.testing.allocator, table);
+    defer {
+        for (ranges) |record| table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(ranges);
+    }
+    var workflow = table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    _ = try workflow.createTableWithRanges(server.svc, table, ranges);
 
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try server.runRound();

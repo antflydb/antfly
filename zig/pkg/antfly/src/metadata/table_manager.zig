@@ -86,6 +86,7 @@ pub const TableRecord = struct {
     restore_location: []const u8 = "",
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
+    data_generation: u64 = 0,
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {
         return .{
@@ -242,6 +243,11 @@ pub const SchemaRewriteJobInvalidateRequest = struct {
     last_error: []const u8,
 };
 
+pub const TableCatalogUpdateWithSchemaRewriteJobsRequest = struct {
+    table: TableRecord,
+    schema_rewrite_jobs: []const SchemaRewriteJobRecord = &.{},
+};
+
 pub const table_emptying_declared = "declared";
 pub const table_emptying_running = "running";
 pub const table_emptying_ready = "ready";
@@ -252,6 +258,8 @@ pub const TableEmptyingJobRecord = struct {
     table_id: u64,
     group_id: u64,
     schema_generation: u64,
+    data_generation: u64 = 0,
+    barrier_id: u64 = 0,
     start_row_key: []const u8 = "",
     end_row_key: ?[]const u8 = null,
     affected_table_ids: []const u64 = &.{},
@@ -284,6 +292,16 @@ pub const TableEmptyingJobInvalidateRequest = struct {
     job_id: u64,
     lease_owner: []const u8,
     last_error: []const u8,
+};
+
+pub const TableEmptyingBarrierPromotion = struct {
+    table_id: u64,
+    target_generation: u64,
+};
+
+pub const TableEmptyingBarrierPromotionRequest = struct {
+    job_ids: []const u64 = &.{},
+    promotions: []const TableEmptyingBarrierPromotion = &.{},
 };
 
 pub const ForeignKeyReferenceRangeSelector = struct {
@@ -434,6 +452,8 @@ pub fn stableTableEmptyingJobId(record: TableEmptyingJobRecord) u64 {
     hashTableEmptyingJobU64(&hasher, record.table_id);
     hashTableEmptyingJobU64(&hasher, record.group_id);
     hashTableEmptyingJobU64(&hasher, record.schema_generation);
+    hashTableEmptyingJobU64(&hasher, record.data_generation);
+    hashTableEmptyingJobU64(&hasher, record.barrier_id);
     hasher.update(record.start_row_key);
     hasher.update(&[_]u8{0});
     if (record.end_row_key) |end_row_key| hasher.update(end_row_key);
@@ -794,6 +814,34 @@ pub const TableManager = struct {
             return;
         }
         try self.tables.put(self.alloc, record.table_id, owned);
+    }
+
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogUpdateWithSchemaRewriteJobsRequest) !void {
+        if (request.table.table_id == 0) return error.UnknownTable;
+        const target_generation = schemaRewriteGenerationForSchemaJson(request.table.schema_json);
+        if (target_generation == 0) return error.InvalidSchemaRewriteGeneration;
+        var validator = TableManager.init(self.alloc);
+        defer validator.deinit();
+        try validator.upsertTable(request.table);
+        for (request.schema_rewrite_jobs, 0..) |job, i| {
+            try validateSchemaRewriteJobForTableUpdate(request.table.table_id, target_generation, job);
+            try validator.upsertSchemaRewriteJob(job);
+            for (request.schema_rewrite_jobs[0..i]) |previous| {
+                if (previous.job_id == job.job_id) return error.InvalidSchemaRewriteJob;
+            }
+        }
+
+        try self.upsertTable(request.table);
+        for (request.schema_rewrite_jobs) |job| {
+            try self.upsertSchemaRewriteJob(job);
+        }
+    }
+
+    fn validateSchemaRewriteJobForTableUpdate(table_id: u64, schema_generation: u64, record: SchemaRewriteJobRecord) !void {
+        if (record.table_id != table_id) return error.InvalidSchemaRewriteJob;
+        if (record.schema_generation != schema_generation) return error.InvalidSchemaRewriteGeneration;
+        try group_ids.requireDataGroupId(record.group_id);
+        if (record.job_id == 0) return error.InvalidSchemaRewriteJob;
     }
 
     fn ensureCatalogForTable(self: *TableManager, record: TableRecord) !void {
@@ -1479,6 +1527,40 @@ pub const TableManager = struct {
         updated.lease_expires_at_ms = 0;
         updated.last_error = request.last_error;
         try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *TableManager, request: TableEmptyingBarrierPromotionRequest) !void {
+        if (request.job_ids.len == 0 or request.promotions.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+
+        for (request.job_ids, 0..) |job_id, i| {
+            if (job_id == 0) return error.InvalidTableEmptyingBarrierPromotion;
+            for (request.job_ids[0..i]) |previous| {
+                if (previous == job_id) return error.InvalidTableEmptyingBarrierPromotion;
+            }
+            const record = self.findTableEmptyingJob(job_id) orelse return error.UnknownTableEmptyingJob;
+            if (!std.mem.eql(u8, record.state, table_emptying_ready)) return error.TableEmptyingJobNotReady;
+        }
+
+        for (request.promotions, 0..) |promotion, i| {
+            if (promotion.table_id == 0 or promotion.target_generation == 0) return error.InvalidTableEmptyingBarrierPromotion;
+            _ = self.tables.getPtr(promotion.table_id) orelse return error.UnknownTable;
+            for (request.promotions[0..i]) |previous| {
+                if (previous.table_id == promotion.table_id and previous.target_generation != promotion.target_generation) {
+                    return error.InvalidTableEmptyingBarrierPromotion;
+                }
+            }
+        }
+
+        for (request.promotions) |promotion| {
+            const table = self.tables.getPtr(promotion.table_id).?;
+            if (table.data_generation < promotion.target_generation) {
+                table.data_generation = promotion.target_generation;
+            }
+        }
+
+        for (request.job_ids) |job_id| {
+            if (!self.removeTableEmptyingJob(job_id)) return error.UnknownTableEmptyingJob;
+        }
     }
 
     pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
@@ -2335,6 +2417,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
         .restore_location = restore_location,
         .desired_replica_count = record.desired_replica_count,
         .min_ranges = record.min_ranges,
+        .data_generation = record.data_generation,
     };
 }
 
@@ -2687,6 +2770,8 @@ pub fn cloneTableEmptyingJob(alloc: std.mem.Allocator, record: TableEmptyingJobR
         .table_id = record.table_id,
         .group_id = record.group_id,
         .schema_generation = record.schema_generation,
+        .data_generation = record.data_generation,
+        .barrier_id = record.barrier_id,
         .start_row_key = start_row_key,
         .end_row_key = end_row_key,
         .affected_table_ids = affected_table_ids,
@@ -3988,6 +4073,65 @@ test "table manager owns schema rewrite jobs" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
+test "table manager atomically applies table catalog updates with schema rewrite jobs" {
+    const alloc = std.testing.allocator;
+    const original_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const updated_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = original_schema_json });
+    const generation = schemaRewriteGenerationForSchemaJson(updated_schema_json);
+    try manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{
+        .table = .{ .table_id = 7, .name = "orders", .schema_json = updated_schema_json },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 9101,
+                .table_id = 7,
+                .group_id = 9001,
+                .schema_generation = generation,
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+        },
+    });
+
+    const tables = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings(updated_schema_json, tables[0].schema_json);
+
+    const jobs = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(u64, 9101), jobs[0].job_id);
+
+    const rejected_schema_json = "{\"version\":3}";
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{
+        .table = .{ .table_id = 7, .name = "orders", .schema_json = rejected_schema_json },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 0,
+                .table_id = 7,
+                .group_id = 9001,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(rejected_schema_json),
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+        },
+    }));
+
+    const tables_after_error = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, tables_after_error);
+    try std.testing.expectEqualStrings(updated_schema_json, tables_after_error[0].schema_json);
+}
+
 test "table manager applies schema rewrite job lifecycle operations" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -4521,6 +4665,83 @@ test "table manager applies secondary index rebuild lifecycle operations" {
         defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
         try std.testing.expectEqualStrings(secondary_index_rebuild_invalid, ranges[0].state);
         try std.testing.expectEqualStrings("schema generation moved", ranges[0].last_error);
+    }
+}
+
+test "table manager promotes table-emptying barriers atomically" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .data_generation = 9 });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 1,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = 1,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .state = table_emptying_declared,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+
+    try std.testing.expectError(error.TableEmptyingJobNotReady, manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    }));
+
+    {
+        const tables = try manager.listTables(std.testing.allocator);
+        defer manager.freeTables(std.testing.allocator, tables);
+        for (tables) |table| {
+            if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 4), table.data_generation);
+            if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 9), table.data_generation);
+        }
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 2), jobs.len);
+    }
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = 1,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    });
+    {
+        const tables = try manager.listTables(std.testing.allocator);
+        defer manager.freeTables(std.testing.allocator, tables);
+        for (tables) |table| {
+            if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 5), table.data_generation);
+            if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 10), table.data_generation);
+        }
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 0), jobs.len);
     }
 }
 

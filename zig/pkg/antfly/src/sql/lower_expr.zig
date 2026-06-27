@@ -504,12 +504,11 @@ fn validateGeneratedExpressionOperatorTokens(
         },
         .is_null, .is_not_null, .is_true, .is_false, .is_unknown, .is_not_true, .is_not_false, .is_not_unknown => {
             if (operator_tokens.end == operator_tokens.start + 1) {
-                if (kind == .is_null) {
-                    if (!first.matchesKeywordTag(.isnull)) return error.UnsupportedSqlShape;
-                } else if (kind == .is_not_null) {
-                    if (!first.matchesKeywordTag(.notnull)) return error.UnsupportedSqlShape;
-                } else {
-                    return error.UnsupportedSqlShape;
+                if (first.matchesKeywordTag(.is)) return;
+                switch (kind) {
+                    .is_null => if (!first.matchesKeywordTag(.isnull)) return error.UnsupportedSqlShape,
+                    .is_not_null => if (!first.matchesKeywordTag(.notnull)) return error.UnsupportedSqlShape,
+                    else => return error.UnsupportedSqlShape,
                 }
             } else if (operator_tokens.end == operator_tokens.start + 2) {
                 if (!first.matchesKeywordTag(.is)) return error.UnsupportedSqlShape;
@@ -3137,6 +3136,101 @@ fn generatedExpressionForExactRange(
             if (generatedExpressionForExactRange(fetch_expression, range)) |found| return found;
         }
     }
+    return null;
+}
+
+fn generatedExpressionListForOperatorStart(
+    list: generated_parser.GeneratedSqlListAst,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+    operator_token_index: usize,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    for (list.expressions) |*item| {
+        if (generatedExpressionForOperatorStart(item, expected_kind, operator_token_index)) |found| return found;
+    }
+    return null;
+}
+
+fn generatedExpressionForOperatorStart(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+    operator_token_index: usize,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    if (expression.kind == expected_kind) {
+        if (expression.operator_tokens) |operator_tokens| {
+            if (operator_tokens.start == operator_token_index) return expression;
+        }
+    }
+    if (expression.inner_expression) |inner| {
+        if (generatedExpressionForOperatorStart(inner, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.left_expression) |left| {
+        if (generatedExpressionForOperatorStart(left, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.right_expression) |right| {
+        if (generatedExpressionForOperatorStart(right, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.between_lower_expression) |lower| {
+        if (generatedExpressionForOperatorStart(lower, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.between_upper_expression) |upper| {
+        if (generatedExpressionForOperatorStart(upper, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.escape_expression) |escape| {
+        if (generatedExpressionForOperatorStart(escape, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.cast_expression) |cast| {
+        if (generatedExpressionForOperatorStart(cast, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.case_first_condition) |condition| {
+        if (generatedExpressionForOperatorStart(condition, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.case_first_result) |result| {
+        if (generatedExpressionForOperatorStart(result, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.case_else_expression) |case_else| {
+        if (generatedExpressionForOperatorStart(case_else, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.boolean_first_condition) |condition| {
+        if (generatedExpressionForOperatorStart(condition, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.boolean_last_condition) |condition| {
+        if (generatedExpressionForOperatorStart(condition, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.extract_source_expression) |source| {
+        if (generatedExpressionForOperatorStart(source, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.filter_expression) |filter| {
+        if (generatedExpressionForOperatorStart(filter, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.over_frame_start_expression) |frame_start| {
+        if (generatedExpressionForOperatorStart(frame_start, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.over_frame_end_expression) |frame_end| {
+        if (generatedExpressionForOperatorStart(frame_end, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.subquery_where_expression) |where_expression| {
+        if (generatedExpressionForOperatorStart(where_expression, expected_kind, operator_token_index)) |found| return found;
+    }
+    if (expression.subquery_tail) |tail| {
+        if (tail.limit_expression) |limit_expression| {
+            if (generatedExpressionForOperatorStart(limit_expression, expected_kind, operator_token_index)) |found| return found;
+        }
+        if (tail.offset_expression) |offset_expression| {
+            if (generatedExpressionForOperatorStart(offset_expression, expected_kind, operator_token_index)) |found| return found;
+        }
+        if (tail.fetch_count_expression) |fetch_expression| {
+            if (generatedExpressionForOperatorStart(fetch_expression, expected_kind, operator_token_index)) |found| return found;
+        }
+    }
+    if (generatedExpressionListForOperatorStart(expression.argument_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.argument_order_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.within_group_order_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.over_partition_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.over_order_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.array_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.case_condition_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.case_result_items, expected_kind, operator_token_index)) |found| return found;
+    if (generatedExpressionListForOperatorStart(expression.boolean_condition_items, expected_kind, operator_token_index)) |found| return found;
     return null;
 }
 
@@ -26179,8 +26273,8 @@ fn validateGeneratedQuantifiedPredicateExpression(
     operator_token_index: usize,
     quantifier_token_index: usize,
 ) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != .quantified_comparison) return error.UnsupportedSqlShape;
+    const root = generated_expression_ast orelse return;
+    const expression = generatedExpressionForOperatorStart(root, .quantified_comparison, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26208,8 +26302,8 @@ fn validateGeneratedPatternPredicateExpression(
     operator_token_index: usize,
     quantifier_token_index: ?usize,
 ) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const root = generated_expression_ast orelse return;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26276,9 +26370,9 @@ fn validateGeneratedIsTailPredicateExpression(
     operator_token_index: usize,
     is_tail: ExpressionIsTail,
 ) !void {
-    const expression = generated_expression_ast orelse return;
+    const root = generated_expression_ast orelse return;
     const expected_kind = generatedIsTailExpressionKind(is_tail);
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
     try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
@@ -26290,9 +26384,9 @@ fn validateGeneratedPostfixNullPredicateExpression(
     operator_token_index: usize,
     op: runtime_schema.RelationalCheckOp,
 ) !void {
-    const expression = generated_expression_ast orelse return;
+    const root = generated_expression_ast orelse return;
     const expected_kind = generatedComparisonExpressionKindForOp(op);
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26315,8 +26409,8 @@ fn validateGeneratedSingleOperatorPredicateExpression(
     tokens: []const Token,
     operator_token_index: usize,
 ) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const root = generated_expression_ast orelse return;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26345,8 +26439,8 @@ fn validateGeneratedSetOrBetweenPredicateExpression(
     negation_token_index: ?usize,
     between_modifier_token_index: ?usize,
 ) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const root = generated_expression_ast orelse return;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26416,9 +26510,9 @@ fn validateGeneratedRegexPredicateExpression(
     case_insensitive: bool,
     negated: bool,
 ) !void {
-    const expression = generated_expression_ast orelse return;
+    const root = generated_expression_ast orelse return;
     const expected_kind = generatedRegexPredicateKind(case_insensitive, negated);
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
+    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
         operator_tokens.start != operator_token_index or
@@ -26506,8 +26600,8 @@ fn validateGeneratedComparisonPredicateExpression(
     operator_token_index: usize,
     op: runtime_schema.RelationalCheckOp,
 ) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != .comparison) return error.UnsupportedSqlShape;
+    const root = generated_expression_ast orelse return;
+    const expression = generatedExpressionForOperatorStart(root, .comparison, operator_token_index) orelse return error.UnsupportedSqlShape;
     const expected_token_kind = try tokenKindForComparisonOp(op);
     const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
     if (operator_token_index >= tokens.len or
@@ -29323,14 +29417,14 @@ test "sql adapter lower expr validates retained generated read body payloads" {
     var paginated = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY");
     defer paginated.deinit(alloc);
     switch ((paginated.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
-        .read => |read| try validateGeneratedReadAstPayloads(paginated.items(), read),
+        .read => |read| try validateGeneratedReadAstPayloads(paginated.items(), read.*),
         else => return error.TestUnexpectedResult,
     }
 
     var cte_paginated = try tokenized.ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records ORDER BY id LIMIT 5 OFFSET 2 ROWS) SELECT id FROM source_rows");
     defer cte_paginated.deinit(alloc);
     switch ((cte_paginated.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
-        .read => |read| try validateGeneratedReadAstPayloads(cte_paginated.items(), read),
+        .read => |read| try validateGeneratedReadAstPayloads(cte_paginated.items(), read.*),
         else => return error.TestUnexpectedResult,
     }
 
@@ -29338,7 +29432,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
     defer malformed_body_window.deinit(alloc);
     if (malformed_body_window.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| {
+            .read => |read| {
                 if (read.cte_items.len == 0) return error.TestUnexpectedResult;
                 read.cte_items[0].body_window_count += 1;
                 try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedReadAstPayloads(malformed_body_window.items(), read.*));
@@ -29351,7 +29445,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
     defer malformed_body_row_lock.deinit(alloc);
     if (malformed_body_row_lock.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| {
+            .read => |read| {
                 if (read.cte_items.len == 0) return error.TestUnexpectedResult;
                 read.cte_items[0].body_row_lock_tokens = read.cte_items[0].body_source_tokens;
                 try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedReadAstPayloads(malformed_body_row_lock.items(), read.*));

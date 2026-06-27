@@ -4288,6 +4288,56 @@ pub fn validateTemporalPortionRequest(
     if (mutationTouchesField(req, period.start_column) or mutationTouchesField(req, period.end_column)) return error.InvalidQueryRequest;
 }
 
+fn queryIsRangeClippedWholeTableMutationSource(req: types.RelationalRowsQueryRequest) bool {
+    return req.source_cte.len == 0 and
+        req.predicates.len == 0 and
+        req.array_any.len == 0 and
+        req.array_contains.len == 0 and
+        req.array_eq.len == 0 and
+        req.in_predicates.len == 0 and
+        req.json_contains.len == 0 and
+        req.json_path_eq.len == 0 and
+        req.json_path_exists.len == 0 and
+        req.text_patterns.len == 0 and
+        req.or_predicates.len == 0 and
+        req.not_predicates.len == 0 and
+        req.access_or_predicates.len == 0 and
+        req.access_not_predicates.len == 0 and
+        req.expression_predicates.len == 0 and
+        req.expression_or_predicates.len == 0 and
+        req.expression_not_predicates.len == 0 and
+        req.expression_array_contains.len == 0 and
+        req.select.len == 0 and
+        req.json_extract.len == 0 and
+        req.array_length.len == 0 and
+        req.coalesce.len == 0 and
+        req.field_aliases.len == 0 and
+        req.expressions.len == 0 and
+        req.select_all and
+        !queryHasDistinctOn(req) and
+        req.order_by.len == 0 and
+        req.limit == null and
+        req.offset == 0 and
+        req.row_claim != null;
+}
+
+fn validateRestartIdentityMutationSourceRequest(req: types.RelationalRowsMutationSourceRequest) !void {
+    if (req.kind != .delete) return error.InvalidQueryRequest;
+    if (!queryIsRangeClippedWholeTableMutationSource(req.source)) return error.InvalidQueryRequest;
+    if (req.rewrite_identity or
+        req.operations.len != 0 or
+        req.patch_expressions.len != 0 or
+        req.increment_expressions.len != 0 or
+        req.json_set_expressions.len != 0 or
+        req.temporal_portion != null or
+        req.returning.len != 0 or
+        req.returning_expressions.len != 0 or
+        req.returning_all)
+    {
+        return error.InvalidQueryRequest;
+    }
+}
+
 pub fn validateMutationSourceRequest(
     alloc: Allocator,
     runtime_schema: schema_mod.TableSchema,
@@ -4300,7 +4350,7 @@ pub fn validateMutationSourceRequest(
     if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
     if (queryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
     try validateBaseQueryRequestAgainstSchema(runtime_schema, req.source);
-    if (req.restart_identity) return error.UnsupportedQueryRequest;
+    if (req.restart_identity) try validateRestartIdentityMutationSourceRequest(req);
     if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
     if (req.kind == .delete and (req.rewrite_identity or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
     try validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});
@@ -14521,6 +14571,73 @@ test "relational rows mutation source updates claimed base rows transactionally"
         },
         .operations = ranged_operations[0..],
     }, routed_range));
+}
+
+test "relational rows mutation source validates restart identity only for table-emptying deletes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    const txn_id: types.TxnId = .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    const claim = types.RowClaimRequest{
+        .mode = .for_update,
+        .owner_id = "session:truncate",
+        .txn_id = txn_id,
+    };
+    const ranged_source = types.RelationalRowsQueryRequest{
+        .row_claim = claim,
+        .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+    };
+
+    const accepted_claim = try validateMutationSourceRequest(alloc, runtime_schema, .{
+        .kind = .delete,
+        .restart_identity = true,
+        .source = ranged_source,
+    });
+    try std.testing.expectEqual(txn_id, accepted_claim.txn_id.?);
+
+    try std.testing.expectError(error.InvalidQueryRequest, validateMutationSourceRequest(alloc, runtime_schema, .{
+        .kind = .update,
+        .restart_identity = true,
+        .source = ranged_source,
+        .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"archived\"" }},
+    }));
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"ready\"",
+    }};
+    var filtered_source = ranged_source;
+    filtered_source.predicates = predicates[0..];
+    try std.testing.expectError(error.InvalidQueryRequest, validateMutationSourceRequest(alloc, runtime_schema, .{
+        .kind = .delete,
+        .restart_identity = true,
+        .source = filtered_source,
+    }));
+
+    const returning = [_][]const u8{"id"};
+    try std.testing.expectError(error.InvalidQueryRequest, validateMutationSourceRequest(alloc, runtime_schema, .{
+        .kind = .delete,
+        .restart_identity = true,
+        .source = ranged_source,
+        .returning = returning[0..],
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, validateMutationSourceRequest(alloc, runtime_schema, .{
+        .kind = .delete,
+        .restart_identity = true,
+        .source = ranged_source,
+        .temporal_portion = .{ .period = "valid_at", .from_json = "0", .to_json = "1" },
+    }));
 }
 
 test "relational rows mutation source plans across injected owner ranges" {

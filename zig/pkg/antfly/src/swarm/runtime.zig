@@ -251,6 +251,7 @@ const LocalSwarmMetadata = struct {
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
+                .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
@@ -415,6 +416,33 @@ const LocalSwarmMetadata = struct {
         try self.persistLocked();
     }
 
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn statusApplyTableCatalogUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingBarrierPromotionRequest) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.promoteTableEmptyingBarrier(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
     pub fn upsertRange(self: *LocalSwarmMetadata, record: antfly.metadata.RangeRecord) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -557,7 +585,7 @@ const LocalSwarmMetadata = struct {
 
         var changed = false;
         for (plan.table_upserts) |record| {
-            try self.manager.upsertTable(record);
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
             changed = true;
         }
         for (plan.range_upserts) |record| {
@@ -595,13 +623,15 @@ const LocalSwarmMetadata = struct {
             alloc.free(ranges);
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
-        self.epoch +|= 1;
-        try self.persistLocked();
+        {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        }
+
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(self, table, ranges);
     }
 
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
@@ -619,13 +649,15 @@ const LocalSwarmMetadata = struct {
             alloc.free(ranges);
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
-        self.epoch +|= 1;
-        try self.persistLocked();
+        {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        }
+
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(self, table, ranges);
     }
 
     fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
@@ -645,7 +677,7 @@ const LocalSwarmMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -658,7 +690,7 @@ const LocalSwarmMetadata = struct {
         var updated = table.*;
         updated.indexes_json = try antfly.public_api.indexes.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -672,7 +704,7 @@ const LocalSwarmMetadata = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -696,7 +728,7 @@ const LocalSwarmMetadata = struct {
         updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -711,7 +743,7 @@ const LocalSwarmMetadata = struct {
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -937,7 +969,7 @@ const LocalSwarmMetadata = struct {
             self.alloc.free(updated.read_schema_json);
             updated.read_schema_json = try self.alloc.dupe(u8, "");
 
-            try self.manager.upsertTable(updated);
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
             changed = true;
         }
 

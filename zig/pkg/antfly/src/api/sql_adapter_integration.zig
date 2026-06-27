@@ -286,7 +286,6 @@ fn expectAuthDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.Authori
 fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlSummaryPlan) !void {
     const expected = summary.ddl_tag orelse return;
     switch (payload) {
-        .adapter_noop => return error.TestUnexpectedResult,
         .session_catalog => |plan| switch (plan) {
             .set_search_path => try std.testing.expectEqual(AppParityDdlTag.set_search_path, expected),
             .set_setting => try std.testing.expectEqual(AppParityDdlTag.set_setting, expected),
@@ -388,6 +387,7 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
                 try expectOptionalTableName(summary.table_name, drop.sequence_name);
             },
         },
+        .trigger_catalog => return error.TestUnexpectedResult,
         .identity_allocator_catalog => |plan| {
             try std.testing.expectEqual(AppParityDdlTag.identity_allocator, expected);
             try expectOptionalTableName(summary.table_name, plan.table_name);

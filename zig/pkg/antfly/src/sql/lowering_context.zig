@@ -5842,7 +5842,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_extract_expression_parsed_sql.items(), &malformed_extract_expression_read_ast),
+        validateGeneratedReadAstForStatement(malformed_extract_expression_parsed_sql.items(), malformed_extract_expression_read_ast),
     );
 
     var malformed_array_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5873,7 +5873,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_array_expression_parsed_sql.items(), &malformed_array_expression_read_ast),
+        validateGeneratedReadAstForStatement(malformed_array_expression_parsed_sql.items(), malformed_array_expression_read_ast),
     );
 
     var malformed_logical_not_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5926,7 +5926,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_current_timestamp_precision_parsed_sql.items(), &malformed_current_timestamp_precision_read_ast),
+        validateGeneratedReadAstForStatement(malformed_current_timestamp_precision_parsed_sql.items(), malformed_current_timestamp_precision_read_ast),
     );
 
     var malformed_interval_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5955,7 +5955,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_interval_literal_parsed_sql.items(), &malformed_interval_literal_read_ast),
+        validateGeneratedReadAstForStatement(malformed_interval_literal_parsed_sql.items(), malformed_interval_literal_read_ast),
     );
 
     var malformed_timestamp_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -5985,7 +5985,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_timestamp_literal_parsed_sql.items(), &malformed_timestamp_literal_read_ast),
+        validateGeneratedReadAstForStatement(malformed_timestamp_literal_parsed_sql.items(), malformed_timestamp_literal_read_ast),
     );
 
     var malformed_join_tree_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6034,7 +6034,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     malformed_join_gap_read_ast.join_right_tokens = malformed_join_gap_read_ast.join_items[0].right_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_join_gap_parsed_sql.items(), &malformed_join_gap_read_ast),
+        validateGeneratedReadAstForStatement(malformed_join_gap_parsed_sql.items(), malformed_join_gap_read_ast),
     );
 
     var malformed_join_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6051,7 +6051,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     malformed_join_kind_read_ast.join_kind = .inner;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_join_kind_parsed_sql.items(), &malformed_join_kind_read_ast),
+        validateGeneratedReadAstForStatement(malformed_join_kind_parsed_sql.items(), malformed_join_kind_read_ast),
     );
 
     var malformed_join_tail_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6076,7 +6076,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     malformed_join_tail_read_ast.join_items[0].tokens.end = malformed_join_tail_end;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedJoinTreeMetadata(malformed_join_tail_parsed_sql.items(), &malformed_join_tail_read_ast),
+        validateGeneratedJoinTreeMetadata(malformed_join_tail_parsed_sql.items(), malformed_join_tail_read_ast),
     );
 
     var malformed_join_condition_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6301,7 +6301,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_inline_window_parsed_sql.items(), &malformed_inline_window_read_ast),
+        validateGeneratedReadAstForStatement(malformed_inline_window_parsed_sql.items(), malformed_inline_window_read_ast),
     );
 
     var malformed_inline_window_frame_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6357,7 +6357,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     cte_read_ast.cte_last_name_tokens = cte_read_ast.cte_items[0].name_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(cte_parsed_sql.items(), &cte_read_ast),
+        validateGeneratedReadAstForStatement(cte_parsed_sql.items(), cte_read_ast),
     );
 
     var multi_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6386,7 +6386,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     multi_cte_read_ast.cte_last_name_tokens = multi_cte_read_ast.cte_items[1].name_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(multi_cte_parsed_sql.items(), &multi_cte_read_ast),
+        validateGeneratedReadAstForStatement(multi_cte_parsed_sql.items(), multi_cte_read_ast),
     );
 
     var materialized_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
@@ -6415,7 +6415,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(materialized_cte_parsed_sql.items(), &materialized_cte_read_ast),
+        validateGeneratedReadAstForStatement(materialized_cte_parsed_sql.items(), materialized_cte_read_ast),
     );
 
     var malformed_cte_body_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(

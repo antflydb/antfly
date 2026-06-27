@@ -609,6 +609,9 @@ pub const StatusSource = struct {
         apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         compare_and_swap_table_schema: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) anyerror!void = null,
         upsert_table_emptying_job: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) anyerror!void = null,
+        upsert_table: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableRecord) anyerror!void = null,
+        apply_table_catalog_update_with_schema_rewrite_jobs: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) anyerror!void = null,
+        promote_table_emptying_barrier: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) anyerror!void = null,
         apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_tablespace_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.TablespaceCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
@@ -728,6 +731,30 @@ pub const StatusSource = struct {
     ) !void {
         const fn_ptr = self.vtable.upsert_table_emptying_job orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, record);
+    }
+
+    pub fn upsertTable(
+        self: StatusSource,
+        record: metadata_table_manager.TableRecord,
+    ) !void {
+        const fn_ptr = self.vtable.upsert_table orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, record);
+    }
+
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: StatusSource,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const fn_ptr = self.vtable.apply_table_catalog_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn promoteTableEmptyingBarrier(
+        self: StatusSource,
+        request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
+    ) !void {
+        const fn_ptr = self.vtable.promote_table_emptying_barrier orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
     }
 
     pub fn applyPreparedTransactionPlan(
@@ -964,6 +991,33 @@ pub const StatusSource = struct {
                 return error.UnsupportedOperation;
             }
 
+            fn upsertTable(ptr: *anyopaque, record: metadata_table_manager.TableRecord) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "upsertTable")) {
+                    return try svc.upsertTable(record);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+                ptr: *anyopaque,
+                request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+            ) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
+                    return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn promoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "promoteTableEmptyingBarrier")) {
+                    return try svc.promoteTableEmptyingBarrier(request);
+                }
+                return error.UnsupportedOperation;
+            }
+
             fn applyPreparedTransactionPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult {
                 const svc = cast(ptr);
                 if (comptime @hasDecl(T, "applyPreparedTransactionPlan")) {
@@ -1100,6 +1154,9 @@ pub const StatusSource = struct {
             .apply_relational_sql_ddl_plan_with_session = Gen.applyRelationalSqlDdlPlanWithSession,
             .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
             .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
+            .upsert_table = Gen.upsertTable,
+            .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
+            .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
             .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .apply_tablespace_catalog_plan = Gen.applyTablespaceCatalogPlan,
@@ -1259,8 +1316,23 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
-    try svc.upsertTable(updated);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated);
     try svc.runRound();
+}
+
+fn applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(
+    svc: anytype,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime @hasDecl(ServiceDeclType, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
+        return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = table });
+    }
+    return error.UnsupportedOperation;
 }
 
 fn createNamespaceOnService(svc: anytype, database_name: []const u8, namespace_name: []const u8) !void {
@@ -1781,8 +1853,16 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
 
         pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
-        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
-            const owned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+        pub fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            const owned = try metadata_table_manager.cloneTable(std.testing.allocator, request.table);
             metadata_table_manager.freeTable(std.testing.allocator, self.table);
             self.table = owned;
             self.upsert_count += 1;
@@ -2891,7 +2971,7 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
             .{ .group_id = 9902, .range_id = 9912, .table_id = 88, .start_key = "n", .end_key = null },
         },
         jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
-        upsert_table_count: usize = 0,
+        apply_table_update_count: usize = 0,
         run_round_count: usize = 0,
 
         fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -2903,6 +2983,110 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
 
         fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1];
+        }
+
+        pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            const records = try allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer allocator.free(records);
+            records[0] = try metadata_table_manager.cloneTable(allocator, self.table);
+            return records;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| metadata_table_manager.freeTable(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedRanges(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+            const records = try allocator.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
+            errdefer allocator.free(records);
+            for (self.ranges, 0..) |record, index| {
+                records[index] = try metadata_table_manager.cloneRange(allocator, record);
+            }
+            return records;
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+            for (records) |record| metadata_table_manager.freeRange(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+            const records = try allocator.alloc(metadata_table_manager.SchemaRewriteJobRecord, self.jobs.items.len);
+            errdefer allocator.free(records);
+            for (self.jobs.items, 0..) |record, index| {
+                records[index] = try metadata_table_manager.cloneSchemaRewriteJob(allocator, record);
+            }
+            return records;
+        }
+
+        pub fn freeProjectedSchemaRewriteJobs(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+            for (records) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try allocator.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator, records: []raft_reconciler.PlacementIntent) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedTableEmptyingJobs(_: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableEmptyingJobRecord {
+            return try allocator.alloc(metadata_table_manager.TableEmptyingJobRecord, 0);
+        }
+
+        pub fn freeProjectedTableEmptyingJobs(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?metadata_transition_state.SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?metadata_transition_state.MergeObservation {
+            return null;
+        }
+
+        pub fn applyReconciliationPlan(_: *@This(), _: *const metadata_reconciler.ReconciliationPlan) !void {}
+
+        pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}
+
+        fn catalogSource(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = catalogAdminSnapshot,
+                    .free_admin_snapshot = catalogFreeAdminSnapshot,
+                },
+            };
+        }
+
+        fn catalogAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.adminSnapshot();
+        }
+
+        fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.freeAdminSnapshot(snapshot);
         }
 
         pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -2919,24 +3103,35 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
 
         pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
-        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
-            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+        pub fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn upsertSchemaRewriteJob(_: *@This(), _: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, request.table);
             if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
             self.table = cloned;
             self.table_owned = true;
-            self.upsert_table_count += 1;
-        }
-
-        pub fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
-            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
-            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
-            for (self.jobs.items) |*existing| {
-                if (existing.job_id != record.job_id) continue;
-                metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing.*);
-                existing.* = owned;
-                return;
+            self.apply_table_update_count += 1;
+            for (request.schema_rewrite_jobs) |record| {
+                const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+                errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+                for (self.jobs.items) |*existing| {
+                    if (existing.job_id != record.job_id) continue;
+                    metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing.*);
+                    existing.* = owned;
+                    break;
+                } else {
+                    try self.jobs.append(std.testing.allocator, owned);
+                }
             }
-            try self.jobs.append(std.testing.allocator, owned);
         }
 
         pub fn runRound(self: *@This()) !void {
@@ -2947,28 +3142,26 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
     var service = FakeService{};
     defer service.deinit(alloc);
 
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByQualifiedName(
-        &snapshot,
-        catalog_resources.default_database_name,
-        catalog_resources.default_namespace_name,
-        "audit_log",
-    ) orelse return error.TestUnexpectedResult;
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(
+    var parsed = try sql_adapter.ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer parsed.deinit(alloc);
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
-        table,
-        "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;",
+        &parsed,
+        service.catalogSource(),
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer durable_plan.deinit(alloc);
+    var applied = try applyRelationalSqlDdlPlanOnServiceWithSession(
+        &service,
+        alloc,
+        &durable_plan,
         catalog_resources.SqlCatalogSession.default(),
     );
     defer applied.deinit(alloc);
-    try service.upsertTable(applied.table);
-    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
-    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
-    try service.runRound();
 
     try std.testing.expect(applied.rewrite_required);
-    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expectEqual(@as(usize, 1), service.apply_table_update_count);
     try std.testing.expectEqual(@as(usize, 1), service.run_round_count);
     try std.testing.expectEqual(@as(usize, 4), service.jobs.items.len);
 
@@ -3058,7 +3251,7 @@ fn createCatalogIndexOnService(svc: anytype, alloc: std.mem.Allocator, target: c
     var updated_record = table.*;
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated_record);
     try svc.runRound();
 }
 
@@ -3080,7 +3273,7 @@ fn dropCatalogIndexOnService(svc: anytype, alloc: std.mem.Allocator, target: cat
     defer alloc.free(indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
-    try svc.upsertTable(updated_record);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated_record);
     try svc.runRound();
 }
 
@@ -3094,7 +3287,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated_record);
     try svc.runRound();
 }
 
@@ -3109,7 +3302,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
-    try svc.upsertTable(updated_record);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated_record);
     try svc.runRound();
 }
 
@@ -4300,6 +4493,9 @@ pub const ApiHttpServer = struct {
                 .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                 .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
                 .upsert_table_emptying_job = apiHttpServerCatalogUpsertTableEmptyingJob,
+                .upsert_table = apiHttpServerCatalogUpsertTable,
+                .apply_table_catalog_update_with_schema_rewrite_jobs = apiHttpServerCatalogApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .promote_table_emptying_barrier = apiHttpServerCatalogPromoteTableEmptyingBarrier,
             },
         };
     }
@@ -4813,17 +5009,58 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
         timing: SqlStatementExecutionTiming,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
+        var applied = relational_sql_ddl.applyRoutineLogicalPlanWithSessionAlloc(self.alloc, self, plan, session.session()) catch |err| switch (err) {
+            error.TriggerNotFound => switch (plan.*) {
+                .trigger_catalog => |trigger_plan| switch (trigger_plan) {
+                    .drop => |drop| return try self.applyUpdatePolicyDropTriggerPlan(drop, session, context, timing),
+                    .create => return err,
+                },
+                else => return err,
+            },
+            else => return err,
+        };
+        errdefer applied.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+        return applied;
+    }
+
+    pub fn applyAuthorizationLogicalPlanWithSessionAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        plan: sql_adapter.AuthorizationLogicalPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (self.cfg.user_manager) |manager| {
+            var catalog = try auth_sql_adapter.authCatalogForPlanWithSessionAlloc(alloc, self.catalogSource(), plan, session);
+            defer catalog.deinit(alloc);
+            if (try auth_sql_adapter.executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog.value)) |applied_value| {
+                return applied_value;
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    pub fn applyRoutineLogicalPlanWithSessionAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.RoutineLogicalPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
         switch (plan.*) {
             .function_catalog => |*function_plan| {
-                try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
+                try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session);
                 try self.sql_routine_runtime.apply(function_plan.*);
+                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
             },
             .trigger_catalog => |trigger_plan| {
-                return try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(trigger_plan, session, context, timing);
+                try self.sql_routine_runtime.applyTriggerCatalogPlan(trigger_plan);
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+                errdefer applied.deinit(alloc);
+                applied.noop = true;
+                return applied;
             },
             .procedure_call => return error.UnsupportedSqlShape,
         }
-        return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
     }
 
     fn applyCursorLogicalPlanWithSession(
@@ -4848,20 +5085,18 @@ pub const ApiHttpServer = struct {
         try self.rejectUnsupportedDocumentSqlViewMappingForDurablePlan(durable_plan.*, session.session());
         switch (durable_plan.*) {
             .auth => |auth_plan| {
-                if (self.cfg.user_manager) |manager| {
-                    var catalog = try auth_sql_adapter.authCatalogForPlanWithSessionAlloc(self.alloc, self.catalogSource(), auth_plan, session.session());
-                    defer catalog.deinit(self.alloc);
-                    if (try auth_sql_adapter.executeRelationalSqlDurablePlanOnUserManagerWithCatalog(manager, self.alloc, durable_plan, catalog.value)) |applied_value| {
-                        var applied = applied_value;
-                        errdefer applied.deinit(self.alloc);
-                        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-                        return applied;
-                    }
-                }
-                return error.UnsupportedSqlShape;
+                var applied = try relational_sql_ddl.applyAuthorizationLogicalPlanWithSessionAlloc(self.alloc, self, auth_plan, session.session());
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
             },
             .routine => |*routine| return try self.applyDurableRoutineSqlPlanWithSession(routine, session, context, timing),
-            .maintenance => return error.UnsupportedSqlShape,
+            .maintenance => {
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, durable_plan, session.session(), context.function_bindings);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
+            },
             .bulk_io => return error.UnsupportedSqlShape,
             .extension => {
                 var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, durable_plan, session.session(), context.function_bindings);
@@ -5840,14 +6075,16 @@ pub const ApiHttpServer = struct {
         }
 
         var scheduled_jobs: usize = 0;
+        const barrier_id = try catalog_jobs.tableEmptyingBarrierIdForSnapshot(&snapshot, affected_table_ids.items, lowered.restart_identity, lowered.truncate_cascade);
         for (affected_tables.items) |table| {
-            scheduled_jobs += try catalog_jobs.scheduleTableEmptyingJobsForTableSnapshot(
+            scheduled_jobs += try catalog_jobs.scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
                 catalog,
                 snapshot.ranges,
                 table.*,
                 affected_table_ids.items,
                 lowered.restart_identity,
                 lowered.truncate_cascade,
+                barrier_id,
             );
         }
         if (scheduled_jobs == 0) return error.UnsupportedOperation;
@@ -14546,6 +14783,24 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogUpsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.source.upsertTableEmptyingJob(record);
+    }
+
+    fn apiHttpServerCatalogUpsertTable(ptr: *anyopaque, record: metadata_table_manager.TableRecord) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.upsertTable(record);
+    }
+
+    fn apiHttpServerCatalogApplyTableCatalogUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn apiHttpServerCatalogPromoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.promoteTableEmptyingBarrier(request);
     }
 
     fn waitForTableMetadata(

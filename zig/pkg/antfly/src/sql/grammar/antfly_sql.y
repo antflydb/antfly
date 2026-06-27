@@ -341,8 +341,8 @@ create_table_as_data_opt:
   ;
 
 create_index_statement:
-    CREATE create_index_unique_opt INDEX if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list RPAREN index_include_opt index_options_opt index_where_opt
-  | CREATE create_index_unique_opt INDEX CONCURRENTLY if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list RPAREN index_include_opt index_options_opt index_where_opt
+    CREATE create_index_unique_opt INDEX if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_include_opt index_options_opt index_where_opt
+  | CREATE create_index_unique_opt INDEX CONCURRENTLY if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_include_opt index_options_opt index_where_opt
   ;
 
 create_index_unique_opt:
@@ -1139,6 +1139,11 @@ merge_condition_opt:
 index_method_opt:
     /* empty */
   | USING identifier_name
+  ;
+
+index_element_list_opt:
+    /* empty */
+  | index_element_list
   ;
 
 index_element_list:

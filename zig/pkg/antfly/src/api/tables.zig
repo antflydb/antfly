@@ -1609,17 +1609,19 @@ pub fn applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindings
     session: catalog_resources.SqlCatalogSession,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !AppliedRelationalSqlDdlRecord {
-    var catalog_source = try SingleTableCatalogSource.initAlloc(alloc, table);
-    defer catalog_source.deinit(alloc);
-    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
-        alloc,
-        parsed_sql,
-        catalog_source.iface(),
-        session,
-        function_bindings,
-    );
+    var durable_plan = try durableRelationalSqlDdlPlanFromParsedSqlAlloc(alloc, parsed_sql, function_bindings);
     defer durable_plan.deinit(alloc);
     return try applyRelationalSqlDdlDurablePlanToTableRecordWithSessionAlloc(alloc, table, &durable_plan, session);
+}
+
+fn durableRelationalSqlDdlPlanFromParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    function_bindings: sql_adapter.SqlFunctionBindings,
+) !sql_adapter.DurableSqlPlan {
+    var logical_plan = try sql_adapter.logical_ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    errdefer logical_plan.deinit(alloc);
+    return try sql_adapter.takeDurableSqlPlanFromLogical(&logical_plan);
 }
 
 pub fn applyRelationalSqlDdlDurablePlanToTableRecordWithSessionAlloc(
@@ -1709,8 +1711,26 @@ pub fn applyUntargetedRelationalDerivedIndexTablePlanOnServiceWithSessionAlloc(
         session,
     );
     errdefer applied.deinit(alloc);
-    try svc.upsertTable(applied.table);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, applied.table);
     return applied;
+}
+
+fn applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(
+    svc: anytype,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime @hasDecl(ServiceDeclType, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
+        return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(.{
+            .table = table,
+            .schema_rewrite_jobs = &.{},
+        });
+    }
+    return error.UnsupportedOperation;
 }
 
 fn graphMetricGraphIndexNameFromConfigAlloc(
@@ -1770,12 +1790,14 @@ pub fn applyRelationalDerivedIndexTablePlanOnServiceAlloc(
     var updated_record = table.*;
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, create_index.index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
 
-    return .{
+    var applied = AppliedRelationalSqlDdlRecord{
         .table = try metadata_table_manager.cloneTable(alloc, updated_record),
         .requires_rebuild = true,
     };
+    errdefer applied.deinit(alloc);
+    try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, applied.table);
+    return applied;
 }
 
 fn tableIndexesJsonContainsIndex(
@@ -2002,13 +2024,7 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 ) !RelationalSqlDdlTarget {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
-        alloc,
-        &parsed_sql,
-        table_catalog.emptyCatalogSource(),
-        session,
-        function_bindings,
-    );
+    var durable_plan = try durableRelationalSqlDdlPlanFromParsedSqlAlloc(alloc, &parsed_sql, function_bindings);
     defer durable_plan.deinit(alloc);
     return switch (durable_plan) {
         .table_ddl => |table_plan| try relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, table_plan, session),
@@ -2211,7 +2227,7 @@ fn validateRelationalStorageModeUpdateAlloc(
     const next_runtime = try schema_mod.deriveRuntimeTableSchema(alloc, next_parsed);
     defer runtime_schema_mod.freeSchema(alloc, next_runtime);
 
-    if (!runtime_schema_mod.relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
+    if (!relationalColumnCatalogsEqualForSchemaUpdate(current_runtime.relational_columns, next_runtime.relational_columns)) {
         return error.InvalidSchemaUpdateRequest;
     }
     if (!runtime_schema_mod.relationalCheckCatalogsEqual(current_runtime.checks, next_runtime.checks)) {
@@ -2245,6 +2261,31 @@ fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.Table
             if (!foreignKeysSameDefinition(current_foreign_key, foreign_key)) return error.InvalidSchemaUpdateRequest;
         }
     }
+}
+
+fn relationalColumnCatalogsEqualForSchemaUpdate(
+    current: []const runtime_schema_mod.RelationalColumn,
+    next: []const runtime_schema_mod.RelationalColumn,
+) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name)) return false;
+        if (!std.mem.eql(u8, left.path, right.path)) return false;
+        if (runtime_schema_mod.relationalColumnDefinitionsEqual(left, right)) continue;
+        if (!relationalColumnDefinitionsEqualIgnoringSecondaryIndexLifecycle(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalColumnDefinitionsEqualIgnoringSecondaryIndexLifecycle(
+    current: runtime_schema_mod.RelationalColumn,
+    next: runtime_schema_mod.RelationalColumn,
+) bool {
+    if (!current.indexed or !next.indexed) return false;
+    var normalized_next = next;
+    normalized_next.index_lifecycle = current.index_lifecycle;
+    normalized_next.index_generation = current.index_generation;
+    return runtime_schema_mod.relationalColumnDefinitionsEqual(current, normalized_next);
 }
 
 fn primaryKeysEqual(a: ?runtime_schema_mod.PrimaryKey, b: ?runtime_schema_mod.PrimaryKey) bool {
@@ -2472,6 +2513,62 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     return updated;
 }
 
+pub fn schemaWithSecondaryIndexBuildingAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+    new_generation: u64,
+) ![]u8 {
+    if (new_generation == 0) return error.InvalidSchemaUpdateRequest;
+    const generation_integer = std.math.cast(i64, new_generation) orelse return error.InvalidSchemaUpdateRequest;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+    const json_alloc = parsed.arena.allocator();
+
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const default_type_value = root.get("default_type") orelse return error.InvalidSchemaUpdateRequest;
+    if (default_type_value != .string) return error.InvalidSchemaUpdateRequest;
+    const document_schemas = root.getPtr("document_schemas") orelse return error.InvalidSchemaUpdateRequest;
+    if (document_schemas.* != .object) return error.InvalidSchemaUpdateRequest;
+    const document_schema = document_schemas.object.getPtr(default_type_value.string) orelse return error.InvalidSchemaUpdateRequest;
+    if (document_schema.* != .object) return error.InvalidSchemaUpdateRequest;
+    const schema = document_schema.object.getPtr("schema") orelse return error.InvalidSchemaUpdateRequest;
+    if (schema.* != .object) return error.InvalidSchemaUpdateRequest;
+    const properties = schema.object.getPtr("properties") orelse return error.InvalidSchemaUpdateRequest;
+    if (properties.* != .object) return error.InvalidSchemaUpdateRequest;
+    const property = schemaPropertyForSecondaryIndex(properties, index_name) orelse return error.SecondaryIndexNotFound;
+    if (property.* != .object) return error.InvalidSchemaUpdateRequest;
+
+    if (property.object.getPtr("x-antfly-index-lifecycle")) |value| {
+        value.* = .{ .string = "building" };
+    } else {
+        const key = try json_alloc.dupe(u8, "x-antfly-index-lifecycle");
+        try property.object.put(json_alloc, key, .{ .string = "building" });
+    }
+    if (property.object.getPtr("x-antfly-index-generation")) |value| {
+        value.* = .{ .integer = generation_integer };
+    } else {
+        const key = try json_alloc.dupe(u8, "x-antfly-index-generation");
+        try property.object.put(json_alloc, key, .{ .integer = generation_integer });
+    }
+
+    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(updated);
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
+    defer validated.deinit(alloc);
+    const runtime = try schema_mod.deriveRuntimeTableSchema(alloc, validated);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+
+    const column = secondaryIndexColumnByIdentity(runtime.relational_columns, index_name) orelse return error.SecondaryIndexNotFound;
+    if (!column.indexed or column.index_lifecycle != .building or column.index_generation != new_generation) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    return updated;
+}
+
 fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []const u8) ?*std.json.Value {
     if (properties.* != .object) return null;
     var it = properties.object.iterator();
@@ -2481,6 +2578,14 @@ fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []co
         if (declared == .string and std.mem.eql(u8, declared.string, index_name)) return entry.value_ptr;
     }
     return properties.object.getPtr(index_name);
+}
+
+fn secondaryIndexColumnByIdentity(columns: []const runtime_schema_mod.RelationalColumn, index_name: []const u8) ?runtime_schema_mod.RelationalColumn {
+    for (columns) |column| {
+        const identity = column.index_name orelse column.name;
+        if (std.mem.eql(u8, identity, index_name)) return column;
+    }
+    return null;
 }
 
 fn relationalRowsExpressionConditionSlicesEqual(
@@ -4264,7 +4369,7 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
                 if (!std.mem.eql(u8, table.namespace_name, existing_target.namespace_name)) continue;
                 var renamed_table = table;
                 renamed_table.namespace_name = new_target.namespace_name;
-                try svc.upsertTable(renamed_table);
+                try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, renamed_table);
             }
             try svc.removeNamespace(existing.namespace_id);
             applied.renamed_namespace = true;
@@ -4374,7 +4479,7 @@ fn rewriteTablespaceReferencesOnService(
         if (!std.mem.eql(u8, table.tablespace_name, old_tablespace_name)) continue;
         var updated = table;
         updated.tablespace_name = new_tablespace_name;
-        try svc.upsertTable(updated);
+        try applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(svc, updated);
     }
 }
 
@@ -5342,6 +5447,7 @@ test "table catalog identity scopes lookup and derived ids" {
 test "table catalog identity applies SQL database and namespace catalog lifecycle" {
     const CatalogService = struct {
         manager: metadata_table_manager.TableManager,
+        apply_table_update_count: usize = 0,
 
         fn init(alloc: std.mem.Allocator) @This() {
             return .{ .manager = metadata_table_manager.TableManager.init(alloc) };
@@ -5390,8 +5496,17 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
             _ = try self.manager.removeNamespace(namespace_id);
         }
 
-        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
-            try self.manager.upsertTable(record);
+        pub fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            self.apply_table_update_count += 1;
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
         }
 
         pub fn upsertTablespace(self: *@This(), record: metadata_table_manager.TablespaceRecord) !void {
@@ -5462,6 +5577,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var renamed_tablespace = try service.apply(std.testing.allocator, "ALTER TABLESPACE fastspace RENAME TO archive_space;");
     defer renamed_tablespace.deinit(std.testing.allocator);
     try std.testing.expect(renamed_tablespace.renamed_tablespace);
+    try std.testing.expectEqual(@as(usize, 1), service.apply_table_update_count);
     {
         const table = service.manager.tables.get(deriveQualifiedTableId(default_database_name, default_namespace_name, "fast_docs")).?;
         try std.testing.expectEqualStrings("archive_space", table.tablespace_name);
@@ -5508,6 +5624,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var renamed_namespace = try service.apply(std.testing.allocator, "ALTER SCHEMA analytics RENAME TO reporting;");
     defer renamed_namespace.deinit(std.testing.allocator);
     try std.testing.expect(renamed_namespace.renamed_namespace);
+    try std.testing.expectEqual(@as(usize, 2), service.apply_table_update_count);
     const table = service.manager.tables.get(deriveQualifiedTableId(default_database_name, "analytics", "events")).?;
     try std.testing.expectEqualStrings("reporting", table.namespace_name);
 
@@ -6432,6 +6549,48 @@ test "metadata.schema update promotes secondary index only for matching building
     try std.testing.expectError(
         error.SecondaryIndexNotBuilding,
         schemaWithSecondaryIndexReadyAlloc(alloc, updated, "amount", 9),
+    );
+}
+
+test "metadata.schema update marks secondary index building and permits lifecycle transition" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","x-antfly-index-name":"usage_status_idx"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const building = try schemaWithSecondaryIndexBuildingAlloc(alloc, schema_json, "usage_status_idx", 10);
+    defer alloc.free(building);
+    var parsed = try parseValidatedTableSchema(alloc, building);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    const status_column = secondaryIndexColumnByIdentity(runtime.relational_columns, "usage_status_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.building, status_column.index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 10), status_column.index_generation);
+
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 9,
+        .name = "usage_records",
+        .schema_json = schema_json,
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+    const updated_table = try applySchemaUpdateRecord(alloc, &table, building);
+    defer metadata_table_manager.freeTable(alloc, updated_table);
+
+    const ready = try schemaWithSecondaryIndexReadyAlloc(alloc, updated_table.schema_json, "usage_status_idx", 10);
+    defer alloc.free(ready);
+    const ready_table = try applySchemaUpdateRecord(alloc, &updated_table, ready);
+    defer metadata_table_manager.freeTable(alloc, ready_table);
+
+    try std.testing.expectError(
+        error.SecondaryIndexNotFound,
+        schemaWithSecondaryIndexBuildingAlloc(alloc, schema_json, "missing_idx", 10),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        schemaWithSecondaryIndexBuildingAlloc(alloc, schema_json, "usage_status_idx", 0),
     );
 }
 

@@ -285,7 +285,7 @@ test "durable sql planner returns typed routine catalog plan from parsed sql" {
     switch (durable) {
         .routine => |routine_plan| switch (routine_plan) {
             .function_catalog => |function_catalog| switch (function_catalog) {
-                .create => |create| try std.testing.expectEqualStrings("normalize_status", create.function_name),
+                .create => |create| try std.testing.expectEqualStrings("normalize_status", create.routine_name),
                 else => return error.TestUnexpectedResult,
             },
             else => return error.TestUnexpectedResult,
@@ -331,7 +331,7 @@ test "durable sql planner returns typed maintenance plan from parsed sql" {
         .maintenance => |maintenance_plan| switch (maintenance_plan) {
             .vacuum => |vacuum| {
                 try std.testing.expect(vacuum.verbose);
-                try std.testing.expectEqualStrings("usage_records", vacuum.table_name.?);
+                try std.testing.expectEqualStrings("usage_records", vacuum.table_name);
             },
             else => return error.TestUnexpectedResult,
         },
