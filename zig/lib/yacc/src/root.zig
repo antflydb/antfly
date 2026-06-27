@@ -1449,7 +1449,25 @@ fn emitZigMetadata(
         \\    rhs_len: u16,
         \\};
         \\
+        \\pub const Shift = struct {
+        \\    token_index: usize,
+        \\    terminal: u16,
+        \\};
+        \\
         \\pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void {
+        \\    const Adapter = struct {
+        \\        inner: @TypeOf(reducer),
+        \\
+        \\        pub fn shift(_: @This(), _: Shift) !void {}
+        \\
+        \\        pub fn reduce(self: @This(), reduction: Reduction) !void {
+        \\            try self.inner.reduce(reduction);
+        \\        }
+        \\    };
+        \\    return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });
+        \\}
+        \\
+        \\pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void {
         \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
         \\    var stack_len: usize = 1;
         \\    stack_buffer[0] = 0;
@@ -1462,6 +1480,7 @@ fn emitZigMetadata(
         \\        switch (action.kind) {
         \\            .shift => {
         \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+        \\                try event_handler.shift(.{ .token_index = index, .terminal = lookahead });
         \\                stack_buffer[stack_len] = action.target;
         \\                stack_len += 1;
         \\                index += 1;
@@ -1469,7 +1488,7 @@ fn emitZigMetadata(
         \\            .reduce => {
         \\                const production = productions[action.target];
         \\                if (production.rhs_len > stack_len - 1) return ParseError.StackUnderflow;
-        \\                try reducer.reduce(.{
+        \\                try event_handler.reduce(.{
         \\                    .production = action.target,
         \\                    .lhs = production.lhs,
         \\                    .rhs_len = production.rhs_len,
@@ -2382,8 +2401,12 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Reduction = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Shift = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "try reducer.reduce(.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.shift(.{ .token_index = index, .terminal = lookahead });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.reduce(.{") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseError") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "ParseError!void") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseDiagnostic = struct") != null);
