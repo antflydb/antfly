@@ -395,8 +395,9 @@ fail closed through the generated parser instead of falling back to the legacy
 write classifier. Generated-covered DML now also derives the parsed write
 family from the retained generated DML AST instead of re-entering the
 hand-written write classifier. The generated AST distinguishes direct
-`INSERT ... VALUES`, `INSERT ... SELECT`, joined `UPDATE ... FROM`, joined
-`DELETE ... USING`, `TRUNCATE`, and `MERGE` write families; point-vs-source
+`INSERT ... VALUES`, `INSERT ... SELECT`, joined `UPDATE ... FROM`/semijoin
+updates, source-tail updates, joined `DELETE ... USING`/semijoin deletes,
+source-tail deletes, `TRUNCATE`, and `MERGE` write families; point-vs-source
 update/delete selector decisions remain in typed lowering where schema and
 unique-selector metadata are available. Deeper DML cutover still requires
 replacing token-based recursive DML command-body lowering with complete
@@ -915,6 +916,7 @@ Unsupported DDL remains on the existing parser until
    Generated DML AST kind also owns parsed-statement write-family
    classification for generated-covered writes without re-entering the
    hand-written write classifier, preserves recursive CTE write
+   metadata plus generated mutation source-tail and semijoin-source
    metadata at the parsed boundary, validates top-level command source spans
    for plain and `WITH`-prefixed writes, checks retained CTE prefix
    count/first/last/body-read compatibility plus CTE item layout and comma

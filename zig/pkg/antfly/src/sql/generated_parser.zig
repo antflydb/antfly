@@ -1785,6 +1785,8 @@ pub const GeneratedSqlDmlAst = struct {
     returning_tokens: ?GeneratedSqlTokenRange = null,
     additional_target_tokens: ?GeneratedSqlTokenRange = null,
     cte_recursive: bool = false,
+    mutation_source_tail: bool = false,
+    mutation_join_source: bool = false,
     default_values: bool = false,
     restart_identity: bool = false,
     cascade: bool = false,
@@ -6357,14 +6359,19 @@ fn buildUpdateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
     const returning_index = findTopLevelKeyword(tokens, set_index + 1, end, .returning);
     const assignments_end = minOptionalIndex(from_index, minOptionalIndex(where_index, returning_index) orelse end) orelse end;
     if (set_index + 1 < assignments_end) ast.assignments_tokens = .{ .start = set_index + 1, .end = assignments_end };
+    ast.mutation_source_tail = statementHasForPortionBeforeKeyword(tokens, search_start, set_index) or statementHasMutationSourceTail(tokens, set_index + 1, end);
     if (from_index) |idx| {
         const source_end = minOptionalIndex(where_index, returning_index) orelse end;
-        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+        if (idx + 1 < source_end) {
+            ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+            ast.mutation_join_source = true;
+        }
     }
     if (where_index) |idx| {
         const where_end = returning_index orelse end;
         if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
+    if (statementHasWhereSemijoinSubquery(tokens, set_index + 1, end)) ast.mutation_join_source = true;
     if (returning_index) |idx| {
         if (idx + 1 < end) ast.returning_tokens = .{ .start = idx + 1, .end = end };
     }
@@ -6379,14 +6386,21 @@ fn buildDeleteDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
     const using_index = findTopLevelKeyword(tokens, scan_start, end, .using);
     const where_index = findTopLevelKeyword(tokens, scan_start, end, .where);
     const returning_index = findTopLevelKeyword(tokens, scan_start, end, .returning);
+    ast.mutation_source_tail =
+        statementHasForPortionBeforeKeyword(tokens, scan_start, minOptionalIndex(where_index, returning_index) orelse end) or
+        statementHasMutationSourceTail(tokens, scan_start, end);
     if (using_index) |idx| {
         const source_end = minOptionalIndex(where_index, returning_index) orelse end;
-        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+        if (idx + 1 < source_end) {
+            ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+            ast.mutation_join_source = true;
+        }
     }
     if (where_index) |idx| {
         const where_end = returning_index orelse end;
         if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
+    if (statementHasWhereSemijoinSubquery(tokens, scan_start, end)) ast.mutation_join_source = true;
     if (returning_index) |idx| {
         if (idx + 1 < end) ast.returning_tokens = .{ .start = idx + 1, .end = end };
     }
@@ -6443,6 +6457,76 @@ fn firstTopLevelSetOperation(tokens: []const token_mod.Token, start: usize, end:
         }
     }
     return best;
+}
+
+fn firstTopLevelKeywordIndex(tokens: []const token_mod.Token, start: usize, end: usize, keywords: []const token_mod.TokenKeyword) ?usize {
+    var best: ?usize = null;
+    for (keywords) |keyword| {
+        if (findTopLevelKeyword(tokens, start, end, keyword)) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
+}
+
+fn statementHasForPortionBeforeKeyword(tokens: []const token_mod.Token, start: usize, stop: usize) bool {
+    var index = start;
+    while (index + 1 < stop) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.@"for") and tokens[index + 1].matchesKeywordTag(.portion)) return true;
+    }
+    return false;
+}
+
+fn statementHasMutationSourceTail(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    if (firstTopLevelKeywordIndex(tokens, start, end, &.{ .order, .limit, .offset, .fetch }) != null) return true;
+    var index = start;
+    while (index + 1 < end) : (index += 1) {
+        if (!tokens[index].matchesKeywordTag(.@"for")) continue;
+        if (tokens[index + 1].matchesKeywordTag(.update) or
+            tokens[index + 1].matchesKeywordTag(.no) or
+            tokens[index + 1].matchesKeywordTag(.share) or
+            tokens[index + 1].matchesKeywordTag(.key))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn statementHasWhereSemijoinSubquery(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    const where_index = findTopLevelKeyword(tokens, start, end, .where) orelse return false;
+    const stop = firstTopLevelKeywordIndex(tokens, where_index + 1, end, &.{ .order, .limit, .offset, .fetch, .@"for", .returning }) orelse end;
+    return tokenRangeHasTopLevelSemijoinSubquery(tokens, where_index + 1, stop);
+}
+
+fn tokenRangeHasTopLevelSemijoinSubquery(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0) {
+                if ((tokens[index].matchesKeywordTag(.in) or tokens[index].matchesKeywordTag(.exists)) and
+                    nextParenContainsSelect(tokens, index + 1, end))
+                {
+                    return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn nextParenContainsSelect(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    var index = start;
+    while (index < end and tokens[index].kind == .comma) : (index += 1) {}
+    if (index >= end or tokens[index].kind != .lparen) return false;
+    if (index + 1 >= end or !tokens[index + 1].matchesKeywordTag(.select)) return false;
+    return findMatchingParen(tokens, index, end) != null;
 }
 
 fn consumeGeneratedIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {

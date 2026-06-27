@@ -2171,11 +2171,23 @@ fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classi
     return switch (dml_ast.kind) {
         .insert_values => .insert,
         .insert_select => .insert_source,
-        .update => if (dml_ast.source_tokens != null) .update_joined_source else .update,
-        .delete => if (dml_ast.source_tokens != null) .delete_joined_source else .delete,
+        .update => generatedUpdateDmlAstWriteKind(dml_ast),
+        .delete => generatedDeleteDmlAstWriteKind(dml_ast),
         .truncate => .truncate,
         .merge => .merge,
     };
+}
+
+fn generatedUpdateDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+    if (dml_ast.mutation_join_source) return .update_joined_source;
+    if (dml_ast.mutation_source_tail) return .update_source;
+    return .update;
+}
+
+fn generatedDeleteDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+    if (dml_ast.mutation_join_source) return .delete_joined_source;
+    if (dml_ast.mutation_source_tail) return .delete_source;
+    return .delete;
 }
 
 fn generatedDmlAstHasValidClassificationPayload(
@@ -2198,6 +2210,7 @@ fn generatedDmlAstHasValidClassificationPayload(
 
     if (!generatedDmlSourcePayloadIsValid(tokens, end, dml_ast.source_tokens, dml_ast.source_read, dml_ast.kind)) return false;
     if (!generatedDmlTopLevelLayoutIsValid(tokens, end, command_start, dml_ast)) return false;
+    if (!generatedDmlMutationSourceFlagsAreValid(dml_ast)) return false;
 
     const target = dml_ast.target_table_tokens orelse return false;
     if (target.start <= command_start) return false;
@@ -2208,6 +2221,16 @@ fn generatedDmlAstHasValidClassificationPayload(
         .update => dml_ast.assignments_tokens != null,
         .delete, .truncate => true,
         .merge => dml_ast.source_tokens != null and dml_ast.source_read != null and dml_ast.where_tokens != null,
+    };
+}
+
+fn generatedDmlMutationSourceFlagsAreValid(dml_ast: generated_parser.GeneratedSqlDmlAst) bool {
+    return switch (dml_ast.kind) {
+        .update, .delete => blk: {
+            if (dml_ast.mutation_join_source and dml_ast.source_tokens == null and dml_ast.where_tokens == null) return false;
+            break :blk true;
+        },
+        .insert_values, .insert_select, .truncate, .merge => !dml_ast.mutation_source_tail and !dml_ast.mutation_join_source,
     };
 }
 
@@ -7045,7 +7068,11 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
         .{ .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')", .generated = .insert_values, .write = .insert },
         .{ .sql = "INSERT INTO usage_records (id) SELECT id FROM incoming_usage", .generated = .insert_select, .write = .insert_source },
         .{ .sql = "UPDATE usage_records SET status = 'done' WHERE id = 'u1'", .generated = .update, .write = .update },
+        .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id", .generated = .update, .write = .update_joined_source },
+        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING sku", .generated = .update, .write = .update_source },
         .{ .sql = "DELETE FROM usage_records WHERE id = 'u1'", .generated = .delete, .write = .delete },
+        .{ .sql = "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)", .generated = .delete, .write = .delete_joined_source },
+        .{ .sql = "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING sku", .generated = .delete, .write = .delete_source },
         .{ .sql = "TRUNCATE usage_records", .generated = .truncate, .write = .truncate },
         .{ .sql = "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .generated = .merge, .write = .merge },
     };
@@ -7119,6 +7146,16 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
     malformed_generated.ast = null;
     generated_insert.tokenized_sql.write_statement_kind = .insert;
     generated_insert.statement = parseStatement(generated_insert.raw_statement, malformed_generated, &generated_insert.tokenized_sql);
+    try std.testing.expect(generated_insert.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
+
+    var malformed_mutation_source_flag = generated_insert.generated_statement.?;
+    switch (malformed_mutation_source_flag.ast.?) {
+        .dml => |*dml_ast| dml_ast.mutation_source_tail = true,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert.tokenized_sql.write_statement_kind = .insert;
+    generated_insert.statement = parseStatement(generated_insert.raw_statement, malformed_mutation_source_flag, &generated_insert.tokenized_sql);
     try std.testing.expect(generated_insert.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
 
