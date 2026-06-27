@@ -3061,6 +3061,7 @@ pub fn build(b: *std.Build) void {
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db split destination read-only open does not create missing root",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db merge coordinator opt-in applies configured receiver identity namespace",

@@ -118,12 +118,20 @@ pub const Destination = struct {
     db: db_mod.DB,
 
     pub fn init(alloc: std.mem.Allocator, cfg: DestinationConfig) !Destination {
+        return try initWithCreateRoot(alloc, cfg, true);
+    }
+
+    fn initWithCreateRoot(alloc: std.mem.Allocator, cfg: DestinationConfig, create_root: bool) !Destination {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
         errdefer alloc.free(root_dir);
-        try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        if (create_root) {
+            try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        } else {
+            try std.Io.Dir.cwd().access(io_impl.io(), root_dir, .{});
+        }
 
         return .{
             .alloc = alloc,
@@ -155,10 +163,14 @@ pub const Destination = struct {
         read_only_options.open_mode = mode;
         read_only_options.start_index_workers = false;
         read_only_options.start_optional_runtimes = false;
-        return try init(alloc, .{
-            .root_dir = root_dir_raw,
-            .db = read_only_options,
-        });
+        return try initWithCreateRoot(
+            alloc,
+            .{
+                .root_dir = root_dir_raw,
+                .db = read_only_options,
+            },
+            false,
+        );
     }
 
     pub fn deinit(self: *Destination) void {
@@ -372,12 +384,14 @@ pub const SyncCoordinator = struct {
 
     pub fn init(alloc: std.mem.Allocator, cfg: SyncConfig) !SyncCoordinator {
         const source_root_dir = try alloc.dupe(u8, cfg.source_root_dir);
-        errdefer alloc.free(source_root_dir);
+        var source_root_dir_owned = true;
+        errdefer if (source_root_dir_owned) alloc.free(source_root_dir);
         const dest_root_dir = try alloc.dupe(u8, cfg.dest_root_dir);
         errdefer alloc.free(dest_root_dir);
 
         var source_cfg = cfg.source;
         source_cfg.root_dir = source_root_dir;
+        source_root_dir_owned = false;
         errdefer freeConfig(alloc, source_cfg);
 
         var dest_cfg = cfg.dest;
@@ -596,12 +610,14 @@ pub const MergeCoordinator = struct {
 
     pub fn init(alloc: std.mem.Allocator, cfg: MergeConfig) !MergeCoordinator {
         const donor_root_dir = try alloc.dupe(u8, cfg.donor_root_dir);
-        errdefer alloc.free(donor_root_dir);
+        var donor_root_dir_owned = true;
+        errdefer if (donor_root_dir_owned) alloc.free(donor_root_dir);
         const receiver_root_dir = try alloc.dupe(u8, cfg.receiver_root_dir);
         errdefer alloc.free(receiver_root_dir);
 
         var donor_cfg = cfg.donor;
         donor_cfg.root_dir = donor_root_dir;
+        donor_root_dir_owned = false;
         errdefer freeConfig(alloc, donor_cfg);
 
         var receiver_cfg = cfg.receiver;
@@ -1007,6 +1023,21 @@ fn parseReplayOperation(alloc: std.mem.Allocator, data: []const u8) !?ReplayOper
         return .{ .delete = try alloc.dupe(u8, data["del:".len..]) };
     }
     return null;
+}
+
+test "db split destination read-only open does not create missing root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-readonly-missing", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), dst_root, .{}));
+
+    try std.testing.expectError(error.FileNotFound, Destination.initReadOnly(std.testing.allocator, dst_root));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), dst_root, .{}));
 }
 
 test "db split destination applies handoff and filtered split deltas" {
@@ -1542,20 +1573,22 @@ test "db merge coordinator bootstraps receiver for donor range" {
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
 
-    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:y={\"v\":\"donor-2\"}") },
-    });
-    defer std.testing.allocator.free(donor_setup);
-    try donor.snapshotBuilder().applyBatch(.{
-        .group_id = 141,
-        .commit_index = 3,
-        .entries_bytes = donor_setup,
-    });
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:y={\"v\":\"donor-2\"}") },
+        });
+        defer std.testing.allocator.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 141,
+            .commit_index = 3,
+            .entries_bytes = donor_setup,
+        });
+    }
 
     {
         var receiver = try Destination.init(std.testing.allocator, .{ .root_dir = receiver_root });
@@ -1649,18 +1682,20 @@ test "db merge coordinator finalize persists across reopen" {
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-finalize-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
-    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
-    });
-    defer std.testing.allocator.free(donor_setup);
-    try donor.snapshotBuilder().applyBatch(.{
-        .group_id = 151,
-        .commit_index = 2,
-        .entries_bytes = donor_setup,
-    });
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+        });
+        defer std.testing.allocator.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 151,
+            .commit_index = 2,
+            .entries_bytes = donor_setup,
+        });
+    }
 
     {
         var receiver = try Destination.init(std.testing.allocator, .{ .root_dir = receiver_root });
@@ -1708,8 +1743,10 @@ test "db merge coordinator reassigns receiver identity namespace only after opt-
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+    }
 
     const old_namespace = doc_identity.Namespace{
         .table_id = 7,
@@ -1774,8 +1811,10 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-target-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+    }
 
     const old_namespace = doc_identity.Namespace{
         .table_id = 8,
@@ -1813,7 +1852,6 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
         },
         .receiver_identity_reassignment_namespace = target_namespace,
     });
-    defer coord.deinit();
 
     try std.testing.expectError(error.DocIdentityReassignmentNotAllowed, coord.acceptDonorRange());
     try std.testing.expect(!coord.allow_doc_identity_reassignment);
@@ -1826,11 +1864,13 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
     try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
     try std.testing.expect(coord.allow_doc_identity_reassignment);
 
-    var txn = try coord.receiver.db.core.store.beginProbeTxn();
-    defer txn.abort();
-    const ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
-    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), state.canonical_doc_id);
+    {
+        var txn = try coord.receiver.db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), state.canonical_doc_id);
+    }
 
     try coord.acceptDonorRange();
     const status = try coord.status();
@@ -1838,6 +1878,8 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
     try std.testing.expectEqual(target_namespace.table_id, status.receiver_identity_reassignment_namespace_table_id);
     try std.testing.expectEqual(target_namespace.shard_id, status.receiver_identity_reassignment_namespace_shard_id);
     try std.testing.expectEqual(target_namespace.range_id, status.receiver_identity_reassignment_namespace_range_id);
+    coord.deinit();
+
     {
         var reopened = try MergeCoordinator.init(std.testing.allocator, .{
             .donor_root_dir = donor_root,
@@ -1898,18 +1940,20 @@ test "db merge coordinator allocates donor docs in receiver identity namespace" 
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-identity-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
-    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
-    });
-    defer std.testing.allocator.free(donor_setup);
-    try donor.snapshotBuilder().applyBatch(.{
-        .group_id = 171,
-        .commit_index = 2,
-        .entries_bytes = donor_setup,
-    });
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+        });
+        defer std.testing.allocator.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 171,
+            .commit_index = 2,
+            .entries_bytes = donor_setup,
+        });
+    }
 
     const receiver_namespace = doc_identity.Namespace{
         .table_id = 7,
@@ -1994,19 +2038,21 @@ test "db merge coordinator rollback restores receiver base range" {
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-rollback-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
-    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:y={\"v\":\"donor-2\"}") },
-    });
-    defer std.testing.allocator.free(donor_setup);
-    try donor.snapshotBuilder().applyBatch(.{
-        .group_id = 161,
-        .commit_index = 3,
-        .entries_bytes = donor_setup,
-    });
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:y={\"v\":\"donor-2\"}") },
+        });
+        defer std.testing.allocator.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 161,
+            .commit_index = 3,
+            .entries_bytes = donor_setup,
+        });
+    }
 
     {
         var receiver = try Destination.init(std.testing.allocator, .{ .root_dir = receiver_root });
@@ -2078,18 +2124,20 @@ test "db merge coordinator rollback reapplies target namespace for persisted rea
         .range_id = 9202,
     };
 
-    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
-    defer donor.deinit();
-    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
-    });
-    defer std.testing.allocator.free(donor_setup);
-    try donor.snapshotBuilder().applyBatch(.{
-        .group_id = 261,
-        .commit_index = 2,
-        .entries_bytes = donor_setup,
-    });
+    {
+        var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+        defer donor.deinit();
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+        });
+        defer std.testing.allocator.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 261,
+            .commit_index = 2,
+            .entries_bytes = donor_setup,
+        });
+    }
 
     {
         var receiver = try Destination.init(std.testing.allocator, .{

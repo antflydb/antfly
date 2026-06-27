@@ -120,13 +120,13 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
         },
         .receiver_identity_reassignment_namespace = target_namespace,
     });
-    defer coord.deinit();
 
     try std.testing.expectError(error.DocIdentityReassignmentNotAllowed, coord.acceptDonorRange());
     try std.testing.expect(!coord.allow_doc_identity_reassignment);
 
     try coord.recordDocIdentityReassignmentOptIn();
     try coord.acceptDonorRange();
+    coord.deinit();
 
     {
         var reopened = try db_split_handoff.MergeCoordinator.init(std.testing.allocator, .{
