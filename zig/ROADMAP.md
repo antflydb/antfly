@@ -83,30 +83,35 @@ Substantial pieces already exist:
 
 The live gaps are tracked in [TODO.md](TODO.md):
 
-- current CI failures and coverage follow-up
 - serverless table architecture and publication parity
 - stateful/control-plane follow-up
 - query, search, retrieval, API, config, and protocol parity
 
 ## Major Lanes
 
-### 1. Product Correctness And CI
+### 1. Serverless Table Product
 
 Primary reference:
 
-- [TODO.md](TODO.md)
+- [SERVERLESS.md](SERVERLESS.md)
 
 Near-term goals:
 
-- fix the current PR 145 CI failures before expanding public surface area:
-  artifact-manifest E2E visibility, transaction trace validation drift, and Go
-  generated OpenAPI/server surface drift
-- make readiness/status bugs diagnosable from preserved roots, server logs, and
-  single-lane reruns
-- keep generated checks, TLA validation, base E2E, and full E2E lanes clear
-  about which failures are required versus informational
-- keep `zig build openapi-root-check` as the safe Zig contract drift check and
-  `make zig-generated-check` as the generated-source check
+- keep `/tables/...` as the public serverless product surface
+- keep provider/runtime controls under `/_internal/...`
+- make published read/search behavior operationally credible before adding new
+  serverless-only product surface area
+- harden object-store publication, prune, retry, crash, and remote-backend
+  semantics
+- make published/latest/exact-read freshness semantics explicit
+
+Principles:
+
+- serverless should be the same product with a different execution model, not a
+  namespace-only database model
+- reuse engine code from search, vector, graph, indexing, and segment machinery
+- do not make serverless depend on hosted-Raft lifecycle or replica placement
+  as first-order architecture
 
 ### 2. Public API, OpenAPI, And Table Contract
 
@@ -151,31 +156,7 @@ Near-term goals:
 - keep simulation and chaos coverage focused on externally visible table,
   shard, and range behavior rather than on copied implementation details
 
-### 4. Serverless Table Product
-
-Primary reference:
-
-- [SERVERLESS.md](SERVERLESS.md)
-
-Near-term goals:
-
-- keep `/tables/...` as the public serverless product surface
-- keep provider/runtime controls under `/_internal/...`
-- finish canonical table metadata, publication state, and build-status
-  alignment
-- make index/schema changes publish through concrete per-family and per-index
-  artifact actions
-- make published/latest/exact-read freshness semantics explicit
-
-Principles:
-
-- serverless should be the same product with a different execution model, not a
-  namespace-only database model
-- reuse engine code from search, vector, graph, indexing, and segment machinery
-- do not make serverless depend on hosted-Raft lifecycle or replica placement
-  as first-order architecture
-
-### 5. Query, Search, And Retrieval
+### 4. Query, Search, And Retrieval
 
 Primary references:
 
@@ -192,7 +173,7 @@ Near-term goals:
 - keep inference integration work separate from Antfly product API planning
   unless the integration surface requires a shared contract change
 
-### 6. Storage Engine And Durability
+### 5. Storage Engine And Durability
 
 Primary references:
 
@@ -209,7 +190,7 @@ Near-term goals:
 - support metadata/data workflows without storage regressions
 - keep reopen/recovery, split/restore, and simulation matrices strong
 
-### 7. Inference And Shared Libraries
+### 6. Inference And Shared Libraries
 
 Primary references:
 
@@ -231,9 +212,8 @@ Near-term goals:
 
 ## Immediate Project Order
 
-1. Stabilize the active CI failures in [TODO.md](TODO.md), especially
-   artifact-manifest E2E visibility, transaction trace validation drift, and
-   generated OpenAPI/server drift.
+1. Keep CI and generated-contract checks green as guardrails, with focused
+   reruns when route or trace behavior changes.
 2. Tighten generated/OpenAPI checks around Go and Zig surface changes so route
    additions fail close to the source of drift.
 3. Keep the CI lanes stable enough to decide which E2E and TLA checks should be

@@ -9,34 +9,18 @@ Use [ROADMAP.md](ROADMAP.md) for project-wide sequencing and
 
 ## Current Bugs
 
-Observed on 2026-06-27 from PR 145 / `combine-pr-141-143-144` GitHub CI:
-
-- [ ] Fix Zig E2E artifact manifest generation/regression.
-  - workflow: `Zig Tests`
-  - run: `https://github.com/antflydb/antfly/actions/runs/28294019438`
-  - failing job: `e2e-base`
-  - failing test:
-    `e2e/antfly/test_artifacts.py::test_document_artifact_manifest_and_reprocess_job_e2e`
-  - symptom: the test writes document-artifact input with
-    `sync_level=full_index`, then times out waiting for the document artifact
-    manifest to become visible.
-- [ ] Fix transaction trace validation drift.
-  - workflow: `Zig Tests`
-  - run: `https://github.com/antflydb/antfly/actions/runs/28294019438`
-  - failing job: `tla-verify`
-  - command: `make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson`
-  - symptom: transaction trace validation reports `84 of 85 trace(s) passed`.
-- [ ] Fix Go generated OpenAPI/server surface drift.
-  - workflow: `Go`
-  - run: `https://github.com/antflydb/antfly/actions/runs/28294019418`
-  - failing job: `unit`
-  - symptom: `src/metadata/api.go` wrapper does not implement
-    `ServerInterface`; missing method `ListArtifactEnrichments`.
+No current release-blocking bugs are tracked here. Keep this section for live
+failures that need owner-visible follow-up, not for historical CI incidents.
 
 ### Recently Cleared From The Live Bug List
 
 These are no longer tracked as active bugs unless a new failure reappears:
 
+- PR 145 generated OpenAPI/server drift from missing Go
+  `ListArtifactEnrichments`.
+- PR 145 document artifact manifest E2E visibility under
+  `sync_level=full_index`.
+- PR 145 transaction trace validation drift.
 - Stateful lookup / full-text derived-index race.
 - CDC distributed apply and projected status summary counters.
 - API-only remote index status propagation.
