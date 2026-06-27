@@ -1978,6 +1978,8 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+    .{ .sql = "CREATE INDEX CONCURRENTLY usage_records_created_at_idx ON usage_records (created_at)", .kind = .extension_index },
+    .{ .sql = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_records_email_key ON usage_records (lower(email))", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
     .{ .sql = "CREATE EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
@@ -1997,6 +1999,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP CAST (jsonb AS text)", .kind = .ddl },
     .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
+    .{ .sql = "DROP INDEX CONCURRENTLY IF EXISTS usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP SCHEMA analytics CASCADE", .kind = .ddl },
     .{ .sql = "DROP DATABASE tenant_ops", .kind = .ddl },
@@ -2571,6 +2574,7 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
         if (tok.matchesKeyword("authorization")) return generated.tokenId(.AUTHORIZATION);
         if (tok.matchesKeyword("session")) return generated.tokenId(.SESSION);
     }
+    if (generatedIndexConcurrentlyKeywordContext(tokens, index) and tok.matchesKeyword("concurrently")) return generated.tokenId(.CONCURRENTLY);
     if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.tokenId(.ROUTINE);
     if (generatedSessionKeywordContext(tokens, index) and tok.matchesKeyword("local")) return generated.tokenId(.LOCAL);
     if (!generatedTransactionControlContext(tokens, index)) return null;
@@ -2607,6 +2611,17 @@ fn generatedSessionAuthorizationKeywordContext(tokens: []const token_mod.Token, 
     if (!tokens[1].matchesKeyword("session")) return false;
     if (!tokens[2].matchesKeyword("authorization")) return false;
     return index == 1 or index == 2;
+}
+
+fn generatedIndexConcurrentlyKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or tokens.len < 3) return false;
+    const first = tokens[0];
+    if (first.matchesKeywordTag(.drop)) {
+        return index == 2 and tokens.len > 3 and tokens[1].matchesKeywordTag(.index);
+    }
+    if (!first.matchesKeywordTag(.create)) return false;
+    if (tokens[1].matchesKeywordTag(.index)) return index == 2 and tokens.len > 3;
+    return index == 3 and tokens.len > 4 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index);
 }
 
 fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -4039,6 +4054,7 @@ fn buildDdlAst(
                 ast.unique = true;
                 index = 3;
             }
+            if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             if (ast.object_name_tokens) |name_range| index = name_range.end;
@@ -4306,6 +4322,7 @@ fn buildDdlAst(
             if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
         },
         .drop_index => {
+            if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
@@ -7752,7 +7769,10 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX CONCURRENTLY usage_status_idx ON usage_records (status)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_status_idx ON usage_records (lower(status))")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX CONCURRENTLY IF EXISTS usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_extension }, (try parseSqlAlloc(alloc, "CREATE EXTENSION vector")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_extension }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')")).statement);

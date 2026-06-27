@@ -6353,6 +6353,37 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_index_concurrently = try ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_status_idx ON usage_records (lower(status))");
+    defer create_index_concurrently.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, create_index_concurrently.generatedStatementKind().?);
+    switch (create_index_concurrently.generated_statement.?.ast.?) {
+        .extension_index => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_index, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.unique);
+            try std.testing.expect(ddl_ast.if_not_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, ddl_ast.index_table_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_index_concurrently = try ParsedSql.initAlloc(alloc, "DROP INDEX CONCURRENTLY IF EXISTS usage_status_idx RESTRICT");
+    defer drop_index_concurrently.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, drop_index_concurrently.generatedStatementKind().?);
+    switch (drop_index_concurrently.generated_statement.?.ast.?) {
+        .extension_index => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_index, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(!ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_index_concurrently.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var alter_table = try ParsedSql.initAlloc(alloc, "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT");
     defer alter_table.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_table.generatedStatementKind().?);

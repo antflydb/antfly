@@ -207,6 +207,11 @@ partial-index `WHERE ...` token ranges; parsed-statement classification and
 generated-first create-index planning now validate exact `CREATE [UNIQUE]
 INDEX [IF NOT EXISTS] ... ON ... [USING ...] (...) [INCLUDE (...)] [WITH (...)]
 [WHERE ...]` clause adjacency before lowering through the typed DDL planner.
+Generated index DDL also accepts PostgreSQL-compatible `CONCURRENTLY` placement
+for `CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS] ...` and
+`DROP INDEX CONCURRENTLY [IF EXISTS] ...`, preserving the existing typed index
+plan semantics while keeping those strict generated-owned heads from falling
+back to the legacy DDL classifier.
 Antfly-derived index methods exposed through PostgreSQL-style `CREATE INDEX
 ... USING antfly_full_text`/`antfly_aknn`/`antfly_graph`/
 `antfly_graph_metric`/`antfly_hybrid`/`antfly_algebraic` now use the same

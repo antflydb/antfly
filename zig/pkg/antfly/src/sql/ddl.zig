@@ -6206,6 +6206,7 @@ fn createIndexPlanFromGeneratedAstAlloc(
     if (index >= end or !tokens[index].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
     index += 1;
 
+    if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
     if (ast.if_not_exists) try expectGeneratedIfNotExists(tokens, &index, end);
     const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
     index = name_range.end;
@@ -18031,6 +18032,27 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const concurrent_index_sql = "CREATE INDEX CONCURRENTLY usage_records_created_at_idx ON usage_records (created_at);";
+    var generated_concurrent_index = try generatedDdlPlanForTestAlloc(alloc, concurrent_index_sql);
+    defer generated_concurrent_index.deinit(alloc);
+    var legacy_concurrent_index = try legacyDdlParserPlanForTestAlloc(alloc, concurrent_index_sql);
+    defer legacy_concurrent_index.deinit(alloc);
+    switch (generated_concurrent_index) {
+        .create_index => |generated| switch (legacy_concurrent_index) {
+            .create_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
+                try std.testing.expectEqual(legacy.unique, generated.unique);
+                try std.testing.expectEqual(legacy.method, generated.method);
+                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const drop_index_sql = "DROP INDEX IF EXISTS usage_records_status_idx RESTRICT;";
     var generated_drop_index = try generatedDdlPlanForTestAlloc(alloc, drop_index_sql);
     defer generated_drop_index.deinit(alloc);
@@ -18038,6 +18060,22 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     defer legacy_drop_index.deinit(alloc);
     switch (generated_drop_index) {
         .drop_index => |generated| switch (legacy_drop_index) {
+            .drop_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const concurrent_drop_index_sql = "DROP INDEX CONCURRENTLY IF EXISTS usage_records_status_idx RESTRICT;";
+    var generated_concurrent_drop_index = try generatedDdlPlanForTestAlloc(alloc, concurrent_drop_index_sql);
+    defer generated_concurrent_drop_index.deinit(alloc);
+    var legacy_concurrent_drop_index = try legacyDdlParserPlanForTestAlloc(alloc, concurrent_drop_index_sql);
+    defer legacy_concurrent_drop_index.deinit(alloc);
+    switch (generated_concurrent_drop_index) {
+        .drop_index => |generated| switch (legacy_concurrent_drop_index) {
             .drop_index => |legacy| {
                 try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
                 try std.testing.expectEqual(legacy.if_exists, generated.if_exists);

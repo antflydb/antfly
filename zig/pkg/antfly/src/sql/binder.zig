@@ -2221,6 +2221,41 @@ fn appendExistingCreateTargetIfPresentAlloc(
     return try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, table_name, session, true);
 }
 
+fn foreignKeyReferencesSelf(child_table_name: []const u8, foreign_key: runtime_schema.ForeignKey) bool {
+    return std.mem.eql(u8, foreign_key.parent_table, child_table_name) or
+        std.mem.eql(u8, foreign_key.parent_table, "row");
+}
+
+fn appendBoundCatalogObjectsForForeignKeysAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    child_table_name: []const u8,
+    foreign_keys: []const runtime_schema.ForeignKey,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    for (foreign_keys) |foreign_key| {
+        if (foreignKeyReferencesSelf(child_table_name, foreign_key)) continue;
+        try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, foreign_key.parent_table, session, false);
+    }
+}
+
+fn appendBoundCatalogObjectsForAlterTableForeignKeysAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: ddl_plan.AlterTablePlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    for (plan.operations) |operation| {
+        switch (operation) {
+            .add_column => |add_column| try appendBoundCatalogObjectsForForeignKeysAlloc(alloc, objects, catalog, plan.table_name, add_column.foreign_keys, session),
+            .add_foreign_key => |foreign_key| try appendBoundCatalogObjectsForForeignKeysAlloc(alloc, objects, catalog, plan.table_name, &.{foreign_key}, session),
+            else => {},
+        }
+    }
+}
+
 fn collectTableDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
@@ -2230,7 +2265,10 @@ fn collectTableDdlBoundCatalogObjectsAlloc(
 ) !void {
     switch (plan) {
         .moved => return,
-        .create_table => |create| try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.table_name, session),
+        .create_table => |create| {
+            try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.table_name, session);
+            try appendBoundCatalogObjectsForForeignKeysAlloc(alloc, objects, catalog, create.table_name, create.foreign_keys, session);
+        },
         .table_clone => |clone| {
             try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, clone.table_name, session);
             try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, clone.source_table_name, session, false);
@@ -2272,7 +2310,10 @@ fn collectTableDdlBoundCatalogObjectsAlloc(
         },
         .drop_index => |drop| try appendOptionalBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, .target, catalog, drop.index_name, session, drop.if_exists),
         .drop_table => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.table_name, session, drop.if_exists),
-        .alter_table => |alter| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, alter.if_exists),
+        .alter_table => |alter| {
+            try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, alter.if_exists);
+            try appendBoundCatalogObjectsForAlterTableForeignKeysAlloc(alloc, objects, catalog, alter, session);
+        },
         .create_update_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
     }
 }
@@ -3579,6 +3620,55 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     var bound_create_table = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_create_table, catalog.iface());
     defer bound_create_table.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), (try bound_create_table.ddlCatalog()).bound_objects.len);
+
+    var parsed_create_fk_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TABLE usage_events (id text PRIMARY KEY, usage_id text REFERENCES usage_records(id))",
+    );
+    defer parsed_create_fk_table.deinit(alloc);
+    var bound_create_fk_table = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_create_fk_table, catalog.iface());
+    defer bound_create_fk_table.deinit(alloc);
+    const create_fk_ddl = try bound_create_fk_table.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), create_fk_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.source, create_fk_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", create_fk_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), create_fk_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, create_fk_ddl.bound_objects[0].schema_generation);
+
+    var parsed_missing_create_fk_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TABLE bad_usage_events (id text PRIMARY KEY, usage_id text REFERENCES missing_usage_records(id))",
+    );
+    defer parsed_missing_create_fk_table.deinit(alloc);
+    try std.testing.expectError(error.TableNotFound, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_create_fk_table, catalog.iface()));
+
+    var parsed_alter_add_fk = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE incoming_usage ADD CONSTRAINT incoming_usage_source_fkey FOREIGN KEY (source) REFERENCES usage_records(id)",
+    );
+    defer parsed_alter_add_fk.deinit(alloc);
+    var bound_alter_add_fk = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_alter_add_fk, catalog.iface());
+    defer bound_alter_add_fk.deinit(alloc);
+    const alter_add_fk_ddl = try bound_alter_add_fk.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), alter_add_fk_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, alter_add_fk_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("incoming_usage", alter_add_fk_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 2), alter_add_fk_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(BoundCatalogObjectRole.source, alter_add_fk_ddl.bound_objects[1].role);
+    try std.testing.expectEqualStrings("usage_records", alter_add_fk_ddl.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), alter_add_fk_ddl.bound_objects[1].table_id);
+
+    var parsed_alter_add_column_fk = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE incoming_usage ADD COLUMN usage_ref text REFERENCES usage_records(id)",
+    );
+    defer parsed_alter_add_column_fk.deinit(alloc);
+    var bound_alter_add_column_fk = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_alter_add_column_fk, catalog.iface());
+    defer bound_alter_add_column_fk.deinit(alloc);
+    const alter_add_column_fk_ddl = try bound_alter_add_column_fk.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), alter_add_column_fk_ddl.bound_objects.len);
+    try std.testing.expectEqualStrings("incoming_usage", alter_add_column_fk_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqualStrings("usage_records", alter_add_column_fk_ddl.bound_objects[1].target.table_name);
 
     try std.testing.expectError(error.UnsupportedSqlShape, bindReadPlanCatalogStatementAlloc(alloc, &parsed_write, catalog.iface()));
     try std.testing.expectError(error.UnsupportedSqlShape, bindWritePlanCatalogStatementAlloc(alloc, &parsed_read, .{}, catalog.iface()));
