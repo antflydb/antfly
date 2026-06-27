@@ -848,6 +848,118 @@ test "catalog jobs schedules table emptying jobs from snapshot ranges" {
     }
 }
 
+test "catalog jobs table emptying barrier waits for every affected table range" {
+    const alloc = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 91, .name = "events", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}" },
+        .{ .table_id = 92, .name = "events_archive", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"name\":\"archive\"}" },
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 8101, .range_id = 8102, .table_id = 91, .start_key = "", .end_key = null },
+        .{ .group_id = 8201, .range_id = 8202, .table_id = 92, .start_key = "", .end_key = null },
+    };
+    const affected = [_]u64{ 91, 92 };
+    var ready = tableEmptyingJobForRange(tables[0], ranges[0], affected[0..], true, true);
+    ready.state = metadata_table_manager.table_emptying_ready;
+    const jobs = [_]metadata_table_manager.TableEmptyingJobRecord{ready};
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+        .stores = &.{},
+        .placement_intents = &.{},
+        .table_emptying_jobs = jobs[0..],
+    };
+
+    const completed = try completedTableEmptyingBarrierJobIdsForTableAlloc(alloc, &snapshot, 91);
+    defer alloc.free(completed);
+    try std.testing.expectEqual(@as(usize, 0), completed.len);
+}
+
+test "catalog jobs table emptying barrier rejects invalid affected range job" {
+    const alloc = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 91, .name = "events", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}" },
+        .{ .table_id = 92, .name = "events_archive", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"name\":\"archive\"}" },
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 8101, .range_id = 8102, .table_id = 91, .start_key = "", .end_key = null },
+        .{ .group_id = 8201, .range_id = 8202, .table_id = 92, .start_key = "", .end_key = null },
+    };
+    const affected = [_]u64{ 91, 92 };
+    var first = tableEmptyingJobForRange(tables[0], ranges[0], affected[0..], true, true);
+    first.state = metadata_table_manager.table_emptying_ready;
+    var second = tableEmptyingJobForRange(tables[1], ranges[1], affected[0..], true, true);
+    second.state = metadata_table_manager.table_emptying_invalid;
+    const jobs = [_]metadata_table_manager.TableEmptyingJobRecord{ first, second };
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+        .stores = &.{},
+        .placement_intents = &.{},
+        .table_emptying_jobs = jobs[0..],
+    };
+
+    try std.testing.expectError(error.TableEmptyingJobInvalid, completedTableEmptyingBarrierJobIdsForTableAlloc(alloc, &snapshot, 91));
+}
+
+test "catalog jobs promotes completed table emptying barrier by removing durable jobs" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 91, .name = "events", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}" },
+            .{ .table_id = 92, .name = "events_archive", .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"name\":\"archive\"}" },
+        },
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 8101, .range_id = 8102, .table_id = 91, .start_key = "", .end_key = null },
+            .{ .group_id = 8201, .range_id = 8202, .table_id = 92, .start_key = "", .end_key = null },
+        },
+        affected: [2]u64 = .{ 91, 92 },
+        jobs: [2]metadata_table_manager.TableEmptyingJobRecord = undefined,
+        removed: std.ArrayListUnmanaged(u64) = .empty,
+
+        fn seed(self: *@This()) void {
+            self.jobs[0] = tableEmptyingJobForRange(self.tables[0], self.ranges[0], self.affected[0..], true, true);
+            self.jobs[0].state = metadata_table_manager.table_emptying_ready;
+            self.jobs[1] = tableEmptyingJobForRange(self.tables[1], self.ranges[1], self.affected[0..], true, true);
+            self.jobs[1].state = metadata_table_manager.table_emptying_ready;
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.removed.deinit(allocator);
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .table_emptying_jobs = self.jobs[0..],
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn removeTableEmptyingJob(self: *@This(), job_id: u64) !void {
+            try self.removed.append(std.testing.allocator, job_id);
+        }
+    };
+
+    var service = FakeService{};
+    service.seed();
+    defer service.deinit(alloc);
+
+    const promoted = try promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(alloc, &service, "events");
+
+    try std.testing.expectEqual(@as(usize, 2), promoted);
+    try std.testing.expectEqual(@as(usize, 2), service.removed.items.len);
+    try std.testing.expectEqual(service.jobs[0].job_id, service.removed.items[0]);
+    try std.testing.expectEqual(service.jobs[1].job_id, service.removed.items[1]);
+}
+
 test "catalog jobs snapshot scheduler does not require HTTP service surface" {
     const alloc = std.testing.allocator;
     const Scheduler = struct {
