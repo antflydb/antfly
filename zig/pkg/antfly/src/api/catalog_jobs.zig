@@ -292,7 +292,7 @@ pub fn completedTableEmptyingBarrierJobIdsForTableAlloc(
 
     for (snapshot.table_emptying_jobs) |candidate| {
         if (!tableEmptyingJobInvolvesTable(candidate, table_id)) continue;
-        var barrier_job_ids = (try completedTableEmptyingBarrierJobIdsForCandidateAlloc(alloc, snapshot, candidate)) orelse continue;
+        const barrier_job_ids = (try completedTableEmptyingBarrierJobIdsForCandidateAlloc(alloc, snapshot, candidate)) orelse continue;
         defer alloc.free(barrier_job_ids);
         for (barrier_job_ids) |job_id| try appendUniqueTableEmptyingJobId(alloc, &completed_job_ids, job_id);
     }
