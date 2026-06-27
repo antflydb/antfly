@@ -248,8 +248,9 @@ plus expressions, cross-table sources, conflict-update predicates and
 expressions, and non-recursive CTE write prefixes. Generated DML child-read
 metadata now also fails closed when the retained read kind disagrees with the
 retained `SELECT`/set-operation/relation-source clause shape, so insert-source
-and mutation-source wrappers cannot publish impossible child-read families for
-later lowerers to rediscover. Parsed-statement classification also validates
+and mutation-source wrappers cannot publish impossible child-read families or
+unrecognized retained child-`SELECT` tails for later lowerers to rediscover.
+Parsed-statement classification also validates
 generated top-level DML clause layout before publishing a write family:
 `INSERT` target/column/value/default/conflict/returning ranges must align with
 `INTO`, `VALUES`, `DEFAULT VALUES`, `ON CONFLICT`, and `RETURNING`; `UPDATE`
@@ -791,7 +792,7 @@ Unsupported DDL remains on the existing parser until
    layout for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE`, and required source
    child-read payloads before direct generated
    lowering, validates retained generated child-read `SELECT` source, `WHERE`,
-   set-operation clause boundaries, and generated read-kind compatibility for
+   set-operation clause boundaries, recognized child-`SELECT` tail starts, and generated read-kind compatibility for
    insert-source and relation-source writes, and fails closed when retained generated kind metadata is missing,
    internally inconsistent, or disagrees with the legacy classifier instead of
    falling back to legacy write-family classification.

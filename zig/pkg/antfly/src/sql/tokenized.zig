@@ -2494,16 +2494,35 @@ fn generatedDmlSelectReadBodyClauseLayoutIsValid(
     }
 
     if (read_body.set_operation_tokens) |set_operation| {
-        if (set_operation.start < previous_end or set_operation.end > range.end) return false;
+        if (set_operation.start != previous_end or set_operation.end > range.end) return false;
         if (!tokens[set_operation.start].matchesKeywordTag(.@"union") and
             !tokens[set_operation.start].matchesKeywordTag(.intersect) and
             !tokens[set_operation.start].matchesKeywordTag(.except))
         {
             return false;
         }
+        previous_end = set_operation.end;
     }
 
-    return true;
+    return generatedDmlSelectReadBodyTailIsValid(tokens, range, previous_end);
+}
+
+fn generatedDmlSelectReadBodyTailIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    tail_start: usize,
+) bool {
+    if (tail_start == range.end) return true;
+    if (tail_start > range.end or tail_start >= tokens.len) return false;
+    if (tokens[tail_start].matchesKeywordTag(.group)) {
+        return tail_start + 1 < range.end and tokens[tail_start + 1].matchesKeywordTag(.by);
+    }
+    return tokens[tail_start].matchesKeywordTag(.having) or
+        tokens[tail_start].matchesKeywordTag(.window) or
+        tokens[tail_start].matchesKeywordTag(.order) or
+        tokens[tail_start].matchesKeywordTag(.limit) or
+        tokens[tail_start].matchesKeywordTag(.offset) or
+        tokens[tail_start].matchesKeywordTag(.fetch);
 }
 
 fn generatedDmlOptionalNestedRangeIsValid(
@@ -6829,6 +6848,19 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     generated_insert_select.statement = parseStatement(generated_insert_select.raw_statement, malformed_source_kind, &generated_insert_select.tokenized_sql);
     try std.testing.expect(generated_insert_select.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
+
+    var generated_insert_select_no_from = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, amount) SELECT 1, 2");
+    defer generated_insert_select_no_from.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_select_no_from.generatedStatementKind().?);
+
+    var malformed_select_projection_tail = generated_insert_select_no_from.generated_statement.?;
+    switch (malformed_select_projection_tail.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.projection_tokens.?.end -= 1,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert_select_no_from.statement = parseStatement(generated_insert_select_no_from.raw_statement, malformed_select_projection_tail, &generated_insert_select_no_from.tokenized_sql);
+    try std.testing.expect(generated_insert_select_no_from.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select_no_from.statement));
 
     var generated_insert_set_operation = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage UNION SELECT id FROM archived_usage");
     defer generated_insert_set_operation.deinit(alloc);
