@@ -308,10 +308,10 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 if (rest.len != 0) {
                     if (try splitUnclosedActionBlockPrefix(rest)) |split| {
                         const prefix = std.mem.trim(u8, split.prefix, " \t\r");
-                        if (prefix.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], prefix);
+                        if (prefix.len != 0) try appendAlternatives(allocator, &grammar, &grammar.rules.items[active_rule.?], prefix);
                         skip_brace_block_depth = split.depth;
                     } else {
-                        try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
+                        try appendAlternatives(allocator, &grammar, &grammar.rules.items[active_rule.?], rest);
                     }
                 }
                 if (ends_rule) active_rule = null;
@@ -330,10 +330,10 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 line;
             if (try splitUnclosedActionBlockPrefix(alt)) |split| {
                 const prefix = std.mem.trim(u8, split.prefix, " \t\r");
-                if (prefix.len != 0) try appendAlternatives(allocator, &grammar.rules.items[rule_idx], prefix);
+                if (prefix.len != 0) try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], prefix);
                 skip_brace_block_depth = split.depth;
             } else {
-                try appendAlternatives(allocator, &grammar.rules.items[rule_idx], alt);
+                try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], alt);
             }
             if (ends_rule) active_rule = null;
             continue;
@@ -507,17 +507,23 @@ fn parseReference(grammar: *Grammar, line: []const u8) !void {
 }
 
 fn parseTokens(allocator: std.mem.Allocator, grammar: *Grammar, text: []const u8) !void {
-    var parts = std.mem.tokenizeAny(u8, text, " \t\r");
+    const parts = try declarationPartsAlloc(allocator, text);
     var previous_token: ?[]const u8 = null;
-    while (parts.next()) |name| {
-        if (isBisonTypeTag(name)) continue;
-        if (isBisonTokenCode(name)) continue;
+    var previous_can_alias = false;
+    for (parts, 0..) |name, index| {
         if (isLiteralAlias(name)) {
-            const token_name = previous_token orelse return error.InvalidTokenAlias;
+            const next_is_literal = index + 1 < parts.len and isLiteralAlias(parts[index + 1]);
+            const token_name = if (previous_can_alias and !next_is_literal)
+                previous_token orelse return error.InvalidTokenAlias
+            else
+                try ensureLiteralTerminal(allocator, grammar, name);
             try appendTokenAlias(allocator, grammar, name, token_name);
+            previous_token = token_name;
+            previous_can_alias = false;
             continue;
         }
         previous_token = try appendTokenName(allocator, grammar, name);
+        previous_can_alias = true;
     }
 }
 
@@ -529,24 +535,40 @@ fn parsePrecedenceDeclaration(
 ) !void {
     grammar.precedence_level_count += 1;
     const level = grammar.precedence_level_count;
-    var parts = std.mem.tokenizeAny(u8, text, " \t\r");
+    const parts = try declarationPartsAlloc(allocator, text);
     var previous_token: ?[]const u8 = null;
-    while (parts.next()) |name| {
-        if (isBisonTypeTag(name)) continue;
-        if (isBisonTokenCode(name)) continue;
+    var previous_can_alias = false;
+    for (parts, 0..) |name, index| {
         if (isLiteralAlias(name)) {
-            const token_name = previous_token orelse resolveTerminalName(grammar.*, name) orelse return error.InvalidTokenAlias;
+            const next_is_literal = index + 1 < parts.len and isLiteralAlias(parts[index + 1]);
+            const token_name = if (previous_can_alias and !next_is_literal)
+                previous_token orelse return error.InvalidTokenAlias
+            else
+                resolveTerminalName(grammar.*, name) orelse try ensureLiteralTerminal(allocator, grammar, name);
             try appendTokenAlias(allocator, grammar, name, token_name);
             try setTokenPrecedence(allocator, grammar, token_name, .{ .level = level, .associativity = associativity });
+            previous_token = token_name;
+            previous_can_alias = false;
             continue;
         }
         const token_name = try appendTokenName(allocator, grammar, name);
         try setTokenPrecedence(allocator, grammar, token_name, .{ .level = level, .associativity = associativity });
         previous_token = token_name;
+        previous_can_alias = true;
     }
 }
 
-fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8) !void {
+fn declarationPartsAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var parts = std.mem.tokenizeAny(u8, text, " \t\r");
+    while (parts.next()) |name| {
+        if (isBisonTypeTag(name) or isBisonTokenCode(name)) continue;
+        try out.append(allocator, name);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendAlternative(allocator: std.mem.Allocator, grammar: *Grammar, rule: *Rule, text: []const u8) !void {
     const trimmed = std.mem.trim(u8, text, " \t\r");
     if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "%empty") or std.mem.eql(u8, trimmed, "/* empty */")) {
         try rule.alternatives.append(allocator, .{ .symbols = &.{} });
@@ -560,15 +582,17 @@ fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8
         const symbol = (try nextGrammarSymbol(trimmed, &index)) orelse break;
         if (std.mem.eql(u8, symbol, "%prec")) {
             const override = (try nextGrammarSymbol(trimmed, &index)) orelse return error.InvalidPrecedenceOverride;
+            if (isLiteralAlias(override)) _ = try ensureLiteralTerminal(allocator, grammar, override);
             precedence_symbol = try dupToken(allocator, override);
             continue;
         }
+        if (isLiteralAlias(symbol)) _ = try ensureLiteralTerminal(allocator, grammar, symbol);
         try symbols.append(allocator, try dupToken(allocator, symbol));
     }
     try rule.alternatives.append(allocator, .{ .symbols = try symbols.toOwnedSlice(allocator), .precedence_symbol = precedence_symbol });
 }
 
-fn appendAlternatives(allocator: std.mem.Allocator, rule: *Rule, text: []const u8) !void {
+fn appendAlternatives(allocator: std.mem.Allocator, grammar: *Grammar, rule: *Rule, text: []const u8) !void {
     var start: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
@@ -583,14 +607,14 @@ fn appendAlternatives(allocator: std.mem.Allocator, rule: *Rule, text: []const u
             },
             '{' => try skipActionBlock(text, &index),
             '|' => {
-                try appendAlternative(allocator, rule, text[start..index]);
+                try appendAlternative(allocator, grammar, rule, text[start..index]);
                 index += 1;
                 start = index;
             },
             else => index += 1,
         }
     }
-    try appendAlternative(allocator, rule, text[start..]);
+    try appendAlternative(allocator, grammar, rule, text[start..]);
 }
 
 fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
@@ -1583,6 +1607,32 @@ fn appendTokenAlias(
     });
 }
 
+fn ensureLiteralTerminal(
+    allocator: std.mem.Allocator,
+    grammar: *Grammar,
+    literal: []const u8,
+) ![]const u8 {
+    if (resolveTerminalName(grammar.*, literal)) |token_name| return token_name;
+    const token_name = try literalTokenNameAlloc(allocator, literal);
+    const owned_token = try appendTokenName(allocator, grammar, token_name);
+    try appendTokenAlias(allocator, grammar, literal, owned_token);
+    return owned_token;
+}
+
+fn literalTokenNameAlloc(allocator: std.mem.Allocator, literal: []const u8) ![]const u8 {
+    const content = if (literal.len >= 2) literal[1 .. literal.len - 1] else literal;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(allocator, "LIT");
+    if (content.len == 0) {
+        try out.appendSlice(allocator, "_EMPTY");
+        return try out.toOwnedSlice(allocator);
+    }
+    for (content) |byte| {
+        try appendFmt(allocator, &out, "_{X:0>2}", .{byte});
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 fn setTokenPrecedence(
     allocator: std.mem.Allocator,
     grammar: *Grammar,
@@ -1839,6 +1889,36 @@ test "parseGrammar resolves yacc literal terminals through symbolic token aliase
     try std.testing.expect(std.mem.indexOf(u8, generated, "    COMMA,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    ',',") == null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "terminalIdByName") != null);
+}
+
+test "parseGrammar creates stable terminals for unaliased bison literals" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID '(' ')'
+        \\%left '+'
+        \\expr:
+        \\    expr '+' expr %prec '+'
+        \\  | '(' expr ')'
+        \\  | ID
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 4), grammar.tokens.items.len);
+    try std.testing.expectEqualStrings("LIT_28", resolveTerminalName(grammar, "'('").?);
+    try std.testing.expectEqualStrings("LIT_29", resolveTerminalName(grammar, "')'").?);
+    try std.testing.expectEqualStrings("LIT_2B", resolveTerminalName(grammar, "'+'").?);
+    try validateGrammar(grammar);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+    const generated = try generateZigMetadata(arena, "literal-auto.y", source);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_2B,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_28,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "    '+',") == null);
 }
 
 test "parseGrammar accepts bison typed declarations and strips semantic actions" {

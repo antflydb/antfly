@@ -42,7 +42,12 @@ generator also accepts PostgreSQL/Yacc-style quoted literal terminals through
 symbolic `%token NAME 'literal'` aliases. Literal symbols may appear in rule
 alternatives while the checked-in generated API continues to expose stable Zig
 identifier token names, which keeps PostgreSQL-style grammar migration from
-polluting the runtime token enum with punctuation-shaped symbols. The generator
+polluting the runtime token enum with punctuation-shaped symbols when an
+explicit scanner token already exists. Unaliased Bison literal terminals in
+declarations, precedence declarations, or productions are also supported: the
+reader registers deterministic internal token names such as `LIT_2B` for `'+'`
+so source-like PostgreSQL grammar can be ingested without hand-aliasing every
+punctuation literal. The generator
 also supports Yacc precedence declarations, including `%left`, `%right`,
 `%nonassoc`, and production-level `%prec` overrides, so intentional
 shift/reduce ambiguity can be resolved in table construction instead of being
