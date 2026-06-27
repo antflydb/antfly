@@ -10840,6 +10840,47 @@ fn incrementStartupConfiguredIndexCounts(
     }
 }
 
+fn startupRuntimeStatusFreshness(phase: db_mod.types.StartupCatchUpPhase) runtime_status.RuntimeStatusFreshness {
+    return switch (phase) {
+        .idle => .stale,
+        .opening_db => .opening,
+        .artifact_rebuild, .startup_catch_up => .catching_up,
+    };
+}
+
+fn setRuntimeStatusMetadata(
+    status: *runtime_status.LocalTableRuntimeStatus,
+    source: runtime_status.RuntimeStatusSource,
+    freshness: runtime_status.RuntimeStatusFreshness,
+) void {
+    status.metadata.source = source;
+    status.metadata.freshness = freshness;
+    status.metadata.updated_at_ns = platform_time.monotonicNs();
+}
+
+fn markStartupRuntimeStatus(
+    status: *runtime_status.LocalTableRuntimeStatus,
+    startup: db_mod.types.StartupCatchUpStats,
+) void {
+    setRuntimeStatusMetadata(status, .startup_catch_up, startupRuntimeStatusFreshness(startup.phase));
+}
+
+fn clearStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
+    status.stats.async_indexing.startup.active = false;
+    status.stats.async_indexing.startup.phase = .idle;
+}
+
+fn markClearedStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
+    clearStartupRuntimeStatus(status);
+    var runtime_fact_probe = status.*;
+    runtime_fact_probe.metadata.source = .cached_snapshot;
+    const source: runtime_status.RuntimeStatusSource = if (runtime_status.statusHasRuntimeFacts(runtime_fact_probe))
+        .cached_snapshot
+    else
+        .synthetic_config;
+    setRuntimeStatusMetadata(status, source, .stale);
+}
+
 fn publishStartupCatchUpRuntimeStatusSnapshot(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -10903,13 +10944,23 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
 
     if (!status_initialized) return;
 
+    var preserve_metadata = false;
     status.group_id = group_id;
-    if (!startup.active and db == null) {
+    if (startup.active) {
+        markStartupRuntimeStatus(&status, startup);
+        preserve_metadata = true;
+    } else if (db == null) {
         var merged_startup = status.stats.async_indexing.startup;
         db_mod.types.accumulateStartupCatchUpStats(&merged_startup, startup);
         status.stats.async_indexing.startup = merged_startup;
+        markClearedStartupRuntimeStatus(&status);
+        preserve_metadata = true;
     }
-    try snapshot_cache.upsertGroupStatus(table_name, status);
+    if (preserve_metadata) {
+        try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+    } else {
+        try snapshot_cache.upsertGroupStatus(table_name, status);
+    }
 }
 
 fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
@@ -19709,6 +19760,8 @@ test "provisioned table write source startup snapshot preserves existing group s
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.opening, statuses.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
@@ -19902,6 +19955,8 @@ test "runtime status snapshot with startup phase refreshes live table stats for 
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.catching_up, statuses.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.artifact_rebuild, statuses.items[0].stats.async_indexing.startup.phase);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
@@ -20122,11 +20177,23 @@ test "provisioned table write source startup snapshot builds synthetic status fr
         .wal_retained_segments = 5,
         .wal_retained_bytes = 123,
     }, null, &configured_indexes);
+
+    {
+        var active_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer active_statuses.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), active_statuses.items.len);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, active_statuses.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.opening, active_statuses.items[0].metadata.freshness);
+        try std.testing.expect(active_statuses.items[0].stats.async_indexing.startup.active);
+    }
+
     try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{}, null, null);
 
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(usize, 3), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqualStrings("vec", statuses.items[0].stats.indexes[0].name);
     try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, statuses.items[0].stats.indexes[0].kind);
@@ -20190,11 +20257,23 @@ test "provisioned table write source startup snapshot builds synthetic status fr
         .wal_retained_segments = 7,
         .wal_retained_bytes = 321,
     }, null, &configured_indexes);
+
+    {
+        var active_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer active_statuses.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), active_statuses.items.len);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, active_statuses.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.opening, active_statuses.items[0].metadata.freshness);
+        try std.testing.expect(active_statuses.items[0].stats.async_indexing.startup.active);
+    }
+
     try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{}, null, null);
 
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(usize, 2), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqualStrings("vec", statuses.items[0].stats.indexes[0].name);
     try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, statuses.items[0].stats.indexes[0].kind);
