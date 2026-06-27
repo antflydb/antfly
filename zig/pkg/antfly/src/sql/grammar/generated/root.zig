@@ -216332,6 +216332,10 @@ pub const Shift = struct {
     terminal: u16,
 };
 
+pub const Accept = struct {
+    token_count: usize,
+};
+
 pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void {
     const Adapter = struct {
         inner: @TypeOf(reducer),
@@ -216341,6 +216345,8 @@ pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer:
         pub fn reduce(self: @This(), reduction: Reduction) !void {
             try self.inner.reduce(reduction);
         }
+
+        pub fn accept(_: @This(), _: Accept) !void {}
     };
     return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });
 }
@@ -216377,7 +216383,10 @@ pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handle
                 stack_buffer[stack_len] = goto_entry.target;
                 stack_len += 1;
             },
-            .accept => return,
+            .accept => {
+                try event_handler.accept(.{ .token_count = index });
+                return;
+            },
         }
     }
 }

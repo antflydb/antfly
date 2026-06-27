@@ -1507,6 +1507,10 @@ fn emitZigMetadata(
         \\    terminal: u16,
         \\};
         \\
+        \\pub const Accept = struct {
+        \\    token_count: usize,
+        \\};
+        \\
         \\pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void {
         \\    const Adapter = struct {
         \\        inner: @TypeOf(reducer),
@@ -1516,6 +1520,8 @@ fn emitZigMetadata(
         \\        pub fn reduce(self: @This(), reduction: Reduction) !void {
         \\            try self.inner.reduce(reduction);
         \\        }
+        \\
+        \\        pub fn accept(_: @This(), _: Accept) !void {}
         \\    };
         \\    return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });
         \\}
@@ -1552,7 +1558,10 @@ fn emitZigMetadata(
         \\                stack_buffer[stack_len] = goto_entry.target;
         \\                stack_len += 1;
         \\            },
-        \\            .accept => return,
+        \\            .accept => {
+        \\                try event_handler.accept(.{ .token_count = index });
+        \\                return;
+        \\            },
         \\        }
         \\    }
         \\}
@@ -2462,11 +2471,13 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Reduction = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Shift = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Accept = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.shift(.{ .token_index = index, .terminal = lookahead });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.reduce(.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.accept(.{ .token_count = index });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseError") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "ParseError!void") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseDiagnostic = struct") != null);
