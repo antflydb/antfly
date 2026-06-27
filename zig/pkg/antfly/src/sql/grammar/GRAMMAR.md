@@ -773,8 +773,9 @@ Unsupported DDL remains on the existing parser until
    classification for generated-covered writes, preserves recursive CTE write
    metadata at the parsed boundary, validates top-level command source spans
    for plain and `WITH`-prefixed writes, checks retained CTE prefix
-   count/first/last/body-read compatibility, target/source/assignment clause
-   ranges, and required source child-read payloads before direct generated
+   count/first/last/body-read compatibility plus CTE item layout and comma
+   adjacency, target/source/assignment clause ranges, and required source
+   child-read payloads before direct generated
    lowering, validates retained generated child-read `SELECT` source, `WHERE`,
    and set-operation clause boundaries for insert-source and relation-source
    writes, and fails closed when retained generated kind metadata is missing,
@@ -1208,7 +1209,11 @@ now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete
 `FOR` strength, optional `OF` target list, and `NOWAIT`/`SKIP LOCKED` wait
-policy layout instead of only checking the leading `FOR` token.
+policy layout instead of only checking the leading `FOR` token. Read
+classification also verifies that top-level and CTE-body clause body ranges are
+preceded by the expected clause keywords, including `FROM`, `WHERE`, `GROUP BY`,
+`HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH`, before a
+generated read family is published.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

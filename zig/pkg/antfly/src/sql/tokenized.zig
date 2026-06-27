@@ -2094,13 +2094,67 @@ fn generatedDmlCtePrefixIsValid(
     if (!std.meta.eql(prefix.items[prefix.items.len - 1].body_tokens, prefix.last_body_tokens)) return false;
     if (!generatedDmlReadBodyIsValid(tokens, end, prefix.first_body_tokens, prefix.first_body_read, .select_body)) return false;
     if (!generatedDmlReadBodyIsValid(tokens, end, prefix.last_body_tokens, prefix.last_body_read, .select_body)) return false;
-    for (prefix.items) |item| {
+    var expected_start = prefix.list_tokens.start;
+    for (prefix.items, 0..) |item, index| {
         if (!generatedDmlTokenRangeIsValid(tokens, end, item.name_tokens)) return false;
+        if (!generatedDmlCteItemLayoutIsValid(tokens, end, prefix.list_tokens, item, expected_start)) return false;
         if (!generatedDmlReadBodyIsValid(tokens, end, item.body_tokens, item.body_read, .select_body)) return false;
         if (item.body_tokens.start == 0 or item.body_tokens.end >= end) return false;
         if (tokens[item.body_tokens.start - 1].kind != .lparen or tokens[item.body_tokens.end].kind != .rparen) return false;
+        expected_start = item.body_tokens.end + 1;
+        if (index + 1 < prefix.items.len) {
+            if (expected_start >= prefix.list_tokens.end or tokens[expected_start].kind != .comma) return false;
+            expected_start += 1;
+        }
     }
+    return expected_start == prefix.list_tokens.end;
+}
+
+fn generatedDmlCteItemLayoutIsValid(
+    tokens: []const Token,
+    end: usize,
+    list_tokens: generated_parser.GeneratedSqlTokenRange,
+    item: generated_parser.GeneratedSqlDmlCteItemAst,
+    expected_start: usize,
+) bool {
+    if (!generatedDmlTokenRangeIsValid(tokens, end, item.name_tokens)) return false;
+    if (!generatedDmlTokenRangeIsValid(tokens, end, item.body_tokens)) return false;
+    if (item.name_tokens.start != expected_start or item.name_tokens.end <= item.name_tokens.start) return false;
+    if (item.name_tokens.start < list_tokens.start or item.body_tokens.end > list_tokens.end) return false;
+
+    var cursor = item.name_tokens.end;
+    if (cursor < list_tokens.end and tokens[cursor].kind == .lparen) {
+        cursor = (generatedDmlMatchingParenInRange(tokens, cursor, list_tokens.end) orelse return false) + 1;
+    }
+    if (cursor >= list_tokens.end or !tokens[cursor].matchesKeywordTag(.as)) return false;
+    cursor += 1;
+    if (cursor < list_tokens.end and tokens[cursor].matchesKeywordTag(.materialized)) {
+        cursor += 1;
+    } else if (cursor + 1 < list_tokens.end and tokens[cursor].matchesKeywordTag(.not) and tokens[cursor + 1].matchesKeywordTag(.materialized)) {
+        cursor += 2;
+    }
+    if (cursor >= list_tokens.end or tokens[cursor].kind != .lparen) return false;
+    if (item.body_tokens.start != cursor + 1) return false;
+    if (item.body_tokens.end >= list_tokens.end or tokens[item.body_tokens.end].kind != .rparen) return false;
     return true;
+}
+
+fn generatedDmlMatchingParenInRange(tokens: []const Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or end > tokens.len or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 0;
+    var index = open_index;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 const GeneratedDmlReadBodyShape = enum {
@@ -2306,6 +2360,7 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.distinct_tokens)) return false;
     if (!generatedReadDistinctPayloadIsValid(tokens, end, read_ast.distinct_tokens, read_ast.distinct_on_items)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.source_tokens, .from)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_name_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_argument_tokens)) return false;
@@ -2333,8 +2388,10 @@ fn generatedReadAstHasValidClassificationPayload(
         read_ast.join_tree_depth,
     )) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.where_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.where_tokens, .where)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(read_ast.where_expression, read_ast.where_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.group_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeywordPair(tokens, read_ast.group_tokens, .group, .by)) return false;
     if (!generatedReadOptionalListPayloadIsValid(tokens, end, read_ast.group_tokens, read_ast.group_items, .{
         .reject_aliases = true,
         .reject_order_modifiers = true,
@@ -2342,10 +2399,13 @@ fn generatedReadAstHasValidClassificationPayload(
         .last_expression = read_ast.group_last_expression,
     })) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.having_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.having_tokens, .having)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(read_ast.having_expression, read_ast.having_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.window_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.window_tokens, .window)) return false;
     if (!generatedReadWindowPayloadIsValid(tokens, end, read_ast.window_tokens, read_ast.window_items, read_ast.window_count)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.order_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeywordPair(tokens, read_ast.order_tokens, .order, .by)) return false;
     if (!generatedReadOptionalListPayloadIsValid(tokens, end, read_ast.order_tokens, read_ast.order_items, .{
         .reject_aliases = true,
         .allow_order_modifiers = true,
@@ -2353,8 +2413,11 @@ fn generatedReadAstHasValidClassificationPayload(
         .last_expression = read_ast.order_last_expression,
     })) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.limit_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.limit_tokens, .limit)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.offset_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.offset_tokens, .offset)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.fetch_tokens, .fetch)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_count_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.row_lock_tokens)) return false;
     if (!generatedReadRowLockPayloadIsValid(tokens, end, read_ast.row_lock_tokens)) return false;
@@ -2472,6 +2535,7 @@ fn generatedReadCtePayloadIsValid(
             .last_expression = cte.body_projection_last_expression,
         })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_source_tokens, .from)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_operator_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_left_tokens)) return false;
@@ -2493,8 +2557,10 @@ fn generatedReadCtePayloadIsValid(
             cte.body_join_tree_depth,
         )) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_where_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_where_tokens, .where)) return false;
         if (!generatedReadOptionalExpressionTokensMatchMaybeRange(cte.body_where_expression, cte.body_where_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_group_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeywordPair(tokens, cte.body_group_tokens, .group, .by)) return false;
         if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_group_tokens, cte.body_group_items, .{
             .reject_aliases = true,
             .reject_order_modifiers = true,
@@ -2502,10 +2568,13 @@ fn generatedReadCtePayloadIsValid(
             .last_expression = cte.body_group_last_expression,
         })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_having_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_having_tokens, .having)) return false;
         if (!generatedReadOptionalExpressionTokensMatchMaybeRange(cte.body_having_expression, cte.body_having_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_window_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_window_tokens, .window)) return false;
         if (!generatedReadWindowPayloadIsValid(tokens, end, cte.body_window_tokens, cte.body_window_items, cte.body_window_count)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_order_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeywordPair(tokens, cte.body_order_tokens, .order, .by)) return false;
         if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_order_tokens, cte.body_order_items, .{
             .reject_aliases = true,
             .allow_order_modifiers = true,
@@ -2513,8 +2582,11 @@ fn generatedReadCtePayloadIsValid(
             .last_expression = cte.body_order_last_expression,
         })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_limit_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_limit_tokens, .limit)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_offset_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_offset_tokens, .offset)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_tokens)) return false;
+        if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_fetch_tokens, .fetch)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_count_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_row_lock_tokens)) return false;
         if (!generatedReadRowLockPayloadIsValid(tokens, end, cte.body_row_lock_tokens)) return false;
@@ -3407,6 +3479,27 @@ fn generatedReadGraphTableFunctionKindFromAntfly(kind: generated_parser.Generate
         .graph_metric_rerank => .metric_rerank,
         else => null,
     };
+}
+
+fn generatedReadOptionalRangeIsPrecededByKeyword(
+    tokens: []const Token,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    keyword: TokenKeyword,
+) bool {
+    const actual = range orelse return true;
+    return actual.start > 0 and tokens[actual.start - 1].matchesKeywordTag(keyword);
+}
+
+fn generatedReadOptionalRangeIsPrecededByKeywordPair(
+    tokens: []const Token,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    first: TokenKeyword,
+    second: TokenKeyword,
+) bool {
+    const actual = range orelse return true;
+    return actual.start >= 2 and
+        tokens[actual.start - 2].matchesKeywordTag(first) and
+        tokens[actual.start - 1].matchesKeywordTag(second);
 }
 
 fn generatedReadOptionalNestedRangeIsValid(
@@ -6382,6 +6475,23 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     generated_recursive_insert.statement = parseStatement(generated_recursive_insert.raw_statement, malformed_cte_prefix, &generated_recursive_insert.tokenized_sql);
     try std.testing.expect(generated_recursive_insert.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_recursive_insert.statement));
+
+    var generated_multi_cte_update = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE seed_rows AS (SELECT id FROM usage_records), source_rows AS (SELECT id FROM seed_rows), final_rows AS (SELECT id FROM source_rows) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM final_rows)");
+    defer generated_multi_cte_update.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_multi_cte_update.generatedStatementKind().?);
+
+    var malformed_middle_cte_item = generated_multi_cte_update.generated_statement.?;
+    switch (malformed_middle_cte_item.ast.?) {
+        .dml => |*dml_ast| {
+            const cte_prefix = if (dml_ast.cte_prefix) |*cte_prefix| cte_prefix else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 3), cte_prefix.items.len);
+            cte_prefix.items[1].name_tokens.start -= 1;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    generated_multi_cte_update.statement = parseStatement(generated_multi_cte_update.raw_statement, malformed_middle_cte_item, &generated_multi_cte_update.tokenized_sql);
+    try std.testing.expect(generated_multi_cte_update.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_multi_cte_update.statement));
 }
 
 test "sql adapter parsed sql requires generated parser success for plain DML heads" {
@@ -7503,6 +7613,26 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_set_operation_where_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_set_operation_where_query.statement));
 
+    var generated_limit_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records LIMIT 5");
+    defer generated_limit_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_limit_query.generatedStatementKind().?);
+
+    var malformed_limit_generated = generated_limit_query.generated_statement.?;
+    if (malformed_limit_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                read_ast.limit_tokens = read_ast.projection_tokens;
+                read_ast.limit_expression.tokens = read_ast.projection_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_limit_query.statement = parseStatement(generated_limit_query.raw_statement, malformed_limit_generated, &generated_limit_query.tokenized_sql);
+    try std.testing.expect(generated_limit_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_limit_query.statement));
+
     var generated_offset_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records OFFSET 2 ROWS");
     defer generated_offset_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_offset_query.generatedStatementKind().?);
@@ -7683,6 +7813,22 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
         return error.TestUnexpectedResult;
     }
     generated_cte_where_query.statement = parseStatement(generated_cte_where_query.raw_statement, malformed_cte_where_generated, &generated_cte_where_query.tokenized_sql);
+    try std.testing.expect(generated_cte_where_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_where_query.statement));
+
+    var malformed_cte_where_clause_generated = generated_cte_where_query.generated_statement.?;
+    if (malformed_cte_where_clause_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                read_ast.cte_items[0].body_where_tokens = read_ast.cte_items[0].body_projection_tokens;
+                read_ast.cte_items[0].body_where_expression.tokens = read_ast.cte_items[0].body_projection_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_where_query.statement = parseStatement(generated_cte_where_query.raw_statement, malformed_cte_where_clause_generated, &generated_cte_where_query.tokenized_sql);
     try std.testing.expect(generated_cte_where_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_where_query.statement));
 
