@@ -1195,7 +1195,10 @@ generated read family. It also validates top-level and CTE-body generated
 projection, `DISTINCT ON`, grouping, and ordering list payloads, including
 first/last expression summaries, alias spans, direction/`USING` operator
 ordering, `NULLS` ordering, and delimiter adjacency before publishing a
-generated read family.
+generated read family, validates generated set-operation right-query
+projection/source/predicate payloads, and requires top-level and CTE-body
+`WHERE`/`HAVING` generated predicate expression spans to match their retained
+clause bodies.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
