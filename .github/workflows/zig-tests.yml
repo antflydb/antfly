@@ -177,6 +177,8 @@ jobs:
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
+        env:
+          ANTFLY_TEST_CLEANUP_TRACE: "1"
         run: |
           set -euo pipefail
 
