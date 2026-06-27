@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 11473
+%expect 10615
 
 %start statement
 
@@ -263,9 +263,33 @@ create_role_statement:
 
 create_type_system_statement:
     CREATE COLLATION identifier_name diagnostic_tail_opt
-  | CREATE OPERATOR diagnostic_tail
+  | CREATE OPERATOR operator_symbol diagnostic_tail_opt
   | CREATE AGGREGATE identifier_name diagnostic_tail
   | CREATE CAST diagnostic_tail
+  ;
+
+operator_symbol:
+    EQ
+  | NEQ
+  | LT
+  | LTE
+  | GT
+  | GTE
+  | PLUS
+  | MINUS
+  | STAR
+  | SLASH
+  | PERCENT
+  | PIPE_CONCAT
+  | AT_CONTAINS
+  | RANGE_OVERLAP
+  | QUESTION
+  | QUESTION_ANY
+  | QUESTION_ALL
+  | REGEX_MATCH
+  | REGEX_IMATCH
+  | REGEX_NOT_MATCH
+  | REGEX_NOT_IMATCH
   ;
 
 create_routine_replace_opt:
@@ -277,6 +301,11 @@ routine_kind:
     FUNCTION
   | PROCEDURE
   | ROUTINE
+  ;
+
+drop_routine_kind:
+    FUNCTION
+  | PROCEDURE
   ;
 
 routine_parameter_list_opt:
@@ -395,8 +424,6 @@ alter_role_database_opt:
 
 alter_type_system_statement:
     ALTER COLLATION identifier_name RENAME TO identifier_name
-  | ALTER OPERATOR diagnostic_tail
-  | ALTER AGGREGATE diagnostic_tail
   ;
 
 alter_table_relation_prefix_opt:
@@ -422,10 +449,10 @@ drop_statement:
   | DROP PUBLICATION if_exists_opt qualified_name
   | DROP SUBSCRIPTION if_exists_opt qualified_name
   | DROP POLICY if_exists_opt identifier_name ON qualified_name drop_behavior_opt
-  | DROP routine_kind if_exists_opt qualified_name LPAREN routine_type_list_opt RPAREN drop_behavior_opt
+  | DROP drop_routine_kind if_exists_opt qualified_name LPAREN routine_type_list_opt RPAREN drop_behavior_opt
   | DROP role_keyword if_exists_opt identifier_name drop_behavior_opt
   | DROP COLLATION if_exists_opt identifier_name
-  | DROP OPERATOR diagnostic_tail
+  | DROP OPERATOR operator_symbol diagnostic_tail_opt
   | DROP AGGREGATE identifier_name diagnostic_tail
   | DROP CAST diagnostic_tail
   ;
@@ -616,6 +643,7 @@ cursor_statement:
     CLOSE diagnostic_tail
   | DECLARE diagnostic_tail
   | FETCH diagnostic_tail
+  | MOVE diagnostic_tail
   ;
 
 unsupported_statement:
@@ -629,20 +657,24 @@ unsupported_statement:
   | CREATE ACCESS METHOD diagnostic_tail_opt
   | CREATE FOREIGN DATA identifier_name diagnostic_tail_opt
   | CREATE FOREIGN TABLE diagnostic_tail_opt
-  | CREATE identifier_name TRIGGER diagnostic_tail_opt
-  | CREATE identifier_name diagnostic_tail_opt
-  | CREATE identifier_name identifier_name diagnostic_tail_opt
+  | CREATE IDENT TRIGGER diagnostic_tail_opt
+  | CREATE IDENT diagnostic_tail_opt
+  | CREATE IDENT IDENT diagnostic_tail_opt
+  | CREATE OPERATOR IDENT diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
   | CREATE TRIGGER diagnostic_tail_opt
+  | CREATE USER diagnostic_tail_opt
   | ALTER FOREIGN DATA identifier_name diagnostic_tail_opt
   | ALTER DEFAULT PRIVILEGES diagnostic_tail_opt
   | ALTER FOREIGN TABLE diagnostic_tail_opt
+  | ALTER AGGREGATE diagnostic_tail
   | ALTER identifier_name FOR diagnostic_tail
   | ALTER INDEX diagnostic_tail_opt
   | ALTER identifier_name TRIGGER diagnostic_tail_opt
   | ALTER identifier_name identifier_name diagnostic_tail_opt
   | ALTER MATERIALIZED VIEW diagnostic_tail_opt
+  | ALTER OPERATOR diagnostic_tail
   | ALTER RULE diagnostic_tail_opt
   | ALTER SERVER diagnostic_tail_opt
   | ALTER SYSTEM diagnostic_tail_opt
@@ -662,12 +694,14 @@ unsupported_statement:
   | DROP PUBLICATION if_exists_opt qualified_name COMMA diagnostic_tail
   | DROP role_keyword if_exists_opt identifier_name COMMA diagnostic_tail
   | DROP COLLATION if_exists_opt identifier_name COMMA diagnostic_tail
+  | DROP OPERATOR IDENT diagnostic_tail_opt
   | DROP identifier_name TRIGGER diagnostic_tail_opt
   | DROP identifier_name diagnostic_tail_opt
   | DROP identifier_name identifier_name diagnostic_tail_opt
   | DROP OWNED diagnostic_tail_opt
   | DROP SCHEMA if_exists_opt qualified_name COMMA diagnostic_tail
   | DROP RULE diagnostic_tail_opt
+  | DROP ROUTINE diagnostic_tail_opt
   | DROP SERVER diagnostic_tail_opt
   | DROP TRIGGER diagnostic_tail_opt
   | IMPORT FOREIGN SCHEMA identifier_name FROM SERVER identifier_name INTO identifier_name diagnostic_tail_opt
@@ -682,16 +716,15 @@ unsupported_statement:
   | LOAD diagnostic_tail_opt
   | LOCK diagnostic_tail_opt
   | MATCH diagnostic_tail_opt
-  | MOVE diagnostic_tail_opt
   | NOTIFY diagnostic_tail_opt
+  | SET ROLE diagnostic_tail_opt
   | SET SESSION AUTHORIZATION diagnostic_tail_opt
   | VACUUM diagnostic_tail_opt
   | REINDEX diagnostic_tail_opt
-  | RELEASE diagnostic_tail_opt
   | REASSIGN OWNED diagnostic_tail_opt
+  | RESET ROLE
   | RESET SESSION AUTHORIZATION
   | REVOKE diagnostic_tail_opt
-  | SAVEPOINT diagnostic_tail_opt
   | SECURITY diagnostic_tail_opt
   | UNLISTEN diagnostic_tail_opt
   ;
@@ -1511,7 +1544,6 @@ identifier_name:
   | RESET
   | RESTART
   | REVOKE
-  | ROLE
   | SAVEPOINT
   | SECURITY
   | SEQUENCE

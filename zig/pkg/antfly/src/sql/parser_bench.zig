@@ -133,7 +133,10 @@ pub fn main(init: std.process.Init) !void {
         for (cases) |case| {
             counting.reset();
             const parse_started = monotonicNanos();
-            var parsed = try generated_parser.parseTokensAlloc(parse_alloc, case.tokens);
+            var parsed = generated_parser.parseTokensAlloc(parse_alloc, case.tokens) catch |err| {
+                std.debug.print("sql_parser_bench parse error={s} sql=\"{s}\"\n", .{ @errorName(err), case.sql });
+                return err;
+            };
             const parse_elapsed = monotonicNanos() - parse_started;
 
             durations[duration_index] = @intCast(parse_elapsed);

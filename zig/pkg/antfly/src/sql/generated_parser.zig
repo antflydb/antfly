@@ -1910,9 +1910,18 @@ pub const GeneratedSqlReductionTrace = struct {
             index -= 1;
             const event = self.reductions[index];
             if (event.rule != .statement or event.rhs.len != 1) continue;
-            return statementKindFromGrammarRule(event.rhsRule(0) orelse return null);
+            const kind = statementKindFromGrammarRule(event.rhsRule(0) orelse return null) orelse return null;
+            if (kind == .ddl and self.hasExtensionIndexDdlBefore(index)) return .extension_index;
+            return kind;
         }
         return null;
+    }
+
+    fn hasExtensionIndexDdlBefore(self: @This(), statement_reduction_index: usize) bool {
+        for (self.reductions[0..statement_reduction_index]) |event| {
+            if (reductionIsExtensionIndexDdl(event.rule, event.production)) return true;
+        }
+        return false;
     }
 };
 
@@ -2354,18 +2363,21 @@ pub fn parseTokensAllocWithAstMode(
     tokens: []const token_mod.Token,
     ast_mode: GeneratedSqlAstMode,
 ) !GeneratedSqlParseResult {
-    const statement = classifyStatement(tokens);
+    var grammar_statement_kind: GeneratedSqlStatementKind = undefined;
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
-        try parseGeneratedTokenIds(alloc, token_ids);
+        grammar_statement_kind = try parseGeneratedTokenIdStatementKind(alloc, token_ids);
     } else |err| switch (err) {
         error.NoSpaceLeft => {
             const token_ids = try tokenIdsAlloc(alloc, tokens);
             defer alloc.free(token_ids);
-            try parseGeneratedTokenIds(alloc, token_ids);
+            grammar_statement_kind = try parseGeneratedTokenIdStatementKind(alloc, token_ids);
         },
         else => return err,
     }
+
+    const statement = classifyStatement(tokens);
+    if (grammar_statement_kind != std.meta.activeTag(statement)) return error.UnsupportedSqlShape;
     return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
 }
 
@@ -2430,20 +2442,45 @@ const ReductionTraceHandler = struct {
 
 const StatementKindTraceHandler = struct {
     statement_kind: ?GeneratedSqlStatementKind = null,
+    saw_extension_index_ddl: bool = false,
 
     pub fn shift(_: *@This(), _: generated.Shift) !void {}
 
     pub fn reduce(self: *@This(), reduction: generated.Reduction) !void {
         const info = generated.productionInfo(reduction.production) orelse return error.UnsupportedSqlShape;
+        if (reductionIsExtensionIndexDdl(info.rule, reduction.production)) {
+            self.saw_extension_index_ddl = true;
+        }
         if (info.rule != .statement) return;
         const rhs = generated.productionRhs(reduction.production) orelse return error.UnsupportedSqlShape;
         if (rhs.len != 1) return error.UnsupportedSqlShape;
         const rule = generated.symbolRule(rhs[0]) orelse return error.UnsupportedSqlShape;
-        self.statement_kind = statementKindFromGrammarRule(rule) orelse return error.UnsupportedSqlShape;
+        const kind = statementKindFromGrammarRule(rule) orelse return error.UnsupportedSqlShape;
+        self.statement_kind = if (kind == .ddl and self.saw_extension_index_ddl) .extension_index else kind;
     }
 
     pub fn accept(_: *@This(), _: generated.Accept) !void {}
 };
+
+fn reductionIsExtensionIndexDdl(rule: ?GeneratedSqlGrammarRule, production: u16) bool {
+    return switch (rule orelse return false) {
+        .create_index_statement, .create_extension_statement => true,
+        .drop_statement => dropStatementProductionIsExtensionIndex(production),
+        else => false,
+    };
+}
+
+fn dropStatementProductionIsExtensionIndex(production: u16) bool {
+    const rhs = generated.productionRhs(production) orelse return false;
+    if (rhs.len < 2) return false;
+    if (!grammarSymbolNameEquals(rhs[0], "DROP")) return false;
+    return grammarSymbolNameEquals(rhs[1], "INDEX") or grammarSymbolNameEquals(rhs[1], "EXTENSION");
+}
+
+fn grammarSymbolNameEquals(symbol: u16, expected: []const u8) bool {
+    const name = generated.terminalName(symbol) orelse return false;
+    return std.mem.eql(u8, name, expected);
+}
 
 fn parseGeneratedTokenIdStatementKind(alloc: std.mem.Allocator, token_ids: []const u16) !GeneratedSqlStatementKind {
     var handler = StatementKindTraceHandler{};
@@ -13133,6 +13170,10 @@ test "generated SQL reduction traces derive statement family" {
         .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
         .{ .sql = "PREPARE TRANSACTION 'usage_batch'", .kind = .prepared_transaction },
         .{ .sql = "CREATE TABLE usage_records (id text)", .kind = .ddl },
+        .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+        .{ .sql = "CREATE EXTENSION vector", .kind = .extension_index },
+        .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
+        .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
         .{ .sql = "INSERT INTO usage_records (id) VALUES ('u1')", .kind = .dml },
         .{ .sql = "SELECT id FROM usage_records", .kind = .read },
         .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
@@ -13167,6 +13208,23 @@ test "generated SQL parser derives statement family without trace allocation" {
         var tokens = try lexer.tokenizeAlloc(std.testing.allocator, case.sql);
         defer lexer.freeTokens(std.testing.allocator, &tokens);
         try std.testing.expectEqual(case.kind, try parseStatementKindFromGrammarAlloc(std.testing.allocator, tokens.items));
+    }
+}
+
+test "generated SQL parser validates normal parse path against grammar family" {
+    const cases = [_]GeneratedSqlCorpusCase{
+        .{ .sql = "SET search_path TO public", .kind = .session },
+        .{ .sql = "CREATE TABLE usage_records (id text)", .kind = .ddl },
+        .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+        .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
+        .{ .sql = "INSERT INTO usage_records (id) VALUES ('u1')", .kind = .dml },
+        .{ .sql = "SELECT id FROM usage_records", .kind = .read },
+    };
+
+    for (cases) |case| {
+        var result = try parseSqlAlloc(std.testing.allocator, case.sql);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.kind, result.kind);
     }
 }
 

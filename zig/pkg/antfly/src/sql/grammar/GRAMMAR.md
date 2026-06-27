@@ -106,6 +106,15 @@ statement classification with grammar-owned AST dispatch. The runtime also has
 a non-allocating statement-family helper that observes the accepted LR
 reductions without retaining a full trace, giving the normal parse path a
 low-overhead migration target once each family is proven equivalent. The
+normal generated parse path now validates its retained legacy statement
+classification against that LR-derived family, preserving the existing
+`extension_index` split by observing index/extension DDL reductions while
+failing closed on future classification drift. That guard has already forced
+the grammar fallbacks to be narrower: valid savepoint release and cursor `MOVE`
+forms reduce through transaction/cursor families, role/session authorization
+controls reduce as unsupported, symbolic `CREATE/DROP OPERATOR` remains DDL
+while operator class/family forms remain unsupported, and generic `CREATE`
+fallbacks no longer steal supported DDL such as `CREATE VIEW`. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
