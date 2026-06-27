@@ -1085,11 +1085,7 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse {
-            std.log.err("debug provisioned document artifact group resolution miss table={s} doc={s}", .{ table_name, doc_key });
-            return null;
-        };
-        std.log.err("debug provisioned document artifact group={d} table={s} doc={s}", .{ group_id, table_name, doc_key });
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
@@ -1992,11 +1988,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse {
-            std.log.err("debug hosted document artifact group resolution miss table={s} doc={s}", .{ table_name, doc_key });
-            return null;
-        };
-        std.log.err("debug hosted document artifact group={d} table={s} doc={s}", .{ group_id, table_name, doc_key });
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
@@ -4438,7 +4430,6 @@ fn documentArtifactManifestProvisionedLocal(
 ) !?db_mod.types.DocumentArtifactManifest {
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
-    std.log.err("debug document artifact manifest read path={s} group={d} table={s} doc={s} artifact={s} root_generation={d}", .{ path, group_id, table_name, doc_key, artifact_name, lsm_root_generation });
     if (cache) |cached| {
         var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
         defer db_lease.release();
