@@ -864,8 +864,12 @@ fn boundSqlAuthorizationForObjectsAlloc(
 }
 
 fn freeBoundCatalogObjects(alloc: std.mem.Allocator, objects: []BoundCatalogObject) void {
-    for (objects) |*object| object.deinit(alloc);
+    deinitBoundCatalogObjects(alloc, objects);
     if (objects.len > 0) alloc.free(objects);
+}
+
+fn deinitBoundCatalogObjects(alloc: std.mem.Allocator, objects: []BoundCatalogObject) void {
+    for (objects) |*object| object.deinit(alloc);
 }
 
 fn boundCatalogObjectForBindingAlloc(
@@ -2118,7 +2122,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(
     var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
     var bound_objects_transferred = false;
     errdefer if (!bound_objects_transferred) {
-        freeBoundCatalogObjects(alloc, bound_objects.items);
+        deinitBoundCatalogObjects(alloc, bound_objects.items);
         bound_objects.deinit(alloc);
     };
 
@@ -2217,7 +2221,7 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAll
     var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
     var bound_objects_transferred = false;
     errdefer if (!bound_objects_transferred) {
-        freeBoundCatalogObjects(alloc, bound_objects.items);
+        deinitBoundCatalogObjects(alloc, bound_objects.items);
         bound_objects.deinit(alloc);
     };
     if (try readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
@@ -2478,7 +2482,7 @@ fn collectDdlBoundCatalogObjectsAlloc(
     var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
     var transferred = false;
     errdefer if (!transferred) {
-        freeBoundCatalogObjects(alloc, bound_objects.items);
+        deinitBoundCatalogObjects(alloc, bound_objects.items);
         bound_objects.deinit(alloc);
     };
 
@@ -2964,7 +2968,7 @@ fn readSourceTableNamesFromWithAlloc(
     tokens: []const Token,
 ) !?ReadSourceTableNames {
     var index: usize = 1;
-    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
+    const recursive = consumeKeyword(tokens, &index, .recursive);
 
     var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
     defer {
@@ -2989,16 +2993,18 @@ fn readSourceTableNamesFromWithAlloc(
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
         if (index + 1 >= close_index) return error.UnsupportedSqlShape;
 
-        var cte_tables = (try selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0)) orelse return error.UnsupportedSqlShape;
-        defer cte_tables.deinit(alloc);
-        try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &cte_tables);
-        if (cte_tables.source) |source| {
-            if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
-        }
+        const cte_source = try readCteSourceTableNameAlloc(
+            alloc,
+            cte_bindings.items,
+            cte_name,
+            tokens[index + 1 .. close_index],
+            recursive,
+        );
+        errdefer alloc.free(cte_source);
 
         try cte_bindings.append(alloc, .{
             .name = cte_name,
-            .source = try alloc.dupe(u8, cte_tables.left),
+            .source = cte_source,
         });
         cte_name_transferred = true;
 
@@ -3019,6 +3025,45 @@ fn readSourceTableNamesFromWithAlloc(
     };
     final_tables.source = null;
     return .{ .left = final_tables.left, .source = source };
+}
+
+fn readCteSourceTableNameAlloc(
+    alloc: std.mem.Allocator,
+    bindings: []const CteSourceBinding,
+    cte_name: []const u8,
+    body_tokens: []const Token,
+    recursive: bool,
+) ![]const u8 {
+    const source_tokens = if (recursive) recursiveReadCteAnchorTokens(body_tokens) orelse body_tokens else body_tokens;
+    var cte_tables = (try selectReadTableNamesAlloc(alloc, source_tokens, 0)) orelse return error.UnsupportedSqlShape;
+    defer cte_tables.deinit(alloc);
+    try resolveSelectReadTablesAgainstCtes(alloc, bindings, &cte_tables);
+    if (cte_tables.source) |source| {
+        if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
+    }
+    if (recursive and std.mem.eql(u8, cte_tables.left, cte_name)) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, cte_tables.left);
+}
+
+fn recursiveReadCteAnchorTokens(tokens: []const Token) ?[]const Token {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, index| {
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .identifier => {
+                if (depth == 0 and selectSetOperationKeyword(token)) {
+                    if (index == 0) return null;
+                    return tokens[0..index];
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
@@ -3238,6 +3283,16 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     defer lateral.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", lateral.left);
     try std.testing.expectEqualStrings("balance_records", lateral.source);
+
+    var recursive_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows",
+    );
+    defer recursive_sql.deinit(alloc);
+    var recursive = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &recursive_sql)).?;
+    defer recursive.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", recursive.left);
+    try std.testing.expectEqualStrings("usage_records", recursive.source);
 }
 
 test "sql adapter binder resolves catalog prebind table names from shared tokens" {

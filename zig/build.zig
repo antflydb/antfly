@@ -1548,6 +1548,8 @@ pub fn build(b: *std.Build) void {
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
     integration_test_step.dependOn(&run_public_api_parity_tests.step);
+    integration_test_step.dependOn(graph_metric_tests.integration);
+    integration_test_step.dependOn(&run_public_api_graph_metric_e2e_tests.step);
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
@@ -1856,12 +1858,8 @@ pub fn build(b: *std.Build) void {
         &db_storage_tests.all.step,
         &storage_backend_tests.sparse.run.step,
         &storage_backend_tests.derived_log.run.step,
-        &graph_metric_tests.lifecycle.step,
-        &graph_metric_tests.query_fan_in.step,
-        &graph_metric_tests.cleanup.step,
-        &graph_metric_tests.degree_canary.step,
-        &graph_metric_tests.default_gate.step,
-        &run_public_api_graph_metric_e2e_tests.step,
+        graph_metric_tests.unit,
+        &graph_metric_tests.smoke.step,
     });
 
     const bench_steps = antfly_benches_build.addBenchSteps(.{
@@ -1975,7 +1973,6 @@ pub fn build(b: *std.Build) void {
     cli_test_step.dependOn(&run_antfly_main_tests.step);
     cli_test_step.dependOn(&run_lite_cli_tests.step);
     cli_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
-    unit_test_step.dependOn(&graph_metric_tests.operations.step);
     unit_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
 
     if (edition == .full) {

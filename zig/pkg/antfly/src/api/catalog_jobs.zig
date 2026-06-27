@@ -307,6 +307,198 @@ pub fn scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
     return scheduled;
 }
 
+pub const TableEmptyingBarrierAdmission = struct {
+    applied: tables_api.AppliedRelationalSqlDdlRecord,
+    affected_tables: []metadata_table_manager.TableRecord = &.{},
+    scheduled_jobs: usize = 0,
+
+    pub fn deinitAffectedTables(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.affected_tables) |record| metadata_table_manager.freeTable(alloc, record);
+        alloc.free(self.affected_tables);
+        self.affected_tables = &.{};
+    }
+};
+
+const TableEmptyingDuplicatePolicy = enum {
+    reject,
+    ignore,
+};
+
+fn appendTableEmptyingAffectedRecord(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    affected_table_ids: *std.ArrayListUnmanaged(u64),
+    affected_tables: *std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord),
+    duplicate_policy: TableEmptyingDuplicatePolicy,
+) !bool {
+    for (affected_table_ids.items) |table_id| {
+        if (table_id == table.table_id) {
+            return switch (duplicate_policy) {
+                .reject => error.InvalidArgument,
+                .ignore => false,
+            };
+        }
+    }
+    try affected_table_ids.append(alloc, table.table_id);
+    errdefer _ = affected_table_ids.pop();
+    try affected_tables.append(alloc, table);
+    return true;
+}
+
+fn appendTableEmptyingTargetWithSession(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    affected_table_ids: *std.ArrayListUnmanaged(u64),
+    affected_tables: *std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord),
+    duplicate_policy: TableEmptyingDuplicatePolicy,
+) !bool {
+    const target = try session.tableTargetFromObjectName(table_name);
+    const table = tables_api.findTableByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    return try appendTableEmptyingAffectedRecord(alloc, table, affected_table_ids, affected_tables, duplicate_policy);
+}
+
+fn tableEmptyingForeignKeyReferencesTable(
+    snapshot: *const metadata_api.AdminSnapshot,
+    child_table: metadata_table_manager.TableRecord,
+    child_schema: runtime_schema_mod.TableSchema,
+    foreign_key: runtime_schema_mod.ForeignKey,
+    parent_table: metadata_table_manager.TableRecord,
+) !bool {
+    const parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, child_schema.default_type))
+        child_table.name
+    else
+        foreign_key.parent_table;
+    const child_search_path = [_][]const u8{child_table.namespace_name};
+    const child_session = catalog_resources.SqlCatalogSession{
+        .current_database_name = child_table.database_name,
+        .search_path = child_search_path[0..],
+    };
+    const parent_target = try child_session.tableTargetFromObjectName(parent_table_name);
+    const resolved_parent = tables_api.findTableByQualifiedName(snapshot, parent_target.database_name, parent_target.namespace_name, parent_target.table_name) orelse return error.InvalidSqlCatalog;
+    return resolved_parent.table_id == parent_table.table_id;
+}
+
+fn appendTableEmptyingCascadeTargets(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    affected_table_ids: *std.ArrayListUnmanaged(u64),
+    affected_tables: *std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord),
+) !void {
+    var cursor: usize = 0;
+    while (cursor < affected_tables.items.len) : (cursor += 1) {
+        const parent_table = affected_tables.items[cursor].*;
+        for (snapshot.tables) |*candidate_table| {
+            if (candidate_table.schema_json.len == 0) continue;
+            var parsed_child = try tables_api.parseValidatedTableSchema(alloc, candidate_table.schema_json);
+            defer parsed_child.deinit(alloc);
+            const child_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_child);
+            defer runtime_schema_mod.freeSchema(alloc, child_schema);
+            if (child_schema.storage_mode != .relational) continue;
+
+            for (child_schema.foreign_keys) |foreign_key| {
+                if (!(try tableEmptyingForeignKeyReferencesTable(snapshot, candidate_table.*, child_schema, foreign_key, parent_table))) continue;
+                _ = try appendTableEmptyingAffectedRecord(
+                    alloc,
+                    candidate_table,
+                    affected_table_ids,
+                    affected_tables,
+                    .ignore,
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn cloneTableEmptyingAffectedTablesAlloc(
+    alloc: std.mem.Allocator,
+    affected_tables: []const *const metadata_table_manager.TableRecord,
+) ![]metadata_table_manager.TableRecord {
+    const out = try alloc.alloc(metadata_table_manager.TableRecord, affected_tables.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (affected_tables, 0..) |table, i| {
+        out[i] = try metadata_table_manager.cloneTable(alloc, table.*);
+        cloned += 1;
+    }
+    return out;
+}
+
+pub fn scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    primary_table_name: []const u8,
+    additional_table_names: []const []const u8,
+    restart_identity: bool,
+    cascade: bool,
+    session: catalog_resources.SqlCatalogSession,
+) !TableEmptyingBarrierAdmission {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "adminSnapshot") or
+        !@hasDecl(ServiceDeclType, "freeAdminSnapshot") or
+        !@hasDecl(ServiceDeclType, "upsertTableEmptyingJob"))
+    {
+        return error.UnsupportedOperation;
+    }
+
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+
+    var affected_table_ids = std.ArrayListUnmanaged(u64).empty;
+    defer affected_table_ids.deinit(alloc);
+    var affected_tables = std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord).empty;
+    defer affected_tables.deinit(alloc);
+
+    _ = try appendTableEmptyingTargetWithSession(alloc, &snapshot, primary_table_name, session, &affected_table_ids, &affected_tables, .reject);
+    for (additional_table_names) |additional_table_name| {
+        _ = try appendTableEmptyingTargetWithSession(alloc, &snapshot, additional_table_name, session, &affected_table_ids, &affected_tables, .reject);
+    }
+    if (cascade) {
+        try appendTableEmptyingCascadeTargets(alloc, &snapshot, &affected_table_ids, &affected_tables);
+    }
+
+    const barrier_id = try tableEmptyingBarrierIdForSnapshot(&snapshot, affected_table_ids.items, restart_identity, cascade);
+    var scheduled_jobs: usize = 0;
+    for (affected_tables.items) |table| {
+        scheduled_jobs += try scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
+            svc,
+            snapshot.ranges,
+            table.*,
+            affected_table_ids.items,
+            restart_identity,
+            cascade,
+            barrier_id,
+        );
+    }
+    if (scheduled_jobs == 0) return error.UnsupportedOperation;
+
+    const owned_affected_tables = try cloneTableEmptyingAffectedTablesAlloc(alloc, affected_tables.items);
+    errdefer {
+        for (owned_affected_tables) |record| metadata_table_manager.freeTable(alloc, record);
+        alloc.free(owned_affected_tables);
+    }
+
+    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    metadata_table_manager.freeTable(alloc, applied.table);
+    applied.table = try metadata_table_manager.cloneTable(alloc, affected_tables.items[0].*);
+
+    return .{
+        .applied = applied,
+        .affected_tables = owned_affected_tables,
+        .scheduled_jobs = scheduled_jobs,
+    };
+}
+
 fn findTableById(snapshot: *const metadata_api.AdminSnapshot, table_id: u64) ?metadata_table_manager.TableRecord {
     for (snapshot.tables) |table| {
         if (table.table_id == table_id) return table;
@@ -1021,6 +1213,86 @@ test "catalog jobs schedules table emptying jobs from snapshot ranges" {
         try std.testing.expect(job.cascade);
         try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
     }
+}
+
+test "catalog jobs admits session qualified table emptying barrier with cascade" {
+    const alloc = std.testing.allocator;
+    const tenant_orders_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id","customer_id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"cascade"}]}
+    ;
+    const FakeService = struct {
+        tables: [3]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 1, .name = "customers", .namespace_name = "public", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}" },
+            .{ .table_id = 2, .name = "customers", .namespace_name = "tenant", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}" },
+            .{ .table_id = 3, .name = "orders", .namespace_name = "tenant", .schema_json = tenant_orders_schema },
+        },
+        ranges: [3]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 8101, .range_id = 8102, .table_id = 1, .start_key = "", .end_key = null },
+            .{ .group_id = 8201, .range_id = 8202, .table_id = 2, .start_key = "", .end_key = null },
+            .{ .group_id = 8301, .range_id = 8302, .table_id = 3, .start_key = "", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.TableEmptyingJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.jobs.items) |record| metadata_table_manager.freeTableEmptyingJob(allocator, record);
+            self.jobs.deinit(allocator);
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTableEmptyingJob(self: *@This(), record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            const owned = try metadata_table_manager.cloneTableEmptyingJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, owned);
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+    const search_path = [_][]const u8{"tenant"};
+    var admission = try scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
+        alloc,
+        &service,
+        "customers",
+        &.{},
+        true,
+        true,
+        .{ .search_path = search_path[0..] },
+    );
+    defer admission.applied.deinit(alloc);
+    defer admission.deinitAffectedTables(alloc);
+
+    try std.testing.expectEqual(@as(u64, 2), admission.applied.table.table_id);
+    try std.testing.expectEqual(@as(usize, 2), admission.scheduled_jobs);
+    try std.testing.expectEqual(@as(usize, 2), admission.affected_tables.len);
+    try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);
+
+    var saw_tenant_parent = false;
+    var saw_tenant_child = false;
+    for (service.jobs.items) |job| {
+        try std.testing.expect(job.table_id != 1);
+        try std.testing.expect(job.restart_identity);
+        try std.testing.expect(job.cascade);
+        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
+        try std.testing.expectEqual(@as(u64, 2), job.affected_table_ids[0]);
+        try std.testing.expectEqual(@as(u64, 3), job.affected_table_ids[1]);
+        saw_tenant_parent = saw_tenant_parent or job.table_id == 2;
+        saw_tenant_child = saw_tenant_child or job.table_id == 3;
+    }
+    try std.testing.expect(saw_tenant_parent);
+    try std.testing.expect(saw_tenant_child);
 }
 
 test "catalog jobs table emptying barrier waits for every affected table range" {

@@ -36,6 +36,10 @@ func (t *TableApi) DeleteArtifactEnrichment(w http.ResponseWriter, r *http.Reque
 	documentArtifactRouteNotImplemented(w)
 }
 
+func (t *TableApi) ListArtifactEnrichments(w http.ResponseWriter, r *http.Request, tableName string) {
+	documentArtifactRouteNotImplemented(w)
+}
+
 func (t *TableApi) ListDocumentArtifactManifests(w http.ResponseWriter, r *http.Request, tableName string, key string, params ListDocumentArtifactManifestsParams) {
 	documentArtifactRouteNotImplemented(w)
 }

@@ -239,12 +239,16 @@ pub const GraphMetricTestModules = struct {
 };
 
 pub const GraphMetricTestRuns = struct {
+    unit: *std.Build.Step,
+    smoke: *std.Build.Step.Run,
     lifecycle: *std.Build.Step.Run,
     query_fan_in: *std.Build.Step.Run,
     operations: *std.Build.Step.Run,
+    runtime_operations: *std.Build.Step.Run,
     cleanup: *std.Build.Step.Run,
     degree_canary: *std.Build.Step.Run,
     default_gate: *std.Build.Step.Run,
+    integration: *std.Build.Step,
 };
 
 pub const RootTestStep = struct {
@@ -2294,8 +2298,19 @@ pub const StorageBackendTestFilters = struct {
 };
 
 pub const GraphMetricTestFilters = struct {
-    pub const lifecycle = [_][]const u8{
+    pub const unit_runtime = [_][]const u8{
+        "graph metric runtime config rejects zero lease and maintenance budgets when enabled",
+        "graph metric runtime config rejects worker id lists for single-owner roles",
+        "graph metric runtime role gates apply without durable lease ownership",
+        "graph metric runtime worker pool identity is order independent",
+        "graph metric runtime boundary tick preserves worker pool operation",
+    };
+
+    pub const smoke = [_][]const u8{
         "graph degree planned build publishes scores matching local runner",
+    };
+
+    pub const lifecycle = [_][]const u8{
         "graph pagerank planned build publishes scores matching local runner",
         "graph pagerank planned build drains partitioned pages across workers",
         "graph pagerank later iteration exhausted page fails build and preserves prior generation",
@@ -2306,7 +2321,6 @@ pub const GraphMetricTestFilters = struct {
         "graph eigenvector reclaimed initialize page overwrites stale rank output",
         "graph eigenvector reclaimed contribution and reduce pages overwrite stale output",
         "graph eigenvector convergence page reclaim recomputes without stale partial summary",
-        "graph eigenvector cleanup page resumes after reopen with published scores visible",
         "graph eigenvector failed planned build preserves prior published generation",
         "graph eigenvector coordinator publish failure preserves prior published generation after reopen",
         "graph hits planned build publishes paired scores matching local runner",
@@ -2317,15 +2331,10 @@ pub const GraphMetricTestFilters = struct {
         "graph hits reclaimed initialize page overwrites stale rank output",
         "graph hits reclaimed contribution and reduce pages overwrite stale output",
         "graph hits convergence page reclaim recomputes without stale partial summary",
-        "graph hits cleanup page resumes after reopen with published pair visible",
         "graph hits failed planned build preserves prior published pair",
         "graph hits coordinator publish failure preserves prior published pair after reopen",
         "graph hits planned build drains partitioned paired pages across workers",
         "graph hits larger manifest resumes across reopen boundaries",
-        "graph metric failed planned build cleans abandoned scores and job namespace",
-        "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
-        "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
-        "graph metric repeated failed hits builds bound diagnostics and cleanup abandoned namespaces",
     };
 
     pub const query_fan_in = [_][]const u8{
@@ -2365,14 +2374,17 @@ pub const GraphMetricTestFilters = struct {
         "index encoders expose mixed graph metric runtime roles without aggregate role",
         "graph metric status encoder exposes active build pages",
         "distributed graph expand request defers worker result limit for metric post processing",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
-        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
         "internal group write routes expose graph metric maintenance boundary",
         "internal group write routes graph metric maintenance fences service runtime owners",
         "internal group write routes graph metric maintenance releases only current service owner",
+    };
+
+    pub const runtime_operations = [_][]const u8{
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
     };
 
     pub const cleanup = [_][]const u8{
@@ -3348,25 +3360,46 @@ pub fn addGraphMetricTestSteps(
     modules: GraphMetricTestModules,
     root_test_skip_filters: []const []const u8,
 ) GraphMetricTestRuns {
+    const runtime_unit = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.unit_runtime, root_test_skip_filters);
+    const smoke = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.smoke, root_test_skip_filters);
     const lifecycle = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.lifecycle, root_test_skip_filters);
     const query_fan_in = addSimpleSelectedTestRun(b, modules.query_fan_in, &GraphMetricTestFilters.query_fan_in, &.{});
     const operations = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.operations, root_test_skip_filters);
+    const runtime_operations = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.runtime_operations, root_test_skip_filters);
     const cleanup = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.cleanup, root_test_skip_filters);
     const degree_canary = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.degree_canary, root_test_skip_filters);
     const default_gate = addSimpleSelectedTestRun(b, modules.root, &GraphMetricTestFilters.default_gate, root_test_skip_filters);
 
+    const unit = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, fan-in, and API logic tests");
+    unit.dependOn(&runtime_unit.step);
+    unit.dependOn(&query_fan_in.step);
+    unit.dependOn(&operations.step);
+
+    addFocusedTestStep(b, "graph-metric-smoke-test", "Run one small graph metric DB smoke test", smoke);
     addFocusedTestStep(b, "graph-metric-lifecycle-test", "Run focused graph metric planned lifecycle tests", lifecycle);
     addFocusedTestStep(b, "graph-metric-operations-test", "Run focused graph metric operation tests", operations);
+    addFocusedTestStep(b, "graph-metric-runtime-operations-test", "Run focused graph metric runtime operation tests", runtime_operations);
     addFocusedTestStep(b, "graph-metric-degree-canary-test", "Run focused graph metric degree-canary tests", degree_canary);
     addFocusedTestStep(b, "graph-metric-default-gate-test", "Run focused graph metric default-gate tests", default_gate);
 
+    const integration = b.step("graph-metric-integration-test", "Run graph metric scheduler, worker, cleanup, and runtime lifecycle tests");
+    integration.dependOn(&lifecycle.step);
+    integration.dependOn(&runtime_operations.step);
+    integration.dependOn(&cleanup.step);
+    integration.dependOn(&degree_canary.step);
+    integration.dependOn(&default_gate.step);
+
     return .{
+        .unit = unit,
+        .smoke = smoke,
         .lifecycle = lifecycle,
         .query_fan_in = query_fan_in,
         .operations = operations,
+        .runtime_operations = runtime_operations,
         .cleanup = cleanup,
         .degree_canary = degree_canary,
         .default_gate = default_gate,
+        .integration = integration,
     };
 }
 

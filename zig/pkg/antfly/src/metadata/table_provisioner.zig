@@ -1417,6 +1417,7 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
     // The graph index was added; the resolvers section was not treated as one.
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.enrichments_added);
     try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
     try std.testing.expectEqual(@as(usize, 0), summary.resolvers_updated);
 
@@ -1428,6 +1429,13 @@ test "table provisioner registers a resolver declared in the table index config"
 
         try std.testing.expect(db.core.index_manager.has("relations_graph"));
         try std.testing.expect(!db.core.index_manager.has("resolvers"));
+
+        const enrichments = try db.listEnrichments(std.testing.allocator);
+        defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("relations_v1", enrichments[0].name);
+        try std.testing.expectEqual(db_mod.types.EnrichmentKind.asset, enrichments[0].kind);
+        try std.testing.expectEqualStrings("relations", enrichments[0].field);
 
         const resolvers = try db.listResolvers(std.testing.allocator);
         defer {

@@ -397,6 +397,7 @@ pub const AppParityCatalogTable = struct {
 pub const AppParitySourceSchemaCatalog = struct {
     single_table: [1]metadata_table_manager.TableRecord = undefined,
     owned_tables: []metadata_table_manager.TableRecord = &.{},
+    owned_table_names: [][]u8 = &.{},
     owned_source_table_name: []u8 = &.{},
     table_count: usize = 0,
 
@@ -422,19 +423,32 @@ pub const AppParitySourceSchemaCatalog = struct {
         if (catalog_tables.len == 0) return error.InvalidSqlCatalog;
         var records = try alloc.alloc(metadata_table_manager.TableRecord, catalog_tables.len);
         errdefer alloc.free(records);
+        var names = try alloc.alloc([]u8, catalog_tables.len);
+        errdefer alloc.free(names);
+        var names_initialized: usize = 0;
+        errdefer {
+            for (names[0..names_initialized]) |name| alloc.free(name);
+        }
         for (catalog_tables, 0..) |table, i| {
+            const owned_name = try alloc.dupe(u8, table.name);
+            names[i] = owned_name;
+            names_initialized += 1;
             records[i] = .{
                 .table_id = 90_001 + @as(u64, @intCast(i)),
-                .name = table.name,
+                .name = owned_name,
                 .placement_role = "data",
                 .schema_json = table.schema_json,
             };
         }
-        return .{ .owned_tables = records, .table_count = catalog_tables.len };
+        return .{ .owned_tables = records, .owned_table_names = names, .table_count = catalog_tables.len };
     }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.owned_tables.len > 0) alloc.free(self.owned_tables);
+        if (self.owned_table_names.len > 0) {
+            for (self.owned_table_names) |name| alloc.free(name);
+            alloc.free(self.owned_table_names);
+        }
         if (self.owned_source_table_name.len > 0) alloc.free(self.owned_source_table_name);
         self.* = undefined;
     }

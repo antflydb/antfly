@@ -318,6 +318,15 @@ fn collectArtifactEnrichmentsFromValue(
 ) !void {
     switch (value) {
         .object => |object| {
+            if (isGraphIndexConfig(object)) {
+                if (try collectGraphShorthandAssetEnrichment(alloc, object)) |asset| {
+                    errdefer {
+                        var mutable = asset;
+                        mutable.deinit(alloc);
+                    }
+                    try out.append(alloc, asset);
+                }
+            }
             if (object.get("enrichments")) |enrichments| {
                 if (enrichments == .array) {
                     for (enrichments.array.items) |item| {
@@ -344,6 +353,51 @@ fn collectArtifactEnrichmentsFromValue(
         },
         else => {},
     }
+}
+
+fn isGraphIndexConfig(object: std.json.ObjectMap) bool {
+    const type_value = object.get("type") orelse return false;
+    return type_value == .string and std.mem.eql(u8, type_value.string, "graph");
+}
+
+fn collectGraphShorthandAssetEnrichment(
+    alloc: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !?db_mod.types.EnrichmentConfig {
+    const artifact = object.get("artifact") orelse return null;
+    if (artifact != .object) return error.InvalidEnrichmentConfig;
+
+    const name = artifact.object.get("name") orelse return error.InvalidEnrichmentConfig;
+    if (name != .string or name.string.len == 0) return error.InvalidEnrichmentConfig;
+    const kind = artifact.object.get("kind") orelse return error.InvalidEnrichmentConfig;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidEnrichmentConfig;
+
+    const field = if (artifact.object.get("field")) |field_value| blk: {
+        if (field_value != .string) return error.InvalidEnrichmentConfig;
+        break :blk field_value.string;
+    } else "";
+    const template = if (artifact.object.get("template")) |template_value| blk: {
+        if (template_value != .string) return error.InvalidEnrichmentConfig;
+        break :blk template_value.string;
+    } else "";
+    if (field.len == 0 and template.len == 0) return error.InvalidEnrichmentConfig;
+
+    const content_type = if (artifact.object.get("content_type")) |content_type_value| blk: {
+        if (content_type_value != .string) return error.InvalidEnrichmentConfig;
+        break :blk content_type_value.string;
+    } else "";
+    var cfg = db_mod.types.EnrichmentConfig{
+        .name = try alloc.dupe(u8, name.string),
+        .kind = .asset,
+    };
+    errdefer cfg.deinit(alloc);
+    if (field.len > 0) cfg.field = try alloc.dupe(u8, field);
+    if (template.len > 0) cfg.template = try alloc.dupe(u8, template);
+    if (content_type.len > 0) cfg.content_type = try alloc.dupe(u8, content_type);
+    if (artifact.object.get("producer_json")) |producer_value| {
+        cfg.producer_json = try std.json.Stringify.valueAlloc(alloc, producer_value, .{});
+    }
+    return cfg;
 }
 
 fn validateArtifactEnrichmentConfigShape(cfg: db_mod.types.EnrichmentConfig) !void {
@@ -2797,6 +2851,34 @@ test "index metadata validates artifact enrichment graph" {
         std.testing.allocator,
         "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512},{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"}]}",
     );
+}
+
+test "index metadata collects graph shorthand artifact enrichment" {
+    const indexes_json =
+        \\{
+        \\  "document_units_graph":{
+        \\    "type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.edges[*]","format":"extraction_relation"},
+        \\    "artifact":{
+        \\      "name":"document_units_v1",
+        \\      "kind":"asset",
+        \\      "field":"url",
+        \\      "content_type":"application/json",
+        \\      "producer_json":{"type":"document_extraction","config":{"source":{"filename_field":"filename"}}}
+        \\    },
+        \\    "edge_types":[{"name":"mentions"}]
+        \\  }
+        \\}
+    ;
+    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator, indexes_json);
+    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    try std.testing.expectEqualStrings("document_units_v1", enrichments[0].name);
+    try std.testing.expectEqual(db_mod.types.EnrichmentKind.asset, enrichments[0].kind);
+    try std.testing.expectEqualStrings("url", enrichments[0].field);
+    try std.testing.expectEqualStrings("application/json", enrichments[0].content_type);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments[0].producer_json, "document_extraction") != null);
 }
 
 test "index metadata rejects artifact enrichment deletion with dependents" {

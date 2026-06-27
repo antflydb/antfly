@@ -7487,7 +7487,11 @@ pub const WritePlanLoweringContext = struct {
         if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
             std.log.debug("write lowering using generated dml kind={}", .{dml_ast.kind});
             return self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options, self.function_bindings) catch |err| {
-                std.log.err("write lowering generated dml failed kind={} err={}", .{ dml_ast.kind, err });
+                if (err == error.UnsupportedSqlShape) {
+                    std.log.debug("write lowering generated dml unsupported kind={} err={}", .{ dml_ast.kind, err });
+                } else {
+                    std.log.err("write lowering generated dml failed kind={} err={}", .{ dml_ast.kind, err });
+                }
                 return err;
             };
         }
