@@ -1315,6 +1315,7 @@ pub const APITestFilters = struct {
         "sql adapter ddl fingerprint owns transaction protocol ddl surfaces",
         "sql adapter ddl fingerprint owns prepared transaction ddl surfaces",
         "sql adapter ddl fingerprint owns prepared statement cursor and savepoint ddl surfaces",
+        "sql prepared statement runtime",
         "sql routine runtime",
         "api http server recovers durable SQL routine catalog",
         "api http server routes routine-backed SQL trigger DDL through routine runtime",

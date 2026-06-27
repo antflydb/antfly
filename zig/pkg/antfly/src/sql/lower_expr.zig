@@ -2118,20 +2118,43 @@ fn generatedGroupExpressionAtItemStart(
     return null;
 }
 
-fn generatedOrderExpressionAtItemStart(
+const GeneratedOrderItem = struct {
+    tokens: generated_parser.GeneratedSqlTokenRange,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+};
+
+fn generatedOrderItemAtStart(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
-) !?*const generated_parser.GeneratedSqlExpressionAst {
+) !?GeneratedOrderItem {
     const read = generated_read_ast orelse return null;
     if (read.order_items.items.len != read.order_items.count or read.order_items.expressions.len != read.order_items.count) return error.UnsupportedSqlShape;
     for (read.order_items.items, 0..) |item, index| {
         if (item.start == pos) {
             try validateGeneratedExpressionPayloads(tokens, read.order_items.expressions[index]);
-            return &read.order_items.expressions[index];
+            return .{
+                .tokens = item,
+                .expression = &read.order_items.expressions[index],
+            };
         }
     }
     return null;
+}
+
+fn generatedOrderExpressionAtItemStart(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const item = try generatedOrderItemAtStart(tokens, pos, generated_read_ast);
+    return if (item) |generated_item| generated_item.expression else null;
+}
+
+fn validateGeneratedOrderItemEnd(generated_item: ?GeneratedOrderItem, pos: usize) !void {
+    if (generated_item) |item| {
+        if (pos != item.tokens.end) return error.UnsupportedSqlShape;
+    }
 }
 
 fn generatedSelectItemStartAllowsExpressionKind(
@@ -14024,8 +14047,9 @@ pub fn parseAggregateOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, order_expression_options.generated_read_ast);
-        if (generated_expression == null and order_expression_options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedOrderItemAtStart(tokens, item_start, order_expression_options.generated_read_ast);
+        if (generated_item == null and order_expression_options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var item_order_expression_options = order_expression_options;
         item_order_expression_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
@@ -14049,6 +14073,7 @@ pub fn parseAggregateOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
+        try validateGeneratedOrderItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14067,8 +14092,9 @@ pub fn parseWindowOutputOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedOrderItemAtStart(tokens, item_start, options.generated_read_ast);
+        if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var item_options = options;
         item_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
@@ -14097,6 +14123,7 @@ pub fn parseWindowOutputOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
+        try validateGeneratedOrderItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14114,8 +14141,9 @@ pub fn parseJoinOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedOrderItemAtStart(tokens, item_start, options.generated_read_ast);
+        if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var item_options = options;
         item_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
@@ -14144,6 +14172,7 @@ pub fn parseJoinOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
+        try validateGeneratedOrderItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14645,8 +14674,9 @@ pub fn parseOrderByWithExpressionHooksAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, generated_read_ast);
-        if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedOrderItemAtStart(tokens, item_start, generated_read_ast);
+        if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var item_hooks = hooks;
         item_hooks.generated_expression_ast = generated_expression;
         var order = try parseOrderExpressionAlloc(
@@ -14667,6 +14697,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
+        try validateGeneratedOrderItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14683,8 +14714,9 @@ pub fn parseSelectOutputOrderByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedOrderExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedOrderItemAtStart(tokens, item_start, options.generated_read_ast);
+        if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var order_expression_hooks = options.order_expression_hooks;
         order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
@@ -14719,6 +14751,7 @@ pub fn parseSelectOutputOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
+        try validateGeneratedOrderItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -33702,6 +33735,22 @@ fn corruptGeneratedReadFirstOrderExpressionOperatorToTokens(parsed_sql: *tokeniz
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstOrderItemEndToExpressionEnd(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.order_items.items.len == 0 or read.order_items.expression_items.len == 0) return error.TestUnexpectedResult;
+                    read.order_items.items[0].end = read.order_items.expression_items[0].end;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstOrderFunctionNameToFirstProjection(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -34919,6 +34968,20 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_query_order_operator,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_query_order_item_end = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY id DESC LIMIT 5",
+    );
+    defer malformed_query_order_item_end.deinit(alloc);
+    try corruptGeneratedReadFirstOrderItemEndToExpressionEnd(&malformed_query_order_item_end);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_query_order_item_end,
         schema,
         &.{},
         .{},

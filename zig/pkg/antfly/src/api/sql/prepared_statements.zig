@@ -204,7 +204,7 @@ test "sql prepared statement runtime stores session scoped plans" {
     const executable = try runtime.executableForExecute(session_a, execute_read);
     try std.testing.expectEqual(sql_adapter.PreparedStatementSubjectKind.read, executable.statement_kind);
     try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, executable.statement_family);
-    try std.testing.expectEqualStrings("usage_plan", executable.parsed_sql.statement.raw().text);
+    try std.testing.expectEqual(sql_adapter.SqlReadStatementKind.query, executable.parsed_sql.readStatementKind().?);
 
     try runtime.apply(.{ .execute = execute_read }, session_a);
     try std.testing.expectError(
