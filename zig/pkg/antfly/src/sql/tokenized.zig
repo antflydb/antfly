@@ -287,7 +287,15 @@ pub const ParsedSql = struct {
     }
 
     pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
-        return self.readStatementKind() orelse self.generatedReadStatementKind();
+        const parsed_kind = self.readStatementKind();
+        if (self.generated_statement) |generated_statement| {
+            if (generated_statement.kind() == .read) {
+                const generated_kind = self.generatedReadStatementKind() orelse return null;
+                const published_kind = parsed_kind orelse return null;
+                return if (published_kind == generated_kind) published_kind else null;
+            }
+        }
+        return parsed_kind;
     }
 
     pub fn generatedReadStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
@@ -296,6 +304,20 @@ pub const ParsedSql = struct {
 
     pub fn writeStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlWriteStatementKind {
         return self.statement.writeKind();
+    }
+
+    pub fn writeStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlWriteStatementKind {
+        const parsed_kind = self.writeStatementKind();
+        if (self.generated_statement) |generated_statement| {
+            if (generated_statement.kind() == .dml) {
+                const generated_kind = generatedDmlStatementKind(self.items(), generated_statement) orelse return null;
+                const published_kind = parsed_kind orelse return null;
+                if (published_kind != generated_kind.write_kind) return null;
+                if (self.isRecursiveWriteStatement() != generated_kind.recursive) return null;
+                return published_kind;
+            }
+        }
+        return parsed_kind;
     }
 
     pub fn isRecursiveWriteStatement(self: *const ParsedSql) bool {
@@ -5368,6 +5390,20 @@ test "sql adapter parsed sql owns typed statement variants" {
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, read.readStatementKindIncludingGeneratedAst().?);
+
+    var generated_alias_read = try ParsedSql.initAlloc(alloc, "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'");
+    defer generated_alias_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_alias_read.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_alias_read.generatedReadStatementKind().?);
+    if (generated_alias_read.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| read_ast.source_alias_tokens = null,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expect(generated_alias_read.generatedReadStatementKind() == null);
+    try std.testing.expect(generated_alias_read.readStatementKindIncludingGeneratedAst() == null);
 
     var write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
     defer write.deinit(alloc);
@@ -5379,6 +5415,23 @@ test "sql adapter parsed sql owns typed statement variants" {
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, write.writeStatementKindIncludingGeneratedAst().?);
+
+    var generated_alias_write = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT s.id FROM ONLY incoming_usage AS s WHERE s.status = 'open'");
+    defer generated_alias_write.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_alias_write.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_alias_write.writeStatementKindIncludingGeneratedAst().?);
+    if (generated_alias_write.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .dml => |*dml_ast| {
+                dml_ast.source_read.?.source_alias_tokens = null;
+                dml_ast.source_read.?.source_alias_name_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_alias_write.writeStatementKind().?);
+    try std.testing.expect(generated_alias_write.writeStatementKindIncludingGeneratedAst() == null);
 
     var recursive_write = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
     defer recursive_write.deinit(alloc);
@@ -5390,6 +5443,16 @@ test "sql adapter parsed sql owns typed statement variants" {
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, recursive_write.writeStatementKindIncludingGeneratedAst().?);
+    if (recursive_write.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .dml => |*dml_ast| dml_ast.cte_recursive = false,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, recursive_write.writeStatementKind().?);
+    try std.testing.expect(recursive_write.isRecursiveWriteStatement());
+    try std.testing.expect(recursive_write.writeStatementKindIncludingGeneratedAst() == null);
 
     var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN SELECT id FROM usage_records;");
     defer explain.deinit(alloc);

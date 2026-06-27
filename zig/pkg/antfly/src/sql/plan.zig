@@ -861,7 +861,7 @@ pub fn lowerWritePlanWithParsedSqlAlloc(
 ) !LoweredWritePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
 
-    const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+    const write_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.isRecursiveWriteStatement()) {
         return try lowerRecursiveWritePlanWithHooksAlloc(write_kind, schema, options, hooks);
     }

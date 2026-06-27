@@ -12827,7 +12827,7 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     options: plan_mod.LowerWritePlanOptions,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
-    const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+    const write_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
     if (dml_ast.cte_recursive) {
         return try lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind);

@@ -1177,7 +1177,13 @@ contract until storage and API row plans grow those outer-join semantics.
    publishes the same read family as the parsed statement before dispatching
    through the generated-AST path, so corrupted retained read metadata cannot
    bypass parsed-statement publication and be reinterpreted by typed token
-   planning.
+   planning. Shared runtime/document read-kind helpers apply the same
+   publication check when generated read metadata is present, so catalog
+   routing cannot recover a generated read family from corrupted retained
+   generated metadata after the parsed statement boundary. DML write-kind
+   helpers apply the same publication check for generated write family and
+   recursive CTE flags before shared write lowering selects the generated DML
+   execution path.
    Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now
