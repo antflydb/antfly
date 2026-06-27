@@ -12529,7 +12529,14 @@ pub fn parseLogicalDdlPlanAlloc(
     };
     if (parsed_sql.generated_statement) |generated_statement| {
         if (generated_statement.ast) |generated_ast| {
-            if (try planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options)) |logical_plan| {
+            if (planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
+                error.UnsupportedSqlShape => blk: {
+                    if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
+                    state.pos = 0;
+                    break :blk null;
+                },
+                else => return err,
+            }) |logical_plan| {
                 return logical_plan;
             }
         }
@@ -12774,37 +12781,75 @@ fn legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(
     };
     if (parsed_sql.generated_statement) |generated_statement| {
         if (generated_statement.ast) |generated_ast| {
-            switch (generated_ast) {
-                .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
-                .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
-                .prepared_transaction => |prepared_transaction_ast| return .{ .prepared_transaction = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) },
-                .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
-                .cursor => |cursor_ast| return try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast),
-                .ddl, .extension_index => |ddl_ast| {
-                    if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
-                        return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
-                    }
+            if (legacyDdlParserPlanFromGeneratedAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
+                error.UnsupportedSqlShape => blk: {
+                    if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
+                    state.pos = 0;
+                    break :blk null;
                 },
-                .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
-                .unsupported => |unsupported_ast| {
-                    if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
-                        if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
-                            return .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) };
-                        }
-                        return catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
-                            error.UnsupportedSqlShape => switch (boundary.family) {
-                                .update_policy_trigger => .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) },
-                                else => return err,
-                            },
-                            else => return err,
-                        };
-                    }
-                },
-                .dml, .read => {},
+                else => return err,
+            }) |plan| {
+                return plan;
             }
         }
     }
     return try parseLegacyDdlParserPlanAlloc(alloc, tokens, &state.pos, options);
+}
+
+fn generatedAstAllowsLegacyDdlFallback(generated_ast: generated_parser.GeneratedSqlAst) bool {
+    return switch (generated_ast) {
+        .session,
+        .prepared,
+        .cursor,
+        => true,
+        .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
+            .create_table,
+            .alter_table,
+            => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn legacyDdlParserPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    tokens: []const grammar.Token,
+    state: *parser_context.ParserState,
+    generated_statement: tokenized.GeneratedRawSqlStatement,
+    generated_ast: generated_parser.GeneratedSqlAst,
+    options: DdlPlanParserOptions,
+) !?LegacyDdlParserPlan {
+    switch (generated_ast) {
+        .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
+        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+        .prepared_transaction => |prepared_transaction_ast| return .{ .prepared_transaction = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) },
+        .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
+        .cursor => |cursor_ast| return try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast),
+        .ddl, .extension_index => |ddl_ast| {
+            if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
+                return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
+            }
+        },
+        .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
+        .unsupported => |unsupported_ast| {
+            if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
+                if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
+                    return .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) };
+                }
+                return catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
+                    error.UnsupportedSqlShape => switch (boundary.family) {
+                        .update_policy_trigger => .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) },
+                        else => return err,
+                    },
+                    else => return err,
+                };
+            }
+        },
+        .dml, .read => {},
+    }
+    return null;
 }
 
 const legacyDdlParserPlanForTestAlloc = legacyDdlParserPlanAlloc;

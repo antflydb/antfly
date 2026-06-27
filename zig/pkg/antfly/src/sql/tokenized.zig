@@ -1409,12 +1409,7 @@ fn parseStatement(
             else
                 return .{ .unknown = raw_statement },
             .dml => if (generatedDmlStatementKind(tokenized_sql.items(), generated_raw)) |generated| {
-                const classified_recursive_kind = if (generated.recursive) classifier.classifyRecursiveWriteStatement(tokenized_sql.items()) else null;
-                if (classified_recursive_kind orelse tokenized_sql.write_statement_kind) |classified_kind| {
-                    if (!generatedDmlStatementKindMatchesWriteKind(generated.kind, classified_kind)) return .{ .unknown = raw_statement };
-                    return .{ .write = .{ .kind = classified_kind, .raw = raw_statement, .recursive = generated.recursive } };
-                }
-                return .{ .write = .{ .kind = generated.defaultWriteKind(), .raw = raw_statement, .recursive = generated.recursive } };
+                return .{ .write = .{ .kind = generated.write_kind, .raw = raw_statement, .recursive = generated.recursive } };
             } else return .{ .unknown = raw_statement },
             .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind|
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } }
@@ -2151,18 +2146,8 @@ fn generatedUnsupportedOptionalTokenRangeIsValid(
 
 const GeneratedDmlStatementKind = struct {
     kind: generated_parser.GeneratedSqlDmlKind,
+    write_kind: classifier.SqlWriteStatementKind,
     recursive: bool = false,
-
-    fn defaultWriteKind(self: @This()) classifier.SqlWriteStatementKind {
-        return switch (self.kind) {
-            .insert_values => .insert,
-            .insert_select => .insert_source,
-            .update => .update,
-            .delete => .delete,
-            .truncate => .truncate,
-            .merge => .merge,
-        };
-    }
 };
 
 fn generatedDmlStatementKind(
@@ -2175,7 +2160,22 @@ fn generatedDmlStatementKind(
         else => return null,
     };
     if (!generatedDmlAstHasValidClassificationPayload(tokens, dml_ast)) return null;
-    return .{ .kind = dml_ast.kind, .recursive = dml_ast.cte_recursive };
+    return .{
+        .kind = dml_ast.kind,
+        .write_kind = generatedDmlAstWriteKind(tokens, dml_ast),
+        .recursive = dml_ast.cte_recursive,
+    };
+}
+
+fn generatedDmlAstWriteKind(tokens: []const Token, dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+    return switch (dml_ast.kind) {
+        .insert_values => .insert,
+        .insert_select => .insert_source,
+        .update => classifier.classifyWriteStatement(tokens) orelse if (dml_ast.source_tokens != null) .update_joined_source else .update,
+        .delete => classifier.classifyWriteStatement(tokens) orelse if (dml_ast.source_tokens != null) .delete_joined_source else .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+    };
 }
 
 fn generatedDmlAstHasValidClassificationPayload(
@@ -2739,26 +2739,6 @@ fn generatedDmlCommandKeywordMatchesKind(token: Token, kind: generated_parser.Ge
     };
 }
 
-fn generatedDmlStatementKindMatchesWriteKind(
-    generated_kind: generated_parser.GeneratedSqlDmlKind,
-    write_kind: classifier.SqlWriteStatementKind,
-) bool {
-    return switch (generated_kind) {
-        .insert_values => write_kind == .insert,
-        .insert_select => write_kind == .insert_source,
-        .update => switch (write_kind) {
-            .update, .update_source, .update_joined_source => true,
-            else => false,
-        },
-        .delete => switch (write_kind) {
-            .delete, .delete_source, .delete_joined_source => true,
-            else => false,
-        },
-        .truncate => write_kind == .truncate,
-        .merge => write_kind == .merge,
-    };
-}
-
 fn generatedReadStatementKind(
     tokens: []const Token,
     generated_raw: GeneratedRawSqlStatement,
@@ -2769,15 +2749,7 @@ fn generatedReadStatementKind(
         else => return null,
     };
     if (!generatedReadAstHasValidClassificationPayload(tokens, read_ast)) return null;
-    return switch (read_ast.kind) {
-        .query => .query,
-        .aggregate => .aggregate,
-        .join => .join,
-        .lateral => .lateral,
-        .window => .window,
-        .set_operation => .set_operation,
-        .cte => generatedCteReadStatementKind(tokens, read_ast),
-    };
+    return generatedReadStatementKindFromAst(tokens, read_ast);
 }
 
 fn generatedReadAstHasValidClassificationPayload(
@@ -4188,10 +4160,27 @@ fn generatedCteReadStatementKind(
 ) ?classifier.SqlReadStatementKind {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return null;
     if (read_ast.cte_recursive) return .recursive_cte;
+    return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
+}
+
+fn generatedReadStatementKindFromAst(
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) ?classifier.SqlReadStatementKind {
+    if (read_ast.kind == .cte) return generatedCteReadStatementKind(tokens, read_ast);
+    return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
+}
+
+fn generatedReadStatementKindFromStructuredClauses(
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) classifier.SqlReadStatementKind {
     if (read_ast.set_operation_tokens != null) return .set_operation;
+    if (read_ast.kind == .lateral) return .lateral;
     if (read_ast.source_tokens) |source| {
         if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
     }
+    if (read_ast.kind == .window or read_ast.window_tokens != null) return .window;
     if (read_ast.projection_tokens) |projection| {
         if (generatedReadRangeContainsKeyword(tokens, projection, .over)) return .window;
     }
@@ -4199,13 +4188,15 @@ fn generatedCteReadStatementKind(
         generatedReadRangeHasAggregateFunction(tokens, projection)
     else
         false;
-    if ((read_ast.distinct_tokens != null and read_ast.distinct_on_items.count == 0) or
+    if (read_ast.kind == .aggregate or
+        (read_ast.distinct_tokens != null and read_ast.distinct_on_items.count == 0) or
         read_ast.group_tokens != null or
         read_ast.having_tokens != null or
         aggregate_projection)
     {
         return .aggregate;
     }
+    if (read_ast.kind == .join or read_ast.join_tokens != null) return .join;
     if (read_ast.source_tokens) |source| {
         if (generatedReadRangeContainsKeyword(tokens, source, .join)) return .join;
     }
@@ -7109,7 +7100,7 @@ test "sql adapter parsed sql write statement kind can come from generated AST" {
     try std.testing.expect(generated_recursive_update.isRecursiveWriteStatement());
 }
 
-test "sql adapter parsed sql write statement kind fails closed on classifier disagreement" {
+test "sql adapter parsed sql write statement kind is generated-owned for covered DML" {
     const alloc = std.testing.allocator;
 
     var generated_insert = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')");
@@ -7118,8 +7109,11 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
 
     generated_insert.tokenized_sql.write_statement_kind = .delete;
     generated_insert.statement = parseStatement(generated_insert.raw_statement, generated_insert.generated_statement, &generated_insert.tokenized_sql);
-    try std.testing.expect(generated_insert.writeStatementKind() == null);
-    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, generated_insert.writeStatementKind().?);
+    switch (generated_insert.statement) {
+        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
 
     var malformed_generated = generated_insert.generated_statement.?;
     malformed_generated.ast = null;

@@ -390,14 +390,18 @@ clause boundaries through legacy token classification. Incomplete
 migrated DML statements that stop at required generated clause boundaries,
 including `INSERT ... ON CONFLICT ... DO` tails and `MERGE` action bodies, now
 fail closed through the generated parser instead of falling back to the legacy
-write classifier. Other DML shapes still use an initial generated
-AST-to-plan wrapper that fails closed if the generated DML family does not
-match the existing write classifier before delegating to the current typed DML
-lowerer. Deeper DML cutover still requires replacing token-based recursive DML
-command-body lowering with complete generated AST-driven lowering beyond
-validated generated CTE child-read bodies, broader unsupported-shape diagnostics,
-and a later full statement-head promotion once generated coverage matches the
-currently supported typed DML surface.
+write classifier. Generated-covered DML now also derives the parsed write
+family from the retained generated DML AST instead of re-entering the
+hand-written write classifier. The generated AST distinguishes direct
+`INSERT ... VALUES`, `INSERT ... SELECT`, joined `UPDATE ... FROM`, joined
+`DELETE ... USING`, `TRUNCATE`, and `MERGE` write families; point-vs-source
+update/delete selector decisions remain in typed lowering where schema and
+unique-selector metadata are available. Deeper DML cutover still requires
+replacing token-based recursive DML command-body lowering with complete
+generated AST-driven lowering beyond validated generated CTE child-read bodies,
+broader unsupported-shape diagnostics, and a later full statement-head
+promotion once generated coverage matches the currently supported typed DML
+surface.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -903,7 +907,8 @@ Unsupported DDL remains on the existing parser until
    typed recursive parser consumes exactly the retained generated statement
    boundary.
    Generated DML AST kind also owns parsed-statement write-family
-   classification for generated-covered writes, preserves recursive CTE write
+   classification for generated-covered writes without re-entering the
+   hand-written write classifier, preserves recursive CTE write
    metadata at the parsed boundary, validates top-level command source spans
    for plain and `WITH`-prefixed writes, checks retained CTE prefix
    count/first/last/body-read compatibility plus CTE item layout and comma
@@ -1749,8 +1754,8 @@ Generated grammar work needs evidence at multiple levels:
   write-plan variants,
   generated-first write lowering context
   dispatch, generated DML AST kind now drives parsed-statement write-family
-  classification for generated-covered writes with fail-closed classifier
-  disagreement checks, fail-closed generated DML dispatch when retained
+  classification for generated-covered writes without re-entering the
+  hand-written write classifier, fail-closed generated DML dispatch when retained
   generated AST metadata is malformed, and generated-family validation over
   other representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
