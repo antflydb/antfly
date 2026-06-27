@@ -19702,6 +19702,25 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         else => return error.TestUnexpectedResult,
     }
 
+    var concurrent_reindex_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REINDEX INDEX CONCURRENTLY usage_records_status_idx;",
+    );
+    defer concurrent_reindex_sql.deinit(alloc);
+    var concurrent_reindex_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &concurrent_reindex_sql);
+    defer concurrent_reindex_plan.deinit(alloc);
+    switch (concurrent_reindex_plan) {
+        .maintenance_job => |maintenance| switch (maintenance) {
+            .reindex => |reindex| {
+                try std.testing.expectEqual(ReindexMaintenanceTarget.index, reindex.target);
+                try std.testing.expectEqualStrings("usage_records_status_idx", reindex.name);
+                try std.testing.expect(reindex.concurrently);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var cluster_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "CLUSTER usage_records USING usage_records_status_idx;",

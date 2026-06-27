@@ -605,7 +605,8 @@ use a typed `trigger_catalog` plan for generated-covered `CREATE TRIGGER` and
 `DROP TRIGGER` row-trigger forms before reaching the SQL routine runtime.
 Maintenance commands use the same
 validated generated unsupported boundary for `VACUUM`, `ANALYZE`, `REINDEX`,
-and `CLUSTER` before delegating to typed maintenance planning.
+and `CLUSTER` before delegating to typed maintenance planning, including
+PostgreSQL-compatible `REINDEX INDEX CONCURRENTLY ...` option placement.
 Legacy-supported cursor commands use generated cursor AST nodes for `DECLARE`,
 `FETCH`, and `CLOSE`, including validated statement/command source spans and
 typed tail token ranges before delegating to typed cursor portal planning.

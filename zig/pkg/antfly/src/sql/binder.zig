@@ -1072,6 +1072,33 @@ fn appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(
     if (matched == 0) return error.TableNotFound;
 }
 
+fn appendBoundCatalogObjectsForCatalogDatabaseTablesAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    database_name: []const u8,
+) !void {
+    if (database_name.len == 0) return error.UnsupportedSqlShape;
+    var snapshot = catalog.adminSnapshot() catch |err| switch (err) {
+        error.UnsupportedOperation => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    var matched: usize = 0;
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, database_name)) continue;
+        var object = try boundCatalogObjectForTableRecordAlloc(alloc, role, table);
+        var object_transferred = false;
+        errdefer if (!object_transferred) object.deinit(alloc);
+        try objects.append(alloc, object);
+        object_transferred = true;
+        matched += 1;
+    }
+    if (matched == 0) return error.TableNotFound;
+}
+
 fn appendBoundCatalogObjectForCatalogIndexAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
@@ -2394,7 +2421,9 @@ fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
         .reindex => |reindex| switch (reindex.target) {
             .table => try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, reindex.name, session, false),
             .index => try appendBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, .target, catalog, reindex.name, session),
-            .schema, .database, .system => {},
+            .schema => try appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(alloc, objects, .target, catalog, reindex.name, session),
+            .database => try appendBoundCatalogObjectsForCatalogDatabaseTablesAlloc(alloc, objects, .target, catalog, reindex.name),
+            .system => {},
         },
     }
 }
@@ -3582,6 +3611,46 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         try std.testing.expectEqual(@as(u64, 1), maintenance_ddl.bound_objects[0].table_id);
         try std.testing.expectEqual(usage_schema_generation, maintenance_ddl.bound_objects[0].schema_generation);
     }
+
+    const reindex_schema_sql = try std.fmt.allocPrint(alloc, "REINDEX SCHEMA {s}", .{metadata_table_manager.default_namespace_name});
+    defer alloc.free(reindex_schema_sql);
+    var parsed_reindex_schema = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        reindex_schema_sql,
+    );
+    defer parsed_reindex_schema.deinit(alloc);
+    var bound_reindex_schema = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_reindex_schema, catalog.iface());
+    defer bound_reindex_schema.deinit(alloc);
+    const reindex_schema_ddl = try bound_reindex_schema.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), reindex_schema_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, reindex_schema_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", reindex_schema_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), reindex_schema_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, reindex_schema_ddl.bound_objects[0].schema_generation);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, reindex_schema_ddl.bound_objects[1].role);
+    try std.testing.expectEqualStrings("incoming_usage", reindex_schema_ddl.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u64, 2), reindex_schema_ddl.bound_objects[1].table_id);
+    try std.testing.expectEqual(incoming_schema_generation, reindex_schema_ddl.bound_objects[1].schema_generation);
+
+    const reindex_database_sql = try std.fmt.allocPrint(alloc, "REINDEX DATABASE {s}", .{metadata_table_manager.default_database_name});
+    defer alloc.free(reindex_database_sql);
+    var parsed_reindex_database = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        reindex_database_sql,
+    );
+    defer parsed_reindex_database.deinit(alloc);
+    var bound_reindex_database = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_reindex_database, catalog.iface());
+    defer bound_reindex_database.deinit(alloc);
+    const reindex_database_ddl = try bound_reindex_database.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), reindex_database_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, reindex_database_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", reindex_database_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), reindex_database_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, reindex_database_ddl.bound_objects[0].schema_generation);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, reindex_database_ddl.bound_objects[1].role);
+    try std.testing.expectEqualStrings("incoming_usage", reindex_database_ddl.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u64, 2), reindex_database_ddl.bound_objects[1].table_id);
+    try std.testing.expectEqual(incoming_schema_generation, reindex_database_ddl.bound_objects[1].schema_generation);
 
     var parsed_missing_maintenance = try tokenized.ParsedSql.initAlloc(
         alloc,
