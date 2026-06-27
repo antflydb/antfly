@@ -5549,6 +5549,70 @@ pub const ApiHttpServer = struct {
         return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
     }
 
+    fn publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(
+        expression: sql_adapter.generated_parser.GeneratedSqlExpressionAst,
+    ) ?[]const u8 {
+        switch (expression.kind) {
+            .exists_subquery, .not_exists_subquery => return "semijoin execution for EXISTS subquery predicate",
+            .quantified_comparison => if (expression.right_expression_kind == .subquery) return "quantified comparison execution for read-subquery predicate",
+            else => {},
+        }
+        switch (expression.kind) {
+            .logical_or, .logical_and => {
+                for (expression.boolean_condition_items.expressions) |condition| {
+                    if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(condition)) |model| return model;
+                }
+            },
+            .logical_not => if (expression.right_expression) |right| {
+                if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(right.*)) |model| return model;
+            },
+            .grouped => if (expression.inner_expression) |inner| {
+                if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(inner.*)) |model| return model;
+            },
+            else => {},
+        }
+        if (expression.left_expression) |left| {
+            if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(left.*)) |model| return model;
+        }
+        if (expression.right_expression) |right| {
+            if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(right.*)) |model| return model;
+        }
+        return null;
+    }
+
+    fn publicSqlGeneratedReadUnsupportedSubqueryPredicateMissingNativeModel(
+        read: sql_adapter.generated_parser.GeneratedSqlReadAst,
+    ) ?[]const u8 {
+        if (read.where_tokens != null) {
+            if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(read.where_expression)) |model| return model;
+        }
+        if (read.having_tokens != null) {
+            if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(read.having_expression)) |model| return model;
+        }
+        if (read.set_operation.right_where_tokens != null) {
+            if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(read.set_operation.right_where_expression)) |model| return model;
+        }
+        for (read.join_items) |join| {
+            if (join.predicate_tokens != null) {
+                if (publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(join.predicate_expression)) |model| return model;
+            }
+        }
+        return null;
+    }
+
+    fn publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(
+        parsed_sql: *const sql_adapter.ParsedSql,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
+    ) ?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        const generated_statement = parsed_sql.generated_statement orelse return null;
+        const generated_ast = generated_statement.ast orelse return null;
+        const missing_native_model = switch (generated_ast) {
+            .read => |read| publicSqlGeneratedReadUnsupportedSubqueryPredicateMissingNativeModel(read.*),
+            else => null,
+        } orelse return null;
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
+    }
+
     fn applyLoweredPublicSqlMutationSource(
         self: *ApiHttpServer,
         target_table_name: []const u8,
@@ -6309,7 +6373,12 @@ pub const ApiHttpServer = struct {
             switch (err) {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
-                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+                    }
+                    return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                },
                 else => return err,
             }
         };
@@ -6444,7 +6513,12 @@ pub const ApiHttpServer = struct {
             switch (err) {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
-                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+                    }
+                    return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                },
                 else => return err,
             }
         };
@@ -29449,6 +29523,28 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
     try std.testing.expectEqualStrings("u1", rows[1].object.get("id").?.string);
     try std.testing.expectEqual(@as(i64, 10), rows[1].object.get("amount").?.integer);
+
+    var exists_subquery_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE status = 'open');\"}",
+    });
+    defer exists_subquery_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), exists_subquery_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, exists_subquery_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, exists_subquery_resp.body, "semijoin execution for EXISTS subquery predicate");
+
+    var quantified_subquery_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records);\"}",
+    });
+    defer quantified_subquery_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), quantified_subquery_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, quantified_subquery_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, quantified_subquery_resp.body, "quantified comparison execution for read-subquery predicate");
 
     var aggregate_claim_resp = try server.handle(.{
         .method = .POST,

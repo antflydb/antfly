@@ -1157,7 +1157,10 @@ contract until storage and API row plans grow those outer-join semantics.
    `EXISTS`, `NOT EXISTS`, and quantified-comparison read-subquery predicates
    immediately after retained payload validation, so unsupported semijoin and
    quantified-subquery forms fail closed instead of being reinterpreted by the
-   legacy scalar/list predicate parser.
+   legacy scalar/list predicate parser. Public SQL diagnostics now surface the
+   missing native model for those fail-closed predicate shapes as semijoin or
+   quantified read-subquery execution rather than only the generic unsupported
+   SQL statement model.
    Ordinary select-list lowering now threads generated projection expression
    AST items into the typed projection parser and verifies unambiguous
    projection starts against the retained generated expression kind, so
