@@ -2281,6 +2281,7 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.having_tokens)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(read_ast.having_expression, read_ast.having_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.window_tokens)) return false;
+    if (!generatedReadWindowPayloadIsValid(tokens, end, read_ast.window_tokens, read_ast.window_items, read_ast.window_count)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.order_tokens)) return false;
     if (!generatedReadOptionalListPayloadIsValid(tokens, end, read_ast.order_tokens, read_ast.order_items, .{
         .reject_aliases = true,
@@ -2442,6 +2443,7 @@ fn generatedReadCtePayloadIsValid(
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_having_tokens)) return false;
         if (!generatedReadOptionalExpressionTokensMatchMaybeRange(cte.body_having_expression, cte.body_having_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_window_tokens)) return false;
+        if (!generatedReadWindowPayloadIsValid(tokens, end, cte.body_window_tokens, cte.body_window_items, cte.body_window_count)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_order_tokens)) return false;
         if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_order_tokens, cte.body_order_items, .{
             .reject_aliases = true,
@@ -2658,6 +2660,129 @@ fn generatedReadSetOperationPayloadIsEmpty(set_operation: generated_parser.Gener
         set_operation.right_source_tokens == null and
         set_operation.right_where_tokens == null and
         set_operation.right_where_expression.tokens == null;
+}
+
+fn generatedReadWindowPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    items: []const generated_parser.GeneratedSqlWindowAst,
+    count: usize,
+) bool {
+    const range = maybe_range orelse return items.len == 0 and count == 0;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, range)) return false;
+    if (count == 0 or items.len != count) return false;
+
+    var expected_start = range.start;
+    for (items, 0..) |item, index| {
+        if (!generatedReadNestedRangeIsValid(tokens, end, range, item.tokens)) return false;
+        if (item.tokens.start != expected_start or item.tokens.start >= item.tokens.end) return false;
+        if (!generatedReadWindowItemIsValid(tokens, end, item)) return false;
+        expected_start = item.tokens.end;
+        if (index + 1 < items.len) {
+            if (expected_start >= range.end or tokens[expected_start].kind != .comma) return false;
+            expected_start += 1;
+        }
+    }
+    return expected_start == range.end;
+}
+
+fn generatedReadWindowItemIsValid(
+    tokens: []const Token,
+    end: usize,
+    item: generated_parser.GeneratedSqlWindowAst,
+) bool {
+    if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.name_tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.definition_tokens)) return false;
+    if (item.name_tokens.start != item.tokens.start or item.name_tokens.start >= item.name_tokens.end) return false;
+    const as_index = item.name_tokens.end;
+    if (as_index + 1 >= item.tokens.end or !tokens[as_index].matchesKeywordTag(.as) or tokens[as_index + 1].kind != .lparen) return false;
+    if (tokens[item.tokens.end - 1].kind != .rparen) return false;
+    if (!std.meta.eql(item.definition_tokens, generated_parser.GeneratedSqlTokenRange{ .start = as_index + 2, .end = item.tokens.end - 1 })) return false;
+
+    if (!generatedReadOptionalWindowListPayloadIsValid(tokens, end, item.definition_tokens, item.partition_tokens, item.partition_items, .partition)) return false;
+    if (!generatedReadOptionalWindowListPayloadIsValid(tokens, end, item.definition_tokens, item.order_tokens, item.order_items, .order)) return false;
+    if (!generatedReadWindowFramePayloadIsValid(tokens, end, item.definition_tokens, item.frame_tokens, item.frame_start_expression_tokens, item.frame_start_expression_kind, item.frame_start_expression, item.frame_end_expression_tokens, item.frame_end_expression_kind, item.frame_end_expression)) return false;
+    return true;
+}
+
+const GeneratedReadWindowListKind = enum {
+    partition,
+    order,
+};
+
+fn generatedReadOptionalWindowListPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    definition_tokens: generated_parser.GeneratedSqlTokenRange,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    kind: GeneratedReadWindowListKind,
+) bool {
+    const range = maybe_range orelse return generatedReadListPayloadIsEmpty(list, .{}, .{});
+    if (!generatedReadNestedRangeIsValid(tokens, end, definition_tokens, range)) return false;
+    if (range.start < definition_tokens.start + 2) return false;
+    switch (kind) {
+        .partition => {
+            if (!tokens[range.start - 2].matchesKeywordTag(.partition) or !tokens[range.start - 1].matchesKeywordTag(.by)) return false;
+            return generatedReadDelimitedListIsValid(tokens, end, range, list, .{
+                .reject_aliases = true,
+                .reject_order_modifiers = true,
+            });
+        },
+        .order => {
+            if (!tokens[range.start - 2].matchesKeywordTag(.order) or !tokens[range.start - 1].matchesKeywordTag(.by)) return false;
+            return generatedReadDelimitedListIsValid(tokens, end, range, list, .{
+                .reject_aliases = true,
+                .allow_order_modifiers = true,
+            });
+        },
+    }
+}
+
+fn generatedReadWindowFramePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    definition_tokens: generated_parser.GeneratedSqlTokenRange,
+    maybe_frame_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_start_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    start_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    maybe_start_expression: ?*generated_parser.GeneratedSqlExpressionAst,
+    maybe_end_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    end_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    maybe_end_expression: ?*generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    const frame_tokens = maybe_frame_tokens orelse return maybe_start_tokens == null and
+        start_kind == null and
+        maybe_start_expression == null and
+        maybe_end_tokens == null and
+        end_kind == null and
+        maybe_end_expression == null;
+
+    if (!generatedReadNestedRangeIsValid(tokens, end, definition_tokens, frame_tokens)) return false;
+    if (frame_tokens.start >= frame_tokens.end) return false;
+    if (!tokens[frame_tokens.start].matchesKeywordTag(.rows) and !tokens[frame_tokens.start].matchesKeywordTag(.range)) return false;
+    if (!generatedReadWindowFrameExpressionPayloadIsValid(tokens, end, frame_tokens, maybe_start_tokens, start_kind, maybe_start_expression)) return false;
+    if (!generatedReadWindowFrameExpressionPayloadIsValid(tokens, end, frame_tokens, maybe_end_tokens, end_kind, maybe_end_expression)) return false;
+    return true;
+}
+
+fn generatedReadWindowFrameExpressionPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    frame_tokens: generated_parser.GeneratedSqlTokenRange,
+    maybe_expression_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    maybe_expression: ?*generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    const expression_tokens = maybe_expression_tokens orelse return maybe_kind == null and maybe_expression == null;
+    if (!generatedReadNestedRangeIsValid(tokens, end, frame_tokens, expression_tokens)) return false;
+    const expression = maybe_expression orelse return false;
+    if (!generatedReadExpressionTokensEqualRange(expression.*, expression_tokens)) return false;
+    if (maybe_kind) |kind| {
+        if (expression.kind != kind) return false;
+    }
+    return true;
 }
 
 const GeneratedReadDelimitedListValidationOptions = struct {
@@ -7143,6 +7268,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_order_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_order_query.statement));
 
+    var generated_window_query = try ParsedSql.initAlloc(alloc, "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)");
+    defer generated_window_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_window_query.generatedStatementKind().?);
+
+    var malformed_window_generated = generated_window_query.generated_statement.?;
+    if (malformed_window_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.window_items[0].frame_start_expression.?.tokens = read_ast.window_items[0].name_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_window_query.statement = parseStatement(generated_window_query.raw_statement, malformed_window_generated, &generated_window_query.tokenized_sql);
+    try std.testing.expect(generated_window_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_window_query.statement));
+
     var generated_set_operation_where_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION ALL SELECT id FROM usage_archive WHERE status = 'open'");
     defer generated_set_operation_where_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_set_operation_where_query.generatedStatementKind().?);
@@ -7308,6 +7450,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_where_query.statement = parseStatement(generated_cte_where_query.raw_statement, malformed_cte_where_generated, &generated_cte_where_query.tokenized_sql);
     try std.testing.expect(generated_cte_where_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_where_query.statement));
+
+    var generated_cte_window_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)) SELECT id FROM source_rows");
+    defer generated_cte_window_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_window_query.generatedStatementKind().?);
+
+    var malformed_cte_window_generated = generated_cte_window_query.generated_statement.?;
+    if (malformed_cte_window_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_window_items[0].order_items.items[0].end += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_window_query.statement = parseStatement(generated_cte_window_query.raw_statement, malformed_cte_window_generated, &generated_cte_window_query.tokenized_sql);
+    try std.testing.expect(generated_cte_window_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_window_query.statement));
 
     var generated_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id");
     defer generated_join_query.deinit(alloc);

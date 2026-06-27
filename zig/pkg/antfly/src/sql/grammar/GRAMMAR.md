@@ -1198,7 +1198,9 @@ ordering, `NULLS` ordering, and delimiter adjacency before publishing a
 generated read family, validates generated set-operation right-query
 projection/source/predicate payloads, and requires top-level and CTE-body
 `WHERE`/`HAVING` generated predicate expression spans to match their retained
-clause bodies.
+clause bodies. Named `WINDOW` clauses now also validate generated window item
+boundaries, `name AS (...)` layout, partition/order list payloads, and frame
+expression spans before publishing a generated read family.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
