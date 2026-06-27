@@ -1499,6 +1499,7 @@ const TableEmptyingWakeJob = struct {
     runtime: *db_mod.background_runtime.BackendRuntime,
     owner_id: u64,
     source: table_writes.TableWriteSource,
+    catalog: ?table_catalog.CatalogSource = null,
     registry: ?*SchemaRewriteWakeRegistry = null,
     table_name: []const u8,
     table_id: u64 = 0,
@@ -1513,13 +1514,25 @@ const TableEmptyingWakeJob = struct {
         source: table_writes.TableWriteSource,
         table_name: []const u8,
     ) !void {
-        return try TableEmptyingWakeJob.submitWithRegistry(runtime, owner_id, source, table_name, null, 0);
+        return try TableEmptyingWakeJob.submitWithCatalogAndRegistry(runtime, owner_id, source, null, table_name, null, 0);
     }
 
     fn submitWithRegistry(
         runtime: *db_mod.background_runtime.BackendRuntime,
         owner_id: u64,
         source: table_writes.TableWriteSource,
+        table_name: []const u8,
+        registry: ?*SchemaRewriteWakeRegistry,
+        table_id: u64,
+    ) !void {
+        return try TableEmptyingWakeJob.submitWithCatalogAndRegistry(runtime, owner_id, source, null, table_name, registry, table_id);
+    }
+
+    fn submitWithCatalogAndRegistry(
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        owner_id: u64,
+        source: table_writes.TableWriteSource,
+        catalog: ?table_catalog.CatalogSource,
         table_name: []const u8,
         registry: ?*SchemaRewriteWakeRegistry,
         table_id: u64,
@@ -1535,6 +1548,7 @@ const TableEmptyingWakeJob = struct {
             .runtime = runtime,
             .owner_id = owner_id,
             .source = source,
+            .catalog = catalog,
             .registry = registry,
             .table_name = owned_table_name,
             .table_id = table_id,
@@ -1568,7 +1582,10 @@ const TableEmptyingWakeJob = struct {
             )) orelse return;
             defer pass.deinit(alloc);
 
-            if (pass.complete) return;
+            if (pass.complete) {
+                try self.promoteCompletedTableEmptyingBarrier();
+                return;
+            }
             const pass_made_progress = pass.jobs_claimed != 0 or
                 pass.jobs_completed != 0 or
                 pass.jobs_invalidated != 0;
@@ -1580,6 +1597,7 @@ const TableEmptyingWakeJob = struct {
             self.runtime,
             self.owner_id,
             self.source,
+            self.catalog,
             self.table_name,
             self.registry,
             self.table_id,
@@ -1588,6 +1606,14 @@ const TableEmptyingWakeJob = struct {
             else => return err,
         };
         self.registry = null;
+    }
+
+    fn promoteCompletedTableEmptyingBarrier(self: *TableEmptyingWakeJob) !void {
+        const catalog = self.catalog orelse return;
+        _ = catalog_jobs.promoteCompletedTableEmptyingBarriersForTableAlloc(std.heap.page_allocator, catalog, self.table_name) catch |err| switch (err) {
+            error.UnsupportedOperation => return,
+            else => return err,
+        };
     }
 
     fn deinit(ptr: *anyopaque) void {
