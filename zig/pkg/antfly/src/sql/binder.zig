@@ -2156,6 +2156,24 @@ fn collectBulkIoDdlBoundCatalogObjectsAlloc(
     try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, plan.table_name, session, false);
 }
 
+fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: ddl_plan.MaintenanceJobPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    switch (plan) {
+        .vacuum => |vacuum| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, vacuum.table_name, session, false),
+        .analyze => |analyze| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, analyze.table_name, session, false),
+        .cluster => |cluster| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, cluster.table_name, session, false),
+        .reindex => |reindex| switch (reindex.target) {
+            .table => try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, reindex.name, session, false),
+            .index, .schema, .database, .system => {},
+        },
+    }
+}
+
 fn collectDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -2174,6 +2192,7 @@ fn collectDdlBoundCatalogObjectsAlloc(
         .auth => |plan| try collectAuthDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
         .routine => |plan| try collectRoutineDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
         .bulk_io => |plan| try collectBulkIoDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
+        .maintenance => |plan| try collectMaintenanceDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
         else => {},
     }
 
@@ -3264,6 +3283,32 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqualStrings("usage_records", create_index_ddl.bound_objects[0].target.table_name);
     try std.testing.expectEqual(@as(u64, 1), create_index_ddl.bound_objects[0].table_id);
     try std.testing.expectEqual(usage_schema_generation, create_index_ddl.bound_objects[0].schema_generation);
+
+    const maintenance_cases = [_][]const u8{
+        "VACUUM usage_records",
+        "ANALYZE usage_records",
+        "CLUSTER usage_records USING usage_status_idx",
+        "REINDEX TABLE usage_records",
+    };
+    for (maintenance_cases) |maintenance_sql| {
+        var parsed_maintenance = try tokenized.ParsedSql.initAlloc(alloc, maintenance_sql);
+        defer parsed_maintenance.deinit(alloc);
+        var bound_maintenance = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_maintenance, catalog.iface());
+        defer bound_maintenance.deinit(alloc);
+        const maintenance_ddl = try bound_maintenance.ddlCatalog();
+        try std.testing.expectEqual(@as(usize, 1), maintenance_ddl.bound_objects.len);
+        try std.testing.expectEqual(BoundCatalogObjectRole.target, maintenance_ddl.bound_objects[0].role);
+        try std.testing.expectEqualStrings("usage_records", maintenance_ddl.bound_objects[0].target.table_name);
+        try std.testing.expectEqual(@as(u64, 1), maintenance_ddl.bound_objects[0].table_id);
+        try std.testing.expectEqual(usage_schema_generation, maintenance_ddl.bound_objects[0].schema_generation);
+    }
+
+    var parsed_missing_maintenance = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "VACUUM missing_usage_records",
+    );
+    defer parsed_missing_maintenance.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_maintenance, catalog.iface()));
 
     var parsed_create_table = try tokenized.ParsedSql.initAlloc(
         alloc,

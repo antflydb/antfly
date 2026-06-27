@@ -527,6 +527,11 @@ routes to the parsed explain family explicitly; and unsupported heads without
 typed plans route to terminal parsed unsupported statements. Full production AST construction
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
+Generated maintenance DDL that already lowers to typed plans also participates
+in catalog binding: table-targeting `VACUUM`, `ANALYZE`, `CLUSTER`, and
+`REINDEX TABLE` plans resolve their target table and fail closed on missing
+catalog objects before execution, while non-table `REINDEX` targets remain
+catalog-independent at this binding boundary.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points that Antfly does not type yet, including
 `ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;

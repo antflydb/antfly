@@ -9356,40 +9356,6 @@ pub const ApiHttpServer = struct {
         }
     };
 
-    fn sqlAuthCatalogForDdl(self: *ApiHttpServer, sql: []const u8) !OwnedSqlAuthCatalog {
-        return try self.sqlAuthCatalogForDdlWithSession(sql, catalog_resources.SqlCatalogSession.default());
-    }
-
-    fn sqlAuthCatalogForDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
-        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{},
-            else => return err,
-        };
-        defer parsed_sql.deinit(self.alloc);
-        var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, &parsed_sql, .{
-            .catalog = self.catalogSource(),
-            .session = session,
-        }) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{},
-            else => return err,
-        };
-        defer logical_plan.deinit(self.alloc);
-        return try self.sqlAuthCatalogForLogicalPlanWithSession(logical_plan, session);
-    }
-
-    fn sqlAuthCatalogForLogicalPlanWithSession(self: *ApiHttpServer, plan: sql_adapter.LogicalSqlPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
-        return switch (plan) {
-            .auth => |auth_plan| try self.sqlAuthCatalogForAuthLogicalPlanWithSession(auth_plan, session),
-            else => .{
-                .value = .{
-                    .database_name = session.currentDatabase(),
-                    .search_path = session.search_path,
-                    .settings = session.settings,
-                },
-            },
-        };
-    }
-
     fn sqlAuthCatalogForAuthLogicalPlanWithSession(self: *ApiHttpServer, plan: sql_adapter.AuthorizationLogicalPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
         const needs_table_catalog = switch (plan) {
             .authorization_catalog => |authorization_plan| switch (authorization_plan) {
