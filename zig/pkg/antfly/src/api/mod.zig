@@ -29,6 +29,7 @@ const sql_notifications = @import("sql/notifications.zig");
 const sql_prepared_statements = @import("sql/prepared_statements.zig");
 const sql_routines = @import("sql/routines.zig");
 const sql_savepoints = @import("sql/savepoints.zig");
+const sql_sessions = @import("sql/sessions.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -104,6 +105,7 @@ test {
     _ = sql_prepared_statements;
     _ = sql_routines;
     _ = sql_savepoints;
+    _ = sql_sessions;
     _ = openapi_contract.metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "queryNamespaceTable"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "batchNamespaceTable"));

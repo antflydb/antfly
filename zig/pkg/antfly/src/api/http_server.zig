@@ -36,6 +36,7 @@ const sql_notifications = @import("sql/notifications.zig");
 const sql_prepared_statements = @import("sql/prepared_statements.zig");
 const sql_routines = @import("sql/routines.zig");
 const sql_savepoints = @import("sql/savepoints.zig");
+const sql_sessions = @import("sql/sessions.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -3560,7 +3561,7 @@ pub const ApiHttpServer = struct {
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     sql_notification_runtime: sql_notifications.Runtime = .{ .alloc = undefined },
-    sql_catalog_session_runtime: SqlCatalogSessionRuntime = .{ .alloc = undefined },
+    sql_catalog_session_runtime: sql_sessions.Runtime = .{ .alloc = undefined },
     sql_prepared_statement_runtime: sql_prepared_statements.Runtime = .{ .alloc = undefined },
     sql_cursor_runtime: sql_cursors.Runtime = .{ .alloc = undefined },
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
@@ -3591,71 +3592,6 @@ pub const ApiHttpServer = struct {
                 .export_file => {},
             }
             self.* = undefined;
-        }
-    };
-
-    const SqlCatalogSessionRuntime = struct {
-        alloc: std.mem.Allocator,
-        sessions: std.AutoHashMapUnmanaged(u64, sql_adapter.OwnedSqlCatalogSession) = .empty,
-
-        fn init(alloc: std.mem.Allocator) SqlCatalogSessionRuntime {
-            return .{ .alloc = alloc };
-        }
-
-        fn deinit(self: *@This()) void {
-            var it = self.sessions.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
-            self.sessions.deinit(self.alloc);
-            self.* = undefined;
-        }
-
-        fn loadAlloc(self: *@This(), session_id: ?u64) !sql_adapter.OwnedSqlCatalogSession {
-            if (session_id) |id| {
-                if (self.sessions.getPtr(id)) |stored| {
-                    var session = try stored.cloneAlloc(self.alloc);
-                    session.request_read_only = false;
-                    session.notification_session_id = id;
-                    return session;
-                }
-            }
-            var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(self.alloc, catalog_resources.SqlCatalogSession.default());
-            if (session_id) |id| session.notification_session_id = id;
-            return session;
-        }
-
-        fn save(self: *@This(), session: sql_adapter.OwnedSqlCatalogSession) !void {
-            if (session.notification_session_id == 0) return;
-            var stored = try session.cloneAlloc(self.alloc);
-            errdefer stored.deinit(self.alloc);
-            stored.notification_session_id = session.notification_session_id;
-            stored.restoreRequestOverridesForPersistence(self.alloc);
-            if (!self.sessionHasPersistentCatalogState(stored)) {
-                if (self.sessions.fetchRemove(session.notification_session_id)) |old| {
-                    var old_value = old.value;
-                    old_value.deinit(self.alloc);
-                }
-                stored.deinit(self.alloc);
-                return;
-            }
-            if (try self.sessions.fetchPut(self.alloc, session.notification_session_id, stored)) |old| {
-                var old_value = old.value;
-                old_value.deinit(self.alloc);
-            }
-        }
-
-        fn sessionHasPersistentCatalogState(_: *@This(), session: sql_adapter.OwnedSqlCatalogSession) bool {
-            if (session.in_sql_transaction) return true;
-            if (session.sql_transaction_failed) return true;
-            if (session.settings.len > 0) return true;
-            if (session.transaction_local_settings_base != null) return true;
-            if (session.transaction_local_search_path_base != null) return true;
-            if (!std.ascii.eqlIgnoreCase(session.current_database_name, catalog_resources.default_database_name)) return true;
-            if (session.search_path.len != 1 or !std.ascii.eqlIgnoreCase(session.search_path[0], catalog_resources.default_namespace_name)) return true;
-            return false;
-        }
-
-        fn sessionCountForTest(self: *@This()) usize {
-            return self.sessions.count();
         }
     };
 
@@ -3693,7 +3629,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
             .sql_notification_runtime = sql_notifications.Runtime.init(alloc),
-            .sql_catalog_session_runtime = SqlCatalogSessionRuntime.init(alloc),
+            .sql_catalog_session_runtime = sql_sessions.Runtime.init(alloc),
             .sql_prepared_statement_runtime = sql_prepared_statements.Runtime.init(alloc),
             .sql_cursor_runtime = sql_cursors.Runtime.init(alloc),
             .sql_routine_runtime = sql_routines.Runtime.init(alloc),
