@@ -2787,7 +2787,7 @@ fn buildTypedScalar(work: *Graph, dtype: shape_mod.DType, value: f64) !?NodeId {
 //
 // Detects the decomposed attention pattern:
 //   dot_general(softmax(mul(dot_general(Q, transpose(K)), scale)), V)
-// and replaces it with fused_sdpa(Q, K, V).
+// and replaces it with fused_sdpa(Q, K, V, optional_additive_bias).
 //
 // The pattern matching walks backwards from each batched dot_general
 // node and checks the chain: probs @ V where probs = softmax(scale * (Q @ K^T)).
@@ -2796,6 +2796,10 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
     var redirects = std.ArrayListUnmanaged(Redirect).empty;
     errdefer redirects.deinit(allocator);
     var num_rewrites: u32 = 0;
+
+    if (std.c.getenv("ANTFLY_DISABLE_SDPA_FUSION") != null) {
+        return .{ .redirects = redirects, .num_rewrites = num_rewrites };
+    }
 
     const count = work.nodeCount();
 
@@ -2833,6 +2837,7 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
         const softmax_input = softmax_node.inputs[0];
         if (softmax_input == null_node) continue;
         const scale_result = findScaleOp(work, softmax_input) orelse continue;
+        if (scale_result.masked) continue;
 
         // Scores must be dot_general(Q, K^T)
         const scores_id = scale_result.scores_id;
@@ -2906,6 +2911,7 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
         if (!approxEqScale(effective_scale, expected_scale)) continue;
 
         const out_shape = n.output_shape;
+        const fused_num_inputs: u8 = if (scale_result.attn_bias_id != null_node) 4 else 3;
         const fused_id = try work.addNode(.{
             .op = .{ .fused_sdpa = .{
                 .batch = batch,
@@ -2914,8 +2920,8 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
                 .head_dim = head_dim,
             } },
             .output_shape = out_shape,
-            .inputs = .{ q_id, k_id, v_id, null_node },
-            .num_inputs = 3,
+            .inputs = .{ q_id, k_id, v_id, scale_result.attn_bias_id },
+            .num_inputs = fused_num_inputs,
             .vjp_alternate = @intCast(i),
         });
 
@@ -2929,11 +2935,43 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
 const ScaleResult = struct {
     scores_id: NodeId,
     scale: f32,
+    attn_bias_id: NodeId = null_node,
+    // Boolean where-style masks are not representable by the current fused
+    // graph op unless they have already been lowered to additive bias.
+    masked: bool = false,
 };
 
-/// Walk backward from a node through masking ops (where_select, add,
-/// convert_dtype) to find a mul or div by a scalar constant. Returns the
-/// scores input to the scale op if found.
+fn scaleResultWithBias(result: ScaleResult, bias_id: NodeId) ScaleResult {
+    if (bias_id == null_node) return result;
+    if (result.attn_bias_id != null_node) {
+        return .{
+            .scores_id = result.scores_id,
+            .scale = result.scale,
+            .attn_bias_id = result.attn_bias_id,
+            .masked = true,
+        };
+    }
+    return .{
+        .scores_id = result.scores_id,
+        .scale = result.scale,
+        .attn_bias_id = bias_id,
+        .masked = result.masked,
+    };
+}
+
+fn scaleResultMarkMasked(result: ScaleResult) ScaleResult {
+    return .{
+        .scores_id = result.scores_id,
+        .scale = result.scale,
+        .attn_bias_id = result.attn_bias_id,
+        .masked = true,
+    };
+}
+
+/// Walk backward from a node through additive masking/casting/shape-only ops
+/// to find a mul or div by a scalar constant. Returns the scores input to the
+/// scale op and, when present, the additive attention bias that should become
+/// fused_sdpa input 3.
 fn findScaleOp(graph: *const Graph, start_id: NodeId) ?ScaleResult {
     var cur = start_id;
     var depth: u32 = 0;
@@ -2971,40 +3009,37 @@ fn findScaleOp(graph: *const Graph, start_id: NodeId) ?ScaleResult {
         // Skip through masking/casting/shape-only ops
         if (tag == .where_select or tag == .add or tag == .convert_dtype or tag == .reshape or tag == .broadcast_in_dim) {
             // For where_select: input 0 is condition, inputs 1/2 are values.
-            // The scores flow through input 1 (true_value) or input 2.
-            // For add: one operand is the mask, other is scores — follow
-            // the non-constant operand.
+            // The scores may flow through input 1 (true_value) or input 2.
+            // Keep the pattern decomposed because a boolean condition plus
+            // selected score tensor is not the same thing as additive bias.
+            // For add: one operand is additive bias, other is scores.
             // For convert_dtype/reshape/broadcast_in_dim: pass through input 0.
             if (tag == .convert_dtype or tag == .reshape or tag == .broadcast_in_dim) {
                 cur = node.inputs[0];
                 continue;
             }
             if (tag == .where_select) {
-                // where(cond, false_val, true_val) — scores are in true_val (input 2)
-                // or false_val (input 1). Try input 2 first (ONNX Where convention
-                // after conversion: inputs = [cond, false, true]).
-                cur = node.inputs[2];
-                if (cur == null_node) cur = node.inputs[1];
-                continue;
+                if (findScaleOp(graph, node.inputs[1])) |result| {
+                    return scaleResultMarkMasked(result);
+                }
+                if (findScaleOp(graph, node.inputs[2])) |result| {
+                    return scaleResultMarkMasked(result);
+                }
+                return null;
             }
             if (tag == .add) {
                 const a0 = node.inputs[0];
                 const a1 = node.inputs[1];
-                // Follow the non-broadcast/non-constant operand
+                if (a0 == null_node or a1 == null_node) return null;
                 if (a1 != null_node and isSmallOrBroadcast(graph, a1)) {
-                    if (findScaleOp(graph, a0)) |result| return result;
-                    cur = a0;
-                } else if (a0 != null_node and isSmallOrBroadcast(graph, a0)) {
-                    if (findScaleOp(graph, a1)) |result| return result;
-                    cur = a1;
-                } else {
-                    // Can't determine which is the mask. Prefer the branch
-                    // that actually resolves to a score chain.
-                    if (findScaleOp(graph, a0)) |result| return result;
-                    if (findScaleOp(graph, a1)) |result| return result;
-                    cur = a0;
+                    if (findScaleOp(graph, a0)) |result| return scaleResultWithBias(result, a1);
                 }
-                continue;
+                if (a0 != null_node and isSmallOrBroadcast(graph, a0)) {
+                    if (findScaleOp(graph, a1)) |result| return scaleResultWithBias(result, a0);
+                }
+                if (findScaleOp(graph, a0)) |result| return scaleResultWithBias(result, a1);
+                if (findScaleOp(graph, a1)) |result| return scaleResultWithBias(result, a0);
+                return null;
             }
         }
 
@@ -3961,7 +3996,7 @@ test "fuse detects SDPA pattern: matmul-scale-softmax-matmul" {
     try std.testing.expect(found_sdpa);
 }
 
-test "fuse detects SDPA pattern: GPT-2 style (4D, dynamic, div-where-add-cast)" {
+test "fuse detects SDPA pattern: 4D dynamic additive bias is preserved" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -4008,22 +4043,6 @@ test "fuse detects SDPA pattern: GPT-2 style (4D, dynamic, div-where-add-cast)" 
     });
     const scaled = try b.div(scores, scale_bcast);
 
-    // Causal mask via where(cond, neg_inf, scaled)
-    const cond = try b.parameter("mask_cond", Shape.init(.bool_, &.{ 1, 1, S, S }));
-    const neg_inf = try b.scalarConst(.f32, -std.math.inf(f32));
-    const neg_inf_bcast = try g.addNode(.{
-        .op = .{ .broadcast_in_dim = .{ .target_shape = target_shape } },
-        .output_shape = target_shape,
-        .inputs = .{ neg_inf, null_node, null_node, null_node },
-        .num_inputs = 1,
-    });
-    const masked = try g.addNode(.{
-        .op = .{ .where_select = {} },
-        .output_shape = target_shape,
-        .inputs = .{ cond, neg_inf_bcast, scaled, null_node },
-        .num_inputs = 3,
-    });
-
     // Additive bias (broadcast parameter acting like an attention mask)
     const bias = try b.parameter("mask_bias", Shape.init(.f32, &.{ 1, 1, S, S }));
     const bias_bcast = try g.addNode(.{
@@ -4036,7 +4055,7 @@ test "fuse detects SDPA pattern: GPT-2 style (4D, dynamic, div-where-add-cast)" 
         .inputs = .{ bias, null_node, null_node, null_node },
         .num_inputs = 1,
     });
-    const biased = try b.add(masked, bias_bcast);
+    const biased = try b.add(scaled, bias_bcast);
 
     // Softmax (along last axis — dynamic, uses 0 sentinel).
     const probs_f32 = try g.addNode(.{
@@ -4082,11 +4101,88 @@ test "fuse detects SDPA pattern: GPT-2 style (4D, dynamic, div-where-add-cast)" 
             try std.testing.expectEqual(@as(u32, 12), attrs.num_heads);
             try std.testing.expectEqual(@as(u32, 0), attrs.seq_len); // dynamic
             try std.testing.expectEqual(@as(u32, 64), attrs.head_dim);
+            const node = result.graph.node(@intCast(idx));
+            try std.testing.expectEqual(@as(u8, 4), node.num_inputs);
+            try std.testing.expectEqual(bias_bcast, node.inputs[3]);
             found_sdpa = true;
             break;
         }
     }
     try std.testing.expect(found_sdpa);
+}
+
+test "fuse skips SDPA pattern with where_select mask" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const B: i64 = 1;
+    const H: i64 = 2;
+    const S: i64 = 4;
+    const D: i64 = 8;
+
+    const q = try b.parameter("Q", Shape.init(.f32, &.{ B, H, S, D }));
+    const k = try b.parameter("K", Shape.init(.f32, &.{ B, H, S, D }));
+    const v = try b.parameter("V", Shape.init(.f32, &.{ B, H, S, D }));
+    const k_t = try b.transpose(k, &.{ 0, 1, 3, 2 });
+
+    const scores = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ B, H, S, S }),
+        .inputs = .{ q, k_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const scale = try b.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(D))));
+    const scaled = try b.mul(scores, scale);
+    const cond = try b.parameter("mask_cond", Shape.init(.bool_, &.{ B, 1, S, S }));
+    const neg_inf = try b.scalarConst(.f32, -std.math.inf(f32));
+    const neg_inf_bcast = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = Shape.init(.f32, &.{ B, H, S, S }) } },
+        .output_shape = Shape.init(.f32, &.{ B, H, S, S }),
+        .inputs = .{ neg_inf, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const masked = try g.addNode(.{
+        .op = .{ .where_select = {} },
+        .output_shape = Shape.init(.f32, &.{ B, H, S, S }),
+        .inputs = .{ cond, neg_inf_bcast, scaled, null_node },
+        .num_inputs = 3,
+    });
+    const probs = try g.addNode(.{
+        .op = .{ .fused_softmax = .{ .dim = 3 } },
+        .output_shape = Shape.init(.f32, &.{ B, H, S, S }),
+        .inputs = .{ masked, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const output = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ B, H, S, D }),
+        .inputs = .{ probs, v, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(output);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    for (0..result.graph.nodeCount()) |idx| {
+        try std.testing.expect(std.meta.activeTag(result.graph.node(@intCast(idx)).op) != .fused_sdpa);
+    }
 }
 
 test "fuse detects SDPA pattern: CLIP-style prescaled query" {
