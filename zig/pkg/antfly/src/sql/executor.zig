@@ -30,16 +30,26 @@ pub const PlanParsedSqlOptions = struct {
     session: catalog_resources.SqlCatalogSession = catalog_resources.SqlCatalogSession.default(),
     write_options: plan_mod.LowerWritePlanOptions = .{},
     function_bindings: lower_expr.SqlFunctionBindings = .{},
+    authorization: binder.BoundSqlAuthorizationOptions = .{},
+};
+
+pub const PlannedSqlStatement = struct {
+    logical_plan: binder.LogicalSqlPlan,
+    authorization: binder.BoundSqlAuthorization = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.logical_plan.deinit(alloc);
+        self.authorization.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPlan {
-    if (parsed_sql.writeStatementKind()) |kind| {
-        return .{ .write = kind };
-    }
-    if (parsed_sql.readStatementKind()) |kind| {
-        return .{ .read = kind };
-    }
-    return null;
+    return switch (parsed_sql.statement) {
+        .write => |statement| .{ .write = statement.kind },
+        .read => |statement| .{ .read = statement.kind },
+        else => null,
+    };
 }
 
 pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
@@ -47,7 +57,22 @@ pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !SqlExecutionPlan {
-    return try logical_ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    switch (parsed_sql.statement) {
+        .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {},
+        .read, .write => return error.UnsupportedSqlShape,
+    }
+    return try planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = table_catalog.unavailableCatalogSource(),
+        .function_bindings = function_bindings,
+    });
+}
+
+pub fn planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    bound: *binder.BoundSqlStatement,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !SqlExecutionPlan {
+    return try logical_ddl_plan.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
 }
 
 pub fn planParsedSqlWithSessionAlloc(
@@ -55,25 +80,86 @@ pub fn planParsedSqlWithSessionAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     options: PlanParsedSqlOptions,
 ) !SqlExecutionPlan {
-    if (parsed_sql.writeStatementKind() != null) {
-        var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(
-            alloc,
-            parsed_sql,
-            options.write_options,
-            options.catalog,
-            options.session,
-        );
-        defer bound.deinit(alloc);
-        return try binder.logicalWritePlanFromBoundStatement(&bound);
+    switch (parsed_sql.statement) {
+        .write => {
+            var bound = try binder.bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(
+                alloc,
+                parsed_sql,
+                options.write_options,
+                options.catalog,
+                options.session,
+                options.authorization,
+            );
+            defer bound.deinit(alloc);
+            try binder.enforceBoundSqlStatementAuthorization(&bound);
+            return try binder.logicalWritePlanFromBoundStatement(&bound);
+        },
+        .read => {
+            var bound = try binder.bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options.catalog, options.session, options.authorization);
+            defer bound.deinit(alloc);
+            try binder.enforceBoundSqlStatementAuthorization(&bound);
+            return try binder.logicalReadPlanFromBoundStatement(&bound);
+        },
+        .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {
+            var bound = try binder.bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
+                alloc,
+                parsed_sql,
+                options.catalog,
+                options.session,
+                options.function_bindings,
+                options.authorization,
+            );
+            defer bound.deinit(alloc);
+            try binder.enforceBoundSqlStatementAuthorization(&bound);
+            return try planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, options.function_bindings);
+        },
     }
+}
 
-    if (parsed_sql.readStatementKind() != null) {
-        var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, options.catalog, options.session);
-        defer bound.deinit(alloc);
-        return try binder.logicalReadPlanFromBoundStatement(&bound);
-    }
+pub fn planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: PlanParsedSqlOptions,
+) !PlannedSqlStatement {
+    var bound = try binder.bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
+        alloc,
+        parsed_sql,
+        options.catalog,
+        options.session,
+        options.function_bindings,
+        options.authorization,
+    );
+    defer bound.deinit(alloc);
 
-    return try planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, options.function_bindings);
+    var logical_plan = try planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, options.function_bindings);
+    errdefer logical_plan.deinit(alloc);
+    var authorization = try takeBoundSqlStatementAuthorization(&bound);
+    errdefer authorization.deinit(alloc);
+    return .{
+        .logical_plan = logical_plan,
+        .authorization = authorization,
+    };
+}
+
+fn takeBoundSqlStatementAuthorization(bound: *binder.BoundSqlStatement) !binder.BoundSqlAuthorization {
+    return switch (bound.binding) {
+        .read_catalog => |*read| blk: {
+            const authorization = read.authorization;
+            read.authorization = .{};
+            break :blk authorization;
+        },
+        .write_catalog => |*write| blk: {
+            const authorization = write.authorization;
+            write.authorization = .{};
+            break :blk authorization;
+        },
+        .ddl_catalog => |*ddl| blk: {
+            const authorization = ddl.authorization;
+            ddl.authorization = .{};
+            break :blk authorization;
+        },
+        .none => .{},
+    };
 }
 
 test "sql executor classifies statement families and owns ddl plans" {
@@ -94,4 +180,17 @@ test "sql executor classifies statement families and owns ddl plans" {
     var ddl_logical = try planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &ddl_sql, .{});
     defer ddl_logical.deinit(alloc);
     try std.testing.expectEqualStrings("table_ddl", ddl_logical.statementKindName());
+
+    var bound_ddl = try binder.bindDdlStatementWithCatalogSessionAlloc(
+        alloc,
+        &ddl_sql,
+        table_catalog.unavailableCatalogSource(),
+        catalog_resources.SqlCatalogSession.default(),
+    );
+    defer bound_ddl.deinit(alloc);
+    try std.testing.expectEqual(@as(std.meta.Tag(tokenized.ParsedStatement), .ddl), std.meta.activeTag(bound_ddl.statement));
+    try std.testing.expect(bound_ddl.parsed_sql != null);
+    var bound_ddl_logical = try planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound_ddl, .{});
+    defer bound_ddl_logical.deinit(alloc);
+    try std.testing.expectEqualStrings("table_ddl", bound_ddl_logical.statementKindName());
 }

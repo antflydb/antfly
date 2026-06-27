@@ -803,12 +803,16 @@ fn lowerAppParityReadPlanParsedSqlAlloc(
     var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+        var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+            .catalog = catalog.iface(),
+        });
+        defer logical_plan.deinit(alloc);
+        return try sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             alloc,
             parsed_sql,
+            &logical_plan,
             effective_schema,
             entry.params,
-            catalog.iface(),
             .{},
         );
     }
@@ -949,10 +953,15 @@ fn lowerAppParityWritePlanParsedSqlAlloc(
     var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
-            .unique_resolver = unique_resolver,
-            .row_claim = row_claim,
-        }, catalog.iface());
+        var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+            .catalog = catalog.iface(),
+            .write_options = .{
+                .unique_resolver = unique_resolver,
+                .row_claim = row_claim,
+            },
+        });
+        defer logical_plan.deinit(alloc);
+        return try sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
     }
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
         .unique_resolver = unique_resolver,

@@ -202,6 +202,16 @@ pub fn emptyCatalogSource() CatalogSource {
     };
 }
 
+pub fn unavailableCatalogSource() CatalogSource {
+    return .{
+        .ptr = undefined,
+        .vtable = &.{
+            .admin_snapshot = unavailableAdminSnapshot,
+            .free_admin_snapshot = emptyFreeAdminSnapshot,
+        },
+    };
+}
+
 fn emptyAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
     return .{
         .status = .{
@@ -215,6 +225,10 @@ fn emptyAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
         .split_transitions = &.{},
         .merge_transitions = &.{},
     };
+}
+
+fn unavailableAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+    return error.UnsupportedOperation;
 }
 
 fn emptyFreeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}

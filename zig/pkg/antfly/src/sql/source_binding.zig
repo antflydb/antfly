@@ -39,6 +39,8 @@ pub const default_document_sql_bounded_scan_rows: u32 = 10_000;
 pub const RelationalBinding = struct {
     target: CatalogTableRef,
     schema: runtime_schema.TableSchema,
+    table_id: u64 = 0,
+    schema_generation: u64 = 0,
 };
 
 pub const DocumentSqlVirtualFieldSource = enum {
@@ -96,6 +98,8 @@ pub const DocumentSqlCapabilities = struct {
 pub const DocumentBinding = struct {
     target: CatalogTableRef,
     schema: runtime_schema.TableSchema,
+    table_id: u64 = 0,
+    schema_generation: u64 = 0,
     indexes_json: ?[]const u8 = null,
     virtual_schema: DocumentSqlSchema = .{},
     capabilities: DocumentSqlCapabilities = .{},
@@ -104,6 +108,8 @@ pub const DocumentBinding = struct {
 pub const LakeBinding = struct {
     target: CatalogTableRef,
     schema: runtime_schema.TableSchema,
+    table_id: u64 = 0,
+    schema_generation: u64 = 0,
 };
 
 pub const SqlSourceBinding = union(SqlSourceFamily) {
@@ -132,6 +138,22 @@ pub const SqlSourceBinding = union(SqlSourceFamily) {
             .relational => |binding| binding.schema,
             .document => |binding| binding.schema,
             .lake => |binding| binding.schema,
+        };
+    }
+
+    pub fn tableId(self: SqlSourceBinding) u64 {
+        return switch (self) {
+            .relational => |binding| binding.table_id,
+            .document => |binding| binding.table_id,
+            .lake => |binding| binding.table_id,
+        };
+    }
+
+    pub fn schemaGeneration(self: SqlSourceBinding) u64 {
+        return switch (self) {
+            .relational => |binding| binding.schema_generation,
+            .document => |binding| binding.schema_generation,
+            .lake => |binding| binding.schema_generation,
         };
     }
 };

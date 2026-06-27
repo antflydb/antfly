@@ -494,6 +494,131 @@ pub fn appParityCatalogForEntryParsedSqlAlloc(
     return try AppParitySourceSchemaCatalog.initSourceSchemaAlloc(alloc, source_table_name, entry.source_schema_json);
 }
 
+fn appParityBindingCoverageCatalogForEntryParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?AppParitySourceSchemaCatalog {
+    const table_names = try appParityBindingCoverageTableNamesAlloc(alloc, entry, parsed_sql) orelse return null;
+    var catalog_tables = std.ArrayListUnmanaged(AppParityCatalogTable).empty;
+    defer catalog_tables.deinit(alloc);
+    try appendAppParityBindingCoverageCatalogTable(alloc, &catalog_tables, entry, table_names.target);
+    if (table_names.source) |source| {
+        if (!std.mem.eql(u8, table_names.target, source)) {
+            try appendAppParityBindingCoverageCatalogTable(alloc, &catalog_tables, entry, source);
+        }
+    }
+    return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, catalog_tables.items);
+}
+
+const AppParityBindingCoverageTableNames = struct {
+    target: []const u8,
+    source: ?[]const u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.target));
+        if (self.source) |source| alloc.free(@constCast(source));
+        self.* = undefined;
+    }
+};
+
+fn appParityBindingCoverageTableNamesAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?AppParityBindingCoverageTableNames {
+    switch (entry.family) {
+        .read, .query, .aggregate, .join, .lateral, .window => {
+            const resolved = (try binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return null;
+            var tables = resolved;
+            defer tables.deinit(alloc);
+            return .{
+                .target = try alloc.dupe(u8, tables.left),
+                .source = try alloc.dupe(u8, tables.source),
+            };
+        },
+        .insert,
+        .insert_source,
+        .recursive_insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => {
+            const target = try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql);
+            errdefer alloc.free(target);
+            const source = try appParityBindingCoverageWriteSourceTableNameAlloc(alloc, entry, parsed_sql);
+            errdefer if (source) |name| alloc.free(@constCast(name));
+            return .{
+                .target = target,
+                .source = source,
+            };
+        },
+        else => return null,
+    }
+}
+
+fn appParityBindingCoverageWriteSourceTableNameAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?[]const u8 {
+    switch (entry.family) {
+        .insert_source => {
+            if (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved| {
+                var tables = resolved;
+                defer tables.deinit(alloc);
+                return try alloc.dupe(u8, tables.source);
+            }
+            return null;
+        },
+        .recursive_insert_source => {
+            if (try binder.recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved| {
+                var tables = resolved;
+                defer tables.deinit(alloc);
+                return try alloc.dupe(u8, tables.source);
+            }
+            return null;
+        },
+        .update_joined_source, .delete_joined_source, .merge_mutation => {
+            if (try binder.joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved| {
+                var tables = resolved;
+                defer tables.deinit(alloc);
+                return try alloc.dupe(u8, tables.source);
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn appendAppParityBindingCoverageCatalogTable(
+    alloc: std.mem.Allocator,
+    catalog_tables: *std.ArrayListUnmanaged(AppParityCatalogTable),
+    entry: AppParityCorpusEntry,
+    table_name: []const u8,
+) !void {
+    for (catalog_tables.items) |table| {
+        if (std.mem.eql(u8, table.name, table_name)) return;
+    }
+    try catalog_tables.append(alloc, .{
+        .name = table_name,
+        .schema_json = appParityBindingCoverageSchemaJsonForTable(entry, table_name),
+    });
+}
+
+fn appParityBindingCoverageSchemaJsonForTable(entry: AppParityCorpusEntry, table_name: []const u8) []const u8 {
+    for (entry.catalog_tables) |table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table.schema_json;
+    }
+    if (entry.source_schema_json.len > 0 and !std.mem.eql(u8, table_name, "usage_records")) return entry.source_schema_json;
+    return app_parity_default_schema_json;
+}
+
 pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
     defer parsed_sql.deinit(alloc);
@@ -8085,6 +8210,13 @@ pub const AppParityCorpusCoverage = struct {
     parameterized_delete_source: bool = false,
     parameterized_update_joined_source: bool = false,
     parameterized_delete_joined_source: bool = false,
+    bound_catalog_object_schema_generation: bool = false,
+    bound_catalog_object_table_id: bool = false,
+    bound_catalog_read_source: bool = false,
+    bound_catalog_read_target: bool = false,
+    bound_catalog_write_insert_source: bool = false,
+    bound_catalog_write_joined_source: bool = false,
+    bound_catalog_write_target: bool = false,
 
     fn observeMigrationEquivalentDataBackfill(self: *@This(), entry: AppParityCorpusEntry) void {
         self.migration_equivalent_data_backfill_insert =
@@ -8111,6 +8243,77 @@ pub const AppParityCorpusCoverage = struct {
                     planHasStringToken(entry.plan, ":returning=")));
     }
 
+    fn observeBoundCatalogLogicalPlan(self: *@This(), plan: binder.LogicalSqlPlan) void {
+        switch (plan) {
+            .catalog_read => |read| {
+                for (read.bound_objects) |object| {
+                    self.observeBoundCatalogObjectIdentity(object);
+                    switch (object.role) {
+                        .target => self.bound_catalog_read_target = true,
+                        .source => self.bound_catalog_read_source = true,
+                        else => {},
+                    }
+                }
+            },
+            .catalog_write => |write| {
+                for (write.bound_objects) |object| {
+                    self.observeBoundCatalogObjectIdentity(object);
+                    switch (object.role) {
+                        .target => self.bound_catalog_write_target = true,
+                        .insert_source => self.bound_catalog_write_insert_source = true,
+                        .joined_source => self.bound_catalog_write_joined_source = true,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn observeBoundCatalogObjectIdentity(self: *@This(), object: binder.BoundCatalogObject) void {
+        self.bound_catalog_object_table_id = self.bound_catalog_object_table_id or object.table_id != 0;
+        self.bound_catalog_object_schema_generation = self.bound_catalog_object_schema_generation or object.schema_generation != 0;
+    }
+
+    fn observeBoundCatalogFacts(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
+        var catalog = (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return;
+        defer catalog.deinit(alloc);
+        switch (entry.family) {
+            .read, .query, .aggregate, .join, .lateral, .window => {
+                var bound = binder.bindReadPlanCatalogStatementAlloc(alloc, parsed_sql, catalog.iface()) catch |err| switch (err) {
+                    error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return,
+                    else => return err,
+                };
+                defer bound.deinit(alloc);
+                var logical = try binder.logicalReadPlanFromBoundStatement(&bound);
+                defer logical.deinit(alloc);
+                self.observeBoundCatalogLogicalPlan(logical);
+            },
+            .insert,
+            .insert_source,
+            .recursive_insert_source,
+            .update,
+            .delete,
+            .update_source,
+            .delete_source,
+            .truncate_source,
+            .update_joined_source,
+            .delete_joined_source,
+            .merge_mutation,
+            => {
+                var bound = binder.bindWritePlanCatalogStatementAlloc(alloc, parsed_sql, .{}, catalog.iface()) catch |err| switch (err) {
+                    error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return,
+                    else => return err,
+                };
+                defer bound.deinit(alloc);
+                var logical = try binder.logicalWritePlanFromBoundStatement(&bound);
+                defer logical.deinit(alloc);
+                self.observeBoundCatalogLogicalPlan(logical);
+            },
+            else => {},
+        }
+    }
+
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
         defer parsed_sql.deinit(alloc);
@@ -8129,6 +8332,7 @@ pub const AppParityCorpusCoverage = struct {
         const applied_validation = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
         const applied_rewrite = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
         const setup_summary = try appParitySetupSqlSummaryAlloc(alloc, entry.apply_setup_sql);
+        try self.observeBoundCatalogFacts(alloc, entry, &parsed_sql);
         if (entry.params.len > 0) {
             switch (entry.family) {
                 .query => self.parameterized_query = true,

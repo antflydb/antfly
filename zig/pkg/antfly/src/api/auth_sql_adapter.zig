@@ -16,9 +16,13 @@ const std = @import("std");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("tables.zig");
 const catalog_resources = @import("catalog_resources.zig");
+const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_transition_state = @import("../metadata/transition_state.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const table_catalog = @import("table_catalog.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
@@ -53,6 +57,75 @@ pub const SqlAuthCatalog = struct {
     }
 };
 
+const SqlAuthCatalogSource = struct {
+    tables: []metadata_table_manager.TableRecord = &.{},
+
+    fn initAlloc(alloc: std.mem.Allocator, catalog: SqlAuthCatalog) !SqlAuthCatalogSource {
+        var records = std.ArrayListUnmanaged(metadata_table_manager.TableRecord).empty;
+        var transferred = false;
+        errdefer if (!transferred) records.deinit(alloc);
+
+        if (catalog.tables.len > 0) {
+            try records.ensureTotalCapacity(alloc, catalog.tables.len);
+            for (catalog.tables) |table_ref| {
+                records.appendAssumeCapacity(.{
+                    .table_id = tables_api.deriveQualifiedTableId(table_ref.database_name, table_ref.namespace_name, table_ref.table_name),
+                    .name = table_ref.table_name,
+                    .database_name = table_ref.database_name,
+                    .namespace_name = table_ref.namespace_name,
+                    .schema_json = table_ref.schema_json,
+                });
+            }
+        } else if (catalog.public_table_names) |public_table_names| {
+            try records.ensureTotalCapacity(alloc, public_table_names.len);
+            for (public_table_names) |table_name| {
+                records.appendAssumeCapacity(.{
+                    .table_id = tables_api.deriveQualifiedTableId(catalog_resources.default_database_name, catalog_resources.default_namespace_name, table_name),
+                    .name = table_name,
+                    .database_name = catalog_resources.default_database_name,
+                    .namespace_name = catalog_resources.default_namespace_name,
+                });
+            }
+        }
+
+        const tables = try records.toOwnedSlice(alloc);
+        transferred = true;
+        return .{
+            .tables = tables,
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.tables.len > 0) alloc.free(self.tables);
+        self.* = undefined;
+    }
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = self.tables,
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
 pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
@@ -81,7 +154,14 @@ pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindin
     catalog: SqlAuthCatalog,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    var catalog_source = try SqlAuthCatalogSource.initAlloc(alloc, catalog);
+    defer catalog_source.deinit(alloc);
+
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = catalog_source.iface(),
+        .session = catalog.session(),
+        .function_bindings = function_bindings,
+    });
     defer logical_plan.deinit(alloc);
     return try executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(manager, alloc, &logical_plan, catalog);
 }
@@ -93,6 +173,18 @@ pub fn executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(
     catalog: SqlAuthCatalog,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     return switch (logical_plan.*) {
+        .auth => |auth_plan| try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, auth_plan, catalog),
+        else => null,
+    };
+}
+
+pub fn executeRelationalSqlDurablePlanOnUserManagerWithCatalog(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    durable_plan: *sql_adapter.DurableSqlPlan,
+    catalog: SqlAuthCatalog,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    return switch (durable_plan.*) {
         .auth => |auth_plan| try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, auth_plan, catalog),
         else => null,
     };

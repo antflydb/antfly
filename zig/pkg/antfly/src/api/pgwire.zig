@@ -888,6 +888,11 @@ const Connection = struct {
                     try self.sendCommandComplete(tag);
                 }
             },
+            .bulk_io => |bulk_io| {
+                const tag = try pgwire_module.commandTagForBulkIo(self.alloc, bulk_io);
+                defer self.alloc.free(tag);
+                try self.sendCommandComplete(tag);
+            },
         }
     }
 
@@ -1586,6 +1591,14 @@ fn commandTagForRowsBatch(alloc: std.mem.Allocator, statement_kind: []const u8, 
 fn commandTagForMutationSource(alloc: std.mem.Allocator, statement_kind: []const u8, result: anytype) ![]u8 {
     const count = result.staged;
     return try std.fmt.allocPrint(alloc, "{s} {d}", .{ commandVerb(statement_kind), count });
+}
+
+fn commandTagForBulkIo(alloc: std.mem.Allocator, bulk_io: http_server.ApiHttpServer.PublicSqlResult.BulkIo) ![]u8 {
+    const verb = switch (bulk_io.operation) {
+        .import_rows, .export_rows => "COPY",
+    };
+    if (bulk_io.row_count) |row_count| return try std.fmt.allocPrint(alloc, "{s} {d}", .{ verb, row_count });
+    return try alloc.dupe(u8, verb);
 }
 
 fn commandVerb(statement_kind: []const u8) []const u8 {

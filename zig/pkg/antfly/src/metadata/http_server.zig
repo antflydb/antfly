@@ -30,6 +30,7 @@ const catalog_resources = @import("../api/catalog_resources.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const relational_sql_ddl = @import("../api/relational_sql_ddl.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
 const catalog_jobs = @import("../api/catalog_jobs.zig");
 const foreign_mod = @import("../foreign/mod.zig");
@@ -223,14 +224,28 @@ pub const AdminSource = struct {
     }
 
     pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
-        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
-        defer logical_plan.deinit(alloc);
-        var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+        return try self.applyRelationalParsedSqlDdl(alloc, &parsed_sql, catalog_resources.SqlCatalogSession.default());
+    }
+
+    pub fn applyRelationalParsedSqlDdl(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
+        var source = self;
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+            alloc,
+            parsed_sql,
+            adminSourceCatalogSource(&source),
+            session,
+            .{},
+        );
         defer durable_plan.deinit(alloc);
-        return try fn_ptr(self.ptr, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+        return try fn_ptr(self.ptr, alloc, &durable_plan, session);
     }
 
     pub fn applyRelationalSqlDdlPlanWithSession(
@@ -1224,6 +1239,27 @@ pub const AdminSource = struct {
         svc.recordJsonResponseAllocation(bytes);
     }
 };
+
+fn adminSourceCatalogSource(source: *AdminSource) table_catalog.CatalogSource {
+    const Adapter = struct {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const admin_source: *AdminSource = @ptrCast(@alignCast(ptr));
+            return try admin_source.adminSnapshot();
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            const admin_source: *AdminSource = @ptrCast(@alignCast(ptr));
+            admin_source.freeAdminSnapshot(snapshot);
+        }
+    };
+    return .{
+        .ptr = source,
+        .vtable = &.{
+            .admin_snapshot = Adapter.adminSnapshot,
+            .free_admin_snapshot = Adapter.freeAdminSnapshot,
+        },
+    };
+}
 
 pub const MetadataHttpServer = struct {
     alloc: std.mem.Allocator,
@@ -2252,27 +2288,6 @@ fn applyDurableSqlPlanOnMetadataServiceWithSession(
     return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, service_impl, plan, session);
 }
 
-fn applyRelationalDropTableCascadeReferences(
-    service_impl: anytype,
-    alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
-    target_table: metadata_table_manager.TableRecord,
-) !void {
-    for (snapshot.tables) |candidate_table| {
-        if (candidate_table.table_id == target_table.table_id) continue;
-        const next_schema_json = (try tables_api.schemaWithoutForeignKeysReferencingTableAlloc(
-            alloc,
-            candidate_table.schema_json,
-            target_table.name,
-        )) orelse continue;
-        defer alloc.free(next_schema_json);
-
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try service_impl.upsertTable(updated);
-    }
-}
-
 const ParsedGroupStatus = struct {
     group_id: u64,
     doc_count: ?u64 = null,
@@ -3205,9 +3220,7 @@ test "metadata http extension ownership helpers protect internal table mutations
 fn durableSqlPlanForMetadataTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !sql_adapter.DurableSqlPlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
-    defer logical_plan.deinit(alloc);
-    return try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+    return try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
 }
 
 test "metadata catalog validation requires cross-table foreign keys to reference parent unique columns" {

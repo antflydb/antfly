@@ -33,6 +33,10 @@ pub fn applyDurablePlanOnServiceWithSessionAlloc(
         .table_ddl => |*table_plan| return try applyTableDdlPlanOnServiceWithSessionAlloc(alloc, svc, table_plan, session),
         .catalog_ddl => |catalog_plan| return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, catalog_plan, session),
         .extension => |extension| return try applyExtensionLogicalPlanWithSessionAlloc(alloc, svc, extension, session),
+        .auth => return error.UnsupportedSqlShape,
+        .routine => return error.UnsupportedSqlShape,
+        .maintenance => return error.UnsupportedSqlShape,
+        .bulk_io => return error.UnsupportedSqlShape,
     }
 }
 
@@ -90,7 +94,14 @@ fn applyTableDdlPlanOnServiceWithSessionAlloc(
 
     if (target.dropsTable()) {
         if (target.cascade) {
-            try applyDropTableCascadeReferences(svc, alloc, &snapshot, table.*);
+            const cascade_applied = try applyDropTableCascadeReferencesAlloc(svc, alloc, &snapshot, table.*);
+            defer {
+                for (cascade_applied) |*applied| applied.deinit(alloc);
+                alloc.free(cascade_applied);
+            }
+            for (cascade_applied) |applied| {
+                try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
+            }
         } else {
             try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
         }
@@ -139,12 +150,18 @@ fn applyExtensionLogicalPlanWithSessionAlloc(
     return try extension_domain.sql_adapter.executeRelationalSqlExtensionPlanOnService(svc, alloc, plan);
 }
 
-fn applyDropTableCascadeReferences(
+fn applyDropTableCascadeReferencesAlloc(
     svc: anytype,
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     target_table: metadata_table_manager.TableRecord,
-) !void {
+) ![]tables_api.AppliedRelationalSqlDdlRecord {
+    var applied_updates = std.ArrayListUnmanaged(tables_api.AppliedRelationalSqlDdlRecord).empty;
+    errdefer {
+        for (applied_updates.items) |*applied| applied.deinit(alloc);
+        applied_updates.deinit(alloc);
+    }
+
     for (snapshot.tables) |candidate_table| {
         if (candidate_table.table_id == target_table.table_id) continue;
         const next_schema_json = (try tables_api.schemaWithoutForeignKeysReferencingTableAlloc(
@@ -155,9 +172,21 @@ fn applyDropTableCascadeReferences(
         defer alloc.free(next_schema_json);
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
+        var updated_transferred = false;
+        errdefer if (!updated_transferred) metadata_table_manager.freeTable(alloc, updated);
+        var applied = tables_api.AppliedRelationalSqlDdlRecord{
+            .table = updated,
+        };
+        var applied_transferred = false;
+        errdefer if (!applied_transferred) applied.deinit(alloc);
+
         try svc.upsertTable(updated);
+        try applied_updates.append(alloc, applied);
+        applied_transferred = true;
+        updated_transferred = true;
     }
+
+    return try applied_updates.toOwnedSlice(alloc);
 }
 
 fn droppedTableRecordAlloc(

@@ -207,22 +207,38 @@ pub fn executeOneJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Se
 }
 
 fn executeParsedSqlJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
-    if (parsed_sql.writeStatementKind() != null) return try executeWriteAlloc(allocator, db, session, parsed_sql);
-    if (parsed_sql.readStatementKind() != null) return try executeReadAlloc(allocator, db, session, parsed_sql);
-    return try executeDdlAlloc(allocator, db, session, parsed_sql);
+    switch (parsed_sql.statement) {
+        .read => return try executeReadAlloc(allocator, db, session, parsed_sql),
+        .write => return try executeWriteAlloc(allocator, db, session, parsed_sql),
+        else => return try executeNonRowAlloc(allocator, db, session, parsed_sql),
+    }
 }
 
-fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(allocator, parsed_sql, .{});
-    defer logical_plan.deinit(allocator);
-    var table_plan = switch (logical_plan) {
-        .table_ddl => |plan| plan,
-        else => return error.UnsupportedSqlShape,
-    };
-    logical_plan = .{ .other_ddl = .{ .moved = {} } };
-    defer table_plan.deinit(allocator);
+fn executeNonRowAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
+    var catalog = try LiteSingleTableCatalog.fromStoredTableAlloc(allocator, db);
+    defer catalog.deinit(allocator);
 
-    const table_name = try ddlTargetTableNameAlloc(allocator, table_plan, session.catalog.session());
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(allocator, parsed_sql, .{
+        .catalog = catalog.iface(),
+        .session = session.catalog.session(),
+    });
+    defer logical_plan.deinit(allocator);
+
+    return switch (logical_plan) {
+        .table_ddl => try executeTableDdlLogicalPlanAlloc(allocator, db, session, &logical_plan.table_ddl),
+        .session => try executeSessionLogicalPlanAlloc(allocator, session, logical_plan.session),
+        .other_ddl => try executeOtherDdlLogicalPlanAlloc(allocator, session, logical_plan.other_ddl),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn executeTableDdlLogicalPlanAlloc(
+    allocator: Allocator,
+    db: *antfly.db.DB,
+    session: *Session,
+    table_plan: *sql_adapter.TableDdlLogicalPlan,
+) ![]u8 {
+    const table_name = try ddlTargetTableNameAlloc(allocator, table_plan.*, session.catalog.session());
     defer allocator.free(table_name);
 
     const existing_table = try loadLiteSqlTableRecordForTargetAlloc(allocator, db, table_name, session.catalog.session());
@@ -239,14 +255,16 @@ fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, p
     var applied = try tables_api.applyTableDdlPlanToTableRecordWithSessionAlloc(
         allocator,
         &base_table,
-        &table_plan,
+        table_plan,
         session.catalog.session(),
     );
     defer applied.deinit(allocator);
 
     try db.applyLiteSqlTableRecord(allocator, applied.table);
 
-    const response = DdlResponse{
+    const response = NonRowResponse{
+        .kind = "ddl",
+        .statement_kind = "table_ddl",
         .session_id = session.sessionId(),
         .noop = applied.noop,
         .applied = applied,
@@ -254,31 +272,91 @@ fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, p
     return try std.json.Stringify.valueAlloc(allocator, response, .{ .whitespace = .indent_2 });
 }
 
+fn executeSessionLogicalPlanAlloc(
+    allocator: Allocator,
+    session: *Session,
+    plan: sql_adapter.SessionCatalogPlan,
+) ![]u8 {
+    const notification_session_id = session.catalog.notification_session_id;
+    var old = session.catalog;
+    var updated = try sql_adapter.applyOwnedSessionCatalogPlanAlloc(allocator, old, plan);
+    errdefer updated.deinit(allocator);
+    updated.notification_session_id = notification_session_id;
+    old.deinit(allocator);
+    session.catalog = updated;
+
+    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(allocator);
+    defer applied.deinit(allocator);
+    applied.noop = true;
+
+    const response = NonRowResponse{
+        .kind = "session",
+        .statement_kind = "session",
+        .session_id = session.sessionId(),
+        .noop = true,
+        .applied = applied,
+    };
+    return try std.json.Stringify.valueAlloc(allocator, response, .{ .whitespace = .indent_2 });
+}
+
+fn executeOtherDdlLogicalPlanAlloc(
+    allocator: Allocator,
+    session: *Session,
+    plan: sql_adapter.OtherDdlLogicalPlan,
+) ![]u8 {
+    switch (plan) {
+        .adapter_noop => {},
+        .moved => return error.UnsupportedSqlShape,
+    }
+    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(allocator);
+    defer applied.deinit(allocator);
+    applied.noop = true;
+
+    const response = NonRowResponse{
+        .kind = "ddl",
+        .statement_kind = "other_ddl",
+        .session_id = session.sessionId(),
+        .noop = true,
+        .applied = applied,
+    };
+    return try std.json.Stringify.valueAlloc(allocator, response, .{ .whitespace = .indent_2 });
+}
+
 fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
-    const target_table = try writeTargetTableNameAlloc(allocator, parsed_sql);
+    const target_table = try sql_adapter.writeTargetTableNameFromParsedSqlAlloc(allocator, parsed_sql);
     defer allocator.free(target_table);
 
     const table_record = (try loadLiteSqlTableRecordForTargetAlloc(allocator, db, target_table, session.catalog.session())) orelse return error.InvalidSqlCatalog;
     defer metadata_table_manager.freeTable(allocator, table_record);
-    var catalog = SingleTableCatalog.init(table_record);
+    var catalog = LiteSingleTableCatalog.initBorrowed(table_record);
     const catalog_source = catalog.iface();
+
+    var unique_resolver_ctx = DbUniqueSelectorResolverContext{ .db = db };
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(allocator, parsed_sql, .{
+        .catalog = catalog_source,
+        .session = session.catalog.session(),
+        .write_options = .{
+            .unique_resolver = unique_resolver_ctx.resolver(),
+            .sync_level = try sql_adapter.sqlSyncLevelFromSession(session.catalog.session()),
+        },
+    });
+    defer logical_plan.deinit(allocator);
+    switch (logical_plan) {
+        .catalog_write => {},
+        else => return error.UnsupportedSqlShape,
+    }
 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, target_table, session.catalog.session());
     defer storage_schema.freeSchema(allocator, schema);
 
     var write_source = table_writes.BoundTableWriteSource.init(target_table, db);
-    var unique_resolver_ctx = DbUniqueSelectorResolverContext{ .db = db };
-    var lowered = try sql_adapter_runtime.lowerWritePlanWithCatalogSessionParsedSqlAlloc(
+    var lowered = try sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
         allocator,
         parsed_sql,
+        &logical_plan,
         schema,
         &.{},
-        .{
-            .unique_resolver = unique_resolver_ctx.resolver(),
-            .sync_level = try sql_adapter.sqlSyncLevelFromSession(session.catalog.session()),
-        },
-        catalog_source,
-        session.catalog.session(),
+        .{},
     );
     defer lowered.deinit(allocator);
 
@@ -292,31 +370,38 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
         _ = (try write_source.source().batch(allocator, target_table, rows_batch.req)) orelse return error.TableNotFound;
     }
 
-    return try encodeRowsBatchResultAlloc(allocator, session.sessionId(), @tagName(parsed_sql.writeStatementKind().?), rows_batch.*);
+    return try encodeRowsBatchResultAlloc(allocator, session.sessionId(), liteStatementKindForLogicalPlan(logical_plan), rows_batch.*);
 }
 
 fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
-    const statement_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
-    if (try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind)) |body| return body;
-
     var table_names = (try sql_adapter.readSourceTableNamesFromParsedSqlAlloc(allocator, parsed_sql)) orelse return error.UnsupportedSqlShape;
     defer table_names.deinit(allocator);
 
     const table_record = (try loadLiteSqlTableRecordForTargetAlloc(allocator, db, table_names.left, session.catalog.session())) orelse return error.InvalidSqlCatalog;
     defer metadata_table_manager.freeTable(allocator, table_record);
-    var catalog = SingleTableCatalog.init(table_record);
+    var catalog = LiteSingleTableCatalog.initBorrowed(table_record);
     const catalog_source = catalog.iface();
+
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(allocator, parsed_sql, .{
+        .catalog = catalog_source,
+        .session = session.catalog.session(),
+    });
+    defer logical_plan.deinit(allocator);
+    const statement_kind = switch (logical_plan) {
+        .catalog_read => |catalog_read| catalog_read.statement.readKind() orelse return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    };
+    if (try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind)) |body| return body;
 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, table_names.left, session.catalog.session());
     defer storage_schema.freeSchema(allocator, schema);
 
-    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
+    var lowered = try sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
         allocator,
         parsed_sql,
+        &logical_plan,
         schema,
         &.{},
-        catalog_source,
-        session.catalog.session(),
         .{},
     );
     defer lowered.deinit(allocator);
@@ -334,7 +419,7 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     )) orelse return error.TableNotFound;
     defer result.deinit(allocator);
 
-    return try encodeReadResultAlloc(allocator, session.sessionId(), @tagName(statement_kind), result);
+    return try encodeReadResultAlloc(allocator, session.sessionId(), liteStatementKindForLogicalPlan(logical_plan), result);
 }
 
 fn executeAntflyQueryFunctionReadAlloc(
@@ -384,12 +469,35 @@ fn loadLiteSqlTableRecordForTargetAlloc(
     });
 }
 
-const DdlResponse = struct {
-    kind: []const u8 = "ddl",
+const NonRowResponse = struct {
+    kind: []const u8,
+    statement_kind: []const u8,
     session_id: u64,
     noop: bool,
     applied: tables_api.AppliedRelationalSqlDdlRecord,
 };
+
+fn liteStatementKindForLogicalPlan(plan: sql_adapter.LogicalSqlPlan) []const u8 {
+    return switch (plan) {
+        .catalog_read => |read| if (read.statement.readKind()) |kind| @tagName(kind) else "read",
+        .catalog_write => |write| if (write.statement.writeKind()) |kind| @tagName(kind) else "write",
+        .table_ddl => "table_ddl",
+        .catalog_ddl => "catalog_ddl",
+        .other_ddl => "other_ddl",
+        .session => "session",
+        .transaction => "transaction",
+        .prepared_statement => "prepared_statement",
+        .cursor => "cursor",
+        .notification => "notification",
+        .routine => "routine",
+        .auth => "auth",
+        .extension => "extension",
+        .maintenance => "maintenance",
+        .bulk_io => "bulk_io",
+        .read => |kind| @tagName(kind),
+        .write => |kind| @tagName(kind),
+    };
+}
 
 fn encodeReadResultAlloc(allocator: Allocator, session_id: u64, statement_kind: []const u8, result: table_reads.LoweredSqlReadPlanResult) ![]u8 {
     const result_body = switch (result) {
@@ -497,14 +605,29 @@ fn sqlQueryFunctionHitRowAlloc(
     return try out.toOwnedSlice();
 }
 
-const SingleTableCatalog = struct {
-    tables: [1]metadata_table_manager.TableRecord,
+const LiteSingleTableCatalog = struct {
+    table: ?metadata_table_manager.TableRecord = null,
+    owned: bool = false,
 
-    fn init(table_record: metadata_table_manager.TableRecord) SingleTableCatalog {
-        return .{ .tables = .{table_record} };
+    fn initBorrowed(table_record: metadata_table_manager.TableRecord) LiteSingleTableCatalog {
+        return .{ .table = table_record };
     }
 
-    fn iface(self: *SingleTableCatalog) table_catalog.CatalogSource {
+    fn fromStoredTableAlloc(allocator: Allocator, db: *antfly.db.DB) !LiteSingleTableCatalog {
+        return .{
+            .table = try db.getLiteSqlTableRecordAlloc(allocator),
+            .owned = true,
+        };
+    }
+
+    fn deinit(self: *@This(), allocator: Allocator) void {
+        if (self.owned) {
+            if (self.table) |table| metadata_table_manager.freeTable(allocator, table);
+        }
+        self.* = undefined;
+    }
+
+    fn iface(self: *LiteSingleTableCatalog) table_catalog.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -515,10 +638,14 @@ const SingleTableCatalog = struct {
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-        const self: *SingleTableCatalog = @ptrCast(@alignCast(ptr));
+        const self: *LiteSingleTableCatalog = @ptrCast(@alignCast(ptr));
+        const tables = if (self.table) |*table|
+            @as([*]metadata_table_manager.TableRecord, @ptrCast(table))[0..1]
+        else
+            @constCast((&[_]metadata_table_manager.TableRecord{})[0..]);
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables[0..],
+            .tables = tables,
             .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -569,97 +696,6 @@ fn ddlTargetTableNameAlloc(allocator: Allocator, plan: sql_adapter.TableDdlLogic
     defer target.deinit(allocator);
     if (target.table_name.len == 0) return error.UnsupportedSqlShape;
     return try allocator.dupe(u8, target.table_name);
-}
-
-fn writeTargetTableNameAlloc(allocator: Allocator, parsed_sql: *const sql_adapter.ParsedSql) ![]const u8 {
-    const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
-    const tokens = parsed_sql.items();
-    const raw = parsed_sql.statement.raw();
-    if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return error.UnsupportedSqlShape;
-    var pos = withFinalStatementIndex(tokens, raw.token_start, raw.token_end) orelse return error.UnsupportedSqlShape;
-    switch (statement_kind) {
-        .insert, .insert_source => {
-            if (!tokens[pos].matchesKeywordTag(.insert)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-        },
-        .update, .update_source, .update_joined_source => {
-            if (!tokens[pos].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-        },
-        .delete, .delete_source, .delete_joined_source => {
-            if (!tokens[pos].matchesKeywordTag(.delete)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-        },
-        .truncate => {
-            if (!tokens[pos].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.table)) pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-        },
-        .merge => {
-            if (!tokens[pos].matchesKeywordTag(.merge)) return error.UnsupportedSqlShape;
-            pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.into)) pos += 1;
-            if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-        },
-    }
-    if (pos >= raw.token_end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
-    return try sql_adapter.normalizeSqlObjectIdentifierAlloc(allocator, tokens[pos].text);
-}
-
-fn withFinalStatementIndex(tokens: []const sql_adapter.Token, start: usize, end: usize) ?usize {
-    if (start >= end or start >= tokens.len) return null;
-    if (!tokens[start].matchesKeywordTag(.with)) return start;
-
-    var index = start + 1;
-    if (index < end and tokens[index].matchesKeywordTag(.recursive)) index += 1;
-    while (true) {
-        if (index >= end or tokens[index].kind != .identifier) return null;
-        index += 1;
-        if (index < end and tokens[index].kind == .lparen) {
-            index = (findMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
-        }
-        if (index >= end or !tokens[index].matchesKeywordTag(.as)) return null;
-        index += 1;
-        if (index < end and tokens[index].matchesKeywordTag(.not)) {
-            if (index + 1 < end and tokens[index + 1].matchesKeywordTag(.materialized)) index += 2;
-        } else if (index < end and tokens[index].matchesKeywordTag(.materialized)) {
-            index += 1;
-        }
-        if (index >= end or tokens[index].kind != .lparen) return null;
-        index = (findMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
-        if (index < end and tokens[index].kind == .comma) {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-    if (index >= end or tokens[index].kind != .identifier) return null;
-    return index;
-}
-
-fn findMatchingRParenIndex(tokens: []const sql_adapter.Token, lparen_index: usize, end: usize) ?usize {
-    if (lparen_index >= end or tokens[lparen_index].kind != .lparen) return null;
-    var depth: usize = 1;
-    var index = lparen_index + 1;
-    while (index < end) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                depth -= 1;
-                if (depth == 0) return index;
-            },
-            else => {},
-        }
-    }
-    return null;
 }
 
 pub fn firstStatementEnd(sql: []const u8) ?usize {
@@ -844,6 +880,40 @@ test "lite sql ddl updates catalog for subsequent statements" {
 
     try std.testing.expectError(error.InvalidSqlCatalog, executeOneJsonAlloc(allocator, &db, &session, "SELECT id, status FROM other_records;"));
     try std.testing.expectError(error.InvalidSqlCatalog, executeOneJsonAlloc(allocator, &db, &session, "INSERT INTO other_records (id, status) VALUES ('row:a', 'open');"));
+}
+
+test "lite sql applies session plans before later logical planning" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-sql-session-plan", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var db = try antfly.db.DB.open(allocator, path, .{});
+    defer db.close();
+
+    var session = try Session.init(allocator, .{});
+    defer session.deinit(allocator);
+
+    const set_body = try executeOneJsonAlloc(allocator, &db, &session, "SET search_path TO tenant_schema;");
+    defer allocator.free(set_body);
+    var parsed_set = try std.json.parseFromSlice(std.json.Value, allocator, set_body, .{ .allocate = .alloc_always });
+    defer parsed_set.deinit();
+    try std.testing.expectEqualStrings("session", parsed_set.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("session", parsed_set.value.object.get("statement_kind").?.string);
+    try std.testing.expectEqualStrings("tenant_schema", session.catalog.search_path[0]);
+
+    const ddl_body = try executeOneJsonAlloc(allocator, &db, &session, "CREATE TABLE usage_records (id text PRIMARY KEY, status text);");
+    defer allocator.free(ddl_body);
+    var parsed_ddl = try std.json.parseFromSlice(std.json.Value, allocator, ddl_body, .{ .allocate = .alloc_always });
+    defer parsed_ddl.deinit();
+    try std.testing.expectEqualStrings("ddl", parsed_ddl.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("table_ddl", parsed_ddl.value.object.get("statement_kind").?.string);
+
+    const table_record = (try db.getLiteSqlTableRecordAlloc(allocator)) orelse return error.TestUnexpectedResult;
+    defer metadata_table_manager.freeTable(allocator, table_record);
+    try std.testing.expectEqualStrings("tenant_schema", table_record.namespace_name);
 }
 
 test "lite sql antfly query functions use native document query path" {

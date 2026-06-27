@@ -27,6 +27,7 @@ const table_catalog = @import("../api/table_catalog.zig");
 const classifier = @import("classifier.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
+const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const source_binding = @import("source_binding.zig");
@@ -694,6 +695,247 @@ fn deinitCatalogTableRef(alloc: std.mem.Allocator, target: source_binding.Catalo
     alloc.free(@constCast(target.table_name));
 }
 
+fn cloneCatalogTableRefAlloc(alloc: std.mem.Allocator, target: source_binding.CatalogTableRef) !source_binding.CatalogTableRef {
+    const database_name = try alloc.dupe(u8, target.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, target.namespace_name);
+    errdefer alloc.free(namespace_name);
+    const table_name = try alloc.dupe(u8, target.table_name);
+    errdefer alloc.free(table_name);
+    return .{
+        .database_name = database_name,
+        .namespace_name = namespace_name,
+        .table_name = table_name,
+    };
+}
+
+pub const BoundCatalogObjectRole = enum {
+    target,
+    source,
+    insert_source,
+    joined_source,
+};
+
+pub const BoundCatalogObject = struct {
+    role: BoundCatalogObjectRole,
+    target: source_binding.CatalogTableRef,
+    family: source_binding.SqlSourceFamily,
+    schema_version: u32,
+    table_id: u64,
+    schema_generation: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        deinitCatalogTableRef(alloc, self.target);
+        self.* = undefined;
+    }
+};
+
+pub const BoundSqlAuthorizationPermission = enum {
+    read,
+    write,
+    admin,
+};
+
+pub const BoundSqlAuthorizationResourceKind = enum {
+    table,
+    database,
+    all,
+};
+
+pub const BoundSqlAuthorizationGrant = struct {
+    resource_kind: BoundSqlAuthorizationResourceKind,
+    resource: []const u8,
+    permission: BoundSqlAuthorizationPermission,
+};
+
+pub const BoundSqlAuthorizationDecision = enum {
+    not_evaluated,
+    unrestricted,
+    allowed,
+    denied,
+};
+
+pub const BoundSqlAuthorizationOptions = struct {
+    principal_name: ?[]const u8 = null,
+    grants: []const BoundSqlAuthorizationGrant = &.{},
+    grants_evaluated: bool = false,
+    unrestricted: bool = false,
+};
+
+pub const BoundSqlAuthorizationCheck = struct {
+    object_role: BoundCatalogObjectRole,
+    target: source_binding.CatalogTableRef,
+    family: source_binding.SqlSourceFamily,
+    table_id: u64,
+    schema_generation: u64,
+    required_permission: BoundSqlAuthorizationPermission,
+    decision: BoundSqlAuthorizationDecision,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        deinitCatalogTableRef(alloc, self.target);
+        self.* = undefined;
+    }
+};
+
+pub const BoundSqlAuthorization = struct {
+    principal_name: ?[]const u8 = null,
+    checks: []BoundSqlAuthorizationCheck = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.principal_name) |name| alloc.free(@constCast(name));
+        for (self.checks) |*check| check.deinit(alloc);
+        if (self.checks.len > 0) alloc.free(self.checks);
+        self.* = undefined;
+    }
+};
+
+fn authorizationPermissionAllows(grant: BoundSqlAuthorizationPermission, required: BoundSqlAuthorizationPermission) bool {
+    return grant == .admin or grant == required;
+}
+
+fn authorizationGrantMatchesTarget(grant: BoundSqlAuthorizationGrant, target: source_binding.CatalogTableRef, resource_name: []const u8) bool {
+    return switch (grant.resource_kind) {
+        .all => std.mem.eql(u8, grant.resource, "*"),
+        .database => std.mem.eql(u8, grant.resource, "*") or std.mem.eql(u8, grant.resource, target.database_name),
+        .table => std.mem.eql(u8, grant.resource, "*") or catalog_resources.tableResourceMatches(grant.resource, resource_name),
+    };
+}
+
+fn authorizationDecisionForTarget(
+    alloc: std.mem.Allocator,
+    target: source_binding.CatalogTableRef,
+    required_permission: BoundSqlAuthorizationPermission,
+    options: BoundSqlAuthorizationOptions,
+) !BoundSqlAuthorizationDecision {
+    if (options.unrestricted) return .unrestricted;
+    if (!options.grants_evaluated) return .not_evaluated;
+    const resource_name = try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+    defer alloc.free(resource_name);
+    for (options.grants) |grant| {
+        if (!authorizationPermissionAllows(grant.permission, required_permission)) continue;
+        if (authorizationGrantMatchesTarget(grant, target, resource_name)) return .allowed;
+    }
+    return .denied;
+}
+
+fn authorizationRequiredPermissionForBoundObject(object: BoundCatalogObject, default_permission: BoundSqlAuthorizationPermission) BoundSqlAuthorizationPermission {
+    return switch (object.role) {
+        .target => default_permission,
+        .source, .insert_source, .joined_source => .read,
+    };
+}
+
+fn boundSqlAuthorizationForObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: []const BoundCatalogObject,
+    options: BoundSqlAuthorizationOptions,
+    default_permission: BoundSqlAuthorizationPermission,
+) !BoundSqlAuthorization {
+    if (options.principal_name == null and !options.grants_evaluated and !options.unrestricted) return .{};
+
+    var out = BoundSqlAuthorization{
+        .principal_name = if (options.principal_name) |name| try alloc.dupe(u8, name) else null,
+    };
+    errdefer out.deinit(alloc);
+
+    const checks = try alloc.alloc(BoundSqlAuthorizationCheck, objects.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (checks[0..initialized]) |*check| check.deinit(alloc);
+        alloc.free(checks);
+    }
+    for (objects, 0..) |object, i| {
+        const target = try cloneCatalogTableRefAlloc(alloc, object.target);
+        errdefer deinitCatalogTableRef(alloc, target);
+        const required_permission = authorizationRequiredPermissionForBoundObject(object, default_permission);
+        checks[i] = .{
+            .object_role = object.role,
+            .target = target,
+            .family = object.family,
+            .table_id = object.table_id,
+            .schema_generation = object.schema_generation,
+            .required_permission = required_permission,
+            .decision = try authorizationDecisionForTarget(alloc, object.target, required_permission, options),
+        };
+        initialized += 1;
+    }
+    out.checks = checks;
+    return out;
+}
+
+fn freeBoundCatalogObjects(alloc: std.mem.Allocator, objects: []BoundCatalogObject) void {
+    for (objects) |*object| object.deinit(alloc);
+    if (objects.len > 0) alloc.free(objects);
+}
+
+fn boundCatalogObjectForBindingAlloc(
+    alloc: std.mem.Allocator,
+    role: BoundCatalogObjectRole,
+    binding: source_binding.SqlSourceBinding,
+) !BoundCatalogObject {
+    const target = try cloneCatalogTableRefAlloc(alloc, binding.target());
+    errdefer deinitCatalogTableRef(alloc, target);
+    return .{
+        .role = role,
+        .target = target,
+        .family = binding.family(),
+        .schema_version = binding.schema().version,
+        .table_id = binding.tableId(),
+        .schema_generation = binding.schemaGeneration(),
+    };
+}
+
+fn boundCatalogObjectForCatalogTableAlloc(
+    alloc: std.mem.Allocator,
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !BoundCatalogObject {
+    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
+    errdefer deinitCatalogTableRef(alloc, target);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    return .{
+        .role = role,
+        .target = target,
+        .family = source_binding.familyForRuntimeSchema(schema),
+        .schema_version = schema.version,
+        .table_id = table.table_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json),
+    };
+}
+
+fn appendBoundCatalogObjectForBindingAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    binding: source_binding.SqlSourceBinding,
+) !void {
+    var object = try boundCatalogObjectForBindingAlloc(alloc, role, binding);
+    errdefer object.deinit(alloc);
+    try objects.append(alloc, object);
+}
+
+fn appendBoundCatalogObjectForCatalogTableAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    var object = try boundCatalogObjectForCatalogTableAlloc(alloc, role, catalog, table_name, session);
+    errdefer object.deinit(alloc);
+    try objects.append(alloc, object);
+}
+
 fn sourceBindingForCatalogTableWithSessionAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -712,14 +954,23 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
     errdefer runtime_schema.freeSchema(alloc, schema);
     var binding = source_binding.bindingForRuntimeSchema(target, schema);
     switch (binding) {
+        .relational => |*relational| {
+            relational.table_id = table.table_id;
+            relational.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+        },
         .document => |*document| {
+            document.table_id = table.table_id;
+            document.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
             document.indexes_json = try alloc.dupe(u8, table.indexes_json);
             errdefer if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
             document.capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
             errdefer source_binding.deinitDocumentSqlCapabilities(alloc, &document.capabilities);
             document.virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
         },
-        else => {},
+        .lake => |*lake| {
+            lake.table_id = table.table_id;
+            lake.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+        },
     }
     return binding;
 }
@@ -827,11 +1078,15 @@ pub const CatalogBoundWritePlanOptions = struct {
     target_binding: ?source_binding.SqlSourceBinding = null,
     owned_insert_source_schema: ?runtime_schema.TableSchema = null,
     owned_joined_source_schema: ?runtime_schema.TableSchema = null,
+    bound_objects: []BoundCatalogObject = &.{},
+    authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        freeBoundCatalogObjects(alloc, self.bound_objects);
+        self.authorization.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -840,6 +1095,8 @@ pub const CatalogBoundReadPlanSourceSchema = struct {
     target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
     source_binding: ?source_binding.SqlSourceBinding = null,
+    bound_objects: []BoundCatalogObject = &.{},
+    authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
@@ -847,6 +1104,21 @@ pub const CatalogBoundReadPlanSourceSchema = struct {
             if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         }
         if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
+        freeBoundCatalogObjects(alloc, self.bound_objects);
+        self.authorization.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const CatalogBoundDdlPlanFacts = struct {
+    bound_objects: []BoundCatalogObject = &.{},
+    authorization: BoundSqlAuthorization = .{},
+    logical_plan: ?LogicalSqlPlan = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeBoundCatalogObjects(alloc, self.bound_objects);
+        self.authorization.deinit(alloc);
+        if (self.logical_plan) |*plan| plan.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -854,12 +1126,14 @@ pub const CatalogBoundReadPlanSourceSchema = struct {
 pub const BoundSqlBinding = union(enum) {
     read_catalog: CatalogBoundReadPlanSourceSchema,
     write_catalog: CatalogBoundWritePlanOptions,
+    ddl_catalog: CatalogBoundDdlPlanFacts,
     none,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .read_catalog => |*read| read.deinit(alloc),
             .write_catalog => |*write| write.deinit(alloc),
+            .ddl_catalog => |*ddl| ddl.deinit(alloc),
             .none => {},
         }
         self.* = undefined;
@@ -916,6 +1190,7 @@ pub const BoundSqlSession = struct {
 };
 
 pub const BoundSqlStatement = struct {
+    parsed_sql: ?*const tokenized.ParsedSql = null,
     statement: tokenized.ParsedStatement,
     session: BoundSqlSession,
     binding: BoundSqlBinding = .none,
@@ -939,7 +1214,50 @@ pub const BoundSqlStatement = struct {
             else => error.UnsupportedSqlShape,
         };
     }
+
+    pub fn ddlCatalog(self: *BoundSqlStatement) !*CatalogBoundDdlPlanFacts {
+        return switch (self.binding) {
+            .ddl_catalog => |*ddl| ddl,
+            else => error.UnsupportedSqlShape,
+        };
+    }
+
+    pub fn takeDdlLogicalPlan(self: *BoundSqlStatement) !LogicalSqlPlan {
+        const ddl = try self.ddlCatalog();
+        if (ddl.logical_plan) |plan| {
+            ddl.logical_plan = null;
+            return plan;
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    pub fn parsedSql(self: *const BoundSqlStatement) !*const tokenized.ParsedSql {
+        return self.parsed_sql orelse error.UnsupportedSqlShape;
+    }
 };
+
+pub fn enforceBoundSqlAuthorization(authorization: BoundSqlAuthorization) !void {
+    for (authorization.checks) |check| {
+        if (check.decision == .denied) return error.PermissionDenied;
+    }
+}
+
+pub fn enforceBoundSqlStatementAuthorization(bound: *BoundSqlStatement) !void {
+    switch (bound.binding) {
+        .read_catalog => |read| try enforceBoundSqlAuthorization(read.authorization),
+        .write_catalog => |write| try enforceBoundSqlAuthorization(write.authorization),
+        .ddl_catalog => |ddl| try enforceBoundSqlAuthorization(ddl.authorization),
+        .none => {},
+    }
+}
+
+pub fn enforceLogicalSqlPlanAuthorization(logical: *LogicalSqlPlan) !void {
+    switch (logical.*) {
+        .catalog_read => |read| try enforceBoundSqlAuthorization(read.authorization),
+        .catalog_write => |write| try enforceBoundSqlAuthorization(write.authorization),
+        else => {},
+    }
+}
 
 fn requireParsedCatalogReadStatement(statement: tokenized.ParsedStatement) !void {
     switch (statement) {
@@ -955,12 +1273,21 @@ fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !voi
     }
 }
 
+fn requireParsedDdlStatement(statement: tokenized.ParsedStatement) !void {
+    switch (statement) {
+        .ddl, .session, .transaction, .prepared, .explain, .unsupported, .unknown => {},
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 pub const CatalogLogicalReadPlan = struct {
     statement: tokenized.ParsedStatement,
     session: BoundSqlSession,
     target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
     source_binding: ?source_binding.SqlSourceBinding = null,
+    bound_objects: []BoundCatalogObject = &.{},
+    authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
@@ -968,6 +1295,8 @@ pub const CatalogLogicalReadPlan = struct {
             if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         }
         if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
+        freeBoundCatalogObjects(alloc, self.bound_objects);
+        self.authorization.deinit(alloc);
         self.session.deinit(alloc);
         self.* = undefined;
     }
@@ -980,11 +1309,15 @@ pub const CatalogLogicalWritePlan = struct {
     target_binding: ?source_binding.SqlSourceBinding = null,
     owned_insert_source_schema: ?runtime_schema.TableSchema = null,
     owned_joined_source_schema: ?runtime_schema.TableSchema = null,
+    bound_objects: []BoundCatalogObject = &.{},
+    authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        freeBoundCatalogObjects(alloc, self.bound_objects);
+        self.authorization.deinit(alloc);
         self.session.deinit(alloc);
         self.* = undefined;
     }
@@ -1170,6 +1503,26 @@ pub const LogicalSqlPlan = union(enum) {
     }
 };
 
+pub fn takeTableDdlPlanFromLogical(logical: *LogicalSqlPlan) !TableDdlLogicalPlan {
+    return switch (logical.*) {
+        .table_ddl => |plan| blk: {
+            logical.* = .{ .other_ddl = .{ .moved = {} } };
+            break :blk plan;
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+pub fn takeCatalogDdlPlanFromLogical(logical: *LogicalSqlPlan) !CatalogDdlLogicalPlan {
+    return switch (logical.*) {
+        .catalog_ddl => |plan| blk: {
+            logical.* = .{ .other_ddl = .{ .moved = {} } };
+            break :blk plan;
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
 pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const read = try bound.readCatalog();
     const target_binding = read.target_binding;
@@ -1178,6 +1531,10 @@ pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlP
     read.source_schema = null;
     const source_binding_value = read.source_binding;
     read.source_binding = null;
+    const bound_objects = read.bound_objects;
+    read.bound_objects = &.{};
+    const authorization = read.authorization;
+    read.authorization = .{};
     const session = bound.session;
     bound.session = BoundSqlSession.empty();
     return .{ .catalog_read = .{
@@ -1186,6 +1543,8 @@ pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlP
         .target_binding = target_binding,
         .source_schema = source_schema,
         .source_binding = source_binding_value,
+        .bound_objects = bound_objects,
+        .authorization = authorization,
     } };
 }
 
@@ -1197,6 +1556,10 @@ pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSql
     const owned_joined_source_schema = write.owned_joined_source_schema;
     write.owned_insert_source_schema = null;
     write.owned_joined_source_schema = null;
+    const bound_objects = write.bound_objects;
+    write.bound_objects = &.{};
+    const authorization = write.authorization;
+    write.authorization = .{};
     const session = bound.session;
     bound.session = BoundSqlSession.empty();
     return .{ .catalog_write = .{
@@ -1206,6 +1569,8 @@ pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSql
         .target_binding = target_binding,
         .owned_insert_source_schema = owned_insert_source_schema,
         .owned_joined_source_schema = owned_joined_source_schema,
+        .bound_objects = bound_objects,
+        .authorization = authorization,
     } };
 }
 
@@ -1472,12 +1837,24 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
+    return try bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, .{});
+}
+
+pub fn bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !BoundSqlStatement {
     try requireParsedCatalogWriteStatement(parsed_sql.statement);
     var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
     errdefer bound_session.deinit(alloc);
-    var resolved = try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, session);
+    var resolved = try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, authorization_options);
     errdefer resolved.deinit(alloc);
     return .{
+        .parsed_sql = parsed_sql,
         .statement = parsed_sql.statement,
         .session = bound_session,
         .binding = .{ .write_catalog = resolved },
@@ -1511,10 +1888,27 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
+    return try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, .{});
+}
+
+fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !CatalogBoundWritePlanOptions {
     var out = CatalogBoundWritePlanOptions{
         .options = options,
     };
     errdefer out.deinit(alloc);
+    var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
+    var bound_objects_transferred = false;
+    errdefer if (!bound_objects_transferred) {
+        freeBoundCatalogObjects(alloc, bound_objects.items);
+        bound_objects.deinit(alloc);
+    };
 
     const target_table_name = try writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql);
     defer alloc.free(target_table_name);
@@ -1522,6 +1916,9 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
         error.InvalidSqlCatalog, error.TableNotFound => null,
         else => return err,
     };
+    if (out.target_binding) |binding| {
+        try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .target, binding);
+    }
 
     var resolved_recursive_insert_source = false;
 
@@ -1533,6 +1930,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
             if (!std.mem.eql(u8, tables.target, tables.source)) {
                 out.owned_insert_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
                 out.options.insert_source_schema = out.owned_insert_source_schema.?;
+                try appendBoundCatalogObjectForCatalogTableAlloc(alloc, &bound_objects, .insert_source, catalog, tables.source, session);
             }
         } else if (try insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
             var tables = resolved_tables;
@@ -1540,6 +1938,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
             if (!std.mem.eql(u8, tables.target, tables.source)) {
                 out.owned_insert_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
                 out.options.insert_source_schema = out.owned_insert_source_schema.?;
+                try appendBoundCatalogObjectForCatalogTableAlloc(alloc, &bound_objects, .insert_source, catalog, tables.source, session);
             }
         }
     }
@@ -1552,6 +1951,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
                 if (!std.mem.eql(u8, tables.target, tables.source)) {
                     out.owned_joined_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
                     out.options.joined_source_schema = out.owned_joined_source_schema.?;
+                    try appendBoundCatalogObjectForCatalogTableAlloc(alloc, &bound_objects, .joined_source, catalog, tables.source, session);
                 }
             }
         } else |err| switch (err) {
@@ -1560,6 +1960,9 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
         }
     }
 
+    out.bound_objects = try bound_objects.toOwnedSlice(alloc);
+    bound_objects_transferred = true;
+    out.authorization = try boundSqlAuthorizationForObjectsAlloc(alloc, out.bound_objects, authorization_options, .write);
     return out;
 }
 
@@ -1587,14 +1990,32 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
+    return try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, .{});
+}
+
+fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !CatalogBoundReadPlanSourceSchema {
     var out = CatalogBoundReadPlanSourceSchema{};
     errdefer out.deinit(alloc);
+    var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
+    var bound_objects_transferred = false;
+    errdefer if (!bound_objects_transferred) {
+        freeBoundCatalogObjects(alloc, bound_objects.items);
+        bound_objects.deinit(alloc);
+    };
     if (try readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
         var tables = resolved_tables;
         defer tables.deinit(alloc);
         out.target_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.left, session);
+        try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .target, out.target_binding.?);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
             out.source_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+            try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .source, out.source_binding.?);
             out.source_schema = switch (out.source_binding.?) {
                 .relational => |binding| binding.schema,
                 .document => |binding| binding.schema,
@@ -1602,6 +2023,202 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
             };
         }
     }
+    out.bound_objects = try bound_objects.toOwnedSlice(alloc);
+    bound_objects_transferred = true;
+    out.authorization = try boundSqlAuthorizationForObjectsAlloc(alloc, out.bound_objects, authorization_options, .read);
+    return out;
+}
+
+fn appendOptionalBoundCatalogObjectForCatalogTableAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    missing_ok: bool,
+) !void {
+    appendBoundCatalogObjectForCatalogTableAlloc(alloc, objects, role, catalog, table_name, session) catch |err| switch (err) {
+        error.InvalidSqlCatalog, error.TableNotFound => if (missing_ok) return else return err,
+        error.UnsupportedOperation => return,
+        else => return err,
+    };
+}
+
+fn appendExistingCreateTargetIfPresentAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    return try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, table_name, session, true);
+}
+
+fn collectTableDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: TableDdlLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    switch (plan) {
+        .moved => return,
+        .create_table => |create| try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.table_name, session),
+        .table_clone => |clone| {
+            try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, clone.table_name, session);
+            try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, clone.source_table_name, session, false);
+        },
+        .view_catalog => |view| switch (view) {
+            .create => |create| {
+                try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.view_name, session);
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, create.source_table_name, session, false);
+            },
+            .rename => |rename| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, rename.view_name, session, false),
+            .drop => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.view_name, session, drop.if_exists),
+        },
+        .materialized_view_catalog => |view| switch (view) {
+            .create => |create| {
+                try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.view_name, session);
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, create.source_table_name, session, false);
+            },
+            .refresh => |refresh| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, refresh.view_name, session, false),
+            .drop => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.view_name, session, drop.if_exists),
+        },
+        .relation_lifetime => |lifetime| try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, lifetime.create_table.table_name, session),
+        .table_partition_catalog => |partition| switch (partition) {
+            .create_partitioned => |create| try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.create_table.table_name, session),
+            .create_partition => |create| {
+                try appendExistingCreateTargetIfPresentAlloc(alloc, objects, catalog, create.table_name, session);
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, create.parent_table_name, session, false);
+            },
+            .attach => |attach| {
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, attach.parent_table_name, session, false);
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, attach.partition_table_name, session, false);
+            },
+            .detach => |detach| {
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, detach.parent_table_name, session, false);
+                try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .source, catalog, detach.partition_table_name, session, false);
+            },
+        },
+        .create_index => |create| if (create.table_name.len != 0) {
+            try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, create.table_name, session, false);
+        },
+        .drop_index => {},
+        .drop_table => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.table_name, session, drop.if_exists),
+        .alter_table => |alter| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, alter.if_exists),
+        .create_update_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
+    }
+}
+
+fn collectAuthDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: AuthorizationLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    switch (plan) {
+        .authorization_catalog => {},
+        .row_security_catalog => |row_security| switch (row_security) {
+            .alter_table => |alter| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, false),
+            .create_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
+            .alter_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
+            .drop_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, policy.if_exists),
+        },
+    }
+}
+
+fn collectRoutineDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: RoutineLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    switch (plan) {
+        .function_catalog, .procedure_call => {},
+        .trigger_catalog => |trigger| switch (trigger) {
+            .create => |create| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, create.table_name, session, false),
+            .drop => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.table_name, session, drop.if_exists),
+        },
+    }
+}
+
+fn collectBulkIoDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    catalog: table_catalog.CatalogSource,
+    plan: ddl_plan.BulkIoPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, plan.table_name, session, false);
+}
+
+fn collectDdlBoundCatalogObjectsAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    logical_plan: LogicalSqlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) ![]BoundCatalogObject {
+    var bound_objects = std.ArrayListUnmanaged(BoundCatalogObject).empty;
+    var transferred = false;
+    errdefer if (!transferred) {
+        freeBoundCatalogObjects(alloc, bound_objects.items);
+        bound_objects.deinit(alloc);
+    };
+
+    switch (logical_plan) {
+        .table_ddl => |plan| try collectTableDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
+        .auth => |plan| try collectAuthDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
+        .routine => |plan| try collectRoutineDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
+        .bulk_io => |plan| try collectBulkIoDdlBoundCatalogObjectsAlloc(alloc, &bound_objects, catalog, plan, session),
+        else => {},
+    }
+
+    const out = try bound_objects.toOwnedSlice(alloc);
+    transferred = true;
+    return out;
+}
+
+fn ddlAuthorizationDefaultPermission(logical_plan: LogicalSqlPlan) BoundSqlAuthorizationPermission {
+    return switch (logical_plan) {
+        .bulk_io => |plan| switch (plan.direction) {
+            .from => .write,
+            .to => .read,
+        },
+        else => .admin,
+    };
+}
+
+fn resolveDdlCatalogFactsFromParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !CatalogBoundDdlPlanFacts {
+    return try resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, function_bindings, .{});
+}
+
+fn resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: lower_expr.SqlFunctionBindings,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !CatalogBoundDdlPlanFacts {
+    var logical_plan = try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
+    errdefer logical_plan.deinit(alloc);
+    var out = CatalogBoundDdlPlanFacts{
+        .bound_objects = try collectDdlBoundCatalogObjectsAlloc(alloc, catalog, logical_plan, session),
+        .logical_plan = logical_plan,
+    };
+    errdefer out.deinit(alloc);
+    const default_permission = ddlAuthorizationDefaultPermission(logical_plan);
+    logical_plan = .{ .other_ddl = .{ .moved = {} } };
+    out.authorization = try boundSqlAuthorizationForObjectsAlloc(alloc, out.bound_objects, authorization_options, default_permission);
     return out;
 }
 
@@ -1619,16 +2236,98 @@ pub fn bindReadPlanCatalogStatementWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
+    return try bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, .{});
+}
+
+pub fn bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !BoundSqlStatement {
     try requireParsedCatalogReadStatement(parsed_sql.statement);
     var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
     errdefer bound_session.deinit(alloc);
-    var resolved = try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, session);
+    var resolved = try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, authorization_options);
     errdefer resolved.deinit(alloc);
     return .{
+        .parsed_sql = parsed_sql,
         .statement = parsed_sql.statement,
         .session = bound_session,
         .binding = .{ .read_catalog = resolved },
     };
+}
+
+pub fn bindDdlStatementWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+) !BoundSqlStatement {
+    try requireParsedDdlStatement(parsed_sql.statement);
+    var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
+    errdefer bound_session.deinit(alloc);
+    return .{
+        .parsed_sql = parsed_sql,
+        .statement = parsed_sql.statement,
+        .session = bound_session,
+        .binding = .none,
+    };
+}
+
+pub fn bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !BoundSqlStatement {
+    return try bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, function_bindings, .{});
+}
+
+pub fn bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: lower_expr.SqlFunctionBindings,
+    authorization_options: BoundSqlAuthorizationOptions,
+) !BoundSqlStatement {
+    try requireParsedDdlStatement(parsed_sql.statement);
+    var bound_session = try BoundSqlSession.fromSessionAlloc(alloc, session);
+    errdefer bound_session.deinit(alloc);
+    var facts = try resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, function_bindings, authorization_options);
+    errdefer facts.deinit(alloc);
+    return .{
+        .parsed_sql = parsed_sql,
+        .statement = parsed_sql.statement,
+        .session = bound_session,
+        .binding = .{ .ddl_catalog = facts },
+    };
+}
+
+pub fn bindDdlStatementWithCatalogSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !BoundSqlStatement {
+    return try bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(alloc, parsed_sql, catalog, session, .{});
+}
+
+pub fn bindDdlStatementWithCatalogAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    return try bindDdlStatementWithCatalogSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn bindDdlStatementAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !BoundSqlStatement {
+    return try bindDdlStatementWithSessionAlloc(alloc, parsed_sql, catalog_resources.SqlCatalogSession.default());
 }
 
 fn joinedWriteSourceTableNamesFromStatementAlloc(
@@ -2390,6 +3089,8 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const incoming_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+    const usage_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(usage_schema_json);
+    const incoming_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(incoming_schema_json);
     var catalog = MultiTableTestCatalog.init("usage_records", usage_schema_json, "incoming_usage", incoming_schema_json);
 
     var parsed_read = try tokenized.ParsedSql.initAlloc(
@@ -2409,12 +3110,26 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         .relational => |binding| {
             try std.testing.expectEqualStrings("usage_records", binding.target.table_name);
             try std.testing.expectEqual(runtime_schema.StorageMode.relational, binding.schema.storage_mode);
+            try std.testing.expectEqual(@as(u64, 1), binding.table_id);
+            try std.testing.expectEqual(usage_schema_generation, binding.schema_generation);
         },
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(read.source_schema != null);
     try std.testing.expectEqual(@as(usize, 3), read.source_schema.?.relational_columns.len);
     try std.testing.expect(read.source_binding != null);
+    try std.testing.expectEqual(@as(usize, 2), read.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, read.bound_objects[0].role);
+    try std.testing.expectEqual(source_binding.SqlSourceFamily.relational, read.bound_objects[0].family);
+    try std.testing.expectEqualStrings("usage_records", read.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u32, 1), read.bound_objects[0].schema_version);
+    try std.testing.expectEqual(@as(u64, 1), read.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, read.bound_objects[0].schema_generation);
+    try std.testing.expectEqual(BoundCatalogObjectRole.source, read.bound_objects[1].role);
+    try std.testing.expectEqualStrings("incoming_usage", read.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u32, 1), read.bound_objects[1].schema_version);
+    try std.testing.expectEqual(@as(u64, 2), read.bound_objects[1].table_id);
+    try std.testing.expectEqual(incoming_schema_generation, read.bound_objects[1].schema_generation);
     var logical_read = try logicalReadPlanFromBoundStatement(&bound_read);
     defer logical_read.deinit(alloc);
     switch (logical_read) {
@@ -2427,16 +3142,25 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
             try std.testing.expect(logical.source_schema != null);
             try std.testing.expectEqual(@as(usize, 3), logical.source_schema.?.relational_columns.len);
             try std.testing.expect(logical.source_binding != null);
+            try std.testing.expectEqual(@as(usize, 2), logical.bound_objects.len);
+            try std.testing.expectEqual(BoundCatalogObjectRole.target, logical.bound_objects[0].role);
+            try std.testing.expectEqual(BoundCatalogObjectRole.source, logical.bound_objects[1].role);
+            try std.testing.expectEqual(@as(u64, 1), logical.bound_objects[0].table_id);
+            try std.testing.expectEqual(@as(u64, 2), logical.bound_objects[1].table_id);
+            try std.testing.expectEqual(usage_schema_generation, logical.bound_objects[0].schema_generation);
+            try std.testing.expectEqual(incoming_schema_generation, logical.bound_objects[1].schema_generation);
         },
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect((try bound_read.readCatalog()).target_binding == null);
     try std.testing.expect((try bound_read.readCatalog()).source_schema == null);
     try std.testing.expect((try bound_read.readCatalog()).source_binding == null);
+    try std.testing.expectEqual(@as(usize, 0), (try bound_read.readCatalog()).bound_objects.len);
 
     const document_schema_json =
         \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
     ;
+    const document_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(document_schema_json);
     var document_catalog = MultiTableTestCatalog.init("docs", document_schema_json, "incoming_usage", incoming_schema_json);
     var parsed_document_read = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -2447,10 +3171,16 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     defer bound_document_read.deinit(alloc);
     const document_read = try bound_document_read.readCatalog();
     try std.testing.expect(document_read.target_binding != null);
+    try std.testing.expectEqual(@as(usize, 1), document_read.bound_objects.len);
     switch (document_read.target_binding.?) {
         .document => |binding| {
             try std.testing.expectEqualStrings("docs", binding.target.table_name);
             try std.testing.expectEqual(runtime_schema.StorageMode.document, binding.schema.storage_mode);
+            try std.testing.expectEqual(@as(u64, 1), binding.table_id);
+            try std.testing.expectEqual(document_schema_generation, binding.schema_generation);
+            try std.testing.expectEqual(source_binding.SqlSourceFamily.document, document_read.bound_objects[0].family);
+            try std.testing.expectEqual(@as(u64, 1), document_read.bound_objects[0].table_id);
+            try std.testing.expectEqual(document_schema_generation, document_read.bound_objects[0].schema_generation);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2470,6 +3200,15 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const write = try bound_write.writeCatalog();
     try std.testing.expect(write.options.insert_source_schema != null);
     try std.testing.expectEqual(@as(usize, 3), write.options.insert_source_schema.?.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 2), write.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, write.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", write.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), write.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, write.bound_objects[0].schema_generation);
+    try std.testing.expectEqual(BoundCatalogObjectRole.insert_source, write.bound_objects[1].role);
+    try std.testing.expectEqualStrings("incoming_usage", write.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u64, 2), write.bound_objects[1].table_id);
+    try std.testing.expectEqual(incoming_schema_generation, write.bound_objects[1].schema_generation);
     var logical_write = try logicalWritePlanFromBoundStatement(&bound_write);
     defer logical_write.deinit(alloc);
     switch (logical_write) {
@@ -2480,10 +3219,59 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
             }
             try std.testing.expect(logical.options.insert_source_schema != null);
             try std.testing.expectEqual(@as(usize, 3), logical.options.insert_source_schema.?.relational_columns.len);
+            try std.testing.expectEqual(@as(usize, 2), logical.bound_objects.len);
+            try std.testing.expectEqual(BoundCatalogObjectRole.insert_source, logical.bound_objects[1].role);
+            try std.testing.expectEqual(@as(u64, 1), logical.bound_objects[0].table_id);
+            try std.testing.expectEqual(@as(u64, 2), logical.bound_objects[1].table_id);
+            try std.testing.expectEqual(usage_schema_generation, logical.bound_objects[0].schema_generation);
+            try std.testing.expectEqual(incoming_schema_generation, logical.bound_objects[1].schema_generation);
         },
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect((try bound_write.writeCatalog()).owned_insert_source_schema == null);
+    try std.testing.expectEqual(@as(usize, 0), (try bound_write.writeCatalog()).bound_objects.len);
+
+    var parsed_alter = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN source text",
+    );
+    defer parsed_alter.deinit(alloc);
+    var bound_alter = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_alter, catalog.iface());
+    defer bound_alter.deinit(alloc);
+    const alter_ddl = try bound_alter.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), alter_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, alter_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", alter_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), alter_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, alter_ddl.bound_objects[0].schema_generation);
+    try std.testing.expect(alter_ddl.logical_plan != null);
+    var alter_logical = try bound_alter.takeDdlLogicalPlan();
+    defer alter_logical.deinit(alloc);
+    try std.testing.expectEqualStrings("table_ddl", alter_logical.statementKindName());
+    try std.testing.expect((try bound_alter.ddlCatalog()).logical_plan == null);
+
+    var parsed_create_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE INDEX usage_status_idx ON usage_records (status)",
+    );
+    defer parsed_create_index.deinit(alloc);
+    var bound_create_index = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_create_index, catalog.iface());
+    defer bound_create_index.deinit(alloc);
+    const create_index_ddl = try bound_create_index.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), create_index_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, create_index_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", create_index_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), create_index_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, create_index_ddl.bound_objects[0].schema_generation);
+
+    var parsed_create_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TABLE new_usage_records (id text PRIMARY KEY)",
+    );
+    defer parsed_create_table.deinit(alloc);
+    var bound_create_table = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_create_table, catalog.iface());
+    defer bound_create_table.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), (try bound_create_table.ddlCatalog()).bound_objects.len);
 
     try std.testing.expectError(error.UnsupportedSqlShape, bindReadPlanCatalogStatementAlloc(alloc, &parsed_write, catalog.iface()));
     try std.testing.expectError(error.UnsupportedSqlShape, bindWritePlanCatalogStatementAlloc(alloc, &parsed_read, .{}, catalog.iface()));
@@ -2516,6 +3304,97 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqualStrings("tenant_ops", tenant_bound_write.session.current_database_name);
     try std.testing.expectEqualStrings("analytics", tenant_bound_write.session.search_path[0]);
     try std.testing.expect((try tenant_bound_write.writeCatalog()).options.insert_source_schema != null);
+
+    var tenant_alter_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN source text",
+    );
+    defer tenant_alter_sql.deinit(alloc);
+    var tenant_bound_ddl = try bindDdlStatementWithCatalogSessionAlloc(alloc, &tenant_alter_sql, tenant_catalog.iface(), tenant_session);
+    defer tenant_bound_ddl.deinit(alloc);
+    const tenant_ddl = try tenant_bound_ddl.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), tenant_ddl.bound_objects.len);
+    try std.testing.expectEqualStrings("tenant_ops", tenant_ddl.bound_objects[0].target.database_name);
+    try std.testing.expectEqualStrings("analytics", tenant_ddl.bound_objects[0].target.namespace_name);
+    try std.testing.expectEqualStrings("usage_records", tenant_ddl.bound_objects[0].target.table_name);
+
+    const read_auth_grants = [_]BoundSqlAuthorizationGrant{
+        .{ .resource_kind = .table, .resource = "usage_records", .permission = .read },
+        .{ .resource_kind = .table, .resource = "incoming_usage", .permission = .read },
+    };
+    var auth_bound_read = try bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, &parsed_read, catalog.iface(), catalog_resources.SqlCatalogSession.default(), .{
+        .principal_name = "alice",
+        .grants = read_auth_grants[0..],
+        .grants_evaluated = true,
+    });
+    defer auth_bound_read.deinit(alloc);
+    const auth_read = try auth_bound_read.readCatalog();
+    try std.testing.expect(auth_read.authorization.principal_name != null);
+    try std.testing.expectEqualStrings("alice", auth_read.authorization.principal_name.?);
+    try std.testing.expectEqual(@as(usize, 2), auth_read.authorization.checks.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, auth_read.authorization.checks[0].object_role);
+    try std.testing.expectEqual(BoundSqlAuthorizationPermission.read, auth_read.authorization.checks[0].required_permission);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, auth_read.authorization.checks[0].decision);
+    try std.testing.expectEqualStrings("usage_records", auth_read.authorization.checks[0].target.table_name);
+    try std.testing.expectEqual(BoundCatalogObjectRole.source, auth_read.authorization.checks[1].object_role);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, auth_read.authorization.checks[1].decision);
+    var auth_logical_read = try logicalReadPlanFromBoundStatement(&auth_bound_read);
+    defer auth_logical_read.deinit(alloc);
+    switch (auth_logical_read) {
+        .catalog_read => |logical| {
+            try std.testing.expect(logical.authorization.principal_name != null);
+            try std.testing.expectEqualStrings("alice", logical.authorization.principal_name.?);
+            try std.testing.expectEqual(@as(usize, 2), logical.authorization.checks.len);
+            try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, logical.authorization.checks[0].decision);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const write_auth_grants = [_]BoundSqlAuthorizationGrant{
+        .{ .resource_kind = .table, .resource = "usage_records", .permission = .write },
+        .{ .resource_kind = .table, .resource = "incoming_usage", .permission = .read },
+    };
+    var auth_bound_write = try bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, &parsed_write, .{}, catalog.iface(), catalog_resources.SqlCatalogSession.default(), .{
+        .principal_name = "writer",
+        .grants = write_auth_grants[0..],
+        .grants_evaluated = true,
+    });
+    defer auth_bound_write.deinit(alloc);
+    const auth_write = try auth_bound_write.writeCatalog();
+    try std.testing.expectEqual(@as(usize, 2), auth_write.authorization.checks.len);
+    try std.testing.expectEqual(BoundSqlAuthorizationPermission.write, auth_write.authorization.checks[0].required_permission);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, auth_write.authorization.checks[0].decision);
+    try std.testing.expectEqual(BoundSqlAuthorizationPermission.read, auth_write.authorization.checks[1].required_permission);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, auth_write.authorization.checks[1].decision);
+
+    const denied_read_auth_grants = [_]BoundSqlAuthorizationGrant{
+        .{ .resource_kind = .table, .resource = "usage_records", .permission = .read },
+    };
+    var denied_auth_bound_read = try bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, &parsed_read, catalog.iface(), catalog_resources.SqlCatalogSession.default(), .{
+        .principal_name = "limited_reader",
+        .grants = denied_read_auth_grants[0..],
+        .grants_evaluated = true,
+    });
+    defer denied_auth_bound_read.deinit(alloc);
+    const denied_auth_read = try denied_auth_bound_read.readCatalog();
+    try std.testing.expectEqual(@as(usize, 2), denied_auth_read.authorization.checks.len);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, denied_auth_read.authorization.checks[0].decision);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.denied, denied_auth_read.authorization.checks[1].decision);
+    try std.testing.expectError(error.PermissionDenied, enforceBoundSqlStatementAuthorization(&denied_auth_bound_read));
+
+    const ddl_auth_grants = [_]BoundSqlAuthorizationGrant{
+        .{ .resource_kind = .database, .resource = metadata_table_manager.default_database_name, .permission = .admin },
+    };
+    var auth_bound_ddl = try bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(alloc, &parsed_alter, catalog.iface(), catalog_resources.SqlCatalogSession.default(), .{}, .{
+        .principal_name = "admin",
+        .grants = ddl_auth_grants[0..],
+        .grants_evaluated = true,
+    });
+    defer auth_bound_ddl.deinit(alloc);
+    const auth_ddl = try auth_bound_ddl.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), auth_ddl.authorization.checks.len);
+    try std.testing.expectEqual(BoundSqlAuthorizationPermission.admin, auth_ddl.authorization.checks[0].required_permission);
+    try std.testing.expectEqual(BoundSqlAuthorizationDecision.allowed, auth_ddl.authorization.checks[0].decision);
 }
 
 test "sql adapter binder rejects ambiguous physical cte read source tables" {

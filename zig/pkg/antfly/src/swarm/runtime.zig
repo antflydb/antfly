@@ -4537,8 +4537,7 @@ test "swarm local metadata drop table cascade removes child foreign keys" {
 
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE customers CASCADE");
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
-    var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
     defer durable_plan.deinit(alloc);
 
     var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());

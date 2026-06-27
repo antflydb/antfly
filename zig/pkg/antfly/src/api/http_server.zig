@@ -1656,13 +1656,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
             defer parsed_sql.deinit(allocator);
             var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(allocator, &parsed_sql, .{});
             errdefer logical_plan.deinit(allocator);
-            return switch (logical_plan) {
-                .table_ddl => |plan| blk: {
-                    logical_plan = .{ .other_ddl = .{ .moved = {} } };
-                    break :blk plan;
-                },
-                else => error.UnsupportedSqlShape,
-            };
+            return try sql_adapter.takeTableDdlPlanFromLogical(&logical_plan);
         }
     };
 
@@ -2767,27 +2761,6 @@ fn applyTablespaceCatalogPlanOnService(
     errdefer applied.deinit(alloc);
     try svc.runRound();
     return applied;
-}
-
-fn applyRelationalDropTableCascadeReferences(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
-    target_table: metadata_table_manager.TableRecord,
-) !void {
-    for (snapshot.tables) |candidate_table| {
-        if (candidate_table.table_id == target_table.table_id) continue;
-        const next_schema_json = (try tables_api.schemaWithoutForeignKeysReferencingTableAlloc(
-            alloc,
-            candidate_table.schema_json,
-            target_table.name,
-        )) orelse continue;
-        defer alloc.free(next_schema_json);
-
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.upsertTable(updated);
-    }
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -4288,7 +4261,11 @@ pub const ApiHttpServer = struct {
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
-        var logical_plan = sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
+        var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
+            .catalog = self.catalogSource(),
+            .session = session.session(),
+            .function_bindings = function_bindings,
+        }) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
                 return err;
@@ -4313,15 +4290,14 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         switch (logical_plan.*) {
-            .table_ddl, .catalog_ddl, .extension => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .table_ddl, .catalog_ddl, .extension, .auth, .maintenance, .bulk_io => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
             .other_ddl => |plan| return try self.applyOtherDdlLogicalPlanWithSession(plan, session, context),
             .session => |plan| return try self.applySessionLogicalPlanWithSession(plan, session, context),
             .transaction => |plan| return try self.applyTransactionLogicalPlanWithSession(plan, session, context),
             .prepared_statement => |plan| return try self.applyPreparedStatementLogicalPlanWithSession(plan, session, context),
             .notification => |plan| return try self.applyNotificationLogicalPlanWithSession(plan, session, context),
-            .routine => |*plan| return try self.applyRoutineLogicalPlanWithSession(plan, session, context),
-            .auth => return try self.applyAuthLogicalPlanWithSession(logical_plan, session, context),
-            .cursor, .maintenance, .bulk_io => return error.UnsupportedSqlShape,
+            .routine => return try self.applyRoutineLogicalPlanWithSession(logical_plan, session, context),
+            .cursor => |plan| return try self.applyCursorLogicalPlanWithSession(plan, session, context),
             .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
         }
     }
@@ -4505,31 +4481,6 @@ pub const ApiHttpServer = struct {
 
     fn applyRoutineLogicalPlanWithSession(
         self: *ApiHttpServer,
-        plan: *sql_adapter.RoutineLogicalPlan,
-        session: *sql_adapter.OwnedSqlCatalogSession,
-        context: RelationalDdlPlanExecutionContext,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
-        const timing = try self.sqlStatementExecutionTimingForContext(session, context);
-        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-        if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
-
-        switch (plan.*) {
-            .function_catalog => |*function_plan| {
-                try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
-                try self.sql_routine_runtime.apply(function_plan.*);
-            },
-            .trigger_catalog => |trigger_plan| {
-                return try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(trigger_plan, session, context, timing);
-            },
-            .procedure_call => |procedure_call| {
-                try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
-            },
-        }
-        return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
-    }
-
-    fn applyAuthLogicalPlanWithSession(
-        self: *ApiHttpServer,
         logical_plan: *sql_adapter.LogicalSqlPlan,
         session: *sql_adapter.OwnedSqlCatalogSession,
         context: RelationalDdlPlanExecutionContext,
@@ -4538,23 +4489,51 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
 
-        const auth_plan = switch (logical_plan.*) {
-            .auth => |plan| plan,
+        switch (logical_plan.*) {
+            .routine => |plan| switch (plan) {
+                .function_catalog, .trigger_catalog => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, .{
+                    .function_bindings = context.function_bindings,
+                    .statement_timing = timing,
+                }),
+                .procedure_call => |procedure_call| {
+                    try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
+                },
+            },
             else => return error.UnsupportedSqlShape,
-        };
-
-        if (self.cfg.user_manager) |manager| {
-            var catalog = try self.sqlAuthCatalogForAuthLogicalPlanWithSession(auth_plan, session.session());
-            defer catalog.deinit(self.alloc);
-            if (try auth_sql_adapter.executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, self.alloc, auth_plan, catalog.value)) |applied_value| {
-                var applied = applied_value;
-                errdefer applied.deinit(self.alloc);
-                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-                return applied;
-            }
         }
+        return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+    }
 
-        return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context);
+    fn applyDurableRoutineSqlPlanWithSession(
+        self: *ApiHttpServer,
+        plan: *sql_adapter.RoutineLogicalPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+        timing: SqlStatementExecutionTiming,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        switch (plan.*) {
+            .function_catalog => |*function_plan| {
+                try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
+                try self.sql_routine_runtime.apply(function_plan.*);
+            },
+            .trigger_catalog => |trigger_plan| {
+                return try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(trigger_plan, session, context, timing);
+            },
+            .procedure_call => return error.UnsupportedSqlShape,
+        }
+        return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+    }
+
+    fn applyCursorLogicalPlanWithSession(
+        self: *ApiHttpServer,
+        plan: sql_adapter.CursorPortalPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        _ = plan;
+        const timing = try self.sqlStatementExecutionTimingForContext(session, context);
+        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+        return error.UnsupportedSqlShape;
     }
 
     fn applyDurableLogicalPlanWithSession(
@@ -4565,27 +4544,65 @@ pub const ApiHttpServer = struct {
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-        if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
 
-        var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(logical_plan);
+        var durable_plan = try sql_adapter.takeDurableSqlPlanFromLogical(logical_plan);
         defer durable_plan.deinit(self.alloc);
-        try self.rejectUnsupportedDocumentSqlViewMappingForDurablePlan(durable_plan, session.session());
-        switch (durable_plan) {
+        if (try self.publicSqlReadOnlyActive(session)) {
+            switch (durable_plan) {
+                .bulk_io => |plan| if (plan.direction == .from) return error.SqlReadOnlyTransaction,
+                else => return error.SqlReadOnlyTransaction,
+            }
+        }
+        return try self.applyDurableSqlPlanWithSession(&durable_plan, session, context, timing);
+    }
+
+    fn applyDurableSqlPlanWithSession(
+        self: *ApiHttpServer,
+        durable_plan: *sql_adapter.DurableSqlPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+        timing: SqlStatementExecutionTiming,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        try self.rejectUnsupportedDocumentSqlViewMappingForDurablePlan(durable_plan.*, session.session());
+        switch (durable_plan.*) {
+            .auth => {
+                if (self.cfg.user_manager) |manager| {
+                    var catalog = try self.sqlAuthCatalogForDurablePlanWithSession(durable_plan.*, session.session());
+                    defer catalog.deinit(self.alloc);
+                    if (try auth_sql_adapter.executeRelationalSqlDurablePlanOnUserManagerWithCatalog(manager, self.alloc, durable_plan, catalog.value)) |applied_value| {
+                        var applied = applied_value;
+                        errdefer applied.deinit(self.alloc);
+                        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                        return applied;
+                    }
+                }
+                return error.UnsupportedSqlShape;
+            },
+            .routine => |*routine| return try self.applyDurableRoutineSqlPlanWithSession(routine, session, context, timing),
+            .maintenance => return error.UnsupportedSqlShape,
+            .bulk_io => return error.UnsupportedSqlShape,
             .extension => {
-                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, durable_plan, session.session(), context.function_bindings);
                 errdefer applied.deinit(self.alloc);
                 try self.refreshSqlExtensionQueryFunctions();
                 try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
                 return applied;
             },
             else => {
-                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, &durable_plan, session.session(), context.function_bindings);
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, durable_plan, session.session(), context.function_bindings);
                 errdefer applied.deinit(self.alloc);
                 try self.scheduleSchemaRewriteRuntimeHintForAppliedDdl(applied);
                 try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
                 return applied;
             },
         }
+    }
+
+    fn sqlAuthCatalogForDurablePlanWithSession(self: *ApiHttpServer, plan: sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
+        return switch (plan) {
+            .auth => |auth_plan| try self.sqlAuthCatalogForAuthLogicalPlanWithSession(auth_plan, session),
+            else => error.UnsupportedSqlShape,
+        };
     }
 
     fn applyTriggerCatalogPlanWithUpdatePolicyFallback(
@@ -4614,30 +4631,12 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
         timing: SqlStatementExecutionTiming,
     ) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
-        const operations = try self.alloc.alloc(sql_adapter.AlterTableOperation, 1);
-        var operations_transferred = false;
-        errdefer if (!operations_transferred) self.alloc.free(operations);
-        operations[0] = .{ .drop_update_policy = .{
-            .trigger_name = try self.alloc.dupe(u8, drop.trigger_name),
-            .if_exists = drop.if_exists,
-        } };
-        var operation_transferred = false;
-        errdefer if (!operation_transferred) sql_adapter.freeAlterTableOperation(self.alloc, operations[0]);
-        const table_name = try self.alloc.dupe(u8, drop.table_name);
-        errdefer self.alloc.free(table_name);
-
-        var logical_plan: sql_adapter.LogicalSqlPlan = .{ .table_ddl = .{ .alter_table = .{
-            .table_name = table_name,
-            .operations = operations,
-        } } };
-        operations_transferred = true;
-        operation_transferred = true;
-        defer logical_plan.deinit(self.alloc);
-
-        return try self.applyDurableLogicalPlanWithSession(&logical_plan, session, .{
+        var durable_plan = try sql_adapter.durablePlanForDropUpdatePolicyTriggerAlloc(self.alloc, drop);
+        defer durable_plan.deinit(self.alloc);
+        return try self.applyDurableSqlPlanWithSession(&durable_plan, session, .{
             .function_bindings = context.function_bindings,
             .statement_timing = timing,
-        });
+        }, timing);
     }
 
     fn rejectUnsupportedDocumentSqlViewMappingForDurablePlan(
@@ -4790,6 +4789,18 @@ pub const ApiHttpServer = struct {
             }
         };
 
+        pub const BulkIo = struct {
+            operation: sql_adapter.BulkSqlIoOperation,
+            stream: sql_adapter.BulkSqlIoStream,
+            row_count: ?usize = null,
+            payload: ?[]u8 = null,
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                if (self.payload) |payload| alloc.free(payload);
+                self.* = undefined;
+            }
+        };
+
         session_id: u64,
         statement_kind: []const u8,
         transaction_status: PublicSqlTransactionStatus = .idle,
@@ -4798,6 +4809,7 @@ pub const ApiHttpServer = struct {
             read: Read,
             rows_batch: RowsBatch,
             mutation_source: MutationSource,
+            bulk_io: BulkIo,
         },
 
         pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -4806,6 +4818,7 @@ pub const ApiHttpServer = struct {
                 .read => |*read| read.deinit(alloc),
                 .rows_batch => |*rows_batch| rows_batch.deinit(alloc),
                 .mutation_source => |*mutation_source| mutation_source.deinit(alloc),
+                .bulk_io => |*bulk_io| bulk_io.deinit(alloc),
             }
             self.* = undefined;
         }
@@ -4953,13 +4966,37 @@ pub const ApiHttpServer = struct {
         return try out.toOwnedSlice();
     }
 
+    fn encodePublicSqlBulkIoResultAlloc(
+        self: *ApiHttpServer,
+        session_id: u64,
+        statement_kind: []const u8,
+        result: PublicSqlResult.BulkIo,
+    ) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.print(
+            "{{\"kind\":\"bulk_io\",\"session_id\":{d},\"statement_kind\":{f},\"result\":{{\"operation\":{f},\"stream\":{f}",
+            .{
+                session_id,
+                std.json.fmt(statement_kind, .{}),
+                std.json.fmt(@tagName(result.operation), .{}),
+                std.json.fmt(@tagName(result.stream), .{}),
+            },
+        );
+        if (result.row_count) |row_count| try writer.print(",\"row_count\":{d}", .{row_count});
+        if (result.payload) |payload| try writer.print(",\"payload\":{f}", .{std.json.fmt(payload, .{})});
+        try writer.writeAll("}}}");
+        return try out.toOwnedSlice();
+    }
+
     fn encodePublicSqlResultAlloc(self: *ApiHttpServer, result: PublicSqlResult) ![]u8 {
         return switch (result.result) {
             .ddl => |ddl| blk: {
                 var response = try jsonResponse(self.alloc, PublicSqlResponse{
                     .kind = "ddl",
                     .session_id = result.session_id,
-                    .statement_kind = "ddl",
+                    .statement_kind = result.statement_kind,
                     .noop = ddl.applied.noop,
                     .applied = ddl.applied,
                 });
@@ -4969,6 +5006,7 @@ pub const ApiHttpServer = struct {
             .read => |read| try self.encodePublicSqlReadResultAlloc(result.session_id, result.statement_kind, read),
             .rows_batch => |rows_batch| try self.encodePublicSqlRowsBatchResultAlloc(result.session_id, result.statement_kind, rows_batch),
             .mutation_source => |mutation_source| try self.encodePublicSqlRowsMutationSourceResultAlloc(result.session_id, result.statement_kind, mutation_source),
+            .bulk_io => |bulk_io| try self.encodePublicSqlBulkIoResultAlloc(result.session_id, result.statement_kind, bulk_io),
         };
     }
 
@@ -4999,6 +5037,26 @@ pub const ApiHttpServer = struct {
         if (first.matchesKeywordTag(.deallocate)) return "DEALLOCATE";
         if (first.matchesKeywordTag(.call)) return "CALL";
         return "DDL";
+    }
+
+    fn publicSqlStatementKindForLogicalPlan(plan: sql_adapter.LogicalSqlPlan) []const u8 {
+        return switch (plan) {
+            .read => |kind| @tagName(kind),
+            .write => |kind| @tagName(kind),
+            .catalog_read => "read",
+            .catalog_write => "write",
+            .table_ddl, .catalog_ddl, .other_ddl => "ddl",
+            .session => "session",
+            .transaction => "transaction",
+            .prepared_statement => "prepared_statement",
+            .cursor => "cursor",
+            .notification => "notification",
+            .routine => "routine",
+            .auth => "auth",
+            .extension => "extension",
+            .maintenance => "maintenance",
+            .bulk_io => "bulk_io",
+        };
     }
 
     fn publicSqlCreateDdlCommandTag(tokens: []const sql_adapter.Token) []const u8 {
@@ -5746,15 +5804,14 @@ pub const ApiHttpServer = struct {
             return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .read_only_transaction).withMessage("cannot execute write statement in a read-only transaction")) };
         }
 
-        const statement_kind = parsed_sql.writeStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
-        switch (statement_kind) {
-            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
-        }
-
         const write_catalog = switch (logical_plan.*) {
             .catalog_write => |*catalog_write| catalog_write,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
+        const statement_kind = write_catalog.statement.writeKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        switch (statement_kind) {
+            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
+        }
         const target_binding = write_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
         const target = target_binding.target();
         const target_table = try self.alloc.dupe(u8, target.table_name);
@@ -6046,14 +6103,14 @@ pub const ApiHttpServer = struct {
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
-        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
-        if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
-        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
-
         const read_catalog = switch (logical_plan.*) {
             .catalog_read => |*catalog_read| catalog_read,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
+        const statement_kind = read_catalog.statement.readKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
+        const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
+
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
@@ -6158,18 +6215,28 @@ pub const ApiHttpServer = struct {
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
-        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         _ = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
 
-        var bound = sql_adapter.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, self.catalogSource(), session.session()) catch |err| switch (err) {
+        var authorization_options = try self.sqlBoundAuthorizationOptionsForIdentityAlloc(authenticated_identity);
+        defer authorization_options.deinit(self.alloc);
+        var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
+            .catalog = self.catalogSource(),
+            .session = session.session(),
+            .authorization = authorization_options.value,
+        }) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+            error.PermissionDenied => return .{ .response = try self.publicSqlDiagnosticResponse(403, .init(.bind, .permission_denied)) },
             error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
             else => return err,
         };
-        defer bound.deinit(self.alloc);
-        const read_catalog = bound.readCatalog() catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
+        defer logical_plan.deinit(self.alloc);
+        self.enforcePublicSqlLogicalPlanAuthorization(&logical_plan, session.session(), authenticated_identity) catch
+            return .{ .response = try self.publicSqlDiagnosticResponse(403, .init(.bind, .permission_denied)) };
+        const read_catalog = switch (logical_plan) {
+            .catalog_read => |*catalog_read| catalog_read,
+            else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
         };
+        const statement_kind = read_catalog.statement.readKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
@@ -6188,10 +6255,10 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
-            &bound,
+            &logical_plan,
             schema,
             params,
             function_bindings,
@@ -6444,6 +6511,10 @@ pub const ApiHttpServer = struct {
         const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
         const target = session.session().tableTargetFromObjectName(lowered.table_name) catch |err| switch (err) {
             error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+        };
+        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, target, .read) catch |err| switch (err) {
+            error.PermissionDenied => return .{ .response = try self.publicSqlDiagnosticResponse(403, .init(.bind, .permission_denied)) },
+            else => return err,
         };
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
@@ -7914,12 +7985,159 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const OwnedSqlBoundAuthorizationOptions = struct {
+        value: sql_adapter.BoundSqlAuthorizationOptions = .{},
+        grants: []sql_adapter.BoundSqlAuthorizationGrant = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.grants.len > 0) alloc.free(self.grants);
+            self.* = undefined;
+        }
+    };
+
+    const PlannedBulkSqlExecution = struct {
+        durable_plan: sql_adapter.DurableSqlPlan,
+        execution_plan: sql_adapter.BulkSqlIoExecutionPlan,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.durable_plan.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    fn sqlAuthorizationPermissionFromUserPermission(permission: usermgr.PermissionType) sql_adapter.BoundSqlAuthorizationPermission {
+        return switch (permission) {
+            .read => .read,
+            .write => .write,
+            .admin => .admin,
+        };
+    }
+
+    fn sqlAuthorizationResourceKindFromUserResource(resource_type: usermgr.ResourceType) ?sql_adapter.BoundSqlAuthorizationResourceKind {
+        return switch (resource_type) {
+            .table => .table,
+            .database => .database,
+            .@"*" => .all,
+            .namespace, .tablespace, .user => null,
+        };
+    }
+
+    fn sqlBoundAuthorizationOptionsForIdentityAlloc(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !OwnedSqlBoundAuthorizationOptions {
+        const identity = authenticated_identity orelse return .{};
+        var out = OwnedSqlBoundAuthorizationOptions{};
+        errdefer out.deinit(self.alloc);
+
+        out.value.principal_name = identity.username;
+        if (identity.permissions.len == 0) {
+            out.value.unrestricted = true;
+            return out;
+        }
+
+        var grants = std.ArrayListUnmanaged(sql_adapter.BoundSqlAuthorizationGrant).empty;
+        errdefer grants.deinit(self.alloc);
+        for (identity.permissions) |permission| {
+            const resource_kind = sqlAuthorizationResourceKindFromUserResource(permission.resource_type) orelse continue;
+            try grants.append(self.alloc, .{
+                .resource_kind = resource_kind,
+                .resource = permission.resource,
+                .permission = sqlAuthorizationPermissionFromUserPermission(permission.type),
+            });
+        }
+        out.grants = try grants.toOwnedSlice(self.alloc);
+        out.value.grants = out.grants;
+        out.value.grants_evaluated = true;
+        return out;
+    }
+
+    fn sqlBoundAuthorizationOptionsForIdentityPtrAlloc(
+        self: *ApiHttpServer,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !OwnedSqlBoundAuthorizationOptions {
+        if (authenticated_identity) |identity| return try self.sqlBoundAuthorizationOptionsForIdentityAlloc(identity.*);
+        return .{};
+    }
+
+    fn authenticatedIdentityAllowsSqlDatabaseAdmin(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        session: catalog_resources.SqlCatalogSession,
+    ) bool {
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return true;
+        const identity = authenticated_identity orelse return false;
+        if (identity.permissions.len == 0) return true;
+        return permissionsAllow(identity.permissions, .@"*", "*", .admin) or
+            permissionsAllow(identity.permissions, .database, session.currentDatabase(), .admin);
+    }
+
+    fn enforceAuthenticatedIdentitySqlTablePermission(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        target: catalog_resources.TableTarget,
+        permission_type: usermgr.PermissionType,
+    ) !void {
+        const identity = authenticated_identity orelse return;
+        if (identity.permissions.len == 0) return;
+
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        if (permissionsAllow(identity.permissions, .table, resource_name, permission_type) or
+            permissionsAllow(identity.permissions, .database, target.database_name, permission_type))
+        {
+            return;
+        }
+        return error.PermissionDenied;
+    }
+
+    fn publicSqlLogicalPlanRequiresDatabaseAdmin(logical_plan: sql_adapter.LogicalSqlPlan) bool {
+        return switch (logical_plan) {
+            .table_ddl, .catalog_ddl, .extension, .routine, .auth, .maintenance => true,
+            else => false,
+        };
+    }
+
+    fn parsedSqlReadOnlyBulkIoAllowed(parsed_sql: *const sql_adapter.ParsedSql) bool {
+        const tokens = parsed_sql.items();
+        const raw = parsed_sql.raw_statement;
+        if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return false;
+        if (!tokens[raw.token_start].matchesKeywordTag(.copy)) return false;
+        for (tokens[raw.token_start + 1 .. raw.token_end]) |token| {
+            if (token.matchesKeywordTag(.to)) return true;
+            if (token.matchesKeywordTag(.from)) return false;
+        }
+        return false;
+    }
+
+    fn enforcePublicSqlLogicalPlanAuthorization(
+        self: *ApiHttpServer,
+        logical_plan: *sql_adapter.LogicalSqlPlan,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        try sql_adapter.enforceLogicalSqlPlanAuthorization(logical_plan);
+        if (publicSqlLogicalPlanRequiresDatabaseAdmin(logical_plan.*) and
+            !self.authenticatedIdentityAllowsSqlDatabaseAdmin(authenticated_identity, session))
+        {
+            return error.PermissionDenied;
+        }
+    }
+
     fn planPublicParsedSqlExecutionAlloc(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) !PublicSqlPlannedExecutionOrResponse {
-        const write_statement_kind = parsed_sql.writeStatementKind();
+        const write_statement_kind: ?sql_adapter.SqlWriteStatementKind = switch (parsed_sql.statement) {
+            .write => |statement| statement.kind,
+            else => null,
+        };
+        const is_read_statement = switch (parsed_sql.statement) {
+            .read => true,
+            else => false,
+        };
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var write_options: sql_adapter.LowerWritePlanOptions = .{};
         var row_claim_owner_id: ?[]const u8 = null;
@@ -7952,12 +8170,15 @@ pub const ApiHttpServer = struct {
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
+        var authorization_options = try self.sqlBoundAuthorizationOptionsForIdentityAlloc(authenticated_identity);
+        defer authorization_options.deinit(self.alloc);
 
         var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
             .catalog = self.catalogSource(),
             .session = session.session(),
             .write_options = write_options,
             .function_bindings = function_bindings,
+            .authorization = authorization_options.value,
         }) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => {
                 if (write_statement_kind != null) std.log.err("public sql write bind not found err={}", .{err});
@@ -7967,14 +8188,23 @@ pub const ApiHttpServer = struct {
                 if (write_statement_kind != null) return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_write)) };
                 return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
             },
+            error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
-                if (write_statement_kind == null and parsed_sql.readStatementKind() == null and try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                if (write_statement_kind == null and
+                    !is_read_statement and
+                    try self.publicSqlReadOnlyActive(session) and
+                    !parsedSqlReadOnlyBulkIoAllowed(parsed_sql))
+                {
+                    return error.SqlReadOnlyTransaction;
+                }
                 return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
             },
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlParsedDiagnosticResponse(503, parsed_sql, .init(.plan, .unique_owner_unavailable)) },
             else => return err,
         };
         errdefer logical_plan.deinit(self.alloc);
+        self.enforcePublicSqlLogicalPlanAuthorization(&logical_plan, session.session(), authenticated_identity) catch
+            return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
         const owner_id = row_claim_owner_id;
         row_claim_owner_id = null;
         return .{ .planned = .{
@@ -7999,18 +8229,7 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        if (parsed_sql.readStatementKind()) |statement_kind| {
-            if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, statement_kind)) |outcome_value| {
-                var outcome = outcome_value;
-                errdefer outcome.deinit(self.alloc);
-                switch (outcome) {
-                    .response => self.markPublicSqlTransactionFailedIfActive(session),
-                    .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
-                }
-                return outcome;
-            }
-        }
-        var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session) catch |err| switch (err) {
+        var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session, request.authenticated_identity) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
                 self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
@@ -8026,6 +8245,10 @@ pub const ApiHttpServer = struct {
             error.StatementTimeout => {
                 self.markPublicSqlTransactionFailedIfActive(session);
                 return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
+            },
+            error.PermissionDenied => {
+                self.markPublicSqlTransactionFailedIfActive(session);
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
             },
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
@@ -8055,7 +8278,44 @@ pub const ApiHttpServer = struct {
                     .catalog_write => try self.handlePublicSqlWrite(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                     .catalog_read => try self.handlePublicSqlRead(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                     .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                    .bulk_io => bulk_blk: {
+                        var durable_plan = sql_adapter.takeDurableSqlPlanFromLogical(&planned.logical_plan) catch |err| switch (err) {
+                            error.UnsupportedSqlShape => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                            },
+                        };
+                        defer durable_plan.deinit(self.alloc);
+                        break :bulk_blk ApiHttpServer.executePublicBulkSqlDurablePlanWithSession(self, &durable_plan, session, request.authenticated_identity) catch |err| switch (err) {
+                            error.SqlReadOnlyTransaction => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
+                            },
+                            error.PermissionDenied, error.Unauthorized => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
+                            },
+                            error.TableNotFound, error.InvalidSqlCatalog => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .invalid_sql_catalog)) };
+                            },
+                            error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
+                            },
+                            error.UnsupportedSqlShape, error.UnsupportedOperation => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                            },
+                            error.StatementTimeout => {
+                                self.markPublicSqlTransactionFailedIfActive(session);
+                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
+                            },
+                            else => return err,
+                        };
+                    },
                     else => ddl_blk: {
+                        const statement_kind = publicSqlStatementKindForLogicalPlan(planned.logical_plan);
                         const applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, &planned.logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
                             error.DocumentSqlViewMappingUnsupported => {
                                 self.markPublicSqlTransactionFailedIfActive(session);
@@ -8089,7 +8349,7 @@ pub const ApiHttpServer = struct {
                         const session_id = self.ensureSqlProtocolSessionId(session);
                         break :ddl_blk .{ .result = .{
                             .session_id = session_id,
-                            .statement_kind = "ddl",
+                            .statement_kind = statement_kind,
                             .transaction_status = self.publicSqlTransactionStatus(session),
                             .result = .{ .ddl = .{
                                 .applied = applied,
@@ -8129,7 +8389,10 @@ pub const ApiHttpServer = struct {
             result.transaction_status = self.publicSqlTransactionStatus(&session);
             return .{ .result = result };
         }
-        if (parsed_sql.readStatementKind() != null) {
+        if (switch (parsed_sql.statement) {
+            .read => true,
+            else => false,
+        }) {
             var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, request.params, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             try self.savePublicSqlSession(session);
@@ -8140,7 +8403,22 @@ pub const ApiHttpServer = struct {
             return outcome;
         }
 
-        const statement_kind: []const u8 = if (parsed_sql.writeStatementKind()) |kind| @tagName(kind) else "ddl";
+        const statement_kind: []const u8 = switch (parsed_sql.statement) {
+            .write => |statement| @tagName(statement.kind),
+            else => blk: {
+                var planned_or_response = try self.planPublicParsedSqlExecutionAlloc(&parsed_sql, &session, authenticated_identity);
+                var planned_or_response_owned = true;
+                defer if (planned_or_response_owned) planned_or_response.deinit(self.alloc);
+                switch (planned_or_response) {
+                    .response => |*response| {
+                        const out = response.*;
+                        planned_or_response_owned = false;
+                        return .{ .response = out };
+                    },
+                    .planned => |planned| break :blk publicSqlStatementKindForLogicalPlan(planned.logical_plan),
+                }
+            },
+        };
         const session_id = self.ensureSqlProtocolSessionId(&session);
         try self.savePublicSqlSession(session);
         return .{ .result = .{
@@ -8317,9 +8595,54 @@ pub const ApiHttpServer = struct {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
         if (catalog) |source_catalog| {
-            return try sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, source_catalog, session, function_bindings);
+            var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
+                .catalog = source_catalog,
+                .session = session,
+                .function_bindings = function_bindings,
+            });
+            defer logical_plan.deinit(alloc);
+            return try sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, &parsed_sql, &logical_plan, schema, params, function_bindings);
         }
         return try sql_adapter_runtime.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
+    }
+
+    fn planBulkSqlExecutionWithSessionAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !PlannedBulkSqlExecution {
+        var authorization_options = try self.sqlBoundAuthorizationOptionsForIdentityPtrAlloc(authenticated_identity);
+        defer authorization_options.deinit(self.alloc);
+
+        var planned_statement = try sql_adapter.planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(self.alloc, parsed_sql, .{
+            .catalog = self.catalogSource(),
+            .session = session,
+            .authorization = authorization_options.value,
+        });
+        errdefer planned_statement.deinit(self.alloc);
+        var durable_plan = try sql_adapter.takeDurableSqlPlanFromLogical(&planned_statement.logical_plan);
+        errdefer durable_plan.deinit(self.alloc);
+        const bulk_plan = switch (durable_plan) {
+            .bulk_io => |plan| plan,
+            else => return error.UnsupportedSqlShape,
+        };
+        const execution_plan = try sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+
+        sql_adapter.enforceBoundSqlAuthorization(planned_statement.authorization) catch |err| {
+            if (err == error.PermissionDenied) {
+                const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+                self.recordSqlBulkIoDeniedAudit(execution_plan, target, authenticated_identity, err);
+            }
+            return err;
+        };
+        planned_statement.authorization.deinit(self.alloc);
+        planned_statement.authorization = .{};
+
+        return .{
+            .durable_plan = durable_plan,
+            .execution_plan = execution_plan,
+        };
     }
 
     pub fn executeBulkSqlCopyFromStdinWithSession(
@@ -8334,16 +8657,9 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, &parsed_sql, .{
-            .catalog = self.catalogSource(),
-            .session = session,
-        });
-        defer logical_plan.deinit(self.alloc);
-        const bulk_plan = switch (logical_plan) {
-            .bulk_io => |plan| plan,
-            else => return error.UnsupportedSqlShape,
-        };
-        const execution_plan = try sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        defer planned.deinit(self.alloc);
+        const execution_plan = planned.execution_plan;
         if (execution_plan.operation != .import_rows or
             execution_plan.native_route != .rows_batch or
             execution_plan.stream != .stdin)
@@ -8369,16 +8685,9 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, &parsed_sql, .{
-            .catalog = self.catalogSource(),
-            .session = session,
-        });
-        defer logical_plan.deinit(self.alloc);
-        const bulk_plan = switch (logical_plan) {
-            .bulk_io => |plan| plan,
-            else => return error.UnsupportedSqlShape,
-        };
-        const execution_plan = try sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        defer planned.deinit(self.alloc);
+        const execution_plan = planned.execution_plan;
         var result: BulkSqlExecutionResult = switch (execution_plan.operation) {
             .import_rows => blk: {
                 if (execution_plan.native_route != .rows_batch) return error.UnsupportedSqlShape;
@@ -8428,6 +8737,89 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    fn executePublicBulkSqlDurablePlanWithSession(
+        self: *ApiHttpServer,
+        durable_plan: *sql_adapter.DurableSqlPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
+        const bulk_plan = switch (durable_plan.*) {
+            .bulk_io => |plan| plan,
+            else => return error.UnsupportedSqlShape,
+        };
+        if ((try self.publicSqlReadOnlyActive(session)) and bulk_plan.direction == .from) return error.SqlReadOnlyTransaction;
+
+        const execution_plan = try sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+        var identity = authenticated_identity;
+        const identity_ptr: ?*const AuthenticatedIdentity = if (identity) |*value| value else null;
+        const session_value = session.session();
+        const session_id = self.ensureSqlProtocolSessionId(session);
+
+        switch (execution_plan.operation) {
+            .import_rows => {
+                if (execution_plan.native_route != .rows_batch) return error.UnsupportedSqlShape;
+                const rows = switch (execution_plan.stream) {
+                    .stdin => return error.InvalidRowsRequest,
+                    .file => try self.executeBulkSqlImportPlanFromFile(execution_plan, session_value, identity_ptr),
+                    .program => try self.executeBulkSqlImportPlanFromProgram(execution_plan, session_value, identity_ptr),
+                    .stdout => return error.UnsupportedSqlShape,
+                };
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = "bulk_io",
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .rows_batch = .{ .result = rows } },
+                } };
+            },
+            .export_rows => {
+                if (execution_plan.native_route != .rows_query) return error.UnsupportedSqlShape;
+                switch (execution_plan.stream) {
+                    .stdout => {
+                        const exported = try self.executeBulkSqlExportPlanBytes(execution_plan, session_value, identity_ptr);
+                        errdefer self.alloc.free(exported.payload);
+                        try self.recordSqlBulkIoAudit(execution_plan, exported.target, exported.row_count, identity_ptr);
+                        return .{ .result = .{
+                            .session_id = session_id,
+                            .statement_kind = "bulk_io",
+                            .transaction_status = self.publicSqlTransactionStatus(session),
+                            .result = .{ .bulk_io = .{
+                                .operation = execution_plan.operation,
+                                .stream = execution_plan.stream,
+                                .row_count = exported.row_count,
+                                .payload = exported.payload,
+                            } },
+                        } };
+                    },
+                    .file => {
+                        try self.executeBulkSqlExportPlanToFile(execution_plan, session_value, identity_ptr);
+                        return .{ .result = .{
+                            .session_id = session_id,
+                            .statement_kind = "bulk_io",
+                            .transaction_status = self.publicSqlTransactionStatus(session),
+                            .result = .{ .bulk_io = .{
+                                .operation = execution_plan.operation,
+                                .stream = execution_plan.stream,
+                            } },
+                        } };
+                    },
+                    .program => {
+                        try self.executeBulkSqlExportPlanToProgram(execution_plan, session_value, identity_ptr);
+                        return .{ .result = .{
+                            .session_id = session_id,
+                            .statement_kind = "bulk_io",
+                            .transaction_status = self.publicSqlTransactionStatus(session),
+                            .result = .{ .bulk_io = .{
+                                .operation = execution_plan.operation,
+                                .stream = execution_plan.stream,
+                            } },
+                        } };
+                    },
+                    .stdin => return error.UnsupportedSqlShape,
+                }
+            },
+        }
+    }
+
     pub fn executeBulkSqlCopyToStdoutWithSession(
         self: *ApiHttpServer,
         sql: []const u8,
@@ -8439,16 +8831,9 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, &parsed_sql, .{
-            .catalog = self.catalogSource(),
-            .session = session,
-        });
-        defer logical_plan.deinit(self.alloc);
-        const bulk_plan = switch (logical_plan) {
-            .bulk_io => |plan| plan,
-            else => return error.UnsupportedSqlShape,
-        };
-        const execution_plan = try sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        defer planned.deinit(self.alloc);
+        const execution_plan = planned.execution_plan;
         if (execution_plan.operation != .export_rows or
             execution_plan.native_route != .rows_query or
             execution_plan.stream != .stdout)
@@ -8813,6 +9198,7 @@ pub const ApiHttpServer = struct {
             self.recordSqlBulkIoDeniedAudit(plan, target, authenticated_identity, err);
             return err;
         };
+        if (identity.permissions.len == 0) return;
         const resource = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource);
         if (!permissionsAllow(identity.permissions, plan.required_resource_type, resource, plan.required_permission)) {
@@ -20989,11 +21375,7 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
 }
 
 pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
-    if (method == .POST and std.mem.eql(u8, path, stripApiPrefix(routes.Routes.db_v1_sql))) return .{
-        .resource_type = .database,
-        .resource = catalog_resources.default_database_name,
-        .permission_type = .admin,
-    };
+    if (method == .POST and std.mem.eql(u8, path, stripApiPrefix(routes.Routes.db_v1_sql))) return null;
     if (std.mem.eql(u8, path, routes.Routes.tablespaces)) return switch (method) {
         .GET => .{
             .resource_type = .tablespace,
@@ -21285,13 +21667,7 @@ test "explicit catalog routes declare qualified namespace and table permissions"
     const alloc = std.testing.allocator;
 
     {
-        const required = (try requiredPermissionForRequest(alloc, .POST, stripApiPrefix(routes.Routes.db_v1_sql))).?;
-        defer required.deinit(alloc);
-        try std.testing.expectEqual(usermgr.ResourceType.database, required.resource_type);
-        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
-        const resource = try required.resourceNameAlloc(alloc);
-        defer alloc.free(resource);
-        try std.testing.expectEqualStrings(catalog_resources.default_database_name, resource);
+        try std.testing.expect((try requiredPermissionForRequest(alloc, .POST, stripApiPrefix(routes.Routes.db_v1_sql))) == null);
     }
     {
         const required = (try requiredPermissionForRequest(alloc, .GET, "/databases/tenant_ops/namespaces/analytics/tables")).?;
@@ -26825,6 +27201,44 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read)));
 }
 
+test "api http server rejects authorization SQL DDL without user manager" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdlPlanWithSession(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: *sql_adapter.DurableSqlPlan,
+            _: catalog_resources.SqlCatalogSession,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE ROLE app_writer;"));
+}
+
 test "api http server enforces SQL row security WITH CHECK on row writes" {
     const alloc = std.testing.allocator;
     const usage_schema_json =
@@ -27066,8 +27480,6 @@ test "api http server applies SQL DDL with explicit catalog session" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
@@ -27594,6 +28006,128 @@ fn expectPublicSqlDiagnosticBody(
     if (expected_span_end) |span_end| try std.testing.expectEqual(span_end, span.get("end").?.integer);
 }
 
+test "api http server binds public sql authorization to resolved statement targets" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+                .projected_tables = 1,
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = try status(ptr),
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .database_name = catalog_resources.default_database_name,
+                    .namespace_name = catalog_resources.default_namespace_name,
+                    .name = "docs",
+                    .schema_json = schema_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var other_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "other", .read),
+    };
+    defer other_permission[0].deinit(alloc);
+    var other_reader = try auth.manager.createUser("other_reader", "reader", &other_permission);
+    defer other_reader.deinit(alloc);
+
+    var docs_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "docs", .read),
+    };
+    defer docs_permission[0].deinit(alloc);
+    var docs_reader = try auth.manager.createUser("docs_reader", "reader", &docs_permission);
+    defer docs_reader.deinit(alloc);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), null, null);
+    defer server.deinit();
+
+    var unauthorized = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.db_v1_sql,
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM docs;\"}",
+    });
+    defer unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+
+    const other_auth = try encodeBasicAuthorization(alloc, "other_reader", "reader");
+    defer alloc.free(other_auth);
+    var denied_read = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.db_v1_sql,
+        .authorization = other_auth,
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM docs;\"}",
+    });
+    defer denied_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_read.status);
+    try expectPublicSqlDiagnosticBody(alloc, denied_read.body, "bind", "permission_denied", "permission denied", null, null);
+
+    const docs_auth = try encodeBasicAuthorization(alloc, "docs_reader", "reader");
+    defer alloc.free(docs_auth);
+    var allowed_past_route_and_bind = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.db_v1_sql,
+        .authorization = docs_auth,
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM docs;\"}",
+    });
+    defer allowed_past_route_and_bind.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), allowed_past_route_and_bind.status);
+    try expectPublicSqlDiagnosticBody(alloc, allowed_past_route_and_bind.body, "bind", "table_not_found", "table not found", null, null);
+
+    var denied_ddl = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.db_v1_sql,
+        .authorization = docs_auth,
+        .content_type = "application/json",
+        .body = "{\"sql\":\"CREATE TABLE new_docs (id text PRIMARY KEY);\"}",
+    });
+    defer denied_ddl.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_ddl.status);
+    try expectPublicSqlDiagnosticBody(alloc, denied_ddl.body, "bind", "permission_denied", "permission denied", null, null);
+}
+
 test "api http server exposes psql-style SQL session endpoint" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -27630,7 +28164,25 @@ test "api http server exposes psql-style SQL session endpoint" {
     const session_id = @as(u64, @intCast(parsed_prepare.value.object.get("session_id").?.integer));
     try std.testing.expect(session_id != 0);
     try std.testing.expectEqualStrings("ddl", parsed_prepare.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("prepared_statement", parsed_prepare.value.object.get("statement_kind").?.string);
     try std.testing.expect(parsed_prepare.value.object.get("noop").?.bool);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        server.sql_prepared_statement_runtime.statementCountForTest(session_id),
+    );
+
+    var describe_prepare = try server.handlePublicSqlDescribeRequestResult(.{
+        .session_id = session_id,
+        .sql = "PREPARE describe_only(text) AS SELECT id FROM usage_records WHERE status = $1;",
+    }, null);
+    defer describe_prepare.deinit(alloc);
+    switch (describe_prepare) {
+        .result => |result| {
+            try std.testing.expectEqualStrings("prepared_statement", result.statement_kind);
+            try std.testing.expect(!result.has_row_description);
+        },
+        .response => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqual(
         @as(usize, 1),
         server.sql_prepared_statement_runtime.statementCountForTest(session_id),
@@ -27702,7 +28254,7 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer readonly_execute_write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_execute_write_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, readonly_execute_write_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", 0, 30);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_execute_write_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", 0, 29);
 
     const set_transaction_readonly_body = try std.fmt.allocPrint(
         alloc,
@@ -28036,6 +28588,46 @@ test "api http server exposes psql-style SQL session endpoint" {
     defer readonly_ddl_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), readonly_ddl_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, readonly_ddl_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
+
+    var readonly_copy_from_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);\"}",
+    });
+    defer readonly_copy_from_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_copy_from_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_copy_from_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
+
+    var copy_to_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);\"}",
+    });
+    defer copy_to_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), copy_to_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, copy_to_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+
+    var readonly_maintenance_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"VACUUM usage_records;\"}",
+    });
+    defer readonly_maintenance_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_maintenance_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_maintenance_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
+
+    var readonly_cursor_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records;\"}",
+    });
+    defer readonly_cursor_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), readonly_cursor_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_cursor_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
 
     var trigger_function_resp = try server.handle(.{
         .method = .POST,
@@ -28401,6 +28993,24 @@ test "api http server executes Antfly SQL query functions through native query p
 
     var server = ApiHttpServer.init(alloc, .{ .semantic_resolver = semantic.resolver(), .user_manager = &auth.manager }, source.iface(), reads.source(), null);
     defer server.deinit();
+
+    var denied_permissions = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "other_docs", .read),
+    };
+    defer denied_permissions[0].deinit(alloc);
+    const denied_identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "denied_reader"),
+        .permissions = denied_permissions[0..],
+    };
+    defer alloc.free(denied_identity.username);
+    var denied_resp = try server.handlePublicSql(
+        "{\"sql\":\"SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'title', query => 'alpha', limit => 2);\"}",
+        @as(?AuthenticatedIdentity, denied_identity),
+    );
+    defer denied_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, denied_resp.body, "bind", "permission_denied", "permission denied", null, null);
+    try std.testing.expectEqual(@as(usize, 0), reads.query_calls);
 
     var resp = try server.handle(.{
         .method = .POST,
@@ -30385,6 +30995,26 @@ test "api http server keeps updated-at trigger DDL on table source path" {
             };
         }
 
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            if (self.table) |*record| return @as([*]metadata_table_manager.TableRecord, @ptrCast(record))[0..1];
+            return &.{};
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tableSlice(),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -30807,6 +31437,8 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };
@@ -30819,6 +31451,26 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
                 .projected_stores = 1,
             };
         }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            if (self.table) |*record| return @as([*]metadata_table_manager.TableRecord, @ptrCast(record))[0..1];
+            return &.{};
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tableSlice(),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
@@ -31163,7 +31815,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         };
 
         alloc: std.mem.Allocator,
-        events: [13]Captured = undefined,
+        events: [15]Captured = undefined,
         count: usize = 0,
 
         fn deinit(self: *@This()) void {
@@ -31670,7 +32322,87 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             &identity,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 13), audit.count);
+
+    var read_only_permission = try usermgr.Permission.initOwned(alloc, .table, "tenant_ops.analytics.events", .read);
+    var read_only_permission_transferred = false;
+    errdefer if (!read_only_permission_transferred) read_only_permission.deinit(alloc);
+    const read_only_permissions = try alloc.alloc(usermgr.Permission, 1);
+    var read_only_permissions_transferred = false;
+    errdefer if (!read_only_permissions_transferred) alloc.free(read_only_permissions);
+    read_only_permissions[0] = read_only_permission;
+    read_only_permission_transferred = true;
+    const read_only_username = try alloc.dupe(u8, "read_only_bulk");
+    var read_only_username_transferred = false;
+    errdefer if (!read_only_username_transferred) alloc.free(read_only_username);
+    var read_only_identity = AuthenticatedIdentity{
+        .username = read_only_username,
+        .permissions = read_only_permissions,
+    };
+    read_only_username_transferred = true;
+    read_only_permissions_transferred = true;
+    defer read_only_identity.deinit(alloc);
+
+    const writes_before_read_only_denial = writes.calls;
+    try std.testing.expectError(
+        error.PermissionDenied,
+        server.executeBulkSqlCopyFromStdinWithSession(
+            "COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);",
+            "id,status\nu_denied,Ready\n",
+            session,
+            &read_only_identity,
+        ),
+    );
+    try std.testing.expectEqual(writes_before_read_only_denial, writes.calls);
+    try std.testing.expectEqual(@as(usize, 14), audit.count);
+    try std.testing.expectEqual(SqlBulkIoAuditOutcome.denied, audit.events[13].outcome);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoAuditAction.copy_from, audit.events[13].action);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoOperation.import_rows, audit.events[13].operation);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoNativeRoute.rows_batch, audit.events[13].native_route);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoStream.stdin, audit.events[13].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[13].required_permission);
+    try std.testing.expectEqualStrings("read_only_bulk", audit.events[13].authenticated_subject orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("PermissionDenied", audit.events[13].error_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 0), audit.events[13].row_count);
+
+    var write_only_permission = try usermgr.Permission.initOwned(alloc, .table, "tenant_ops.analytics.events", .write);
+    var write_only_permission_transferred = false;
+    errdefer if (!write_only_permission_transferred) write_only_permission.deinit(alloc);
+    const write_only_permissions = try alloc.alloc(usermgr.Permission, 1);
+    var write_only_permissions_transferred = false;
+    errdefer if (!write_only_permissions_transferred) alloc.free(write_only_permissions);
+    write_only_permissions[0] = write_only_permission;
+    write_only_permission_transferred = true;
+    const write_only_username = try alloc.dupe(u8, "write_only_bulk");
+    var write_only_username_transferred = false;
+    errdefer if (!write_only_username_transferred) alloc.free(write_only_username);
+    var write_only_identity = AuthenticatedIdentity{
+        .username = write_only_username,
+        .permissions = write_only_permissions,
+    };
+    write_only_username_transferred = true;
+    write_only_permissions_transferred = true;
+    defer write_only_identity.deinit(alloc);
+
+    const reads_before_write_only_denial = reads.calls;
+    try std.testing.expectError(
+        error.PermissionDenied,
+        server.executeBulkSqlCopyToStdoutWithSession(
+            "COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true);",
+            session,
+            &write_only_identity,
+        ),
+    );
+    try std.testing.expectEqual(reads_before_write_only_denial, reads.calls);
+    try std.testing.expectEqual(@as(usize, 15), audit.count);
+    try std.testing.expectEqual(SqlBulkIoAuditOutcome.denied, audit.events[14].outcome);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoAuditAction.copy_to, audit.events[14].action);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoOperation.export_rows, audit.events[14].operation);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoNativeRoute.rows_query, audit.events[14].native_route);
+    try std.testing.expectEqual(sql_adapter.BulkSqlIoStream.stdout, audit.events[14].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[14].required_permission);
+    try std.testing.expectEqualStrings("write_only_bulk", audit.events[14].authenticated_subject orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("PermissionDenied", audit.events[14].error_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 0), audit.events[14].row_count);
 }
 
 test "api http server serves api key and row filter routes" {

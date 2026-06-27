@@ -27,5 +27,16 @@ pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
     return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
 }
 
+pub fn planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    bound: *binder.BoundSqlStatement,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !binder.LogicalSqlPlan {
+    if (bound.takeDdlLogicalPlan()) |logical_plan| return logical_plan else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+    }
+    return try planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, try bound.parsedSql(), function_bindings);
+}
+
 pub const parseLogicalDdlPlanAlloc = ddl_plan.parseLogicalDdlPlanAlloc;
 pub const planGeneratedLogicalDdlAstAlloc = ddl_plan.planGeneratedLogicalDdlAstAlloc;

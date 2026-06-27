@@ -27,6 +27,7 @@ const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const table_catalog = @import("table_catalog.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const indexes_api = @import("indexes.zig");
 const json_helpers = @import("json_helpers.zig");
@@ -133,6 +134,71 @@ const RelationalSqlDdlTableRef = struct {
         self.* = undefined;
     }
 };
+
+const SingleTableCatalogSource = struct {
+    tables: [1]metadata_table_manager.TableRecord,
+
+    fn initAlloc(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord) !SingleTableCatalogSource {
+        return .{
+            .tables = .{try metadata_table_manager.cloneTable(alloc, table.*)},
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_table_manager.freeTable(alloc, self.tables[0]);
+        self.* = undefined;
+    }
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = .{
+                .metadata_group_id = 0,
+                .metrics = .{},
+            },
+            .tables = self.tables[0..],
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+const BorrowedAdminSnapshotCatalogSource = struct {
+    snapshot: *const metadata_api.AdminSnapshot,
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.snapshot.*;
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
@@ -1533,9 +1599,34 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
 ) !AppliedRelationalSqlDdlRecord {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
+    return try applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, &parsed_sql, session, function_bindings);
+}
+
+pub fn applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: sql_adapter.SqlFunctionBindings,
+) !AppliedRelationalSqlDdlRecord {
+    var catalog_source = try SingleTableCatalogSource.initAlloc(alloc, table);
+    defer catalog_source.deinit(alloc);
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = catalog_source.iface(),
+        .session = session,
+        .function_bindings = function_bindings,
+    });
     defer logical_plan.deinit(alloc);
-    return switch (logical_plan) {
+    return try applyRelationalSqlDdlLogicalPlanToTableRecordWithSessionAlloc(alloc, table, &logical_plan, session);
+}
+
+pub fn applyRelationalSqlDdlLogicalPlanToTableRecordWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    logical_plan: *sql_adapter.LogicalSqlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
+    return switch (logical_plan.*) {
         .table_ddl => |*table_plan| try applyTableDdlPlanToTableRecordWithSessionAlloc(alloc, table, table_plan, session),
         else => error.UnsupportedSqlShape,
     };
@@ -1909,15 +2000,13 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 ) !RelationalSqlDdlTarget {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
+        .catalog = table_catalog.emptyCatalogSource(),
+        .session = session,
+        .function_bindings = function_bindings,
+    });
     defer logical_plan.deinit(alloc);
-    var table_plan = switch (logical_plan) {
-        .table_ddl => |plan| blk: {
-            logical_plan = .{ .other_ddl = .{ .moved = {} } };
-            break :blk plan;
-        },
-        else => return error.UnsupportedSqlShape,
-    };
+    var table_plan = try sql_adapter.takeTableDdlPlanFromLogical(&logical_plan);
     defer table_plan.deinit(alloc);
     return try relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, table_plan, session);
 }
@@ -3994,15 +4083,40 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
 
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
-    defer logical_plan.deinit(alloc);
-    var catalog_plan = switch (logical_plan) {
-        .catalog_ddl => |plan| blk: {
-            logical_plan = .{ .other_ddl = .{ .moved = {} } };
-            break :blk plan;
-        },
-        else => return null,
+    return try applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindingsAlloc(alloc, svc, snapshot, &parsed_sql, session, function_bindings);
+}
+
+pub fn applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: sql_adapter.SqlFunctionBindings,
+) !?AppliedRelationalSqlDdlRecord {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
     };
+    if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+        @hasDecl(ServiceDeclType, "removeDatabase") and
+        @hasDecl(ServiceDeclType, "upsertNamespace") and
+        @hasDecl(ServiceDeclType, "removeNamespace") and
+        @hasDecl(ServiceDeclType, "upsertTablespace") and
+        @hasDecl(ServiceDeclType, "removeTablespace")))
+    {
+        return null;
+    }
+
+    var catalog_source = BorrowedAdminSnapshotCatalogSource{ .snapshot = snapshot };
+    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = catalog_source.iface(),
+        .session = session,
+        .function_bindings = function_bindings,
+    });
+    defer logical_plan.deinit(alloc);
+    var catalog_plan = sql_adapter.takeCatalogDdlPlanFromLogical(&logical_plan) catch return null;
     defer catalog_plan.deinit(alloc);
     return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, snapshot, catalog_plan, session);
 }
@@ -5846,6 +5960,17 @@ test "metadata.schema update sql ddl exposes catalog target and create intent" {
     try std.testing.expectEqualStrings(default_namespace_name, create_target.namespace_name);
     try std.testing.expectEqualStrings("users", create_target.table_name);
     try std.testing.expect(create_target.createsTable());
+
+    const tenant_search_path: []const []const u8 = &.{ "analytics", default_namespace_name };
+    var session_create_target = try relationalSqlDdlTargetWithSessionAlloc(std.testing.allocator, "CREATE TABLE events (id uuid PRIMARY KEY);", .{
+        .current_database_name = "tenant_ops",
+        .search_path = tenant_search_path,
+    });
+    defer session_create_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("tenant_ops", session_create_target.database_name);
+    try std.testing.expectEqualStrings("analytics", session_create_target.namespace_name);
+    try std.testing.expectEqualStrings("events", session_create_target.table_name);
+    try std.testing.expect(session_create_target.createsTable());
 
     var schema_create_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE analytics.users (id uuid PRIMARY KEY);");
     defer schema_create_target.deinit(std.testing.allocator);
