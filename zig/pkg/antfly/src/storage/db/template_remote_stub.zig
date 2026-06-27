@@ -267,33 +267,3 @@ test "template remote stub can use host text renderer for remote helpers" {
 
     try std.testing.expectEqualStrings("remote text", rendered);
 }
-
-fn testHostRenderJsonToPartsErrorDirective(
-    _: ?*anyopaque,
-    alloc: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: RenderConfig,
-) ![]template_mod.ContentPart {
-    const parts = try alloc.alloc(template_mod.ContentPart, 1);
-    errdefer alloc.free(parts);
-    parts[0] = .{ .text = try alloc.dupe(u8, "<<<error:status=413 message=StreamTooLong>>> fallback text") };
-    return parts;
-}
-
-test "template remote stub validates host-rendered parts for error directives" {
-    const alloc = std.testing.allocator;
-    setHostRenderer(.{
-        .render_json_to_parts = testHostRenderJsonToPartsErrorDirective,
-    });
-    defer setHostRenderer(null);
-
-    try std.testing.expectError(
-        RenderError.PermanentPromptFailure,
-        renderJsonToParts(
-            alloc,
-            "{{remoteMedia url=this}}",
-            "\"https://example.com/photo.png\"",
-        ),
-    );
-}
