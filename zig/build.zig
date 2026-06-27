@@ -3516,6 +3516,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
+        "api http server forwards cluster backup mutations to metadata leader",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "public API request body limit matches Go linear merge contract",
