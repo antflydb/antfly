@@ -3375,7 +3375,7 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
 ) !PrepareStatementPlan {
     const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
     const inner = ast.inner_statement_tokens orelse return error.UnsupportedSqlShape;
-    const statement_family = classifier.classifyPreparedStatementStatementKind(tokens, inner.start) orelse return error.UnsupportedSqlShape;
+    const statement_family = try generatedPreparedStatementFamilyAlloc(alloc, tokens, inner);
     const parameter_count = if (ast.parameter_tokens) |parameter_tokens|
         try countGeneratedParenthesizedList(tokens, parameter_tokens)
     else
@@ -3383,8 +3383,50 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
     return .{
         .statement_name = try alloc.dupe(u8, statement_name),
         .parameter_count = parameter_count,
-        .statement_kind = preparedStatementSubjectKindFromSyntax(classifier.preparedStatementSubjectKindFromStatementKind(statement_family)),
-        .statement_family = preparedStatementStatementKindFromSyntax(statement_family),
+        .statement_kind = preparedStatementSubjectKindFromStatementKind(statement_family),
+        .statement_family = statement_family,
+    };
+}
+
+fn generatedPreparedStatementFamilyAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    inner: generated_parser.GeneratedSqlTokenRange,
+) !PreparedStatementStatementKind {
+    var parsed_inner = try generated_parser.parseTokensAlloc(alloc, tokens[inner.start..inner.end]);
+    defer parsed_inner.deinit(alloc);
+
+    return switch (parsed_inner.ast orelse return error.UnsupportedSqlShape) {
+        .read => .read,
+        .dml => |dml_ast| generatedPreparedStatementFamilyFromDmlKind(dml_ast.kind),
+        .ddl => .ddl,
+        .extension_index => .ddl,
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn generatedPreparedStatementFamilyFromDmlKind(kind: generated_parser.GeneratedSqlDmlKind) PreparedStatementStatementKind {
+    return switch (kind) {
+        .insert_values => .insert,
+        .insert_select => .insert_source,
+        .update => .update,
+        .delete => .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+    };
+}
+
+fn preparedStatementSubjectKindFromStatementKind(kind: PreparedStatementStatementKind) PreparedStatementSubjectKind {
+    return switch (kind) {
+        .read => .read,
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .truncate,
+        .merge,
+        => .write,
+        .ddl => .ddl,
     };
 }
 
@@ -5829,6 +5871,14 @@ fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: [
     var pos: usize = 0;
     if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
         return .{ .set_search_path = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    pos = 0;
+    if (parseSetSessionCharacteristicsPlanTailAlloc(alloc, tail, &pos)) |plan| {
+        return .{ .set_setting = plan };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => {},
         else => return err,
@@ -18647,6 +18697,60 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
+    }
+
+    const prepare_family_cases = [_]struct {
+        sql: []const u8,
+        subject: PreparedStatementSubjectKind,
+        family: PreparedStatementStatementKind,
+    }{
+        .{
+            .sql = "PREPARE insert_plan(text) AS INSERT INTO usage_records (id) VALUES ($1);",
+            .subject = .write,
+            .family = .insert,
+        },
+        .{
+            .sql = "PREPARE insert_source_plan AS INSERT INTO usage_records (id) SELECT id FROM incoming_usage;",
+            .subject = .write,
+            .family = .insert_source,
+        },
+        .{
+            .sql = "PREPARE update_plan AS UPDATE usage_records SET status = 'done' WHERE id = 'u1';",
+            .subject = .write,
+            .family = .update,
+        },
+        .{
+            .sql = "PREPARE delete_plan AS DELETE FROM usage_records WHERE id = 'u1';",
+            .subject = .write,
+            .family = .delete,
+        },
+        .{
+            .sql = "PREPARE truncate_plan AS TRUNCATE usage_records;",
+            .subject = .write,
+            .family = .truncate,
+        },
+        .{
+            .sql = "PREPARE merge_plan AS MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status;",
+            .subject = .write,
+            .family = .merge,
+        },
+        .{
+            .sql = "PREPARE create_table_plan AS CREATE TABLE prepared_usage_records (id uuid);",
+            .subject = .ddl,
+            .family = .ddl,
+        },
+    };
+
+    for (prepare_family_cases) |case| {
+        var generated_case = try generatedPreparedStatementPlanForTestAlloc(alloc, case.sql);
+        defer generated_case.deinit(alloc);
+        switch (generated_case) {
+            .prepare => |prepare| {
+                try std.testing.expectEqual(case.subject, prepare.statement_kind);
+                try std.testing.expectEqual(case.family, prepare.statement_family);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");

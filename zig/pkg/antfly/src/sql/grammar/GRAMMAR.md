@@ -144,7 +144,9 @@ tail, and GID metadata agree. This AST is retained by `ParsedSql`; prepared
 statements now have an AST-to-plan conversion path with retained
 statement/command span,
 command-kind, name, parameter, argument, and nested-statement range validation
-plus parity coverage against the existing token-based lowerer, including typed
+and generated parsing of the nested `PREPARE ... AS <statement>` body to derive
+the prepared subject and statement family. The parity coverage against the
+existing token-based lowerer includes typed
 `PREPARE name(type, ...) AS ...` parameter lists and generated `DEALLOCATE ALL`.
 Prepared-statement command heads now require generated parser success at SQL
 ingress for `PREPARE`, `EXECUTE`, and `DEALLOCATE`, including malformed
@@ -816,6 +818,10 @@ Suggested migration order:
    statement name span after the optional `PREPARE` keyword. Prepared
    transactions use a separate generated AST family from named prepared
    statements so two-phase-commit GIDs cannot be confused with statement names.
+   Generated prepared-statement planning now reparses the retained nested
+   statement range through the generated parser and maps generated read, DML,
+   DDL, and extension-index DDL ASTs to the typed prepared-statement family
+   instead of consulting the legacy prepared-statement classifier.
 2. DDL: `CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `ALTER TABLE`,
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,
@@ -1684,7 +1690,8 @@ Generated grammar work needs evidence at multiple levels:
   malformed database/schema/extension catalog DDL heads that no longer fall
   back to legacy DDL probing.
   Runtime DDL lowering now dispatches generated session statements, prepared
-  statements, prepared transactions, graph DDL, database/schema/extension
+  statements with generated-owned nested statement family lowering, prepared
+  transactions, graph DDL, database/schema/extension
   catalog DDL, generated
   `ALTER DATABASE ... SET ...` and `ALTER EXTENSION ... UPDATE` catalog DDL,
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,

@@ -2086,6 +2086,19 @@ fn generatedProjectionExpressionAtItemStart(
             return &read.projection_items.expressions[index];
         }
     }
+    if (read.set_operation_tokens != null) {
+        if (read.set_operation.right_projection_items.items.len != read.set_operation.right_projection_items.count or
+            read.set_operation.right_projection_items.expressions.len != read.set_operation.right_projection_items.count)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        for (read.set_operation.right_projection_items.items, 0..) |item, index| {
+            if (item.start == pos) {
+                try validateGeneratedExpressionPayloads(tokens, read.set_operation.right_projection_items.expressions[index]);
+                return &read.set_operation.right_projection_items.expressions[index];
+            }
+        }
+    }
     return null;
 }
 
@@ -3355,7 +3368,7 @@ fn validateGeneratedRowExpressionIdentity(
         .function_call => {
             const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
             if (generatedFunctionNameMatchesRowExpressionKind(token, parsed_expression.kind)) |matches| {
-                if (!matches) return error.UnsupportedSqlShape;
+                if (!matches and token.kind != .identifier) return error.UnsupportedSqlShape;
             }
         },
         else => {
