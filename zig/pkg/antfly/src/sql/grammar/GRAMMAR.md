@@ -1200,9 +1200,10 @@ projection, `DISTINCT ON`, grouping, and ordering list payloads, including
 first/last expression summaries, alias spans, direction/`USING` operator
 ordering, `NULLS` ordering, and delimiter adjacency before publishing a
 generated read family, validates generated set-operation right-query
-projection/source/predicate payloads, and requires top-level and CTE-body
-`WHERE`/`HAVING` generated predicate expression spans to match their retained
-clause bodies. Named `WINDOW` clauses now also validate generated window item
+projection/source/predicate payloads, right-arm projection adjacency after
+`SELECT`/`DISTINCT`, and right-arm `FROM`/`WHERE` clause keyword layout, and
+requires top-level and CTE-body `WHERE`/`HAVING` generated predicate expression
+spans to match their retained clause bodies. Named `WINDOW` clauses now also validate generated window item
 boundaries, `name AS (...)` layout, partition/order list payloads, and frame
 expression spans before publishing a generated read family. Join classification
 now also validates join operator token sequences against generated join kind

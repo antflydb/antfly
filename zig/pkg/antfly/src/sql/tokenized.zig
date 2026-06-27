@@ -2812,7 +2812,11 @@ fn generatedReadSetOperationPayloadIsValid(
 
     const right_projection = set_operation.right_projection_tokens orelse return false;
     if (!generatedReadNestedRangeIsValid(tokens, end, right_query, right_projection)) return false;
-    if (right_projection.start <= right_select.start) return false;
+    if (set_operation.right_distinct_tokens) |distinct_tokens| {
+        if (distinct_tokens.start != right_select.end or right_projection.start != distinct_tokens.end) return false;
+    } else if (right_projection.start != right_select.end) {
+        return false;
+    }
     if (!generatedReadListPayloadIsValid(tokens, end, right_projection, set_operation.right_projection_items, .{
         .allow_aliases = true,
         .reject_order_modifiers = true,
@@ -2821,7 +2825,9 @@ fn generatedReadSetOperationPayloadIsValid(
     })) return false;
 
     if (!generatedReadOptionalNestedRangeIsValid(tokens, end, right_query, set_operation.right_source_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, set_operation.right_source_tokens, .from)) return false;
     if (!generatedReadOptionalNestedRangeIsValid(tokens, end, right_query, set_operation.right_where_tokens)) return false;
+    if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, set_operation.right_where_tokens, .where)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(set_operation.right_where_expression, set_operation.right_where_tokens)) return false;
     return true;
 }
@@ -7610,6 +7616,22 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
         return error.TestUnexpectedResult;
     }
     generated_set_operation_where_query.statement = parseStatement(generated_set_operation_where_query.raw_statement, malformed_set_operation_where_generated, &generated_set_operation_where_query.tokenized_sql);
+    try std.testing.expect(generated_set_operation_where_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_set_operation_where_query.statement));
+
+    var malformed_set_operation_where_clause_generated = generated_set_operation_where_query.generated_statement.?;
+    if (malformed_set_operation_where_clause_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                read_ast.set_operation.right_where_tokens = read_ast.set_operation.right_projection_tokens;
+                read_ast.set_operation.right_where_expression.tokens = read_ast.set_operation.right_projection_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_set_operation_where_query.statement = parseStatement(generated_set_operation_where_query.raw_statement, malformed_set_operation_where_clause_generated, &generated_set_operation_where_query.tokenized_sql);
     try std.testing.expect(generated_set_operation_where_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_set_operation_where_query.statement));
 
