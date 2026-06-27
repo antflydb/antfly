@@ -31,7 +31,7 @@ pub const RenderError = error{
 
 pub const RenderConfig = struct {};
 
-pub const default_remote_fetch_max_download_size_bytes: u64 = 4 << 20;
+pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 
 const remote_fetch_security = scraping.ContentSecurityConfig{
     .block_private_ips = true,
@@ -113,6 +113,18 @@ pub fn renderJsonToTextWithConfig(
     return try template_mod.renderDocument(alloc, template_source, json_doc);
 }
 
+pub fn renderJsonToValidatedTextWithConfig(
+    alloc: Allocator,
+    template_source: []const u8,
+    json_doc: []const u8,
+    config: RenderConfig,
+) ![]const u8 {
+    const rendered = try renderJsonToTextWithConfig(alloc, template_source, json_doc, config);
+    errdefer alloc.free(@constCast(rendered));
+    try validateRenderedTemplate(alloc, rendered);
+    return rendered;
+}
+
 pub fn renderJsonToParts(
     alloc: Allocator,
     template_source: []const u8,
@@ -130,16 +142,38 @@ pub fn renderJsonToPartsWithConfig(
     if (requiresRemoteHelpers(template_source)) {
         const renderer = host_renderer orelse return error.UnsupportedPlatform;
         if (renderer.render_json_to_parts) |render_fn| {
-            return try render_fn(renderer.ctx, alloc, template_source, json_doc, config);
+            const parts = try render_fn(renderer.ctx, alloc, template_source, json_doc, config);
+            errdefer template_mod.freeContentParts(alloc, parts);
+            try validateRenderedParts(alloc, parts);
+            return parts;
         }
         const rendered = try callHostRenderJsonToText(alloc, template_source, json_doc, config);
         defer alloc.free(@constCast(rendered));
+        try validateRenderedTemplate(alloc, rendered);
         return try template_mod.textToParts(alloc, rendered);
     }
 
     const rendered = try template_mod.renderDocument(alloc, template_source, json_doc);
     defer alloc.free(@constCast(rendered));
+    try validateRenderedTemplate(alloc, rendered);
     return try template_mod.textToParts(alloc, rendered);
+}
+
+fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
+    const directives = try template_mod.parseErrorDirectives(alloc, rendered);
+    defer template_mod.freeErrorDirectives(alloc, directives);
+    if (directives.len == 0) return;
+    if (directives[0].isPermanent()) return RenderError.PermanentPromptFailure;
+    return RenderError.TransientPromptFailure;
+}
+
+fn validateRenderedParts(alloc: Allocator, parts: []const template_mod.ContentPart) !void {
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| try validateRenderedTemplate(alloc, text),
+            else => {},
+        }
+    }
 }
 
 pub fn downloadRemoteContentOutcomeAllocWithConfig(

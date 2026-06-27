@@ -160,7 +160,10 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
         if (producer_cfg.type != .document_extraction) continue;
 
         if (entry.source_template.len > 0) {
-            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch continue;
+            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch |err| switch (err) {
+                error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                else => continue,
+            };
             defer db.alloc.free(rendered);
             try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
             continue;
@@ -13881,6 +13884,14 @@ fn renderSourceTemplateText(
     template_source: []const u8,
     doc_value: []const u8,
 ) ![]const u8 {
+    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
+        return try template_remote.renderJsonToValidatedTextWithConfig(
+            alloc,
+            template_source,
+            doc_value,
+            remoteRenderConfig(secret_store, remote_content),
+        );
+    }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
@@ -13985,7 +13996,10 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -16174,7 +16188,10 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
         return @constCast(rendered);
@@ -16787,7 +16804,7 @@ fn computeDenseRequestImpl(
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(alloc, db, doc_value, request) catch null;
+        const source_parts = try renderSourceParts(alloc, db, doc_value, request);
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -16811,7 +16828,10 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -16889,7 +16909,10 @@ fn computeSparseRequestDerived(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -17073,7 +17096,10 @@ fn renderSourceParts(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+        else => return null,
+    };
     if (parts.len == 0) {
         template_mod.freeContentParts(alloc, parts);
         return null;
@@ -26674,6 +26700,68 @@ test "db allocates final document ordinal then rejects new documents" {
         .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
         .sync_level = .write,
     }));
+}
+
+test "document extraction template prompt failure is rejected before persistence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .template = "<<<error:status=413 message=StreamTooLong>>> fallback text",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try std.testing.expectError(error.PermanentPromptFailure, db.batch(.{
+        .writes = &.{.{
+            .key = "doc:templated-prompt-failure",
+            .value = "{\"url\":\"data:text/plain;base64,Zm9v\"}",
+        }},
+        .sync_level = .write,
+    }));
+}
+
+fn testRemoteTemplateHostRenderJsonToPartsErrorDirective(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+    _: []const u8,
+    _: template_remote.RenderConfig,
+) ![]template_mod.ContentPart {
+    const parts = try alloc.alloc(template_mod.ContentPart, 1);
+    errdefer alloc.free(parts);
+    parts[0] = .{ .text = try alloc.dupe(u8, "<<<error:status=413 message=StreamTooLong>>> fallback text") };
+    return parts;
+}
+
+test "remote template host-rendered parts preserve prompt failures" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteTemplateHostRenderJsonToPartsErrorDirective,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    try std.testing.expectError(
+        error.PermanentPromptFailure,
+        renderSourceTemplateParts(
+            alloc,
+            null,
+            null,
+            "{{remoteMedia url=this}}",
+            "\"https://example.com/photo.png\"",
+        ),
+    );
 }
 
 test "db allocates final document ordinal with all index families present" {
