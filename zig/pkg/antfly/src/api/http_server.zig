@@ -29546,6 +29546,19 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try expectPublicSqlDiagnosticBody(alloc, quantified_subquery_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, quantified_subquery_resp.body, "quantified comparison execution for read-subquery predicate");
 
+    var describe_exists_subquery = try server.handlePublicSqlDescribeRequestResult(.{
+        .sql = "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE status = 'open');",
+    }, null);
+    defer describe_exists_subquery.deinit(alloc);
+    switch (describe_exists_subquery) {
+        .response => |response| {
+            try std.testing.expectEqual(@as(u16, 501), response.status);
+            try expectPublicSqlDiagnosticBody(alloc, response.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+            try expectPublicSqlDiagnosticMissingNativeModel(alloc, response.body, "semijoin execution for EXISTS subquery predicate");
+        },
+        .result => return error.TestUnexpectedResult,
+    }
+
     var aggregate_claim_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
