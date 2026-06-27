@@ -6791,8 +6791,8 @@ pub const IndexManager = struct {
                 .prepared_owner = task.persistent,
             };
         } else |err| switch (err) {
-            error.Unsupported => {},
             error.EmptySegment => return .{ .segments = &.{} },
+            error.Unsupported => {},
             else => {
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
@@ -6804,6 +6804,7 @@ pub const IndexManager = struct {
         const merged = merger_mod.mergeSegmentsBounded(alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
         }) catch |err| {
+            if (err == error.EmptySegment) return .{};
             if (builtin.os.tag != .freestanding) {
                 std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
             }
@@ -6835,7 +6836,9 @@ pub const IndexManager = struct {
         defer self.alloc.free(old_ids);
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
-        const applied = if (result.prepared_segments.len > 0) blk: {
+        const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
+            break :blk try entry.persistent.removeSegmentsIfActive(old_ids);
+        } else if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
             result.prepared_owner = null;
