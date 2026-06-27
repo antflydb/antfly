@@ -1336,6 +1336,47 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
+        \\pub const RuleId = enum(u16) {
+        \\
+    );
+    for (grammar.rules.items) |rule| try appendFmt(allocator, &out, "    {s},\n", .{rule.name});
+    try out.appendSlice(allocator,
+        \\};
+        \\
+        \\pub const ProductionInfo = struct {
+        \\    rule: ?RuleId,
+        \\    lhs: u16,
+        \\    rhs_len: u16,
+        \\};
+        \\
+        \\pub fn productionInfo(production: u16) ?ProductionInfo {
+        \\    if (production >= productions.len) return null;
+        \\    const item = productions[production];
+        \\    return .{
+        \\        .rule = ruleIdForLhs(item.lhs),
+        \\        .lhs = item.lhs,
+        \\        .rhs_len = item.rhs_len,
+        \\    };
+        \\}
+        \\
+        \\pub fn symbolIsNullable(symbol: u16) ?bool {
+        \\    if (symbol >= nullable_symbols.len) return null;
+        \\    return nullable_symbols[symbol];
+        \\}
+        \\
+        \\fn ruleIdForLhs(lhs: u16) ?RuleId {
+        \\    return switch (lhs) {
+        \\
+    );
+    const terminal_count = grammar.tokens.items.len + 1;
+    for (grammar.rules.items, 0..) |rule, rule_idx| {
+        try appendFmt(allocator, &out, "        {d} => .{s},\n", .{ ruleSymbolId(terminal_count, rule_idx), rule.name });
+    }
+    try out.appendSlice(allocator,
+        \\        else => null,
+        \\    };
+        \\}
+        \\
     );
     try appendFmt(allocator, &out,
         \\pub const production_rhs_count = {d};
@@ -2393,7 +2434,12 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const symbols") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Symbol") == null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Rule") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const Rule =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const RuleId = enum(u16)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const ProductionInfo = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn productionInfo(production: u16) ?ProductionInfo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolIsNullable(symbol: u16) ?bool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "fn ruleIdForLhs(lhs: u16) ?RuleId") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".scan_l = \"https://example.test/postgres/scan.l\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);
