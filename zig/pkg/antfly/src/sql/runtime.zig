@@ -1174,7 +1174,7 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
 ) !LoweredReadPlan {
     _ = params;
     _ = function_bindings;
-    return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+    return switch (documentReadKindForBindingParsedSql(parsed_sql) orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
             .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
@@ -1197,6 +1197,72 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
         .join, .lateral => error.DocumentSqlUnsupportedJoin,
         else => error.UnsupportedSqlShape,
     };
+}
+
+fn documentReadKindForBindingParsedSql(parsed_sql: *const sql_adapter.ParsedSql) ?sql_adapter.SqlReadStatementKind {
+    if (parsed_sql.statement.readKind()) |kind| return kind;
+    const generated_statement = parsed_sql.generated_statement orelse return null;
+    const generated_ast = generated_statement.ast orelse return null;
+    const read = switch (generated_ast) {
+        .read => |read| read,
+        else => return null,
+    };
+    const tokens = parsed_sql.items();
+    if (read.set_operation_tokens != null) return .set_operation;
+    if (read.kind == .lateral) return .lateral;
+    if (read.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
+    }
+    if (read.kind == .window or read.window_tokens != null) return .window;
+    if (read.projection_tokens) |projection| {
+        if (generatedReadRangeContainsKeyword(tokens, projection, .over)) return .window;
+    }
+    if (read.kind == .aggregate or
+        (read.distinct_tokens != null and read.distinct_on_items.count == 0) or
+        read.group_tokens != null or
+        read.having_tokens != null or
+        (if (read.projection_tokens) |projection| generatedReadRangeHasAggregateFunction(tokens, projection) else false))
+    {
+        return .aggregate;
+    }
+    if (read.kind == .join or read.join_tokens != null) return .join;
+    if (read.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .join)) return .join;
+    }
+    return .query;
+}
+
+fn generatedReadRangeContainsKeyword(
+    tokens: []const sql_adapter.Token,
+    range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+    keyword: sql_adapter.TokenKeyword,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return true;
+    }
+    return false;
+}
+
+fn generatedReadRangeHasAggregateFunction(
+    tokens: []const sql_adapter.Token,
+    range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        const token = tokens[index];
+        if (token.matchesKeywordTag(.count) or
+            token.matchesKeywordTag(.sum) or
+            token.matchesKeywordTag(.avg) or
+            token.matchesKeywordTag(.min) or
+            token.matchesKeywordTag(.max))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 test "sql runtime rejects document joins with document diagnostic" {

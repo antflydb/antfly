@@ -219,11 +219,13 @@ pub const ParsedSql = struct {
         errdefer tokenized_sql.deinit(alloc);
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
+        applyParsedStatementClassification(&tokenized_sql, statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
             .generated_statement = generated_statement,
-            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
+            .statement = statement,
         };
     }
 
@@ -232,11 +234,13 @@ pub const ParsedSql = struct {
         errdefer tokenized_sql.deinit(alloc);
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
+        applyParsedStatementClassification(&tokenized_sql, statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
             .generated_statement = generated_statement,
-            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
+            .statement = statement,
         };
     }
 
@@ -259,11 +263,13 @@ pub const ParsedSql = struct {
         errdefer tokenized_sql.deinit(alloc);
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
+        applyParsedStatementClassification(&tokenized_sql, statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
             .generated_statement = generated_statement,
-            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
+            .statement = statement,
         };
     }
 
@@ -302,6 +308,16 @@ pub const ParsedSql = struct {
         return null;
     }
 };
+
+fn applyParsedStatementClassification(tokenized_sql: *TokenizedSql, statement: ParsedStatement) void {
+    tokenized_sql.read_statement_kind = null;
+    tokenized_sql.write_statement_kind = null;
+    switch (statement) {
+        .read => |read| tokenized_sql.read_statement_kind = read.kind,
+        .write => |write| tokenized_sql.write_statement_kind = write.kind,
+        else => {},
+    }
+}
 
 fn parseGeneratedRawStatementAlloc(
     alloc: std.mem.Allocator,
@@ -7148,7 +7164,9 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
 
     generated_insert.tokenized_sql.write_statement_kind = .delete;
     generated_insert.statement = parseStatement(generated_insert.raw_statement, generated_insert.generated_statement, &generated_insert.tokenized_sql);
+    applyParsedStatementClassification(&generated_insert.tokenized_sql, generated_insert.statement);
     try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, generated_insert.writeStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, generated_insert.tokenized_sql.write_statement_kind.?);
     switch (generated_insert.statement) {
         .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
         else => return error.TestUnexpectedResult,
@@ -7158,7 +7176,9 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
     malformed_generated.ast = null;
     generated_insert.tokenized_sql.write_statement_kind = .insert;
     generated_insert.statement = parseStatement(generated_insert.raw_statement, malformed_generated, &generated_insert.tokenized_sql);
+    applyParsedStatementClassification(&generated_insert.tokenized_sql, generated_insert.statement);
     try std.testing.expect(generated_insert.writeStatementKind() == null);
+    try std.testing.expect(generated_insert.tokenized_sql.write_statement_kind == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
 
     var malformed_mutation_source_flag = generated_insert.generated_statement.?;
@@ -8363,7 +8383,9 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
 
     generated_query.tokenized_sql.read_statement_kind = .aggregate;
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
+    applyParsedStatementClassification(&generated_query.tokenized_sql, generated_query.statement);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.readStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.tokenized_sql.read_statement_kind.?);
     switch (generated_query.statement) {
         .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.query, statement.kind),
         else => return error.TestUnexpectedResult,
@@ -8383,7 +8405,9 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
         return error.TestUnexpectedResult;
     }
     generated_where_query.statement = parseStatement(generated_where_query.raw_statement, malformed_where_generated, &generated_where_query.tokenized_sql);
+    applyParsedStatementClassification(&generated_where_query.tokenized_sql, generated_where_query.statement);
     try std.testing.expect(generated_where_query.readStatementKind() == null);
+    try std.testing.expect(generated_where_query.tokenized_sql.read_statement_kind == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_where_query.statement));
 
     var generated_having_query = try ParsedSql.initAlloc(alloc, "SELECT status, count(*) FROM usage_records GROUP BY status HAVING count(*) > 1");

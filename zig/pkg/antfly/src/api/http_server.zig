@@ -6281,6 +6281,25 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
+    fn publicSqlReadStatementKindForCatalogRead(
+        read_catalog: *const sql_adapter.CatalogLogicalReadPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) ?sql_adapter.SqlReadStatementKind {
+        if (read_catalog.statement.readKind()) |kind| return kind;
+        const target_binding = read_catalog.target_binding orelse return null;
+        switch (target_binding) {
+            .document => {},
+            else => return null,
+        }
+        const generated_statement = parsed_sql.generated_statement orelse return null;
+        const generated_ast = generated_statement.ast orelse return null;
+        const read = switch (generated_ast) {
+            .read => |read| read,
+            else => return null,
+        };
+        return publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read);
+    }
+
     fn publicSqlGeneratedReadRowClaimDiagnostic(
         parsed_sql: *const sql_adapter.ParsedSql,
         phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
@@ -7112,11 +7131,11 @@ pub const ApiHttpServer = struct {
             .catalog_read => |*catalog_read| catalog_read,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        const statement_kind = read_catalog.statement.readKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
+        const statement_kind = publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
         const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
 
-        const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
@@ -7258,8 +7277,8 @@ pub const ApiHttpServer = struct {
             .catalog_read => |*catalog_read| catalog_read,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
         };
-        const statement_kind = read_catalog.statement.readKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
+        const statement_kind = publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
