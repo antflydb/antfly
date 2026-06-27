@@ -3404,13 +3404,11 @@ pub const DataServer = struct {
             .data => self.markLocalGroupDataChanged(),
             .structural => {
                 self.invalidateLocalGroupStatusCache();
-                self.refreshVisibleProvisionedReplicaState() catch |err| {
-                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
-                        table_name,
-                        err,
-                    });
-                };
                 if (self.data_raft_apply) |apply_sm| {
+                    // Raft-backed tables write through the apply state machine.
+                    // Move create-time seeded writers before refreshing visible
+                    // roots so status reconciliation and the first batch share
+                    // one root writer owner.
                     _ = self.write_source.transferAdoptableWriteCacheEntriesTo(&apply_sm.write_source, table_name) catch |err| {
                         std.log.warn("failed to transfer provisioned write cache to raft apply table={s} err={}", .{
                             table_name,
@@ -3418,6 +3416,12 @@ pub const DataServer = struct {
                         });
                     };
                 }
+                self.refreshVisibleProvisionedReplicaState() catch |err| {
+                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
+                        table_name,
+                        err,
+                    });
+                };
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
