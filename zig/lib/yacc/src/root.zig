@@ -305,13 +305,17 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
 
 fn stripLineComment(line: []const u8) []const u8 {
     var index: usize = 0;
-    var quoted = false;
+    var quote: ?u8 = null;
     while (index + 1 < line.len) : (index += 1) {
-        if (line[index] == '\'' and (index == 0 or line[index - 1] != '\\')) {
-            quoted = !quoted;
+        if ((line[index] == '\'' or line[index] == '"') and (index == 0 or line[index - 1] != '\\')) {
+            if (quote == line[index]) {
+                quote = null;
+            } else if (quote == null) {
+                quote = line[index];
+            }
             continue;
         }
-        if (!quoted and line[index] == '/' and line[index + 1] == '/') {
+        if (quote == null and line[index] == '/' and line[index + 1] == '/') {
             if (index == 0 or std.ascii.isWhitespace(line[index - 1])) return line[0..index];
             index += 1;
         }
@@ -346,7 +350,8 @@ fn parseTokens(allocator: std.mem.Allocator, grammar: *Grammar, text: []const u8
     var previous_token: ?[]const u8 = null;
     while (parts.next()) |name| {
         if (isBisonTypeTag(name)) continue;
-        if (isQuotedLiteral(name)) {
+        if (isBisonTokenCode(name)) continue;
+        if (isLiteralAlias(name)) {
             const token_name = previous_token orelse return error.InvalidTokenAlias;
             try appendTokenAlias(allocator, grammar, name, token_name);
             continue;
@@ -367,7 +372,8 @@ fn parsePrecedenceDeclaration(
     var previous_token: ?[]const u8 = null;
     while (parts.next()) |name| {
         if (isBisonTypeTag(name)) continue;
-        if (isQuotedLiteral(name)) {
+        if (isBisonTokenCode(name)) continue;
+        if (isLiteralAlias(name)) {
             const token_name = previous_token orelse resolveTerminalName(grammar.*, name) orelse return error.InvalidTokenAlias;
             try appendTokenAlias(allocator, grammar, name, token_name);
             try setTokenPrecedence(allocator, grammar, token_name, .{ .level = level, .associativity = associativity });
@@ -436,15 +442,16 @@ fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
     }
 
     const start = index.*;
-    if (text[index.*] == '\'') {
+    if (text[index.*] == '\'' or text[index.*] == '"') {
+        const quote = text[index.*];
         index.* += 1;
         while (index.* < text.len) : (index.* += 1) {
-            if (text[index.*] == '\'' and text[index.* - 1] != '\\') {
+            if (text[index.*] == quote and text[index.* - 1] != '\\') {
                 index.* += 1;
                 break;
             }
         }
-        if (index.* > text.len or text[index.* - 1] != '\'') return error.UnterminatedLiteralTerminal;
+        if (index.* > text.len or text[index.* - 1] != quote) return error.UnterminatedLiteralTerminal;
     } else {
         while (index.* < text.len and !std.ascii.isWhitespace(text[index.*])) index.* += 1;
     }
@@ -1424,12 +1431,28 @@ fn setTokenPrecedence(
     });
 }
 
+fn isLiteralAlias(symbol: []const u8) bool {
+    return isQuotedLiteral(symbol) or isStringLiteral(symbol);
+}
+
 fn isQuotedLiteral(symbol: []const u8) bool {
     return symbol.len >= 2 and symbol[0] == '\'' and symbol[symbol.len - 1] == '\'';
 }
 
+fn isStringLiteral(symbol: []const u8) bool {
+    return symbol.len >= 2 and symbol[0] == '"' and symbol[symbol.len - 1] == '"';
+}
+
 fn isBisonTypeTag(symbol: []const u8) bool {
     return symbol.len >= 2 and symbol[0] == '<' and symbol[symbol.len - 1] == '>';
+}
+
+fn isBisonTokenCode(symbol: []const u8) bool {
+    if (symbol.len == 0) return false;
+    for (symbol) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
 }
 
 fn resolveTerminalName(grammar: Grammar, symbol: []const u8) ?[]const u8 {
@@ -1655,8 +1678,8 @@ test "parseGrammar accepts bison typed declarations and strips semantic actions"
     const source =
         \\%expect 0
         \\%start stmt
-        \\%token <str> IDENT
-        \\%token PLUS '+'
+        \\%token <str> IDENT 258 "identifier"
+        \\%token PLUS 259 '+'
         \\%precedence '+'
         \\%type <node> stmt expr
         \\%%
@@ -1665,13 +1688,13 @@ test "parseGrammar accepts bison typed declarations and strips semantic actions"
         \\  ;
         \\expr:
         \\    expr '+' expr %prec '+' { $$ = make_binary("+", $1, $3); }
-        \\  | IDENT { $$ = make_ident("{not a grammar symbol}"); }
+        \\  | "identifier" { $$ = make_ident("{not a grammar symbol}"); }
         \\  ;
         \\%%
     ;
     const grammar = try parseGrammar(arena, source);
     try std.testing.expectEqual(@as(usize, 2), grammar.tokens.items.len);
-    try std.testing.expectEqual(@as(usize, 1), grammar.token_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.token_aliases.items.len);
     try std.testing.expectEqual(@as(usize, 1), grammar.token_precedences.items.len);
     try std.testing.expectEqual(@as(usize, 2), grammar.rules.items.len);
     try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
@@ -1679,7 +1702,9 @@ test "parseGrammar accepts bison typed declarations and strips semantic actions"
     try std.testing.expectEqual(@as(usize, 3), grammar.rules.items[1].alternatives.items[0].symbols.len);
     try std.testing.expectEqualStrings("'+'", grammar.rules.items[1].alternatives.items[0].precedence_symbol.?);
     try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[1].alternatives.items[1].symbols.len);
+    try std.testing.expectEqualStrings("\"identifier\"", grammar.rules.items[1].alternatives.items[1].symbols[0]);
     try validateGrammar(grammar);
+    try std.testing.expectEqual(try symbolId(grammar, grammar.tokens.items.len + 1, "IDENT"), try symbolId(grammar, grammar.tokens.items.len + 1, "\"identifier\""));
 
     const tables = try buildSlrTables(arena, grammar);
     try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);

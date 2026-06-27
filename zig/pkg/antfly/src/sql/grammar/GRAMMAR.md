@@ -50,7 +50,9 @@ left as broad `%expect` debt. The grammar reader accepts the next layer of
 PostgreSQL/Bison source shape as parser-generator input: typed declaration
 tags such as `%token <str> IDENT`, ignored `%type` metadata, `%precedence`,
 `%%` section separators, literal precedence references through existing token
-aliases, and C/Bison semantic action blocks in rule alternatives. These source
+aliases, declaration numeric token codes, double-quoted token display aliases
+such as `%token <str> IDENT 258 "identifier"`, and C/Bison semantic action
+blocks in rule alternatives. These source
 compatibility features are stripped before table construction so Antfly still
 owns the generated runtime AST and parser facade instead of importing
 PostgreSQL semantic actions. Rule parsing also handles same-line alternatives
