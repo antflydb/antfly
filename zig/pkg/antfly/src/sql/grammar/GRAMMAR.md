@@ -1191,7 +1191,12 @@ contract until storage and API row plans grow those outer-join semantics.
    and document runtime read routing use the generated-aware published read
    family helper before selecting a read shape, and public catalog write routing
    uses the generated-aware published write family when generated DML metadata
-   owns the statement. DML write-kind
+   owns the statement. Prepared statement subject caching uses those same
+   generated-aware published read/write helpers before accepting a stored
+   executable subject. Specialized runtime read-family lowerers for simple
+   select/query, aggregate, set-operation, window, join, and lateral plans also
+   reject generated-owned reads whose retained AST does not match the expected
+   family instead of passing a null generated AST into token fallback. DML write-kind
    helpers apply the same publication check for generated write family and
    recursive CTE flags before shared write lowering selects the generated DML
    execution path.

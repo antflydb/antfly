@@ -209,8 +209,8 @@ pub const Runtime = struct {
 
 fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql) ?sql_adapter.PreparedStatementStatementKind {
     return switch (parsed_sql.statement) {
-        .read => .read,
-        .write => |write| switch (write.kind) {
+        .read => if (parsed_sql.readStatementKindIncludingGeneratedAst() != null) .read else null,
+        .write => switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return null) {
             .insert => .insert,
             .insert_source => .insert_source,
             .update, .update_source, .update_joined_source => .update,
@@ -349,5 +349,37 @@ test "sql prepared statement runtime rejects mismatched subject metadata" {
         .statement_family = .insert,
         .subject_sql = "INSERT INTO usage_records(id) SELECT id FROM incoming_usage;",
     } }, 303));
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
+
+    var malformed_generated_read = try sql_adapter.ParsedSql.initAlloc(alloc, "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'");
+    defer malformed_generated_read.deinit(alloc);
+    if (malformed_generated_read.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| read_ast.source_alias_tokens = null,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expect(malformed_generated_read.readStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expect(preparedStatementFamilyFromParsedSql(&malformed_generated_read) == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
+
+    var malformed_generated_write = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id) SELECT s.id FROM ONLY incoming_usage AS s WHERE s.status = 'open'",
+    );
+    defer malformed_generated_write.deinit(alloc);
+    if (malformed_generated_write.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .dml => |*dml_ast| {
+                if (dml_ast.source_read) |*source_read| {
+                    source_read.source_alias_tokens = null;
+                    source_read.source_alias_name_tokens = null;
+                } else return error.TestUnexpectedResult;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expect(malformed_generated_write.writeStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expect(preparedStatementFamilyFromParsedSql(&malformed_generated_write) == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 }
