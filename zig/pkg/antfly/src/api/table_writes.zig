@@ -5545,13 +5545,27 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn asyncIndexingStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.AsyncIndexingStats {
+        const startup_active = self.startup_catch_up_active.load(.monotonic);
         if (!self.local_db_mutex.tryLock()) {
-            if (self.startup_catch_up_active.load(.monotonic)) {
+            if (startup_active) {
                 if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
             }
             return .{};
         }
         defer self.local_db_mutex.unlock();
+        if (startup_active) {
+            if (self.runtime_status_cache) |snapshot_cache| {
+                const cached = snapshot_cache.summary().async_indexing;
+                if (cached.startup.active or
+                    cached.startup.phase != .idle or
+                    cached.dense_catch_up.active or
+                    cached.dense_catch_up.phase != .idle or
+                    cached.bulk_coalescing.active_session)
+                {
+                    return cached;
+                }
+            }
+        }
         const cache = self.write_cache orelse {
             if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
             return .{};
