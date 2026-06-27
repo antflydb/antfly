@@ -3939,10 +3939,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
-        const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
-            null
-        else
-            identity_namespace;
+        const expected_identity_namespace = identity_namespace;
         if (mode == .status_only) {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
@@ -5555,10 +5552,18 @@ pub const ProvisionedTableWriteSource = struct {
             return .{};
         }
         defer self.local_db_mutex.unlock();
-        const cache = self.write_cache orelse return .{};
+        const cache = self.write_cache orelse {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
+            return .{};
+        };
         var stats = db_mod.types.AsyncIndexingStats{};
+        var observed = false;
         for (cache.entries.items) |entry| {
+            observed = true;
             db_mod.types.accumulateAsyncIndexingStats(&stats, entry.db.snapshotAsyncIndexingStats());
+        }
+        if (!observed) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
         }
         return stats;
     }
@@ -7798,10 +7803,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.write_cache.alloc, self.catalog, table_name, group_id);
-        const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
-            null
-        else
-            identity_namespace;
+        const expected_identity_namespace = identity_namespace;
         if (mode == .status_only) {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
@@ -10378,6 +10380,15 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
 ) !void {
     const snapshot_cache = source.runtime_status_cache orelse return;
     const async_stats = db.snapshotAsyncIndexingStats();
+    if (mode == .best_effort and source.startup_catch_up_active.load(.monotonic)) {
+        if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
+            var status = cached_status;
+            defer status.deinit(alloc);
+            applyStartupCatchUpAsyncOverlay(&status, async_stats, startupCatchUpStatsForPhase(phase, db));
+            try snapshot_cache.upsertGroupStatus(table_name, status);
+        }
+        return;
+    }
     var cached_startup: db_mod.types.StartupCatchUpStats = .{};
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = group_id,
@@ -10838,21 +10849,7 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
     }
 
     if (startup.active) {
-        if (db) |managed_db| {
-            status = .{
-                .group_id = group_id,
-                .stats = try managed_db.runtimeStatusStatsConsistent(alloc),
-            };
-            status_initialized = true;
-            var merged_startup = startup;
-            if (!merged_startup.wal_retention_known) {
-                const cached_startup = try cachedStartupCatchUpStats(snapshot_cache, alloc, table_name, group_id);
-                merged_startup.wal_retention_known = cached_startup.wal_retention_known;
-                merged_startup.wal_retained_segments = cached_startup.wal_retained_segments;
-                merged_startup.wal_retained_bytes = cached_startup.wal_retained_bytes;
-            }
-            applyStartupCatchUpAsyncOverlay(&status, managed_db.snapshotAsyncIndexingStats(), merged_startup);
-        } else if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |owned_status| {
+        if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |owned_status| {
             status = owned_status;
             status_initialized = true;
             var merged_startup = startup;
@@ -10865,6 +10862,9 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
             var merged_existing = status.stats.async_indexing.startup;
             db_mod.types.accumulateStartupCatchUpStats(&merged_existing, merged_startup);
             status.stats.async_indexing.startup = merged_existing;
+            if (db) |managed_db| {
+                applyStartupCatchUpAsyncOverlay(&status, managed_db.snapshotAsyncIndexingStats(), status.stats.async_indexing.startup);
+            }
         } else if (configured_indexes) |summary| {
             status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, startup);
             status_initialized = true;

@@ -3972,6 +3972,9 @@ pub const DB = struct {
 
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
+            // This test drives primary maintenance explicitly; keep detached
+            // primary LSM maintenance from racing the precondition checks.
+            .executor = .{ .backend = .manual },
             .primary_backend = .{ .lsm = .{
                 .flush_threshold = 1,
                 .defer_flush_on_commit = true,
@@ -18736,6 +18739,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    ctx.apply_mutex.lockExclusive();
+    defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);

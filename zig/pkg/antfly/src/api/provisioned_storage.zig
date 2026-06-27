@@ -163,6 +163,7 @@ pub const ProvisionedGroupStorage = struct {
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
     read_cache: table_reads.ProvisionedTableReadCache,
     write_cache: table_writes.ProvisionedTableWriteCache,
+    startup_write_cache: table_writes.ProvisionedTableWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
@@ -175,11 +176,13 @@ pub const ProvisionedGroupStorage = struct {
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
             .read_cache = table_reads.ProvisionedTableReadCache.init(alloc),
             .write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
+            .startup_write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
         self.group_visible_root_generations.deinit(self.alloc);
+        self.startup_write_cache.deinit();
         self.write_cache.deinit();
         self.read_cache.deinit();
         self.runtime_status_cache.deinit();
@@ -214,6 +217,13 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.backend_runtime = self.backend_runtime;
         self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
+        self.startup_write_cache.lsm_cache = null;
+        self.startup_write_cache.hbc_cache = &self.hbc_cache;
+        self.startup_write_cache.resource_manager = &self.resource_manager;
+        self.startup_write_cache.backend_runtime = self.backend_runtime;
+        self.startup_write_cache.antfly_provider = write_source.antfly_provider;
+        self.startup_write_cache.secret_store = write_source.secret_store;
+        self.startup_write_cache.remote_content = write_source.remote_content;
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
@@ -221,6 +231,7 @@ pub const ProvisionedGroupStorage = struct {
         read_source.primary_lookup_db = write_source.primaryLookupDbSource();
         write_source.read_cache = &self.read_cache;
         write_source.write_cache = &self.write_cache;
+        write_source.startup_write_cache = &self.startup_write_cache;
         write_source.runtime_status_cache = &self.runtime_status_cache;
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }
@@ -234,6 +245,7 @@ pub const ProvisionedGroupStorage = struct {
         self.backend_runtime = runtime;
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
+        self.startup_write_cache.backend_runtime = runtime;
         read_source.backend_runtime = runtime;
         write_source.backend_runtime = runtime;
     }
