@@ -3361,6 +3361,17 @@ fn generatedUnaryNegativeMatchesRowExpression(
         std.mem.eql(u8, parsed_expression.operands[0].value_json, "-1");
 }
 
+fn generatedArithmeticOperatorKindMayRepresentRowExpressionKind(
+    generated_kind: generated_parser.GeneratedSqlExpressionKind,
+    parsed_kind: db_mod.types.RelationalRowsExpressionKind,
+) bool {
+    return switch (generated_kind) {
+        .additive, .subtractive => parsed_kind == .add or parsed_kind == .sub,
+        .multiplicative, .divisive, .modulo => parsed_kind == .mul or parsed_kind == .div or parsed_kind == .mod,
+        else => false,
+    };
+}
+
 fn validateGeneratedRowExpressionIdentity(
     tokens: []const Token,
     start: usize,
@@ -3380,7 +3391,7 @@ fn validateGeneratedRowExpressionIdentity(
         },
         else => {
             if (generatedOperatorKindMatchesRowExpressionKind(generated_expression.kind, parsed_expression)) |matches| {
-                if (!matches) return error.UnsupportedSqlShape;
+                if (!matches and !generatedArithmeticOperatorKindMayRepresentRowExpressionKind(generated_expression.kind, parsed_expression.kind)) return error.UnsupportedSqlShape;
                 const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
                 try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
             }
@@ -31286,7 +31297,7 @@ test "sql adapter lower expr lowers arithmetic projections" {
         "SELECT amount + tax * rate - discount / divisor AS net_amount FROM invoices WHERE id = $1",
     );
     defer malformed_generated_arithmetic_kind.deinit(alloc);
-    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_arithmetic_kind, .additive);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_arithmetic_kind, .logical_or);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_arithmetic_kind,
@@ -34305,10 +34316,20 @@ fn corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(parsed_sql:
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .read => |read| {
-                    if (read.projection_items.expressions.len < 2) return error.TestUnexpectedResult;
-                    _ = read.projection_items.expressions[0].function_name_tokens orelse return error.TestUnexpectedResult;
-                    const second_name_tokens = read.projection_items.expressions[1].function_name_tokens orelse return error.TestUnexpectedResult;
-                    read.projection_items.expressions[0].function_name_tokens = second_name_tokens;
+                    var first_function: ?usize = null;
+                    var second_function_name_tokens: ?generated_parser.GeneratedSqlTokenRange = null;
+                    for (read.projection_items.expressions, 0..) |expression, index| {
+                        const name_tokens = expression.function_name_tokens orelse continue;
+                        if (first_function == null) {
+                            first_function = index;
+                            continue;
+                        }
+                        second_function_name_tokens = name_tokens;
+                        break;
+                    }
+                    const first_index = first_function orelse return error.TestUnexpectedResult;
+                    const replacement = second_function_name_tokens orelse return error.TestUnexpectedResult;
+                    read.projection_items.expressions[first_index].function_name_tokens = replacement;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
