@@ -10398,8 +10398,10 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
             var status = cached_status;
             defer status.deinit(alloc);
-            applyStartupCatchUpAsyncOverlay(&status, async_stats, startupCatchUpStatsForPhase(phase, db));
-            try snapshot_cache.upsertGroupStatus(table_name, status);
+            const startup = startupCatchUpStatsForPhase(phase, db);
+            applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
+            markStartupRuntimeStatus(&status, startup);
+            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
         }
         return;
     }
@@ -16791,6 +16793,10 @@ test "provisioned table write source runtime status falls back to shared snapsho
     const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
     items[0] = .{
         .group_id = 7001,
+        .metadata = .{
+            .source = .startup_catch_up,
+            .freshness = .opening,
+        },
         .stats = .{
             .doc_count = 9,
             .index_count = 1,
