@@ -213,6 +213,10 @@ pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
 };
 
+fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
+    return db.open_mode != .query_readonly and db.open_mode != .status_only;
+}
+
 pub fn reconcileDbIndexesWithOptions(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -229,12 +233,10 @@ pub fn reconcileDbIndexesWithOptions(
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
 
-    if (db.open_mode == .query_readonly or db.open_mode == .status_only) {
-        return .{
-            .groups_considered = 0,
-            .dbs_opened = 0,
-        };
-    }
+    // Read/query opens attach to already-persisted index state only. Metadata-driven
+    // materialization is owned by writable provisioners so stale readers never
+    // race the single-writer root contract.
+    if (!dbIndexReconciliationCanMutate(db)) return .{};
 
     const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
@@ -1152,6 +1154,51 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner reconciliation is non-mutating for query read-only dbs" {
+    const path = "/tmp/antfly-metadata-table-provisioner-readonly-reconcile";
+    const indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    {
+        var writer = try db_mod.DB.open(std.testing.allocator, path, .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer writer.close();
+    }
+
+    {
+        var reader = try db_mod.DB.open(std.testing.allocator, path, .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &reader, indexes_json, .{});
+        try std.testing.expect(!summary.indexManagerCatalogChanged());
+        try std.testing.expect(reader.core.textIndex("full_text_index_v0") == null);
+        try std.testing.expectError(error.ReadOnly, reader.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        }));
+        try std.testing.expect(reader.core.textIndex("full_text_index_v0") == null);
+    }
+
+    var writer = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &writer, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expect(writer.core.textIndex("full_text_index_v0") != null);
 }
 
 test "table provisioner reconciles stored algebraic metadata without public type" {

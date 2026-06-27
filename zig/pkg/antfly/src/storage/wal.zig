@@ -1362,6 +1362,18 @@ fn reopenWalSim(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOption
     wal_open.* = true;
 }
 
+fn abandonWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool) void {
+    if (!wal_open.*) return;
+    wal.abandonAfterModeledCrash();
+    wal_open.* = false;
+}
+
+fn reopenWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOptions) !void {
+    abandonWalSimAfterModeledCrash(wal, wal_open);
+    wal.* = try WAL.open(path, opts);
+    wal_open.* = true;
+}
+
 fn applyWalSimAction(
     allocator: Allocator,
     wal: *WAL,
@@ -1843,10 +1855,7 @@ fn replayModeledWalCrashAfterAck(
         &runtime_next_lsn,
     );
     try device_model.device().crash();
-    if (wal_open) {
-        wal.abandonAfterModeledCrash();
-        wal_open = false;
-    }
+    abandonWalSimAfterModeledCrash(&wal, &wal_open);
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -1917,10 +1926,7 @@ fn replayModeledWalCrashFixture(
     };
 
     try device_model.device().crash();
-    if (wal_open) {
-        wal.abandonAfterModeledCrash();
-        wal_open = false;
-    }
+    abandonWalSimAfterModeledCrash(&wal, &wal_open);
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2553,7 +2559,7 @@ fn runModeledWalSimCase(
     }
 
     try device_model.device().crash();
-    try reopenWalSim(&wal, &wal_open, path, opts);
+    try reopenWalSimAfterModeledCrash(&wal, &wal_open, path, opts);
     try verifyWalSimState(allocator, &wal, model.items, runtime_next_lsn, 1);
 }
 
