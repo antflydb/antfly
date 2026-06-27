@@ -6043,6 +6043,15 @@ pub const ApiHttpServer = struct {
         return parsed_kind;
     }
 
+    fn publicSqlWriteStatementKindForCatalogWrite(
+        write_catalog: *const sql_adapter.CatalogLogicalWritePlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) ?sql_adapter.SqlWriteStatementKind {
+        const parsed_kind = parsed_sql.writeStatementKindIncludingGeneratedAst();
+        if (parsed_sql.generatedStatementKind() == .dml) return parsed_kind;
+        return write_catalog.statement.writeKind() orelse parsed_kind;
+    }
+
     fn publicSqlGeneratedReadRowClaimDiagnostic(
         parsed_sql: *const sql_adapter.ParsedSql,
         phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
@@ -6562,7 +6571,7 @@ pub const ApiHttpServer = struct {
             .catalog_write => |*catalog_write| catalog_write,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        const statement_kind = write_catalog.statement.writeKind() orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        const statement_kind = publicSqlWriteStatementKindForCatalogWrite(write_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         switch (statement_kind) {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }

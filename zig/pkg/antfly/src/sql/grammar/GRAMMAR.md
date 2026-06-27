@@ -1189,7 +1189,9 @@ contract until storage and API row plans grow those outer-join semantics.
    no generated read AST is available, so token classifier fallback is reserved
    for statements without generated read payloads. Public row-claim diagnostics
    and document runtime read routing use the generated-aware published read
-   family helper before selecting a read shape. DML write-kind
+   family helper before selecting a read shape, and public catalog write routing
+   uses the generated-aware published write family when generated DML metadata
+   owns the statement. DML write-kind
    helpers apply the same publication check for generated write family and
    recursive CTE flags before shared write lowering selects the generated DML
    execution path.
