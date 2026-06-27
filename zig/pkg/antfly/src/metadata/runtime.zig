@@ -848,7 +848,7 @@ pub fn runFromIterator(
         const run_round_start_ns = platform_time.monotonicNs();
         try server.runRound();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
-        if (run_round_elapsed_ns > std.time.ns_per_s) {
+        if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
         }
         const cdc_round_start_ns = platform_time.monotonicNs();

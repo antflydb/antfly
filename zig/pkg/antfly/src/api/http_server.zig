@@ -3899,6 +3899,7 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
+            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
             return try self.handlePublicClusterBackup(req.body);
         }
         if (req.method == .POST) {
@@ -12219,9 +12220,9 @@ test "api http server requires auth on public routes when enabled" {
 test "api http server dispatches HA admin and internal executors" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{ .status = status },
             };
         }
@@ -12304,9 +12305,9 @@ test "api http server dispatches HA admin and internal executors" {
 test "api http server protects HA admin routes while exempting HA internal routes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{ .status = status },
             };
         }
@@ -20752,6 +20753,75 @@ test "api http server lists cluster backups through public route" {
     try std.testing.expectEqualStrings("docs", parsed.value.backups[0].tables[0]);
     try std.testing.expectEqualStrings(location_uri, parsed.value.backups[0].location);
     try std.testing.expect(parsed.value.backups[0].timestamp.len > 0);
+}
+
+test "api http server forwards cluster backup mutations to metadata leader" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const CaptureForwarder = struct {
+        calls: usize = 0,
+        uri: []u8 = &.{},
+        body: []u8 = &.{},
+
+        fn iface(self: *@This()) RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.uri.len > 0) allocator.free(self.uri);
+            if (self.body.len > 0) allocator.free(self.body);
+            self.* = .{};
+        }
+
+        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.uri.len > 0) allocator.free(self.uri);
+            if (self.body.len > 0) allocator.free(self.body);
+            self.uri = try allocator.dupe(u8, req.uri);
+            self.body = try allocator.dupe(u8, req.body);
+            return .{
+                .status = 202,
+                .content_type = try allocator.dupe(u8, "text/plain"),
+                .body = try allocator.dupe(u8, "forwarded"),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var forwarder = CaptureForwarder{};
+    defer forwarder.deinit(alloc);
+    var server = ApiHttpServer.init(alloc, .{
+        .metadata_mutation_forwarder = forwarder.iface(),
+    }, source.iface(), null, null);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}",
+    });
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expectEqualStrings("forwarded", resp.body);
+    try std.testing.expectEqualStrings("/backup", forwarder.uri);
+    try std.testing.expectEqualStrings("{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}", forwarder.body);
 }
 
 test "api http server backs up and restores a table through public routes" {
