@@ -2224,6 +2224,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP DOMAIN positive_amount, nonempty_text CASCADE", .kind = .unsupported },
     .{ .sql = "DROP EXTENSION vector, postgis", .kind = .unsupported },
     .{ .sql = "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP INDEX CONCURRENTLY usage_status_idx, usage_tenant_idx", .kind = .unsupported },
     .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
     .{ .sql = "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
@@ -2909,7 +2910,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .drop_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .drop_procedure };
         if (second.matchesKeywordTag(.index)) {
-            if (generatedDropCatalogHeadHasMultipleTargets(tokens, 2)) return .{ .unsupported = .drop_index_multi };
+            if (generatedDropIndexHeadHasMultipleTargets(tokens)) return .{ .unsupported = .drop_index_multi };
             return .{ .extension_index = .drop_index };
         }
         if (second.matchesKeywordTag(.schema)) {
@@ -3112,6 +3113,20 @@ fn generatedCreateCatalogHeadHasUnsupportedTail(tokens: []const token_mod.Token,
 
 fn generatedDropCatalogHeadHasMultipleTargets(tokens: []const token_mod.Token, name_start: usize) bool {
     const end = statementTokenEnd(tokens);
+    var index = name_start;
+    _ = consumeGeneratedIfExists(tokens, &index, end);
+    const first = generatedQualifiedNameRange(tokens, index, end) orelse return false;
+    return first.end < end and tokens[first.end].kind == .comma;
+}
+
+fn generatedDropIndexHeadHasMultipleTargets(tokens: []const token_mod.Token) bool {
+    const end = statementTokenEnd(tokens);
+    var index: usize = 2;
+    if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
+    return generatedDropCatalogHeadHasMultipleTargetsFromIndex(tokens, index, end);
+}
+
+fn generatedDropCatalogHeadHasMultipleTargetsFromIndex(tokens: []const token_mod.Token, name_start: usize, end: usize) bool {
     var index = name_start;
     _ = consumeGeneratedIfExists(tokens, &index, end);
     const first = generatedQualifiedNameRange(tokens, index, end) orelse return false;
@@ -7862,6 +7877,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_domain_multi }, (try parseSqlAlloc(alloc, "DROP DOMAIN positive_amount, nonempty_text CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_extension_multi }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector, postgis")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_index_multi }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx, usage_tenant_idx CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_index_multi }, (try parseSqlAlloc(alloc, "DROP INDEX CONCURRENTLY usage_status_idx, usage_tenant_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_materialized_view_multi }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary, old_usage_summary CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_publication_multi }, (try parseSqlAlloc(alloc, "DROP PUBLICATION usage_pub, old_usage_pub")).statement);

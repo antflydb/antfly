@@ -5455,6 +5455,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_index_multi_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DROP INDEX CONCURRENTLY usage_status_idx, usage_tenant_idx",
+            .kind = .drop_index_multi,
+            .reason = .drop_index_multi_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
