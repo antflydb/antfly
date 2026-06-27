@@ -88,12 +88,14 @@ the input token index and terminal id; reduction events report compact
 production/lhs/rhs-length metadata; optional accept callbacks report the
 consumed token count, while raw parser states, action/goto tables, and symbol
 tables stay private. Public `RuleId`, `ProductionInfo`,
-`terminalName`, `ruleName`, `productionInfo`, and `symbolIsNullable` helpers
-provide stable compact interpretation of event ids without exposing the
-underlying parse tables. That
+`terminalName`, `ruleName`, `productionInfo`, `productionRhs`, and
+`symbolIsNullable` helpers provide stable compact interpretation of event ids
+and reduction child-symbol shapes without exposing the underlying parse tables.
+That
 is the production bridge for later generated AST construction: AST builders can
-push token leaves on shifts and combine them on reductions without
-rediscovering syntax from SQL text or depending on table internals. The
+push token leaves on shifts and combine production-shaped children on
+reductions without rediscovering syntax from SQL text or depending on table
+internals. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus

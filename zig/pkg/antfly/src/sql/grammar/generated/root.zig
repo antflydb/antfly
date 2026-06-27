@@ -215976,6 +215976,13 @@ pub fn productionInfo(production: u16) ?ProductionInfo {
     };
 }
 
+pub fn productionRhs(production: u16) ?[]const u16 {
+    if (production >= productions.len) return null;
+    const item = productions[production];
+    const start: usize = @intCast(item.rhs_start);
+    return production_rhs[start .. start + item.rhs_len];
+}
+
 pub fn symbolIsNullable(symbol: u16) ?bool {
     if (symbol >= nullable_symbols.len) return null;
     return nullable_symbols[symbol];

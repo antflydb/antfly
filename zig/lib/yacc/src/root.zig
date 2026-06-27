@@ -1371,6 +1371,13 @@ fn emitZigMetadata(
         \\    };
         \\}
         \\
+        \\pub fn productionRhs(production: u16) ?[]const u16 {
+        \\    if (production >= productions.len) return null;
+        \\    const item = productions[production];
+        \\    const start: usize = @intCast(item.rhs_start);
+        \\    return production_rhs[start .. start + item.rhs_len];
+        \\}
+        \\
         \\pub fn symbolIsNullable(symbol: u16) ?bool {
         \\    if (symbol >= nullable_symbols.len) return null;
         \\    return nullable_symbols[symbol];
@@ -2469,6 +2476,7 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn ruleName(rule: RuleId) []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ProductionInfo = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn productionInfo(production: u16) ?ProductionInfo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn productionRhs(production: u16) ?[]const u16") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolIsNullable(symbol: u16) ?bool") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "fn ruleIdForLhs(lhs: u16) ?RuleId") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".gram_y = \"https://example.test/postgres/gram.y\"") != null);
