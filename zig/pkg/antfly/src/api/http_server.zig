@@ -6291,13 +6291,7 @@ pub const ApiHttpServer = struct {
             .document => {},
             else => return null,
         }
-        const generated_statement = parsed_sql.generated_statement orelse return null;
-        const generated_ast = generated_statement.ast orelse return null;
-        const read = switch (generated_ast) {
-            .read => |read| read,
-            else => return null,
-        };
-        return publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read);
+        return parsed_sql.readStatementKindIncludingGeneratedAst();
     }
 
     fn publicSqlGeneratedReadRowClaimDiagnostic(
@@ -9288,6 +9282,12 @@ pub const ApiHttpServer = struct {
             },
             error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, diagnostic) };
+                }
+                if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, diagnostic) };
+                }
                 if (write_statement_kind == null and
                     !is_read_statement and
                     try self.publicSqlReadOnlyActive(session) and

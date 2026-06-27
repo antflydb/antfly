@@ -16,8 +16,6 @@ const std = @import("std");
 
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
-const classifier = @import("classifier.zig");
-const generated_parser = @import("generated_parser.zig");
 const source_binding = @import("source_binding.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
@@ -428,72 +426,6 @@ fn documentProducerResidualCandidateLimit(bounded_scan_policy: ?source_binding.B
     return max_rows;
 }
 
-fn documentReadKind(parsed_sql: *const tokenized.ParsedSql) ?classifier.SqlReadStatementKind {
-    if (parsed_sql.statement.readKind()) |kind| return kind;
-    const generated_statement = parsed_sql.generated_statement orelse return null;
-    const generated_ast = generated_statement.ast orelse return null;
-    const read = switch (generated_ast) {
-        .read => |read| read,
-        else => return null,
-    };
-    const tokens = parsed_sql.items();
-    if (read.set_operation_tokens != null) return .set_operation;
-    if (read.kind == .lateral) return .lateral;
-    if (read.source_tokens) |source| {
-        if (documentReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
-    }
-    if (read.kind == .window or read.window_tokens != null) return .window;
-    if (read.projection_tokens) |projection| {
-        if (documentReadRangeContainsKeyword(tokens, projection, .over)) return .window;
-    }
-    if (read.kind == .aggregate or
-        (read.distinct_tokens != null and read.distinct_on_items.count == 0) or
-        read.group_tokens != null or
-        read.having_tokens != null or
-        (if (read.projection_tokens) |projection| documentReadRangeHasAggregateFunction(tokens, projection) else false))
-    {
-        return .aggregate;
-    }
-    if (read.kind == .join or read.join_tokens != null) return .join;
-    if (read.source_tokens) |source| {
-        if (documentReadRangeContainsKeyword(tokens, source, .join)) return .join;
-    }
-    return .query;
-}
-
-fn documentReadRangeContainsKeyword(
-    tokens: []const Token,
-    range: generated_parser.GeneratedSqlTokenRange,
-    keyword: TokenKeyword,
-) bool {
-    if (range.end > tokens.len or range.start > range.end) return false;
-    var index = range.start;
-    while (index < range.end) : (index += 1) {
-        if (tokens[index].matchesKeywordTag(keyword)) return true;
-    }
-    return false;
-}
-
-fn documentReadRangeHasAggregateFunction(
-    tokens: []const Token,
-    range: generated_parser.GeneratedSqlTokenRange,
-) bool {
-    if (range.end > tokens.len or range.start > range.end) return false;
-    var index = range.start;
-    while (index < range.end) : (index += 1) {
-        const token = tokens[index];
-        if (token.matchesKeywordTag(.count) or
-            token.matchesKeywordTag(.sum) or
-            token.matchesKeywordTag(.avg) or
-            token.matchesKeywordTag(.min) or
-            token.matchesKeywordTag(.max))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn documentProducerCapabilitiesForRuntimeSchema(
     schema: runtime_schema.TableSchema,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
@@ -536,7 +468,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     const statement_end = documentSqlStatementEnd(tokens);
     const from_index = findTopLevelKeyword(tokens, .from) orelse return error.UnsupportedSqlShape;
     try rejectDocumentSelectProjectionModifier(tokens[1..from_index]);
-    if ((documentReadKind(parsed_sql) orelse return error.UnsupportedSqlShape) != .query) return error.UnsupportedSqlShape;
+    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .query) return error.UnsupportedSqlShape;
 
     const where_index = findTopLevelKeyword(tokens, .where);
     const order_index = findTopLevelKeyword(tokens, .order);
@@ -683,7 +615,7 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     attach_unfiltered_scan: bool,
 ) !DocumentAlgebraicAggregatePlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
-    if ((documentReadKind(parsed_sql) orelse return error.UnsupportedSqlShape) != .aggregate) return error.UnsupportedSqlShape;
+    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .aggregate) return error.UnsupportedSqlShape;
 
     const tokens = parsed_sql.items();
     if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;

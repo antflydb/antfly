@@ -295,6 +295,14 @@ pub const ParsedSql = struct {
         return self.statement.readKind();
     }
 
+    pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?classifier.SqlReadStatementKind {
+        return self.readStatementKind() orelse self.generatedReadStatementKind();
+    }
+
+    pub fn generatedReadStatementKind(self: *const ParsedSql) ?classifier.SqlReadStatementKind {
+        return generatedReadStatementKindFromRaw(self.items(), self.generated_statement orelse return null);
+    }
+
     pub fn writeStatementKind(self: *const ParsedSql) ?classifier.SqlWriteStatementKind {
         return self.statement.writeKind();
     }
@@ -1427,7 +1435,7 @@ fn parseStatement(
             .dml => if (generatedDmlStatementKind(tokenized_sql.items(), generated_raw)) |generated| {
                 return .{ .write = .{ .kind = generated.write_kind, .raw = raw_statement, .recursive = generated.recursive } };
             } else return .{ .unknown = raw_statement },
-            .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind|
+            .read => if (generatedReadStatementKindFromRaw(tokenized_sql.items(), generated_raw)) |kind|
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } }
             else
                 return .{ .unknown = raw_statement },
@@ -2778,7 +2786,7 @@ fn generatedDmlCommandKeywordMatchesKind(token: Token, kind: generated_parser.Ge
     };
 }
 
-fn generatedReadStatementKind(
+fn generatedReadStatementKindFromRaw(
     tokens: []const Token,
     generated_raw: GeneratedRawSqlStatement,
 ) ?classifier.SqlReadStatementKind {
