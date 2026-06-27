@@ -6401,6 +6401,9 @@ pub const ApiHttpServer = struct {
             }
         };
         defer lowered.deinit(self.alloc);
+        if (publicSqlReadUnsupportedRowClaimDiagnostic(&lowered, .plan)) |diagnostic| {
+            return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+        }
         self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
@@ -29409,6 +29412,19 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try std.testing.expectEqual(@as(u16, 501), aggregate_claim_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, aggregate_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, aggregate_claim_resp.body, "lockable base-row source for aggregate row claim");
+
+    var describe_aggregate_claim = try server.handlePublicSqlDescribeRequestResult(.{
+        .sql = "SELECT status, COUNT(*) AS count FROM usage_records GROUP BY status FOR UPDATE;",
+    }, null);
+    defer describe_aggregate_claim.deinit(alloc);
+    switch (describe_aggregate_claim) {
+        .response => |response| {
+            try std.testing.expectEqual(@as(u16, 501), response.status);
+            try expectPublicSqlDiagnosticBody(alloc, response.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+            try expectPublicSqlDiagnosticMissingNativeModel(alloc, response.body, "lockable base-row source for aggregate row claim");
+        },
+        .result => return error.TestUnexpectedResult,
+    }
 
     var join_claim_resp = try server.handle(.{
         .method = .POST,

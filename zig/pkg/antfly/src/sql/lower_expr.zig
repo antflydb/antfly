@@ -3219,6 +3219,12 @@ fn generatedOperatorKindMatchesRowExpressionKind(
     parsed_expression: db_mod.types.RelationalRowsExpression,
 ) ?bool {
     return switch (generated_kind) {
+        .unary_negative => generatedUnaryNegativeMatchesRowExpression(parsed_expression),
+        .additive => parsed_expression.kind == .add,
+        .subtractive => parsed_expression.kind == .sub,
+        .multiplicative => parsed_expression.kind == .mul,
+        .divisive => parsed_expression.kind == .div,
+        .modulo => parsed_expression.kind == .mod,
         .string_concat => parsed_expression.kind == .concat,
         .json_access, .json_text_access, .json_path_access, .json_path_text_access => parsed_expression.kind == .json_extract,
         .json_key_exists => parsed_expression.kind == .json_path_exists,
@@ -3226,6 +3232,16 @@ fn generatedOperatorKindMatchesRowExpressionKind(
         .json_key_all => parsed_expression.kind == .json_path_exists or parsed_expression.kind == .bool_and,
         else => null,
     };
+}
+
+fn generatedUnaryNegativeMatchesRowExpression(
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+) bool {
+    if (parsed_expression.kind == .value) return std.mem.startsWith(u8, parsed_expression.value_json, "-");
+    return parsed_expression.kind == .mul and
+        parsed_expression.operands.len == 2 and
+        parsed_expression.operands[0].kind == .value and
+        std.mem.eql(u8, parsed_expression.operands[0].value_json, "-1");
 }
 
 fn validateGeneratedRowExpressionIdentity(
@@ -30935,6 +30951,20 @@ test "sql adapter lower expr lowers unary minus projections" {
     try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, lowered.plan.query.order_by[0].expression.?.kind);
 
+    var malformed_generated_unary_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT -amount AS neg_amount FROM usage_records WHERE -amount < $1 ORDER BY -amount DESC LIMIT 5",
+    );
+    defer malformed_generated_unary_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_unary_kind, .additive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_unary_kind,
+        schema,
+        &.{.{ .integer = 0 }},
+        .{},
+    ));
+
     var aggregate = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT SUM(-amount) AS negative_total FROM usage_records",
@@ -31061,6 +31091,20 @@ test "sql adapter lower expr lowers arithmetic projections" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
     try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
 
+    var malformed_generated_arithmetic_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT amount + tax * rate - discount / divisor AS net_amount FROM invoices WHERE id = $1",
+    );
+    defer malformed_generated_arithmetic_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_arithmetic_kind, .additive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_arithmetic_kind,
+        schema,
+        &.{.{ .string = "inv1" }},
+        .{},
+    ));
+
     var lowered_mod = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT amount % divisor AS amount_remainder FROM invoices WHERE id = $1",
@@ -31074,6 +31118,20 @@ test "sql adapter lower expr lowers arithmetic projections" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, lowered_mod.plan.query.expressions[0].expression.kind);
     try std.testing.expectEqualStrings("amount", lowered_mod.plan.query.expressions[0].expression.operands[0].field);
     try std.testing.expectEqualStrings("divisor", lowered_mod.plan.query.expressions[0].expression.operands[1].field);
+
+    var malformed_generated_mod_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT amount % divisor AS amount_remainder FROM invoices WHERE id = $1",
+    );
+    defer malformed_generated_mod_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_mod_kind, .divisive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_mod_kind,
+        schema,
+        &.{.{ .string = "inv1" }},
+        .{},
+    ));
 
     var lowered_mod_function = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -31747,6 +31805,19 @@ test "sql adapter lower expr lowers grouped aggregate queries" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_inputs.aggregate.aggregations[1].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_inputs.aggregate.aggregations[1].expression.?.operands[0].kind);
     try std.testing.expectEqualStrings("shifted_remainder", modulo_inputs.aggregate.order_by[0].field);
+
+    var malformed_generated_aggregate_arithmetic_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, SUM(amount % 7) AS amount_remainder FROM usage_records GROUP BY customer",
+    );
+    defer malformed_generated_aggregate_arithmetic_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionArgumentExpressionKind(&malformed_generated_aggregate_arithmetic_kind, .divisive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_aggregate_arithmetic_kind,
+        schema,
+        &.{},
+    ));
 
     var malformed_generated_aggregate_function_name = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -33970,6 +34041,28 @@ fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(parsed_sql
                         if (expression.argument_items.expressions.len == 0) continue;
                         if (expression.argument_items.expressions[0].tokens == null) return error.TestUnexpectedResult;
                         expression.argument_items.expressions[0].tokens = source_tokens;
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.argument_items.expressions.len == 0) continue;
+                        expression.argument_items.expressions[0].kind = kind;
                         return;
                     }
                     return error.TestUnexpectedResult;
@@ -42442,6 +42535,19 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_window.plan.window.windows[1].value_expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_window.plan.window.windows[1].value_expression.?.operands[0].kind);
     try std.testing.expectEqualStrings("running_remainder", modulo_window.plan.window.order_by[0].field);
+
+    var malformed_generated_window_arithmetic_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount % 7) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_remainder FROM usage_records WHERE status = 'open' ORDER BY running_remainder DESC LIMIT 5",
+    );
+    defer malformed_generated_window_arithmetic_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionArgumentExpressionKind(&malformed_generated_window_arithmetic_kind, .divisive);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_window_arithmetic_kind,
+        schema,
+        &.{},
+    ));
 
     var boolean_windows = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,

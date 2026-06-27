@@ -1170,7 +1170,10 @@ contract until storage and API row plans grow those outer-join semantics.
    function-call metadata against the typed row-expression function kind, and
    exact-range generated JSON key/extract and string-concat operator metadata
    against the typed row-expression operator kind, before accepting retained
-   predicate payloads; generated regex predicate handoffs now also require the
+   predicate payloads; exact-range generated arithmetic operator metadata for
+   unary negative, `+`, `-`, `*`, `/`, and `%` now validates against the typed
+   row-expression operator before projection, aggregate-input, window-input,
+   predicate, and order-expression handoffs accept it; generated regex predicate handoffs now also require the
    exact POSIX regex operator kind, reject stray quantifier/escape/negation
    payloads, and require the right operand range to start immediately after the
    operator before typed `regexp_match` conditions are accepted;
