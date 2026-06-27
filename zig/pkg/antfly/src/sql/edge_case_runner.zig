@@ -204,7 +204,7 @@ fn expectSqlAdapterEdgeCaseClassifyWrite(
 ) !void {
     try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
     const expected_kind = edge_case.expected_write_kind orelse return error.TestUnexpectedResult;
-    const actual = parsed_sql.writeStatementKind() orelse return error.TestUnexpectedResult;
+    const actual = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(expected_kind, actual);
 }
 

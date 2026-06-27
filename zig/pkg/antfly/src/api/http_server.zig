@@ -31,12 +31,13 @@ const relational_sql_ddl = @import("relational_sql_ddl.zig");
 const sql_adapter_runtime = @import("../sql/runtime.zig");
 const catalog_jobs = @import("catalog_jobs.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const sql_cursors = sql_adapter.cursors;
-const sql_notifications = sql_adapter.notifications;
-const sql_prepared_statements = sql_adapter.prepared_statements;
-const sql_routines = sql_adapter.routines;
-const sql_savepoints = sql_adapter.savepoints;
-const sql_sessions = sql_adapter.sessions;
+const api_sql = @import("sql/mod.zig");
+const sql_cursors = api_sql.cursors;
+const sql_notifications = api_sql.notifications;
+const sql_prepared_statements = api_sql.prepared_statements;
+const sql_routines = api_sql.routines;
+const sql_savepoints = api_sql.savepoints;
+const sql_sessions = api_sql.sessions;
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -9462,7 +9463,7 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        if (parsed_sql.readStatementKind()) |read_kind| {
+        if (parsed_sql.readStatementKindIncludingGeneratedAst()) |read_kind| {
             if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, read_kind)) |outcome_value| {
                 var outcome = outcome_value;
                 errdefer outcome.deinit(self.alloc);

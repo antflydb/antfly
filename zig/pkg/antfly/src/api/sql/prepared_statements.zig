@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("mod.zig");
+const sql_adapter = @import("../../sql/mod.zig");
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,

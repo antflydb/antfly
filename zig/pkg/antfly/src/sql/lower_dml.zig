@@ -15414,7 +15414,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         schema,
         &.{},
         options,
-        parsed_generated_source_update.writeStatementKind() orelse return error.TestUnexpectedResult,
+        parsed_generated_source_update.writeStatementKindIncludingGeneratedAst() orelse return error.TestUnexpectedResult,
     );
     defer generated_source_update.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", generated_source_update.table_name);
@@ -15466,7 +15466,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         schema,
         &.{},
         options,
-        parsed_generated_source_delete.writeStatementKind() orelse return error.TestUnexpectedResult,
+        parsed_generated_source_delete.writeStatementKindIncludingGeneratedAst() orelse return error.TestUnexpectedResult,
     );
     defer generated_source_delete.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", generated_source_delete.table_name);

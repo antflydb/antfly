@@ -954,6 +954,10 @@ Unsupported DDL remains on the existing parser until
    insert-source and relation-source writes, and fails closed when retained
    generated kind metadata is missing or internally inconsistent instead of
    falling back to legacy write-family classification.
+   Write planning now consumes a single generated-validated published write
+   statement record carrying both write family and recursive-CTE state, so typed
+   write lowering cannot validate the generated DML family and then route
+   recursive mutations from a separate handwritten-only flag.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
    now use generated fail-closed diagnostics instead of classifier fallback.
@@ -1437,6 +1441,10 @@ beyond the generated AST item span and only notice clause drift after
 fallback-style token parsing. Simple, aggregate, and window read source
 lowering also validates parsed table consumption against retained simple-source
 table/alias spans before typed planning continues.
+Public SQL special-case read dispatch for Antfly query functions also uses the
+shared generated-aware read classifier, so generated-covered reads with stale or
+inconsistent retained read metadata reach the normal fail-closed planning
+diagnostic path instead of being routed by handwritten classification first.
    Completing the generated-parser-only read path still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

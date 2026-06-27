@@ -13,12 +13,12 @@
 // limitations.
 
 const std = @import("std");
-const extension_domain = @import("../extensions/mod.zig");
-const docstore_mod = @import("../storage/docstore.zig");
-const relational_rows = @import("../api/relational_rows.zig");
-const runtime_schema = @import("../storage/schema.zig");
-const sql_adapter = @import("mod.zig");
-const table_catalog = @import("../api/table_catalog.zig");
+const extension_domain = @import("../../extensions/mod.zig");
+const docstore_mod = @import("../../storage/docstore.zig");
+const relational_rows = @import("../relational_rows.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const sql_adapter = @import("../../sql/mod.zig");
+const table_catalog = @import("../table_catalog.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,

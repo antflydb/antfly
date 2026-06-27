@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const relational_rows_api = @import("../api/relational_rows.zig");
-const runtime_schema = @import("../storage/schema.zig");
-const sql_adapter = @import("mod.zig");
-const table_reads = @import("../api/table_reads.zig");
+const relational_rows_api = @import("../relational_rows.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const sql_adapter = @import("../../sql/mod.zig");
+const table_reads = @import("../table_reads.zig");
 
 pub const ReadResult = struct {
     result: table_reads.LoweredSqlReadPlanResult,
