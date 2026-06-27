@@ -1609,6 +1609,15 @@ Current implementation status:
 - Corpus coverage now uses centralized plan root/read/merge kind helpers for
   read, merge, and recursive insert-source plan-family checks instead of
   repeated raw prefix probes.
+- Set-operation source-table fixture checks use the same shared exact
+  plan-token scanner for nested right-side table fingerprints, so suffix
+  matches and duplicate `:right=right:table=` tokens cannot claim coverage.
+  The scanner also detects immediately adjacent duplicate plan tokens instead
+  of skipping the delimiter between segments.
+- Specialized runtime DML lowerers now validate generated-owned write family
+  metadata before lowering insert, insert-source, update, delete, truncate,
+  joined mutation-source, and merge plans, so mismatched generated DML ASTs fail
+  closed instead of flowing into token fallback.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

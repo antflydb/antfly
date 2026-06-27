@@ -2882,8 +2882,10 @@ pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_t
         .delete_joined_source,
         .merge_mutation,
         => planHasExactStringToken(entry.plan, ":source=", source_table_name),
-        .read => planHasExactStringToken(entry.plan, ":right=", source_table_name) or
-            setOperationPlanHasRightTable(entry.plan, source_table_name),
+        .read => if (readPlanHasKind(entry.plan, "set_operation"))
+            setOperationPlanHasRightTable(entry.plan, source_table_name)
+        else
+            planHasExactStringToken(entry.plan, ":right=", source_table_name),
         .join,
         .lateral,
         => planHasExactStringToken(entry.plan, ":right=", source_table_name),
@@ -2892,11 +2894,7 @@ pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_t
 }
 
 fn setOperationPlanHasRightTable(plan: []const u8, source_table_name: []const u8) bool {
-    const token = ":right=right:table=";
-    const index = std.mem.indexOf(u8, plan, token) orelse return false;
-    const value_start = index + token.len;
-    const value_end = std.mem.indexOfScalarPos(u8, plan, value_start, ':') orelse plan.len;
-    return std.mem.eql(u8, plan[value_start..value_end], source_table_name);
+    return planHasExactStringToken(plan, ":right=right:table=", source_table_name);
 }
 
 pub fn corpusFixtureSqlParameterCoverageMatchesAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !bool {
@@ -5146,7 +5144,7 @@ pub const PlanFingerprintView = struct {
             while (value_end < self.plan.len and self.plan[value_end] != ':') : (value_end += 1) {}
             if (found != null) return .invalid;
             found = self.plan[value_start..value_end];
-            start = value_end + 1;
+            start = value_end;
         }
         if (found) |value| return .{ .value = value };
         return .absent;
@@ -6477,6 +6475,14 @@ test "sql adapter corpus owns fixture family policies" {
     ));
     try std.testing.expect(corpusFixturePlanMatchesSourceTable(
         .{ .name = "set operation", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
+        "archived_records",
+    ));
+    try std.testing.expect(!corpusFixturePlanMatchesSourceTable(
+        .{ .name = "set operation table suffix", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records_extra", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
+        "archived_records",
+    ));
+    try std.testing.expect(!corpusFixturePlanMatchesSourceTable(
+        .{ .name = "set operation duplicate right table", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records:right=right:table=other_records", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
         "archived_records",
     ));
     const alloc = std.testing.allocator;

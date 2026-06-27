@@ -665,6 +665,22 @@ fn generatedReadAstOrUnsupported(
     return null;
 }
 
+fn requireGeneratedDmlWriteFamily(
+    parsed_sql: *const sql_adapter.ParsedSql,
+    allowed_kinds: []const sql_adapter.SqlWriteStatementKind,
+    expected_recursive: ?bool,
+) !void {
+    if (parsed_sql.generatedStatementKind() != .dml) return;
+    const published = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    if (expected_recursive) |recursive| {
+        if (published.recursive != recursive) return error.UnsupportedSqlShape;
+    }
+    for (allowed_kinds) |allowed| {
+        if (published.kind == allowed) return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
 pub fn lowerSelectAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -1261,6 +1277,22 @@ fn corruptRuntimeTestGeneratedReadKind(
     return error.TestUnexpectedResult;
 }
 
+fn corruptRuntimeTestGeneratedDmlKind(
+    parsed_sql: *sql_adapter.ParsedSql,
+    kind: sql_adapter.generated_parser.GeneratedSqlDmlKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .dml => |dml| {
+                dml.kind = kind;
+                return;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "sql runtime specialized read lowerers fail closed on mismatched generated read AST family" {
     const alloc = std.testing.allocator;
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
@@ -1296,6 +1328,72 @@ test "sql runtime specialized read lowerers fail closed on mismatched generated 
     defer window_sql.deinit(alloc);
     try corruptRuntimeTestGeneratedReadKind(&window_sql, .query);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanParsedSqlAlloc(alloc, &window_sql, schema, &.{}));
+}
+
+test "sql runtime specialized dml lowerers fail closed on generated write family mismatch" {
+    const alloc = std.testing.allocator;
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const NoopResolver = struct {
+        fn resolver(self: *@This()) relational_rows.UniqueSelectorResolver {
+            return .{
+                .ptr = self,
+                .resolve = resolve,
+            };
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]u8 {
+            return null;
+        }
+    };
+    var resolver_ctx = NoopResolver{};
+    const resolver = resolver_ctx.resolver();
+    const txn_id = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .owner_id = "sql-runtime-generated-dml-guard",
+        .txn_id = txn_id,
+    };
+
+    var corrupted_insert = try sql_adapter.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')");
+    defer corrupted_insert.deinit(alloc);
+    try corruptRuntimeTestGeneratedDmlKind(&corrupted_insert, .update);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerInsertWithResolverParsedSqlAlloc(alloc, &corrupted_insert, schema, &.{}, resolver),
+    );
+
+    var insert_source = try sql_adapter.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) SELECT id, status FROM usage_records");
+    defer insert_source.deinit(alloc);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerInsertWithResolverParsedSqlAlloc(alloc, &insert_source, schema, &.{}, resolver),
+    );
+
+    var point_update = try sql_adapter.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'closed' WHERE id = 'u1'");
+    defer point_update.deinit(alloc);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerUpdateMutationSourceParsedSqlAlloc(alloc, &point_update, schema, &.{}, claim),
+    );
+
+    var point_delete = try sql_adapter.ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE id = 'u1'");
+    defer point_delete.deinit(alloc);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerDeleteMutationSourceParsedSqlAlloc(alloc, &point_delete, schema, &.{}, claim),
+    );
+
+    var merge_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING usage_records ON usage_records.id = usage_records.id WHEN MATCHED THEN UPDATE SET status = 'closed'");
+    defer merge_sql.deinit(alloc);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerRecursiveMergeMutationWithSchemasParsedSqlAlloc(alloc, &merge_sql, schema, schema, &.{}),
+    );
 }
 
 test "sql runtime non catalog document reads use conservative capabilities" {
@@ -1706,6 +1804,7 @@ fn lowerInsertParsedSqlAlloc(
     params: []const SqlValue,
 ) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1751,6 +1850,7 @@ fn lowerInsertWithResolverAndFunctionBindingsParsedSqlAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1787,6 +1887,7 @@ pub fn lowerInsertWithResolverStrictParsedSqlAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1830,6 +1931,7 @@ fn lowerInsertSourceWithResolverAndFunctionBindingsParsedSqlAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredInsertSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1881,6 +1983,7 @@ fn lowerInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
 ) !LoweredInsertSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1934,6 +2037,7 @@ fn lowerRecursiveInsertSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
 ) !LoweredRecursiveInsertSource {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.insert_source}, true);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -1988,6 +2092,7 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedS
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{ .update_source, .update_joined_source }, true);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2041,6 +2146,7 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedS
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{ .delete_source, .delete_joined_source }, true);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2089,6 +2195,7 @@ fn lowerUpdateWithFunctionBindingsParsedSqlAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2125,6 +2232,7 @@ pub fn lowerUpdateStrictParsedSqlAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2168,6 +2276,7 @@ fn lowerDeleteWithFunctionBindingsParsedSqlAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.delete}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2216,6 +2325,7 @@ fn lowerUpdateMutationSourceWithFunctionBindingsParsedSqlAlloc(
 ) !LoweredMutationSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2264,6 +2374,7 @@ fn lowerDeleteMutationSourceWithFunctionBindingsParsedSqlAlloc(
 ) !LoweredMutationSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.delete_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2299,6 +2410,7 @@ fn lowerTruncateMutationSourceParsedSqlAlloc(
 ) !LoweredMutationSource {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.truncate}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2345,6 +2457,7 @@ fn lowerMergeMutationPlanWithFunctionBindingsParsedSqlAlloc(
 ) !LoweredMergeMutationPlan {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.merge}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2390,6 +2503,7 @@ fn lowerRecursiveMergeMutationWithSchemasAndFunctionBindingsParsedSqlAlloc(
 ) !LoweredRecursiveMergeMutation {
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.merge}, true);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2539,6 +2653,7 @@ fn lowerUpdateJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.update_joined_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -2602,6 +2717,7 @@ fn lowerDeleteJoinedMutationSourceWithSchemasAndFunctionBindingsParsedSqlAlloc(
     if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    try requireGeneratedDmlWriteFamily(parsed_sql, &.{.delete_joined_source}, false);
     const tokens = parsed_sql.items();
 
     var parser = Parser{
