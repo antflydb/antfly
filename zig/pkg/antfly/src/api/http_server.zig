@@ -6190,7 +6190,7 @@ pub const ApiHttpServer = struct {
         for (read.cte_items) |cte| {
             if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
         }
-        if (read.row_lock_tokens == null) return null;
+        if (read.row_lock_tokens == null and !publicSqlTokensContainRowClaim(parsed_sql.items())) return null;
         return switch (parsed_sql.readStatementKind() orelse publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read)) {
             .query => null,
             .aggregate => "lockable base-row source for aggregate row claim",
@@ -6200,6 +6200,24 @@ pub const ApiHttpServer = struct {
             .set_operation => "lockable base-row source for set-operation row claim",
             .recursive_cte => "lockable base-row source for recursive CTE row claim",
         };
+    }
+
+    fn publicSqlTokensContainRowClaim(tokens: []const sql_adapter.Token) bool {
+        var index: usize = 0;
+        while (index < tokens.len) : (index += 1) {
+            if (!tokens[index].matchesKeywordTag(.@"for")) continue;
+            var next = index + 1;
+            while (next < tokens.len and tokens[next].kind == .semicolon) : (next += 1) {}
+            if (next >= tokens.len) return false;
+            if (tokens[next].matchesKeywordTag(.update) or tokens[next].matchesKeywordTag(.share)) return true;
+            if (tokens[next].matchesKeywordTag(.no) and next + 2 < tokens.len and
+                tokens[next + 1].matchesKeywordTag(.key) and tokens[next + 2].matchesKeywordTag(.update))
+            {
+                return true;
+            }
+            if (tokens[next].matchesKeywordTag(.key) and next + 1 < tokens.len and tokens[next + 1].matchesKeywordTag(.share)) return true;
+        }
+        return false;
     }
 
     fn publicSqlGeneratedReadKindForRowClaimDiagnostic(
@@ -9196,6 +9214,9 @@ pub const ApiHttpServer = struct {
             .read => true,
             else => false,
         };
+        if (is_read_statement) {
+            try self.enforceAntflyQueryFunctionReadPermissionBeforeCatalogPlanning(parsed_sql, session.session(), authenticated_identity);
+        }
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         var write_options: sql_adapter.LowerWritePlanOptions = .{};
         var row_claim_owner_id: ?[]const u8 = null;
@@ -9318,6 +9339,17 @@ pub const ApiHttpServer = struct {
                 .response => {},
             }
             return outcome;
+        }
+        if (parsed_sql.readStatementKind()) |read_kind| {
+            if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, read_kind)) |outcome_value| {
+                var outcome = outcome_value;
+                errdefer outcome.deinit(self.alloc);
+                switch (outcome) {
+                    .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
+                    .response => {},
+                }
+                return outcome;
+            }
         }
         var planned_or_response = self.planPublicParsedSqlExecutionAlloc(parsed_sql, session, request.authenticated_identity) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => {
