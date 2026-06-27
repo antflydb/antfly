@@ -211,6 +211,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     var active_rule: ?usize = null;
     var skip_percent_prologue = false;
     var skip_brace_block_depth: usize = 0;
+    var skip_block_comment = false;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
@@ -223,7 +224,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             continue;
         }
 
-        const without_comment = stripLineComment(raw_line);
+        const without_comment = try stripCommentsAlloc(allocator, raw_line, &skip_block_comment);
         var line = std.mem.trim(u8, without_comment, " \t\r");
         if (line.len == 0) continue;
 
@@ -297,15 +298,17 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             }
         }
 
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const name = std.mem.trim(u8, line[0..colon], " \t\r");
-            if (name.len == 0) return error.InvalidRuleName;
-            try grammar.rules.append(allocator, .{ .name = try dupToken(allocator, name) });
-            active_rule = grammar.rules.items.len - 1;
-            const rest = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
-            if (rest.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
-            if (ends_rule) active_rule = null;
-            continue;
+        if (active_rule == null) {
+            if (indexOfRuleColon(line)) |colon| {
+                const name = std.mem.trim(u8, line[0..colon], " \t\r");
+                if (name.len == 0) return error.InvalidRuleName;
+                try grammar.rules.append(allocator, .{ .name = try dupToken(allocator, name) });
+                active_rule = grammar.rules.items.len - 1;
+                const rest = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+                if (rest.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
+                if (ends_rule) active_rule = null;
+                continue;
+            }
         }
 
         if (active_rule) |rule_idx| {
@@ -326,6 +329,23 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     }
 
     return grammar;
+}
+
+fn indexOfRuleColon(line: []const u8) ?usize {
+    var index: usize = 0;
+    var quote: ?u8 = null;
+    while (index < line.len) : (index += 1) {
+        if ((line[index] == '\'' or line[index] == '"') and (index == 0 or line[index - 1] != '\\')) {
+            if (quote == line[index]) {
+                quote = null;
+            } else if (quote == null) {
+                quote = line[index];
+            }
+            continue;
+        }
+        if (quote == null and line[index] == ':') return index;
+    }
+    return null;
 }
 
 fn isIgnoredBisonDirective(line: []const u8) bool {
@@ -376,24 +396,53 @@ fn braceDepthAfterLine(line: []const u8, initial_depth: usize) !usize {
     return depth;
 }
 
-fn stripLineComment(line: []const u8) []const u8 {
+fn stripCommentsAlloc(allocator: std.mem.Allocator, line: []const u8, in_block_comment: *bool) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     var index: usize = 0;
     var quote: ?u8 = null;
-    while (index + 1 < line.len) : (index += 1) {
+    while (index < line.len) {
+        if (in_block_comment.*) {
+            if (index + 1 < line.len and line[index] == '*' and line[index + 1] == '/') {
+                in_block_comment.* = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
         if ((line[index] == '\'' or line[index] == '"') and (index == 0 or line[index - 1] != '\\')) {
             if (quote == line[index]) {
                 quote = null;
             } else if (quote == null) {
                 quote = line[index];
             }
+            try out.append(allocator, line[index]);
+            index += 1;
             continue;
         }
-        if (quote == null and line[index] == '/' and line[index + 1] == '/') {
-            if (index == 0 or std.ascii.isWhitespace(line[index - 1])) return line[0..index];
-            index += 1;
+        if (quote == null and index + 1 < line.len and line[index] == '/' and line[index + 1] == '*') {
+            if (std.mem.indexOfPos(u8, line, index + 2, "*/")) |end_comment| {
+                if (isEmptyBlockCommentContent(line[index + 2 .. end_comment])) {
+                    try out.appendSlice(allocator, " %empty ");
+                }
+            }
+            in_block_comment.* = true;
+            index += 2;
+            continue;
         }
+        if (quote == null and index + 1 < line.len and line[index] == '/' and line[index + 1] == '/') {
+            if (index == 0 or std.ascii.isWhitespace(line[index - 1])) break;
+        }
+        try out.append(allocator, line[index]);
+        index += 1;
     }
-    return line;
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isEmptyBlockCommentContent(content: []const u8) bool {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(trimmed, "empty");
 }
 
 fn parseReference(grammar: *Grammar, line: []const u8) !void {
@@ -460,7 +509,7 @@ fn parsePrecedenceDeclaration(
 
 fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8) !void {
     const trimmed = std.mem.trim(u8, text, " \t\r");
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "/* empty */")) {
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "%empty") or std.mem.eql(u8, trimmed, "/* empty */")) {
         try rule.alternatives.append(allocator, .{ .symbols = &.{} });
         return;
     }
@@ -506,9 +555,18 @@ fn appendAlternatives(allocator: std.mem.Allocator, rule: *Rule, text: []const u
 }
 
 fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
-    while (index.* < text.len and std.ascii.isWhitespace(text[index.*])) index.* += 1;
+    while (true) {
+        while (index.* < text.len and std.ascii.isWhitespace(text[index.*])) index.* += 1;
+        if (index.* + 1 < text.len and text[index.*] == '/' and text[index.* + 1] == '*') {
+            index.* += 2;
+            while (index.* + 1 < text.len and !(text[index.*] == '*' and text[index.* + 1] == '/')) index.* += 1;
+            if (index.* + 1 >= text.len) return null;
+            index.* += 2;
+            continue;
+        }
+        break;
+    }
     if (index.* >= text.len) return null;
-    if (index.* + 1 < text.len and text[index.*] == '/' and text[index.* + 1] == '*') return null;
     if (text[index.*] == '{') {
         try skipActionBlock(text, index);
         return try nextGrammarSymbol(text, index);
@@ -1846,6 +1904,36 @@ test "parseGrammar skips multiline bison prologue directive and action blocks" {
     try std.testing.expectEqualStrings("IDENT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
     try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[1].symbols.len);
     try validateGrammar(grammar);
+}
+
+test "parseGrammar handles bison empty productions and block comments" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%reference postgres_gram_y https://example.test/postgres/gram.y
+        \\%start stmt
+        \\%token IDENT URL
+        \\/*
+        \\ * top-level comment
+        \\ */
+        \\stmt:
+        \\    IDENT /* inline comment */ URL
+        \\  | "https://example.test/not//comment" /* trailing comment */
+        \\  | %empty
+        \\  | /*EMPTY*/
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqualStrings("https://example.test/postgres/gram.y", grammar.postgres_gram_y);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items.len);
+    try std.testing.expectEqual(@as(usize, 4), grammar.rules.items[0].alternatives.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("IDENT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try std.testing.expectEqualStrings("URL", grammar.rules.items[0].alternatives.items[0].symbols[1]);
+    try std.testing.expectEqualStrings("\"https://example.test/not//comment\"", grammar.rules.items[0].alternatives.items[1].symbols[0]);
+    try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[2].symbols.len);
+    try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[3].symbols.len);
 }
 
 test "buildSlrTables builds conflict-free tables for a small grammar" {
