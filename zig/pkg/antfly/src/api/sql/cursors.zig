@@ -162,7 +162,7 @@ pub const Runtime = struct {
         var read = try self.fetchFromPortal(portal_value, plan, false);
         defer read.deinit(self.alloc);
         return switch (read.result) {
-            .query => |query| query.rows.len,
+            .query => |query| query.total,
             else => 0,
         };
     }
@@ -317,4 +317,61 @@ fn cloneColumnsAlloc(alloc: std.mem.Allocator, columns: []const runtime_schema.R
         try owned.append(alloc, cloned);
     }
     return try owned.toOwnedSlice(alloc);
+}
+
+test "sql cursor runtime owns portals and fetch positions" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const session_id: u64 = 42;
+    var rows = try alloc.alloc([]const u8, 3);
+    rows[0] = try alloc.dupe(u8, "{\"id\":\"a\"}");
+    rows[1] = try alloc.dupe(u8, "{\"id\":\"b\"}");
+    rows[2] = try alloc.dupe(u8, "{\"id\":\"c\"}");
+
+    var result = table_reads.LoweredSqlReadPlanResult{
+        .query = .{
+            .rows = rows,
+            .total = @intCast(rows.len),
+        },
+    };
+    defer result.deinit(alloc);
+
+    var columns = try alloc.alloc(runtime_schema.RelationalColumn, 1);
+    columns[0] = .{
+        .name = try alloc.dupe(u8, "id"),
+        .path = try alloc.dupe(u8, "id"),
+        .field_type = .keyword,
+        .nullable = false,
+    };
+    var columns_slice: []const runtime_schema.RelationalColumn = columns;
+    try runtime.declareReadPortal(session_id, .{
+        .portal_name = "usage_cursor",
+        .statement_kind = .read,
+    }, &result, &columns_slice);
+    try std.testing.expectEqual(@as(usize, 0), result.query.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), columns_slice.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.portalCountForTest(session_id));
+
+    var first = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .next });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.result.query.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", first.result.query.rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), first.columns.len);
+    try std.testing.expectEqualStrings("id", first.columns[0].name);
+
+    var next_two = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .forward, .count = 2 });
+    defer next_two.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), next_two.result.query.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", next_two.result.query.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", next_two.result.query.rows[1]);
+
+    try std.testing.expectEqual(@as(usize, 1), try runtime.move(session_id, .{ .portal_name = "usage_cursor", .direction = .backward, .count = 1 }));
+    var last_again = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .next });
+    defer last_again.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", last_again.result.query.rows[0]);
+
+    try runtime.close(session_id, .{ .portal_name = "usage_cursor" });
+    try std.testing.expectEqual(@as(usize, 0), runtime.portalCountForTest(session_id));
 }

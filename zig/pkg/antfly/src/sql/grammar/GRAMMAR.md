@@ -1404,11 +1404,11 @@ including body-local table-function items, join-tree payloads, named windows,
 pagination with `OFFSET ... ROWS`, row-lock tails, and body set-operation
 metadata, so direct generated read lowering no longer depends on later
 body-clone validation to catch corrupted retained CTE payloads. Generated-aware
-top-level order lowerers now also enforce that each parsed `ORDER BY` item ends
-exactly at the retained generated item boundary after direction and `NULLS`
-modifiers are consumed, so typed order lowering cannot consume beyond the
-generated AST item span and only notice clause drift after fallback-style token
-parsing.
+projection, grouping, and top-level order lowerers now also enforce that each
+parsed item ends exactly at the retained generated item boundary after aliases,
+direction, and `NULLS` modifiers are consumed, so typed lowering cannot consume
+beyond the generated AST item span and only notice clause drift after
+fallback-style token parsing.
    Completing the generated-parser-only read path still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

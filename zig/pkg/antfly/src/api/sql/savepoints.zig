@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const catalog_resources = @import("../catalog_resources.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 
 pub const Runtime = struct {
@@ -145,3 +146,35 @@ pub const Runtime = struct {
         return null;
     }
 };
+
+test "sql savepoint runtime restores owned session snapshots" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const session_id: u64 = 77;
+    var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+    session.notification_session_id = session_id;
+    session.request_read_only = true;
+    session.in_sql_transaction = true;
+
+    try runtime.apply(session_id, .{ .savepoint = .{ .savepoint_name = "before_local" } }, &session);
+    try std.testing.expectEqual(@as(usize, 1), runtime.savepointCountForTest(session_id));
+
+    try session.setTransactionLocalSettingAlloc(alloc, "app.mode", "changed");
+    try std.testing.expectEqual(@as(usize, 1), session.settings.len);
+    try std.testing.expect(session.transaction_local_settings);
+
+    try runtime.apply(session_id, .{ .rollback_to = .{ .savepoint_name = "before_local" } }, &session);
+    try std.testing.expectEqual(session_id, session.notification_session_id);
+    try std.testing.expect(session.request_read_only);
+    try std.testing.expect(session.in_sql_transaction);
+    try std.testing.expect(!session.transaction_local_settings);
+    try std.testing.expectEqual(@as(usize, 0), session.settings.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.savepointCountForTest(session_id));
+
+    try runtime.apply(session_id, .{ .release = .{ .savepoint_name = "before_local" } }, &session);
+    try std.testing.expectEqual(@as(usize, 0), runtime.savepointCountForTest(session_id));
+    try std.testing.expectError(error.SavepointNotFound, runtime.apply(session_id, .{ .release = .{ .savepoint_name = "before_local" } }, &session));
+}

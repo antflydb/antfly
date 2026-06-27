@@ -2073,17 +2073,25 @@ fn generatedWindowClauseEnd(
     return range.end;
 }
 
-fn generatedProjectionExpressionAtItemStart(
+const GeneratedExpressionItem = struct {
+    tokens: generated_parser.GeneratedSqlTokenRange,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+};
+
+fn generatedProjectionItemAtStart(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
-) !?*const generated_parser.GeneratedSqlExpressionAst {
+) !?GeneratedExpressionItem {
     const read = generated_read_ast orelse return null;
     if (read.projection_items.items.len != read.projection_items.count or read.projection_items.expressions.len != read.projection_items.count) return error.UnsupportedSqlShape;
     for (read.projection_items.items, 0..) |item, index| {
         if (item.start == pos) {
             try validateGeneratedExpressionPayloads(tokens, read.projection_items.expressions[index]);
-            return &read.projection_items.expressions[index];
+            return .{
+                .tokens = item,
+                .expression = &read.projection_items.expressions[index],
+            };
         }
     }
     if (read.set_operation_tokens != null) {
@@ -2095,8 +2103,39 @@ fn generatedProjectionExpressionAtItemStart(
         for (read.set_operation.right_projection_items.items, 0..) |item, index| {
             if (item.start == pos) {
                 try validateGeneratedExpressionPayloads(tokens, read.set_operation.right_projection_items.expressions[index]);
-                return &read.set_operation.right_projection_items.expressions[index];
+                return .{
+                    .tokens = item,
+                    .expression = &read.set_operation.right_projection_items.expressions[index],
+                };
             }
+        }
+    }
+    return null;
+}
+
+fn generatedProjectionExpressionAtItemStart(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const item = try generatedProjectionItemAtStart(tokens, pos, generated_read_ast);
+    return if (item) |generated_item| generated_item.expression else null;
+}
+
+fn generatedGroupItemAtStart(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedExpressionItem {
+    const read = generated_read_ast orelse return null;
+    if (read.group_items.items.len != read.group_items.count or read.group_items.expressions.len != read.group_items.count) return error.UnsupportedSqlShape;
+    for (read.group_items.items, 0..) |item, index| {
+        if (item.start == pos) {
+            try validateGeneratedExpressionPayloads(tokens, read.group_items.expressions[index]);
+            return .{
+                .tokens = item,
+                .expression = &read.group_items.expressions[index],
+            };
         }
     }
     return null;
@@ -2107,27 +2146,15 @@ fn generatedGroupExpressionAtItemStart(
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?*const generated_parser.GeneratedSqlExpressionAst {
-    const read = generated_read_ast orelse return null;
-    if (read.group_items.items.len != read.group_items.count or read.group_items.expressions.len != read.group_items.count) return error.UnsupportedSqlShape;
-    for (read.group_items.items, 0..) |item, index| {
-        if (item.start == pos) {
-            try validateGeneratedExpressionPayloads(tokens, read.group_items.expressions[index]);
-            return &read.group_items.expressions[index];
-        }
-    }
-    return null;
+    const item = try generatedGroupItemAtStart(tokens, pos, generated_read_ast);
+    return if (item) |generated_item| generated_item.expression else null;
 }
-
-const GeneratedOrderItem = struct {
-    tokens: generated_parser.GeneratedSqlTokenRange,
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-};
 
 fn generatedOrderItemAtStart(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
-) !?GeneratedOrderItem {
+) !?GeneratedExpressionItem {
     const read = generated_read_ast orelse return null;
     if (read.order_items.items.len != read.order_items.count or read.order_items.expressions.len != read.order_items.count) return error.UnsupportedSqlShape;
     for (read.order_items.items, 0..) |item, index| {
@@ -2151,7 +2178,7 @@ fn generatedOrderExpressionAtItemStart(
     return if (item) |generated_item| generated_item.expression else null;
 }
 
-fn validateGeneratedOrderItemEnd(generated_item: ?GeneratedOrderItem, pos: usize) !void {
+fn validateGeneratedExpressionItemEnd(generated_item: ?GeneratedExpressionItem, pos: usize) !void {
     if (generated_item) |item| {
         if (pos != item.tokens.end) return error.UnsupportedSqlShape;
     }
@@ -13974,8 +14001,9 @@ pub fn parseAggregateGroupByAlloc(
 ) !void {
     while (true) {
         const item_start = pos.*;
-        const generated_expression = try generatedGroupExpressionAtItemStart(tokens, item_start, generated_read_ast);
-        if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedGroupItemAtStart(tokens, item_start, generated_read_ast);
+        if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         if (parser.matchToken(tokens, pos, .number)) |token| {
             try validateGeneratedSimpleGroupExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
@@ -14028,6 +14056,7 @@ pub fn parseAggregateGroupByAlloc(
             }
             item_transferred = true;
         }
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
 }
@@ -14073,7 +14102,7 @@ pub fn parseAggregateOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
-        try validateGeneratedOrderItemEnd(generated_item, pos.*);
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14123,7 +14152,7 @@ pub fn parseWindowOutputOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
-        try validateGeneratedOrderItemEnd(generated_item, pos.*);
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14172,7 +14201,7 @@ pub fn parseJoinOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
-        try validateGeneratedOrderItemEnd(generated_item, pos.*);
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14500,8 +14529,9 @@ pub fn parseAggregateSelectListAlloc(
     while (true) {
         if (nextIsAggregateFunction(tokens, pos.*)) {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, generated_read_ast);
-            if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, generated_read_ast);
+            if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_expression = if (generated_item) |item| item.expression else null;
             var spec_options = aggregate_spec_options;
             spec_options.generated_expression_ast = generated_expression;
             const parsed_spec = try parseAggregateSpecAlloc(
@@ -14537,13 +14567,15 @@ pub fn parseAggregateSelectListAlloc(
             }
             var spec_transferred = false;
             errdefer if (!spec_transferred) plan_mod.freeAggregateSpec(alloc, spec);
+            try validateGeneratedExpressionItemEnd(generated_item, pos.*);
             try outputs.append(alloc, .{ .kind = .aggregation, .index = aggregations.items.len });
             try aggregations.append(alloc, spec);
             spec_transferred = true;
         } else {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, generated_read_ast);
-            if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, generated_read_ast);
+            if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_expression = if (generated_item) |item| item.expression else null;
             var item_options = select_item_options;
             item_options.generated_expression_ast = generated_expression;
             const item = try parseSelectItemAlloc(
@@ -14578,6 +14610,7 @@ pub fn parseAggregateSelectListAlloc(
                 },
                 else => return error.UnsupportedSqlShape,
             }
+            try validateGeneratedExpressionItemEnd(generated_item, pos.*);
             item_transferred = true;
         }
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14697,7 +14730,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
-        try validateGeneratedOrderItemEnd(generated_item, pos.*);
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -14751,7 +14784,7 @@ pub fn parseSelectOutputOrderByAlloc(
             if (order.expression) |expression| freeExpression(alloc, expression);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
-        try validateGeneratedOrderItemEnd(generated_item, pos.*);
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try appendOrderWithNullPlacement(alloc, order_by, order, explicit_nulls_first);
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -24517,8 +24550,9 @@ pub fn parseSelectListAlloc(
         }
 
         const item_start = pos.*;
-        const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
+        if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
         var select_item_options = options.select_item_options;
         select_item_options.generated_expression_ast = generated_expression;
         const item = try parseSelectItemAlloc(
@@ -24690,6 +24724,7 @@ pub fn parseSelectListAlloc(
             },
         }
         item_transferred = true;
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
 
@@ -24825,8 +24860,9 @@ pub fn parseWindowSelectListAlloc(
     while (true) {
         if (peekWindowFunction(tokens, pos.*)) {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-            if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
+            if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_expression = if (generated_item) |item| item.expression else null;
             var window_spec_options = options.window_spec_options;
             window_spec_options.generated_expression_ast = generated_expression;
             const parsed_spec = try parseWindowSpecAlloc(
@@ -24863,13 +24899,15 @@ pub fn parseWindowSelectListAlloc(
             }
             var spec_transferred = false;
             errdefer if (!spec_transferred) plan_mod.freeWindowSpec(alloc, spec);
+            try validateGeneratedExpressionItemEnd(generated_item, pos.*);
             try outputs.append(alloc, .{ .kind = .window, .index = windows.items.len });
             try windows.append(alloc, spec);
             spec_transferred = true;
         } else {
             const item_start = pos.*;
-            const generated_expression = try generatedProjectionExpressionAtItemStart(tokens, item_start, options.generated_read_ast);
-            if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
+            if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+            const generated_expression = if (generated_item) |item| item.expression else null;
             if (generated_expression) |expression| {
                 if (expression.kind != .token_range) return error.UnsupportedSqlShape;
             }
@@ -24896,6 +24934,7 @@ pub fn parseWindowSelectListAlloc(
             if (peekUnsupportedSimpleFieldTail(tokens, pos.*)) return error.UnsupportedSqlShape;
             if (binder.relationalColumnForField(options.schema, field, null) == null) return error.InvalidSqlCatalog;
             try grammar.consumeProjectionAlias(alloc, tokens, pos, field);
+            try validateGeneratedExpressionItemEnd(generated_item, pos.*);
             try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
             try fields.append(alloc, field);
             field_transferred = true;
@@ -34217,6 +34256,22 @@ fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.Pars
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstProjectionItemEndToExpressionEnd(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.items.len == 0 or read.projection_items.expression_items.len == 0) return error.TestUnexpectedResult;
+                    read.projection_items.items[0].end = read.projection_items.expression_items[0].end;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstProjectionOrphanChildKind(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -34795,6 +34850,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_projection,
+        schema,
+        &.{},
+    ));
+
+    var malformed_projection_item_end = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status AS state, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_projection_item_end.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionItemEndToExpressionEnd(&malformed_projection_item_end);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_projection_item_end,
         schema,
         &.{},
     ));
