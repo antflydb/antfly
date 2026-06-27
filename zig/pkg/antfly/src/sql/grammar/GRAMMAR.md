@@ -200,8 +200,10 @@ ingress boundary instead of routing into typed catalog planning.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
-partial-index `WHERE ...` token ranges and generated-first create-index
-planning validates those ranges before lowering through the typed DDL planner.
+partial-index `WHERE ...` token ranges; parsed-statement classification and
+generated-first create-index planning now validate exact `CREATE [UNIQUE]
+INDEX [IF NOT EXISTS] ... ON ... [USING ...] (...) [INCLUDE (...)] [WITH (...)]
+[WHERE ...]` clause adjacency before lowering through the typed DDL planner.
 Antfly-derived index methods exposed through PostgreSQL-style `CREATE INDEX
 ... USING antfly_full_text`/`antfly_aknn`/`antfly_graph`/
 `antfly_graph_metric`/`antfly_hybrid`/`antfly_algebraic` now use the same
@@ -709,7 +711,8 @@ boundary, generated table/index drops validate generated object,
 `IF EXISTS`, and dependency-behavior ranges before typed planning, and generated
 create-index metadata covers basic
 PostgreSQL-style unique, covering, partial, method, element-list, and option
-clauses with generated-first AST-to-plan parity validation. Generated
+clauses with parsed-statement clause-layout validation and generated-first
+AST-to-plan parity validation. Generated
 `ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
 generated-first ALTER TABLE planning validates those ranges before lowering
 through the typed DDL planner for covered add/drop/rename/validate operations

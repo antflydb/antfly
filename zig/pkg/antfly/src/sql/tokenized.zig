@@ -1611,6 +1611,7 @@ fn generatedDdlAstHasValidClassificationPayload(
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_options_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_where_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.alter_table_operation_tokens)) return false;
+    if (!generatedDdlShapePayloadIsValid(tokens, end, ddl_ast)) return false;
     return generatedDdlRequiredRangesArePresent(ddl_ast);
 }
 
@@ -1633,6 +1634,84 @@ fn generatedDdlOptionalTokenRangeIsValid(
 ) bool {
     if (range) |value| return end <= tokens.len and value.start < value.end and value.end <= end;
     return true;
+}
+
+fn generatedDdlShapePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    return switch (ddl_ast.kind) {
+        .create_index => generatedDdlCreateIndexPayloadIsValid(tokens, end, ddl_ast),
+        else => true,
+    };
+}
+
+fn generatedDdlCreateIndexPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (end < 6 or !tokens[0].matchesKeywordTag(.create)) return false;
+    var cursor: usize = 1;
+    if (ddl_ast.unique) {
+        if (cursor >= end or !tokens[cursor].matchesKeywordTag(.unique)) return false;
+        cursor += 1;
+    }
+    if (cursor >= end or !tokens[cursor].matchesKeywordTag(.index)) return false;
+    cursor += 1;
+    if (ddl_ast.if_not_exists) {
+        if (cursor + 2 >= end or !tokens[cursor].matchesKeywordTag(.@"if") or !tokens[cursor + 1].matchesKeywordTag(.not) or !tokens[cursor + 2].matchesKeywordTag(.exists)) return false;
+        cursor += 3;
+    }
+
+    const object = ddl_ast.object_name_tokens orelse return false;
+    if (object.start != cursor or object.end <= object.start or object.end > end) return false;
+    cursor = object.end;
+    if (cursor >= end or !tokens[cursor].matchesKeywordTag(.on)) return false;
+    cursor += 1;
+
+    const table = ddl_ast.index_table_tokens orelse return false;
+    if (table.start != cursor or table.end <= table.start or table.end > end) return false;
+    cursor = table.end;
+
+    if (ddl_ast.index_method_tokens) |method| {
+        if (cursor >= end or !tokens[cursor].matchesKeywordTag(.using)) return false;
+        if (method.start != cursor + 1 or method.end != method.start + 1 or method.end > end) return false;
+        cursor = method.end;
+    }
+
+    const elements = ddl_ast.index_elements_tokens orelse return false;
+    if (cursor >= end or tokens[cursor].kind != .lparen) return false;
+    if (elements.start != cursor + 1 or elements.end <= elements.start or elements.end >= end) return false;
+    if (tokens[elements.end].kind != .rparen) return false;
+    cursor = elements.end + 1;
+
+    if (ddl_ast.index_include_tokens) |include| {
+        if (cursor + 2 >= end or !tokens[cursor].matchesKeywordTag(.include) or tokens[cursor + 1].kind != .lparen) return false;
+        if (include.start != cursor + 2 or include.end <= include.start or include.end >= end) return false;
+        if (tokens[include.end].kind != .rparen) return false;
+        cursor = include.end + 1;
+    }
+
+    if (ddl_ast.index_options_tokens) |options| {
+        if (options.start != cursor or options.end <= options.start or options.end > end) return false;
+        if (!tokens[options.start].matchesKeywordTag(.with)) return false;
+        if (options.start + 1 < options.end and tokens[options.start + 1].kind == .lparen) {
+            if (tokens[options.end - 1].kind != .rparen) return false;
+        } else if (options.end != end) {
+            return false;
+        }
+        cursor = options.end;
+    }
+
+    if (ddl_ast.index_where_tokens) |where| {
+        if (cursor >= end or !tokens[cursor].matchesKeywordTag(.where)) return false;
+        if (where.start != cursor + 1 or where.end <= where.start or where.end != end) return false;
+        cursor = where.end;
+    }
+
+    return cursor == end;
 }
 
 fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -6549,6 +6628,32 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(extension_index.raw_statement, mismatched_extension_kind, &extension_index.tokenized_sql)),
+    );
+
+    var covering_index = try ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX usage_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL");
+    defer covering_index.deinit(alloc);
+    var malformed_index_include = covering_index.generated_statement.?;
+    if (malformed_index_include.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .extension_index => |*ddl_ast| ddl_ast.index_include_tokens.?.start += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(covering_index.raw_statement, malformed_index_include, &covering_index.tokenized_sql)),
+    );
+
+    var malformed_index_where = covering_index.generated_statement.?;
+    if (malformed_index_where.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .extension_index => |*ddl_ast| ddl_ast.index_where_tokens.?.end -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(covering_index.raw_statement, malformed_index_where, &covering_index.tokenized_sql)),
     );
 
     var graph_index = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges");
