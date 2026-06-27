@@ -1184,10 +1184,14 @@ contract until storage and API row plans grow those outer-join semantics.
    `CURRENT_TIMESTAMP[(precision)]`, `EXTRACT(field FROM source)`, and
    `ARRAY[...]` constructors before read lowering consumes their retained
    expression payloads.
-   Generated join-tree validation now also requires exact adjacency between
-   left input, join operator, right input, and `ON`/`USING` condition ranges,
-   and verifies that retained join operator tokens match the generated join
-   kind before typed join planning consumes the metadata.
+Generated join-tree validation now also requires exact adjacency between
+left input, join operator, right input, and `ON`/`USING` condition ranges,
+and verifies that retained join operator tokens match the generated join
+kind before typed join planning consumes the metadata. Parsed-statement
+classification now also validates retained generated join-item arrays,
+left-associative tree root/depth/child links, first-join compatibility fields,
+and top-level/CTE-body `ON`/`USING` payload consistency before publishing a
+generated read family.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

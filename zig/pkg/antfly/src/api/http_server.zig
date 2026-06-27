@@ -8709,15 +8709,13 @@ pub const ApiHttpServer = struct {
         var authorization_options = try self.sqlBoundAuthorizationOptionsForIdentityPtrAlloc(authenticated_identity);
         defer authorization_options.deinit(self.alloc);
 
-        var planned_statement = try sql_adapter.planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(self.alloc, parsed_sql, .{
+        var planned_statement = try sql_adapter.planDurableDdlSqlWithSessionAuthorizationEvidenceAlloc(self.alloc, parsed_sql, .{
             .catalog = self.catalogSource(),
             .session = session,
             .authorization = authorization_options.value,
         });
         errdefer planned_statement.deinit(self.alloc);
-        var durable_plan = try sql_adapter.takeDurableSqlPlanFromLogical(&planned_statement.logical_plan);
-        errdefer durable_plan.deinit(self.alloc);
-        const bulk_plan = switch (durable_plan) {
+        const bulk_plan = switch (planned_statement.durable_plan) {
             .bulk_io => |plan| plan,
             else => return error.UnsupportedSqlShape,
         };
@@ -8734,7 +8732,7 @@ pub const ApiHttpServer = struct {
         planned_statement.authorization = .{};
 
         return .{
-            .durable_plan = durable_plan,
+            .durable_plan = planned_statement.durable_plan,
             .execution_plan = execution_plan,
         };
     }

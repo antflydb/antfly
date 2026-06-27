@@ -2219,6 +2219,21 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_left_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_right_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_predicate_tokens)) return false;
+    if (!generatedReadJoinPayloadIsValid(
+        tokens,
+        end,
+        read_ast.source_tokens,
+        read_ast.join_tokens,
+        read_ast.join_operator_tokens,
+        read_ast.join_kind,
+        read_ast.join_left_tokens,
+        read_ast.join_right_tokens,
+        read_ast.join_predicate_tokens,
+        read_ast.join_predicate_expression,
+        read_ast.join_items,
+        read_ast.join_tree_root_index,
+        read_ast.join_tree_depth,
+    )) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.where_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.group_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.having_tokens)) return false;
@@ -2343,6 +2358,21 @@ fn generatedReadCtePayloadIsValid(
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_left_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_right_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_predicate_tokens)) return false;
+        if (!generatedReadJoinPayloadIsValid(
+            tokens,
+            end,
+            cte.body_source_tokens,
+            cte.body_join_tokens,
+            cte.body_join_operator_tokens,
+            cte.body_join_kind,
+            cte.body_join_left_tokens,
+            cte.body_join_right_tokens,
+            cte.body_join_predicate_tokens,
+            cte.body_join_predicate_expression,
+            cte.body_join_items,
+            cte.body_join_tree_root_index,
+            cte.body_join_tree_depth,
+        )) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_where_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_group_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_having_tokens)) return false;
@@ -2362,6 +2392,130 @@ fn generatedReadCtePayloadIsValid(
         if (cte.body_projection_tokens == null) return false;
     }
     return true;
+}
+
+fn generatedReadJoinPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_join_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_operator_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_kind: ?generated_parser.GeneratedSqlJoinKind,
+    maybe_left_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_right_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_predicate_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    predicate_expression: generated_parser.GeneratedSqlExpressionAst,
+    join_items: []const generated_parser.GeneratedSqlJoinAst,
+    maybe_root_index: ?usize,
+    tree_depth: usize,
+) bool {
+    if (join_items.len == 0) {
+        return maybe_join_tokens == null and
+            maybe_operator_tokens == null and
+            maybe_kind == null and
+            maybe_left_tokens == null and
+            maybe_right_tokens == null and
+            maybe_predicate_tokens == null and
+            predicate_expression.tokens == null and
+            maybe_root_index == null and
+            tree_depth == 0;
+    }
+
+    const source_tokens = maybe_source_tokens orelse return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, source_tokens)) return false;
+    const join_tokens = maybe_join_tokens orelse return false;
+    if (!std.meta.eql(join_tokens, source_tokens)) return false;
+    if (maybe_root_index == null or maybe_root_index.? != join_items.len - 1) return false;
+    if (tree_depth != join_items.len) return false;
+
+    const first = join_items[0];
+    if (!std.meta.eql(maybe_operator_tokens orelse return false, first.operator_tokens)) return false;
+    if ((maybe_kind orelse return false) != first.kind) return false;
+    if (!std.meta.eql(maybe_left_tokens orelse return false, first.left_tokens)) return false;
+    if (!std.meta.eql(maybe_right_tokens orelse return false, first.right_tokens)) return false;
+    if (!generatedReadOptionalExpressionTokensMatchMaybeRange(predicate_expression, maybe_predicate_tokens)) return false;
+    if (!generatedReadOptionalRangesEqual(maybe_predicate_tokens, first.predicate_tokens)) return false;
+
+    var index: usize = 0;
+    while (index < join_items.len) : (index += 1) {
+        const item = join_items[index];
+        if (!generatedReadJoinItemIsValid(tokens, end, source_tokens, join_items, index, item)) return false;
+    }
+    return true;
+}
+
+fn generatedReadJoinItemIsValid(
+    tokens: []const Token,
+    end: usize,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    join_items: []const generated_parser.GeneratedSqlJoinAst,
+    index: usize,
+    item: generated_parser.GeneratedSqlJoinAst,
+) bool {
+    if (!generatedReadNestedRangeIsValid(tokens, end, source_tokens, item.tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.operator_tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.left_tokens)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.right_tokens)) return false;
+    if (item.tree_index != index or item.tree_depth != index + 1) return false;
+    if (index == 0) {
+        if (item.left_child_index != null) return false;
+        if (item.left_tokens.start != source_tokens.start) return false;
+    } else {
+        if ((item.left_child_index orelse return false) != index - 1) return false;
+        if (!std.meta.eql(item.left_tokens, join_items[index - 1].tokens)) return false;
+    }
+    if (item.tokens.start != source_tokens.start) return false;
+    if (item.left_tokens.end != item.operator_tokens.start) return false;
+    if (item.operator_tokens.end != item.right_tokens.start) return false;
+    if (item.right_tokens.end > item.tokens.end) return false;
+
+    return switch (item.condition_kind) {
+        .none => item.condition_tokens.start == item.right_tokens.end and
+            item.condition_tokens.end == item.right_tokens.end and
+            item.predicate_tokens == null and
+            item.predicate_expression.tokens == null and
+            item.using_tokens == null and
+            item.using_column_tokens == null and
+            item.using_columns.count == 0,
+        .on => blk: {
+            if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.condition_tokens)) break :blk false;
+            if (item.condition_tokens.start != item.right_tokens.end or item.condition_tokens.end != item.tokens.end) break :blk false;
+            if (item.condition_tokens.start >= tokens.len or !tokens[item.condition_tokens.start].matchesKeywordTag(.on)) break :blk false;
+            const predicate_tokens = item.predicate_tokens orelse break :blk false;
+            if (!generatedReadNestedRangeIsValid(tokens, end, item.condition_tokens, predicate_tokens)) break :blk false;
+            if (predicate_tokens.start != item.condition_tokens.start + 1 or predicate_tokens.end != item.condition_tokens.end) break :blk false;
+            if (!generatedReadExpressionTokensEqualRange(item.predicate_expression, predicate_tokens)) break :blk false;
+            if (item.using_tokens != null or item.using_column_tokens != null or item.using_columns.count != 0) break :blk false;
+            break :blk true;
+        },
+        .using => blk: {
+            if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.condition_tokens)) break :blk false;
+            if (item.condition_tokens.start != item.right_tokens.end or item.condition_tokens.end != item.tokens.end) break :blk false;
+            if (item.condition_tokens.start >= tokens.len or !tokens[item.condition_tokens.start].matchesKeywordTag(.using)) break :blk false;
+            if (!std.meta.eql(item.using_tokens orelse break :blk false, item.condition_tokens)) break :blk false;
+            const column_tokens = item.using_column_tokens orelse break :blk false;
+            if (!generatedReadNestedRangeIsValid(tokens, end, item.condition_tokens, column_tokens)) break :blk false;
+            if (item.predicate_tokens != null or item.predicate_expression.tokens != null) break :blk false;
+            if (item.using_columns.count == 0 or item.using_columns.items.len != item.using_columns.count) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
+fn generatedReadOptionalRangesEqual(
+    left: ?generated_parser.GeneratedSqlTokenRange,
+    right: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (left == null and right == null) return true;
+    return std.meta.eql(left orelse return false, right orelse return false);
+}
+
+fn generatedReadOptionalExpressionTokensMatchMaybeRange(
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (maybe_range) |range| return generatedReadExpressionTokensEqualRange(expression, range);
+    return expression.tokens == null;
 }
 
 fn generatedReadAntflySourceItemsAreValid(
@@ -6581,6 +6735,40 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_row_lock_query.statement = parseStatement(generated_cte_row_lock_query.raw_statement, malformed_cte_row_lock_generated, &generated_cte_row_lock_query.tokenized_sql);
     try std.testing.expect(generated_cte_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_row_lock_query.statement));
+
+    var generated_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id");
+    defer generated_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_join_query.generatedStatementKind().?);
+
+    var malformed_join_tree_generated = generated_join_query.generated_statement.?;
+    if (malformed_join_tree_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.join_items[0].right_tokens.start += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_join_query.statement = parseStatement(generated_join_query.raw_statement, malformed_join_tree_generated, &generated_join_query.tokenized_sql);
+    try std.testing.expect(generated_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
+
+    var generated_cte_join_query = try ParsedSql.initAlloc(alloc, "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id) SELECT id FROM joined_rows");
+    defer generated_cte_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_join_query.generatedStatementKind().?);
+
+    var malformed_cte_join_tree_generated = generated_cte_join_query.generated_statement.?;
+    if (malformed_cte_join_tree_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_join_tree_depth += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_join_query.statement = parseStatement(generated_cte_join_query.raw_statement, malformed_cte_join_tree_generated, &generated_cte_join_query.tokenized_sql);
+    try std.testing.expect(generated_cte_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_join_query.statement));
 
     var generated_graph_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm");
     defer generated_graph_source_query.deinit(alloc);

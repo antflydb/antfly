@@ -120,6 +120,42 @@ pub fn planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(
     return try DurableSqlPlan.fromLogical(&logical_plan);
 }
 
+pub const DurablePlannedSqlStatement = struct {
+    durable_plan: DurableSqlPlan,
+    authorization: binder.BoundSqlAuthorization = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.durable_plan.deinit(alloc);
+        self.authorization.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn planDurableDdlSqlWithSessionAuthorizationEvidenceAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: executor.PlanParsedSqlOptions,
+) !DurablePlannedSqlStatement {
+    var bound = try binder.bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
+        alloc,
+        parsed_sql,
+        options.catalog,
+        options.session,
+        options.function_bindings,
+        options.authorization,
+    );
+    defer bound.deinit(alloc);
+
+    var durable_plan = try planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, options.function_bindings);
+    errdefer durable_plan.deinit(alloc);
+    var authorization = try binder.takeBoundSqlStatementAuthorization(&bound);
+    errdefer authorization.deinit(alloc);
+    return .{
+        .durable_plan = durable_plan,
+        .authorization = authorization,
+    };
+}
+
 pub fn planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,

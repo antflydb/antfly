@@ -1236,6 +1236,27 @@ pub const BoundSqlStatement = struct {
     }
 };
 
+pub fn takeBoundSqlStatementAuthorization(bound: *BoundSqlStatement) !BoundSqlAuthorization {
+    return switch (bound.binding) {
+        .read_catalog => |*read| blk: {
+            const authorization = read.authorization;
+            read.authorization = .{};
+            break :blk authorization;
+        },
+        .write_catalog => |*write| blk: {
+            const authorization = write.authorization;
+            write.authorization = .{};
+            break :blk authorization;
+        },
+        .ddl_catalog => |*ddl| blk: {
+            const authorization = ddl.authorization;
+            ddl.authorization = .{};
+            break :blk authorization;
+        },
+        .none => .{},
+    };
+}
+
 pub fn enforceBoundSqlAuthorization(authorization: BoundSqlAuthorization) !void {
     for (authorization.checks) |check| {
         if (check.decision == .denied) return error.PermissionDenied;

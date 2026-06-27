@@ -133,32 +133,11 @@ pub fn planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(
 
     var logical_plan = try planDdlLogicalPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, options.function_bindings);
     errdefer logical_plan.deinit(alloc);
-    var authorization = try takeBoundSqlStatementAuthorization(&bound);
+    var authorization = try binder.takeBoundSqlStatementAuthorization(&bound);
     errdefer authorization.deinit(alloc);
     return .{
         .logical_plan = logical_plan,
         .authorization = authorization,
-    };
-}
-
-fn takeBoundSqlStatementAuthorization(bound: *binder.BoundSqlStatement) !binder.BoundSqlAuthorization {
-    return switch (bound.binding) {
-        .read_catalog => |*read| blk: {
-            const authorization = read.authorization;
-            read.authorization = .{};
-            break :blk authorization;
-        },
-        .write_catalog => |*write| blk: {
-            const authorization = write.authorization;
-            write.authorization = .{};
-            break :blk authorization;
-        },
-        .ddl_catalog => |*ddl| blk: {
-            const authorization = ddl.authorization;
-            ddl.authorization = .{};
-            break :blk authorization;
-        },
-        .none => .{},
     };
 }
 
