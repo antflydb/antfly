@@ -89,8 +89,9 @@ production/lhs/rhs-length metadata; optional accept callbacks report the
 consumed token count, while raw parser states, action/goto tables, and symbol
 tables stay private. Public `RuleId`, `ProductionInfo`,
 `terminalName`, `ruleName`, `productionInfo`, `productionRhs`, and
-`symbolIsNullable` helpers provide stable compact interpretation of event ids
-and reduction child-symbol shapes without exposing the underlying parse tables.
+`symbolRule` helpers provide stable compact interpretation of event ids,
+reduction child-symbol shapes, and nonterminal rule identities without exposing
+the underlying parse tables. `symbolIsNullable` provides nullable-symbol checks.
 That
 is the production bridge for later generated AST construction: AST builders can
 push token leaves on shifts and combine production-shaped children on

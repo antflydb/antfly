@@ -1888,6 +1888,11 @@ pub const GeneratedSqlReductionEvent = struct {
     lhs: u16,
     rhs_len: u16,
     rhs: []const u16,
+
+    pub fn rhsRule(self: @This(), index: usize) ?GeneratedSqlGrammarRule {
+        if (index >= self.rhs.len) return null;
+        return generated.symbolRule(self.rhs[index]);
+    }
 };
 
 pub const GeneratedSqlReductionTrace = struct {
@@ -13039,6 +13044,9 @@ test "generated SQL parser exposes accepted reduction traces" {
             .statement => saw_statement = true,
             else => {},
         };
+        if (event.rule == .statement) {
+            try std.testing.expectEqual(GeneratedSqlGrammarRule.session_statement, event.rhsRule(0).?);
+        }
     }
     try std.testing.expect(saw_session_statement);
     try std.testing.expect(saw_statement);
