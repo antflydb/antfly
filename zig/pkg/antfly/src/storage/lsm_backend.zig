@@ -1210,7 +1210,7 @@ pub const Backend = struct {
         const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
         defer self.allocator.free(lock_path);
         self.wal_operation_lock_file = storage_io.openNativePathLockFile(self.allocator, lock_path, .{
-            .create_if_missing = !self.options.backend.read_only,
+            .create_if_missing = true,
         }) catch |err| switch (err) {
             error.FileNotFound => if (self.options.backend.read_only) return else return err,
             else => return err,
@@ -12055,7 +12055,7 @@ test "lsm backend wal operation lock blocks read-only replay during live append 
     defer acquired.release();
 }
 
-test "lsm backend read-only native open does not create missing wal operation lock for legacy roots" {
+test "lsm backend read-only native open creates missing wal operation lock for legacy roots" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     var path_buf: [256]u8 = undefined;
@@ -12088,7 +12088,7 @@ test "lsm backend read-only native open does not create missing wal operation lo
         },
     });
     defer reader.close();
-    try std.testing.expect(!pathExistsForTest(lock_path));
+    try std.testing.expect(pathExistsForTest(lock_path));
 
     var writer = try Backend.open(std.testing.allocator, root_path, .{
         .flush_threshold = 1024,

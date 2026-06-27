@@ -6096,30 +6096,48 @@ pub const DataServer = struct {
         }
 
         const fingerprint = blk: {
-            lockAtomic(self.write_source.localDbMutex());
-            defer self.write_source.localDbMutex().unlock();
+            const next_fingerprint = blk_fingerprint: {
+                lockAtomic(self.write_source.localDbMutex());
+                defer self.write_source.localDbMutex().unlock();
 
-            try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
+                try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
-            const next_fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-            );
+                break :blk_fingerprint antfly.metadata.table_provisioner.provisioningFingerprint(
+                    head.metadata_group_id,
+                    local_group_ids,
+                    snapshot.tables,
+                    snapshot.ranges,
+                );
+            };
             if (self.last_provision_fingerprint == next_fingerprint) {
                 self.last_provision_metadata_epoch = head.metadata_epoch;
                 return;
             }
-            _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-                self.alloc,
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-                try self.ensureBackendRuntime(),
-            );
-            try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
+
+            const backend_runtime = try self.ensureBackendRuntime();
+            for (local_group_ids) |group_id| {
+                if (group_id == head.metadata_group_id) continue;
+                const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
+                const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+
+                var activity = self.write_source.beginGroupRefreshActivity(table.name, group_id);
+                defer activity.deinit();
+
+                var group_ids_one = [_]u64{group_id};
+                {
+                    lockAtomic(self.write_source.localDbMutex());
+                    defer self.write_source.localDbMutex().unlock();
+                    _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                        self.alloc,
+                        head.metadata_group_id,
+                        group_ids_one[0..],
+                        snapshot.tables,
+                        snapshot.ranges,
+                        backend_runtime,
+                    );
+                }
+                try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
+            }
             self.provisioned_storage.read_cache.clear();
             break :blk next_fingerprint;
         };
