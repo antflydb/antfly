@@ -897,7 +897,7 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
     if (schema.storage_mode == .document) {
         if (source_schema != null) return error.DocumentSqlUnsupportedJoin;
         const document_capabilities = sql_adapter.documentCapabilitiesForRuntimeSchema(schema);
-        return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+        return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
             .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, null, document_capabilities) },
             .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, document_capabilities) },
             .join, .lateral => error.DocumentSqlUnsupportedJoin,

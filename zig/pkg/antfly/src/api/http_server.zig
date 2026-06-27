@@ -5938,7 +5938,7 @@ pub const ApiHttpServer = struct {
             if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
         }
         if (read.row_lock_tokens == null and !publicSqlTokensContainRowClaim(parsed_sql.items())) return null;
-        return switch (parsed_sql.readStatementKind() orelse publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read)) {
+        return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read)) {
             .query => null,
             .aggregate => "lockable base-row source for aggregate row claim",
             .join => "lockable base-row source for join row claim",
@@ -6032,13 +6032,15 @@ pub const ApiHttpServer = struct {
         read_catalog: *const sql_adapter.CatalogLogicalReadPlan,
         parsed_sql: *const sql_adapter.ParsedSql,
     ) ?sql_adapter.SqlReadStatementKind {
+        const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
+        if (parsed_sql.generatedStatementKind() == .read) return parsed_kind;
         if (read_catalog.statement.readKind()) |kind| return kind;
         const target_binding = read_catalog.target_binding orelse return null;
         switch (target_binding) {
             .document => {},
             else => return null,
         }
-        return parsed_sql.readStatementKindIncludingGeneratedAst();
+        return parsed_kind;
     }
 
     fn publicSqlGeneratedReadRowClaimDiagnostic(

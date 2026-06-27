@@ -107,7 +107,8 @@ pub const ReadPlanLoweringContext = struct {
     }
 
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
-        if (generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
+        if (parsed_sql.generatedStatementKind() == .read) {
+            const read_ast = generatedReadAstForParsedSql(parsed_sql) orelse return error.UnsupportedSqlShape;
             try validateGeneratedReadPublishedKind(parsed_sql);
             return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast);
         }
@@ -4094,7 +4095,7 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
     _ = params;
     _ = function_bindings;
     const document_plan = @import("document_plan.zig");
-    return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+    return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
             .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
@@ -4521,6 +4522,23 @@ test "sql adapter lowering context requires generated read publication before ge
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
+    );
+
+    var missing_ast_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'order'",
+    );
+    defer missing_ast_sql.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, missing_ast_sql.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, missing_ast_sql.readStatementKind().?);
+    if (missing_ast_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| generated_ast.deinit(alloc);
+        generated_statement.ast = null;
+    }
+    try std.testing.expect(missing_ast_sql.readStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &missing_ast_sql, schema, &.{}, .{}),
     );
 }
 
