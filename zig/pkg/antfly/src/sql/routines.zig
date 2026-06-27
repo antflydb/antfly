@@ -13,12 +13,46 @@
 // limitations.
 
 const std = @import("std");
-const extension_domain = @import("../../extensions/mod.zig");
-const docstore_mod = @import("../../storage/docstore.zig");
-const relational_rows = @import("../relational_rows.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const sql_adapter = @import("../../sql/mod.zig");
-const table_catalog = @import("../table_catalog.zig");
+const builtin = @import("builtin");
+const binder = @import("binder.zig");
+const ddl_plan = @import("ddl.zig");
+const executor = @import("executor.zig");
+const extension_domain = @import("../extensions/mod.zig");
+const lower_expr = @import("lower_expr.zig");
+const relational_row_runtime = @import("../storage/db/relational_rows.zig");
+const docstore_mod = @import("../storage/docstore.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const sql_value = @import("value.zig");
+const table_catalog = if (builtin.is_test) @import("../api/table_catalog.zig") else struct {};
+const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
+
+const sql_adapter = struct {
+    const CreateRoutinePlan = ddl_plan.CreateRoutinePlan;
+    const CreateRoutineTriggerPlan = ddl_plan.CreateRoutineTriggerPlan;
+    const DropRoutinePlan = ddl_plan.DropRoutinePlan;
+    const DropRoutineTriggerPlan = ddl_plan.DropRoutineTriggerPlan;
+    const FunctionCatalogPlan = ddl_plan.FunctionCatalogPlan;
+    const LogicalSqlPlan = binder.LogicalSqlPlan;
+    const ParsedSql = tokenized.ParsedSql;
+    const RoutineBodyPlan = ddl_plan.RoutineBodyPlan;
+    const RoutineExecutionHook = ddl_plan.RoutineExecutionHook;
+    const RoutineExpressionBinding = lower_expr.RoutineExpressionBinding;
+    const RoutineKind = ddl_plan.RoutineKind;
+    const RoutineNullInput = ddl_plan.RoutineNullInput;
+    const RoutineParallelSafety = ddl_plan.RoutineParallelSafety;
+    const RoutinePerformCall = ddl_plan.RoutinePerformCall;
+    const RoutineSecurity = ddl_plan.RoutineSecurity;
+    const RoutineSetting = ddl_plan.RoutineSetting;
+    const RoutineTriggerEvent = ddl_plan.RoutineTriggerEvent;
+    const RoutineVolatility = ddl_plan.RoutineVolatility;
+    const Token = token_mod.Token;
+    const TokenKeyword = token_mod.TokenKeyword;
+    const TokenKind = token_mod.TokenKind;
+    const TriggerCatalogPlan = ddl_plan.TriggerCatalogPlan;
+    const lowerRoutineTriggerCatalogPlanParsedSqlAlloc = ddl_plan.lowerRoutineTriggerCatalogPlanParsedSqlAlloc;
+    const planParsedSqlWithSessionAlloc = executor.planParsedSqlWithSessionAlloc;
+};
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -305,7 +339,7 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, row_json, "null")) return try alloc.dupe(u8, "null");
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
         defer parsed.deinit();
-        return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, expression);
+        return try routineExpressionValueJsonAlloc(alloc, parsed.value, expression);
     }
 
     pub fn executeTriggerRoutineAlloc(
@@ -593,7 +627,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, row_json, "null")) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
             defer parsed.deinit();
-            const ignored = try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, expression);
+            const ignored = try routineExpressionValueJsonAlloc(alloc, parsed.value, expression);
             alloc.free(ignored);
         }
     }
@@ -692,6 +726,21 @@ pub const Runtime = struct {
         }
     }
 };
+
+fn routineExpressionValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    row: std.json.Value,
+    expression: runtime_schema.RelationalRowsExpression,
+) ![]u8 {
+    return try relational_row_runtime.expressionValueJsonWithSourcesAlloc(
+        alloc,
+        row,
+        null,
+        row,
+        expression,
+        sql_value.currentRealtimeNs(),
+    );
+}
 
 pub fn freeExpressionRoutineBindings(
     alloc: std.mem.Allocator,
@@ -1244,8 +1293,8 @@ fn routineRecordKeyAlloc(
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ routine_key_prefix, std.fmt.bytesToHex(digest, .lower) });
 }
 
-const routine_key_prefix = "__api_sql_routines__:";
-const trigger_key_prefix = "__api_sql_triggers__:";
+const routine_key_prefix = "__sql_routines__:";
+const trigger_key_prefix = "__sql_triggers__:";
 
 fn triggerRecordKeyAlloc(
     alloc: std.mem.Allocator,

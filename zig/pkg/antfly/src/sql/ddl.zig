@@ -3355,10 +3355,29 @@ fn validateGeneratedPreparedAstRanges(
             if (ast.parameter_tokens != null or ast.inner_statement_tokens != null) return error.UnsupportedSqlShape;
         },
         .deallocate => {
-            try validateGeneratedPreparedRequiredRangeAt(ast.name_tokens, 1, end, end);
+            _ = try generatedDeallocateStatementNameRange(tokens, ast.name_tokens, end);
             if (ast.parameter_tokens != null or ast.argument_tokens != null or ast.inner_statement_tokens != null) return error.UnsupportedSqlShape;
         },
     }
+}
+
+fn generatedDeallocateStatementNameRange(
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !generated_parser.GeneratedSqlTokenRange {
+    const range = maybe_range orelse return error.UnsupportedSqlShape;
+    if (range.end != end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (range.start == 1) {
+        if (range.start + 1 == range.end) return range;
+        if (range.start + 2 == range.end and tokens[range.start].matchesKeywordTag(.prepare)) {
+            return .{ .start = range.start + 1, .end = range.end };
+        }
+    }
+    if (range.start == 2 and range.start + 1 == range.end and tokens.len > 1 and tokens[1].matchesKeywordTag(.prepare)) {
+        return range;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedPreparedRange(
@@ -3503,7 +3522,8 @@ pub fn deallocatePreparedStatementPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlPreparedAst,
 ) !DeallocatePreparedStatementPlan {
-    const name_tokens = ast.name_tokens orelse return error.UnsupportedSqlShape;
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const name_tokens = try generatedDeallocateStatementNameRange(tokens, ast.name_tokens, end);
     if (name_tokens.start + 1 == name_tokens.end and tokens[name_tokens.start].matchesKeywordTag(.all)) {
         return .{ .all = true };
     }
@@ -3600,6 +3620,19 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
         .reset => try resetSessionCatalogPlanFromGeneratedTailAlloc(alloc, tail),
         .show => try showSessionCatalogPlanFromGeneratedTail(tail),
         .discard_all => try discardSessionCatalogPlanFromGeneratedTail(tail),
+    };
+}
+
+fn sessionLogicalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) !binder.LogicalSqlPlan {
+    const plan = try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast);
+    return switch (plan) {
+        .session_catalog => |session| .{ .session = session },
+        .adapter_noop => |noop| .{ .other_ddl = .{ .adapter_noop = noop } },
+        else => error.UnsupportedSqlShape,
     };
 }
 
@@ -12731,7 +12764,7 @@ pub fn planGeneratedLogicalDdlAstAlloc(
     options: DdlPlanParserOptions,
 ) !?binder.LogicalSqlPlan {
     switch (generated_ast) {
-        .session => |session_ast| return .{ .session = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, session_ast) },
+        .session => |session_ast| return try sessionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
         .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, prepared_ast) },
         .prepared_transaction => |prepared_transaction_ast| return .{ .transaction = .{ .prepared = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) } },
         .transaction => |transaction_ast| {
@@ -12974,10 +13007,6 @@ fn legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(
 
 fn generatedAstAllowsLegacyDdlFallback(generated_ast: generated_parser.GeneratedSqlAst) bool {
     return switch (generated_ast) {
-        .session,
-        .prepared,
-        .cursor,
-        => true,
         .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
             .create_table,
             .alter_table,

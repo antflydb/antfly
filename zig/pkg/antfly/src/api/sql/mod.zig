@@ -15,6 +15,6 @@
 pub const cursors = @import("../../sql/cursors.zig");
 pub const notifications = @import("../../sql/notifications.zig");
 pub const prepared_statements = @import("../../sql/prepared_statements.zig");
-pub const routines = @import("routines.zig");
+pub const routines = @import("../../sql/routines.zig");
 pub const savepoints = @import("../../sql/savepoints.zig");
 pub const sessions = @import("../../sql/sessions.zig");

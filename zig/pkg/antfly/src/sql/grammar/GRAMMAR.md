@@ -742,6 +742,10 @@ cursor statements into typed cursor portal planning. `MOVE` uses the same
 direction/count/name tail parser as `FETCH` but lowers to a distinct cursor
 portal plan variant so runtime code can preserve PostgreSQL cursor movement
 semantics separately from row-producing fetches.
+Generated session, prepared-statement, and cursor ASTs now cover both the
+legacy DDL plan facade and the logical plan facade without a generic token
+fallback; adapter-noop session settings and `DEALLOCATE [PREPARE] name` are
+handled explicitly inside the generated-aware boundary.
 Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
 `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
 savepoint planning. Savepoint heads and rollback-to/release prefixes now pass

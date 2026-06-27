@@ -1622,14 +1622,18 @@ Current implementation status:
   graph metadata when the retained generated AST is missing, preserving
   token fallback only for non-generated statements and explicit valid-AST
   compatibility boundaries.
+- Generated-owned session, prepared-statement, and cursor ASTs now lower
+  through generated-aware DDL paths for both legacy and logical plan entrypoints;
+  adapter no-op session settings are mapped explicitly instead of reopening the
+  token parser.
 - Direct generated-DML lowering validates both write family and recursive-CTE
   state from the published generated-aware write record before dispatching
   recursive or non-recursive write plans.
-- Session, savepoint, notification, prepared-statement, and cursor state
+- Session, savepoint, notification, prepared-statement, cursor, and routine
   runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
-  re-exports those protocol-neutral runtimes while API-owned routine execution
-  stays in `api/sql/routines.zig` until its table/catalog dependencies are
-  split.
+  re-exports those protocol-neutral runtimes for API callers. Routine
+  expression execution uses the storage row-expression evaluator directly, so
+  routine catalog state no longer depends on API row handlers.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
