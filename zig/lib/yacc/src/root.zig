@@ -247,8 +247,21 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             active_rule = null;
             continue;
         }
+        if (std.mem.startsWith(u8, line, "%precedence ")) {
+            try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%precedence ".len..]);
+            active_rule = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, line, "%token ")) {
             try parseTokens(allocator, &grammar, line["%token ".len..]);
+            active_rule = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "%type ")) {
+            active_rule = null;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "%%")) {
             active_rule = null;
             continue;
         }
@@ -332,6 +345,7 @@ fn parseTokens(allocator: std.mem.Allocator, grammar: *Grammar, text: []const u8
     var parts = std.mem.tokenizeAny(u8, text, " \t\r");
     var previous_token: ?[]const u8 = null;
     while (parts.next()) |name| {
+        if (isBisonTypeTag(name)) continue;
         if (isQuotedLiteral(name)) {
             const token_name = previous_token orelse return error.InvalidTokenAlias;
             try appendTokenAlias(allocator, grammar, name, token_name);
@@ -352,9 +366,11 @@ fn parsePrecedenceDeclaration(
     var parts = std.mem.tokenizeAny(u8, text, " \t\r");
     var previous_token: ?[]const u8 = null;
     while (parts.next()) |name| {
+        if (isBisonTypeTag(name)) continue;
         if (isQuotedLiteral(name)) {
-            const token_name = previous_token orelse return error.InvalidTokenAlias;
+            const token_name = previous_token orelse resolveTerminalName(grammar.*, name) orelse return error.InvalidTokenAlias;
             try appendTokenAlias(allocator, grammar, name, token_name);
+            try setTokenPrecedence(allocator, grammar, token_name, .{ .level = level, .associativity = associativity });
             continue;
         }
         const token_name = try appendTokenName(allocator, grammar, name);
@@ -378,8 +394,7 @@ fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8
         if (std.mem.eql(u8, symbol, "%prec")) {
             const override = (try nextGrammarSymbol(trimmed, &index)) orelse return error.InvalidPrecedenceOverride;
             precedence_symbol = try dupToken(allocator, override);
-            if ((try nextGrammarSymbol(trimmed, &index)) != null) return error.InvalidPrecedenceOverride;
-            break;
+            continue;
         }
         try symbols.append(allocator, try dupToken(allocator, symbol));
     }
@@ -390,6 +405,10 @@ fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
     while (index.* < text.len and std.ascii.isWhitespace(text[index.*])) index.* += 1;
     if (index.* >= text.len) return null;
     if (index.* + 1 < text.len and text[index.*] == '/' and text[index.* + 1] == '*') return null;
+    if (text[index.*] == '{') {
+        try skipActionBlock(text, index);
+        return try nextGrammarSymbol(text, index);
+    }
 
     const start = index.*;
     if (text[index.*] == '\'') {
@@ -405,6 +424,40 @@ fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
         while (index.* < text.len and !std.ascii.isWhitespace(text[index.*])) index.* += 1;
     }
     return text[start..index.*];
+}
+
+fn skipActionBlock(text: []const u8, index: *usize) !void {
+    if (text[index.*] != '{') return error.InvalidActionBlock;
+    var depth: usize = 1;
+    index.* += 1;
+    while (index.* < text.len) : (index.* += 1) {
+        switch (text[index.*]) {
+            '\'' => try skipQuotedFragment(text, index, '\''),
+            '"' => try skipQuotedFragment(text, index, '"'),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) {
+                    index.* += 1;
+                    return;
+                }
+            },
+            else => {},
+        }
+    }
+    return error.UnterminatedActionBlock;
+}
+
+fn skipQuotedFragment(text: []const u8, index: *usize, quote: u8) !void {
+    index.* += 1;
+    while (index.* < text.len) : (index.* += 1) {
+        if (text[index.*] == '\\') {
+            if (index.* + 1 < text.len) index.* += 1;
+            continue;
+        }
+        if (text[index.*] == quote) return;
+    }
+    return error.UnterminatedQuotedFragment;
 }
 
 pub fn validateGrammar(grammar: Grammar) !void {
@@ -1350,6 +1403,10 @@ fn isQuotedLiteral(symbol: []const u8) bool {
     return symbol.len >= 2 and symbol[0] == '\'' and symbol[symbol.len - 1] == '\'';
 }
 
+fn isBisonTypeTag(symbol: []const u8) bool {
+    return symbol.len >= 2 and symbol[0] == '<' and symbol[symbol.len - 1] == '>';
+}
+
 fn resolveTerminalName(grammar: Grammar, symbol: []const u8) ?[]const u8 {
     for (grammar.tokens.items) |token| {
         if (std.mem.eql(u8, token, symbol)) return token;
@@ -1564,6 +1621,43 @@ test "parseGrammar resolves yacc literal terminals through symbolic token aliase
     try std.testing.expect(std.mem.indexOf(u8, generated, "    COMMA,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    ',',") == null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "terminalIdByName") != null);
+}
+
+test "parseGrammar accepts bison typed declarations and strips semantic actions" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start stmt
+        \\%token <str> IDENT
+        \\%token PLUS '+'
+        \\%precedence '+'
+        \\%type <node> stmt expr
+        \\%%
+        \\stmt:
+        \\    expr { $$ = $1; }
+        \\  ;
+        \\expr:
+        \\    expr '+' expr %prec '+' { $$ = make_binary("+", $1, $3); }
+        \\  | IDENT { $$ = make_ident("{not a grammar symbol}"); }
+        \\  ;
+        \\%%
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 2), grammar.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.token_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.token_precedences.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.rules.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("expr", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try std.testing.expectEqual(@as(usize, 3), grammar.rules.items[1].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("'+'", grammar.rules.items[1].alternatives.items[0].precedence_symbol.?);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[1].alternatives.items[1].symbols.len);
+    try validateGrammar(grammar);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
 }
 
 test "buildSlrTables builds conflict-free tables for a small grammar" {

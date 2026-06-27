@@ -46,7 +46,14 @@ polluting the runtime token enum with punctuation-shaped symbols. The generator
 also supports Yacc precedence declarations, including `%left`, `%right`,
 `%nonassoc`, and production-level `%prec` overrides, so intentional
 shift/reduce ambiguity can be resolved in table construction instead of being
-left as broad `%expect` debt. The
+left as broad `%expect` debt. The grammar reader accepts the next layer of
+PostgreSQL/Bison source shape as parser-generator input: typed declaration
+tags such as `%token <str> IDENT`, ignored `%type` metadata, `%precedence`,
+`%%` section separators, literal precedence references through existing token
+aliases, and C/Bison semantic action blocks in rule alternatives. These source
+compatibility features are stripped before table construction so Antfly still
+owns the generated runtime AST and parser facade instead of importing
+PostgreSQL semantic actions. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records both
