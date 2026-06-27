@@ -1329,6 +1329,14 @@ fn emitZigMetadata(
         \\    return null;
         \\}
         \\
+        \\pub fn terminalName(terminal: u16) ?[]const u8 {
+        \\    if (terminal == 0) return "$end";
+        \\    inline for (std.meta.fields(Token)) |field| {
+        \\        if (terminal == @intFromEnum(@field(Token, field.name)) + 1) return field.name;
+        \\    }
+        \\    return null;
+        \\}
+        \\
         \\const Rule = enum {
         \\
     );
@@ -1342,6 +1350,10 @@ fn emitZigMetadata(
     for (grammar.rules.items) |rule| try appendFmt(allocator, &out, "    {s},\n", .{rule.name});
     try out.appendSlice(allocator,
         \\};
+        \\
+        \\pub fn ruleName(rule: RuleId) []const u8 {
+        \\    return @tagName(rule);
+        \\}
         \\
         \\pub const ProductionInfo = struct {
         \\    rule: ?RuleId,
@@ -2436,6 +2448,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Symbol") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Rule =") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const RuleId = enum(u16)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn terminalName(terminal: u16) ?[]const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn ruleName(rule: RuleId) []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ProductionInfo = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn productionInfo(production: u16) ?ProductionInfo") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolIsNullable(symbol: u16) ?bool") != null);

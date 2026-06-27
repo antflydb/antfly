@@ -87,8 +87,9 @@ reduction-only and full shift/reduce event parsing. Shift events report the
 input token index and terminal id; reduction events report compact
 production/lhs/rhs-length metadata, while raw parser states, action/goto tables,
 and symbol tables stay private. Public `RuleId`, `ProductionInfo`,
-`productionInfo`, and `symbolIsNullable` helpers provide stable compact
-interpretation of event ids without exposing the underlying parse tables. That
+`terminalName`, `ruleName`, `productionInfo`, and `symbolIsNullable` helpers
+provide stable compact interpretation of event ids without exposing the
+underlying parse tables. That
 is the production bridge for later generated AST construction: AST builders can
 push token leaves on shifts and combine them on reductions without
 rediscovering syntax from SQL text or depending on table internals. The

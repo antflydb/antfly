@@ -215476,6 +215476,14 @@ pub fn terminalIdByName(name: []const u8) ?u16 {
     return null;
 }
 
+pub fn terminalName(terminal: u16) ?[]const u8 {
+    if (terminal == 0) return "$end";
+    inline for (std.meta.fields(Token)) |field| {
+        if (terminal == @intFromEnum(@field(Token, field.name)) + 1) return field.name;
+    }
+    return null;
+}
+
 const Rule = enum {
     statement,
     session_statement,
@@ -215947,6 +215955,10 @@ pub const RuleId = enum(u16) {
     diagnostic_tail,
     diagnostic_token,
 };
+
+pub fn ruleName(rule: RuleId) []const u8 {
+    return @tagName(rule);
+}
 
 pub const ProductionInfo = struct {
     rule: ?RuleId,
