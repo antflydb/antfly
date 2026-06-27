@@ -99,7 +99,10 @@ reductions without rediscovering syntax from SQL text or depending on table
 internals. The SQL generated-parser facade now exposes an opt-in accepted
 reduction trace for tokenized statements, letting runtime tests and later AST
 builders retain a compact grammar-derived proof of the production path without
-changing the normal parse result or exposing parser tables. The
+changing the normal parse result or exposing parser tables. Reduction traces
+can now derive the coarse statement family from the accepted top-level
+`statement` production, which is the next bridge toward replacing token-head
+statement classification with grammar-owned AST dispatch. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus

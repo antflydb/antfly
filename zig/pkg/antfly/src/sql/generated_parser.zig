@@ -1903,7 +1903,34 @@ pub const GeneratedSqlReductionTrace = struct {
         alloc.free(self.reductions);
         self.* = .{ .reductions = &.{}, .accepted_token_count = 0 };
     }
+
+    pub fn statementKind(self: @This()) ?GeneratedSqlStatementKind {
+        var index = self.reductions.len;
+        while (index > 0) {
+            index -= 1;
+            const event = self.reductions[index];
+            if (event.rule != .statement or event.rhs.len != 1) continue;
+            return statementKindFromGrammarRule(event.rhsRule(0) orelse return null);
+        }
+        return null;
+    }
 };
+
+fn statementKindFromGrammarRule(rule: GeneratedSqlGrammarRule) ?GeneratedSqlStatementKind {
+    return switch (rule) {
+        .session_statement => .session,
+        .transaction_statement => .transaction,
+        .prepared_statement => .prepared,
+        .prepared_transaction_statement => .prepared_transaction,
+        .ddl_statement => .ddl,
+        .dml_statement => .dml,
+        .read_statement => .read,
+        .graph_statement => .graph,
+        .cursor_statement => .cursor,
+        .unsupported_statement => .unsupported,
+        else => null,
+    };
+}
 
 pub const GeneratedSqlAstMode = enum {
     full,
@@ -13033,6 +13060,7 @@ test "generated SQL parser exposes accepted reduction traces" {
     defer trace.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 4), trace.accepted_token_count);
+    try std.testing.expectEqual(GeneratedSqlStatementKind.session, trace.statementKind().?);
     try std.testing.expect(trace.reductions.len > 0);
 
     var saw_session_statement = false;
@@ -13050,6 +13078,29 @@ test "generated SQL parser exposes accepted reduction traces" {
     }
     try std.testing.expect(saw_session_statement);
     try std.testing.expect(saw_statement);
+}
+
+test "generated SQL reduction traces derive statement family" {
+    const cases = [_]GeneratedSqlCorpusCase{
+        .{ .sql = "SET search_path TO public", .kind = .session },
+        .{ .sql = "BEGIN READ WRITE", .kind = .transaction },
+        .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
+        .{ .sql = "PREPARE TRANSACTION 'usage_batch'", .kind = .prepared_transaction },
+        .{ .sql = "CREATE TABLE usage_records (id text)", .kind = .ddl },
+        .{ .sql = "INSERT INTO usage_records (id) VALUES ('u1')", .kind = .dml },
+        .{ .sql = "SELECT id FROM usage_records", .kind = .read },
+        .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
+        .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
+        .{ .sql = "ANALYZE", .kind = .unsupported },
+    };
+
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(std.testing.allocator, case.sql);
+        defer lexer.freeTokens(std.testing.allocator, &tokens);
+        var trace = try parseReductionTraceAlloc(std.testing.allocator, tokens.items);
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.kind, trace.statementKind().?);
+    }
 }
 
 test "generated SQL parser diagnostics map generated token indexes to source tokens" {
