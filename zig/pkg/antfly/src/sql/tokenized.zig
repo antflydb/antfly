@@ -205,8 +205,10 @@ pub const ParsedSql = struct {
     pub fn initAlloc(alloc: std.mem.Allocator, source_sql: []const u8) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initAlloc(alloc, source_sql);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items());
-        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        var generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        raw_statement.family = rawStatementFamily(tokenized_sql.items(), raw_statement, generated_statement);
+        if (generated_statement) |*generated_raw| generated_raw.raw = raw_statement;
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
             .tokenized_sql = tokenized_sql,
@@ -219,8 +221,10 @@ pub const ParsedSql = struct {
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenSliceAlloc(alloc, source_sql, source_tokens);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items());
-        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        var generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        raw_statement.family = rawStatementFamily(tokenized_sql.items(), raw_statement, generated_statement);
+        if (generated_statement) |*generated_raw| generated_raw.raw = raw_statement;
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
             .tokenized_sql = tokenized_sql,
@@ -247,8 +251,10 @@ pub const ParsedSql = struct {
     ) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenRangesAlloc(alloc, parent.sql(), parent.items(), ranges);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items());
-        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        var generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        raw_statement.family = rawStatementFamily(tokenized_sql.items(), raw_statement, generated_statement);
+        if (generated_statement) |*generated_raw| generated_raw.raw = raw_statement;
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
             .tokenized_sql = tokenized_sql,
@@ -373,11 +379,17 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokenMatchesText(first, "declare") or tokenMatchesText(first, "close") or tokenMatchesText(first, "fetch") or tokenMatchesText(first, "move")) {
         return raw_statement.token_end > raw_statement.token_start + 1;
     }
-    return switch (raw_statement.family orelse return false) {
-        .insert, .update, .delete, .truncate, .merge => false,
-        .ddl => true,
-        .select, .with => false,
-    };
+    if (tokenMatchesKeyword(first, .select) or
+        tokenMatchesKeyword(first, .with) or
+        tokenMatchesKeyword(first, .insert) or
+        tokenMatchesKeyword(first, .update) or
+        tokenMatchesKeyword(first, .delete) or
+        tokenMatchesKeyword(first, .truncate) or
+        tokenMatchesKeyword(first, .merge))
+    {
+        return false;
+    }
+    return first.kind == .identifier or first.keyword != null;
 }
 
 fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -1023,8 +1035,8 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
-    if (raw_statement.family != .select and raw_statement.family != .with) return false;
     const first = tokens[start];
+    if (!tokenMatchesKeyword(first, .select) and !tokenMatchesKeyword(first, .with)) return false;
     const last = tokens[end - 1];
     if (end == start + 1) {
         return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
@@ -4640,14 +4652,12 @@ fn cloneTokenRangesAlloc(
     return out;
 }
 
-fn parseRawStatement(tokens: []const Token) !RawSqlStatement {
-    const family = classifier.classifyStatementFamily(tokens);
-    if (tokens.len == 0) return .{ .family = family };
+fn parseRawStatementBounds(tokens: []const Token) !RawSqlStatement {
+    if (tokens.len == 0) return .{};
     var token_end = try rawStatementTokenEnd(tokens);
     while (token_end > 0 and tokens[token_end - 1].kind == .semicolon) token_end -= 1;
-    if (token_end == 0) return .{ .family = family };
+    if (token_end == 0) return .{};
     return .{
-        .family = family,
         .token_start = 0,
         .token_end = token_end,
         .source_span = .{
@@ -4655,6 +4665,51 @@ fn parseRawStatement(tokens: []const Token) !RawSqlStatement {
             .end = tokens[token_end - 1].source_end,
         },
     };
+}
+
+fn rawStatementFamily(
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+    generated_statement: ?GeneratedRawSqlStatement,
+) ?classifier.SqlStatementFamily {
+    if (generated_statement) |generated_raw| {
+        if (rawStatementFamilyFromGenerated(tokens, raw_statement, generated_raw)) |family| return family;
+    }
+    return classifier.classifyStatementFamily(tokens);
+}
+
+fn rawStatementFamilyFromGenerated(
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+    generated_raw: GeneratedRawSqlStatement,
+) ?classifier.SqlStatementFamily {
+    if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return null;
+    const first = tokens[raw_statement.token_start];
+    return switch (generated_raw.statement) {
+        .read => if (tokenMatchesKeyword(first, .with)) .with else .select,
+        .dml => generatedDmlFamilyFromHead(first),
+        .session,
+        .transaction,
+        .prepared,
+        .prepared_transaction,
+        .ddl,
+        .extension_index,
+        .graph,
+        .cursor,
+        .unsupported,
+        => .ddl,
+        .other => null,
+    };
+}
+
+fn generatedDmlFamilyFromHead(first: Token) ?classifier.SqlStatementFamily {
+    if (tokenMatchesKeyword(first, .with)) return .with;
+    if (tokenMatchesKeyword(first, .insert)) return .insert;
+    if (tokenMatchesKeyword(first, .update)) return .update;
+    if (tokenMatchesKeyword(first, .delete)) return .delete;
+    if (tokenMatchesKeyword(first, .truncate)) return .truncate;
+    if (tokenMatchesKeyword(first, .merge)) return .merge;
+    return null;
 }
 
 fn rawStatementTokenEnd(tokens: []const Token) !usize {
@@ -4677,7 +4732,7 @@ fn rawStatementTokenEnd(tokens: []const Token) !usize {
     return tokens.len;
 }
 
-test "sql adapter tokenized sql leaves legacy statement family to parsed sql" {
+test "sql adapter parsed sql derives raw family from generated statements first" {
     const alloc = std.testing.allocator;
 
     var query = try TokenizedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
@@ -4686,6 +4741,7 @@ test "sql adapter tokenized sql leaves legacy statement family to parsed sql" {
 
     var parsed_joined = try ParsedSql.initAlloc(alloc, "SELECT o.id FROM usage_records AS o JOIN customers AS c ON o.customer_id = c.id");
     defer parsed_joined.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, parsed_joined.generatedStatementKind().?);
     try std.testing.expectEqual(classifier.SqlStatementFamily.select, parsed_joined.raw_statement.family.?);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.join, parsed_joined.readStatementKind().?);
 
@@ -4699,6 +4755,7 @@ test "sql adapter tokenized sql leaves legacy statement family to parsed sql" {
 
     var parsed_write = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer parsed_write.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed_write.generatedStatementKind().?);
     try std.testing.expectEqual(classifier.SqlStatementFamily.with, parsed_write.raw_statement.family.?);
     try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
 }

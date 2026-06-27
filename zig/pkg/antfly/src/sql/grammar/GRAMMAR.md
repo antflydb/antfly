@@ -118,14 +118,15 @@ fallbacks no longer steal supported DDL such as `CREATE VIEW`. Generated-gate
 admission now comes from the grammar parse itself rather than the hand-written
 token-head classifier, so production ingress no longer decides generated
 coverage by probing legacy statement heads before running the generated parser.
-Tokenization is now scanner-only for concrete read/write dispatch:
-`TokenizedSql` no longer caches legacy read/write statement variants, and those
-compatibility variants are derived from the parsed/generated statement for
-remaining fallback surfaces.
-The remaining legacy classifier dependency is the detailed statement-variant
-builder used after grammar family validation for families that have not yet
-migrated concrete variant dispatch; generated read variants now come from the
-retained generated read AST kind directly. The
+Tokenization and raw-statement construction are now scanner-only before the
+generated parser runs: raw bounds and source spans are computed without calling
+the legacy statement-family classifier. When the generated parser accepts a
+statement, `ParsedSql` stamps the raw statement family from the generated
+statement kind and head token, then uses generated AST payloads for the first
+migrated concrete variants. The legacy classifier is no longer re-exported
+through the SQL facade and remains only as an internal compatibility fallback
+for statement shapes the generated grammar still does not accept. Generated
+read variants now come from the retained generated read AST kind directly. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
@@ -1395,7 +1396,8 @@ including body-local table-function items, join-tree payloads, named windows,
 pagination with `OFFSET ... ROWS`, row-lock tails, and body set-operation
 metadata, so direct generated read lowering no longer depends on later
 body-clone validation to catch corrupted retained CTE payloads.
-   Switching reads from fallback to required generated parsing still requires
+   Removing the remaining compatibility classifier fallback and requiring
+   generated parsing for all reads still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
