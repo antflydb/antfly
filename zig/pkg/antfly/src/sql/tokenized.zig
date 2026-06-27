@@ -8604,6 +8604,24 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_cte_set_operation_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_set_operation_query.statement));
 
+    var generated_cte_set_operation_tail_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive ORDER BY id LIMIT 5) SELECT id FROM source_rows");
+    defer generated_cte_set_operation_tail_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_set_operation_tail_query.generatedStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.cte, generated_cte_set_operation_tail_query.readStatementKind().?);
+
+    var malformed_cte_set_operation_tail_generated = generated_cte_set_operation_tail_query.generated_statement.?;
+    if (malformed_cte_set_operation_tail_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_order_items.items[0].end += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_set_operation_tail_query.statement = parseStatement(generated_cte_set_operation_tail_query.raw_statement, malformed_cte_set_operation_tail_generated, &generated_cte_set_operation_tail_query.tokenized_sql);
+    try std.testing.expect(generated_cte_set_operation_tail_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_set_operation_tail_query.statement));
+
     var generated_multi_cte_query = try ParsedSql.initAlloc(alloc, "WITH first_rows AS (SELECT id FROM usage_records), second_rows AS (SELECT id FROM first_rows) SELECT id FROM second_rows");
     defer generated_multi_cte_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_multi_cte_query.generatedStatementKind().?);

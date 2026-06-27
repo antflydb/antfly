@@ -1948,7 +1948,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     }
 
-    const FakeExecutor = struct {
+    const FakeSource = struct {
         const Parent = @This();
 
         var prepare_calls: usize = 0;
@@ -1958,63 +1958,52 @@ test "metadata replication backfill applies postgres snapshot rows through bound
         var snapshot_begin_calls: usize = 0;
         var snapshot_query_calls: usize = 0;
 
+        fn rowsForParams(inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+            Parent.saw_order_by_id = params.order_by.len == 1 and
+                std.mem.eql(u8, params.order_by[0].field, "id") and
+                !params.order_by[0].desc;
+
+            const all_rows = [_][]const u8{
+                "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
+                "{\"id\":\"doc:2\",\"name\":\"beta\"}",
+            };
+            if (params.offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
+
+            const limit = params.limit orelse all_rows.len;
+            const count = @min(limit, all_rows.len - params.offset);
+            const rows = try inner_alloc.alloc(std.json.Value, count);
+            for (0..count) |i| {
+                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[params.offset + i], .{});
+            }
+            return .{ .rows = rows, .total = all_rows.len };
+        }
+
         const SnapshotSession = struct {
             fn destroy(ptr: *anyopaque, inner_alloc: Allocator) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 inner_alloc.destroy(self);
             }
 
-            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
-                var owned = prepared;
-                defer owned.deinit(inner_alloc);
+            fn query(_: *anyopaque, inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
                 Parent.snapshot_query_calls += 1;
-                Parent.saw_order_by_id = std.mem.indexOf(u8, owned.sql_text, "ORDER BY \"id\" ASC") != null;
-
-                const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-                const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
-
-                const all_rows = [_][]const u8{
-                    "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
-                    "{\"id\":\"doc:2\",\"name\":\"beta\"}",
-                };
-                if (offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
-
-                const count = @min(limit, all_rows.len - offset);
-                const rows = try inner_alloc.alloc(std.json.Value, count);
-                for (0..count) |i| {
-                    rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[offset + i], .{});
-                }
-                return .{ .rows = rows, .total = all_rows.len };
+                return try Parent.rowsForParams(inner_alloc, params);
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
-            var owned = prepared;
-            defer owned.deinit(inner_alloc);
-            saw_order_by_id = std.mem.indexOf(u8, owned.sql_text, "ORDER BY \"id\" ASC") != null;
-
-            const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-            const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
-
-            const all_rows = [_][]const u8{
-                "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
-                "{\"id\":\"doc:2\",\"name\":\"beta\"}",
-            };
-            if (offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
-
-            const count = @min(limit, all_rows.len - offset);
-            const rows = try inner_alloc.alloc(std.json.Value, count);
-            for (0..count) |i| {
-                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[offset + i], .{});
-            }
-            return .{ .rows = rows, .total = all_rows.len };
+        fn destroy(ptr: *anyopaque, inner_alloc: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            inner_alloc.destroy(self);
         }
 
-        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+        fn query(_: *anyopaque, inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+            return try rowsForParams(inner_alloc, params);
+        }
+
+        fn statistics(_: *anyopaque, _: []const u8) !foreign_mod.TableStatistics {
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
-        fn beginSnapshotQuery(_: *anyopaque, inner_alloc: Allocator, _: []const u8) !foreign_mod.PostgresQueryExecutor.SnapshotQuery {
+        fn beginSnapshotQuery(_: *anyopaque, inner_alloc: Allocator) !foreign_mod.SnapshotReader {
             Parent.snapshot_begin_calls += 1;
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
@@ -2027,7 +2016,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
             };
         }
 
-        fn prepareReplication(_: *anyopaque, inner_alloc: Allocator, _: []const u8, params: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPrepareResult {
+        fn prepareReplication(_: *anyopaque, inner_alloc: Allocator, params: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPrepareResult {
             prepare_calls += 1;
             if (last_prepare_slot_name) |slot_name| inner_alloc.free(slot_name);
             if (last_prepare_publication_name) |publication_name| inner_alloc.free(publication_name);
@@ -2036,44 +2025,37 @@ test "metadata replication backfill applies postgres snapshot rows through bound
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:prepared") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
-            const columns = try inner_alloc.alloc(foreign_mod.Column, 2);
-            columns[0] = .{
-                .name = try inner_alloc.dupe(u8, "id"),
-                .data_type = try inner_alloc.dupe(u8, "text"),
-                .nullable = false,
+        fn factory(inner_alloc: Allocator, config: foreign_mod.Config) !foreign_mod.Source {
+            var owned_config = config;
+            defer owned_config.deinit(inner_alloc);
+            const source = try inner_alloc.create(@This());
+            source.* = .{};
+            return .{
+                .ptr = source,
+                .vtable = &.{
+                    .deinit = destroy,
+                    .query = query,
+                    .statistics = statistics,
+                    .begin_snapshot_query = beginSnapshotQuery,
+                    .prepare_replication = prepareReplication,
+                },
             };
-            columns[1] = .{
-                .name = try inner_alloc.dupe(u8, "name"),
-                .data_type = try inner_alloc.dupe(u8, "text"),
-                .nullable = false,
-            };
-            return columns;
         }
     };
-    FakeExecutor.prepare_calls = 0;
-    FakeExecutor.last_prepare_slot_name = null;
-    FakeExecutor.last_prepare_publication_name = null;
-    FakeExecutor.saw_order_by_id = false;
-    FakeExecutor.snapshot_begin_calls = 0;
-    FakeExecutor.snapshot_query_calls = 0;
+    FakeSource.prepare_calls = 0;
+    FakeSource.last_prepare_slot_name = null;
+    FakeSource.last_prepare_publication_name = null;
+    FakeSource.saw_order_by_id = false;
+    FakeSource.snapshot_begin_calls = 0;
+    FakeSource.snapshot_query_calls = 0;
     defer {
-        if (FakeExecutor.last_prepare_slot_name) |slot_name| alloc.free(slot_name);
-        if (FakeExecutor.last_prepare_publication_name) |publication_name| alloc.free(publication_name);
+        if (FakeSource.last_prepare_slot_name) |slot_name| alloc.free(slot_name);
+        if (FakeSource.last_prepare_publication_name) |publication_name| alloc.free(publication_name);
     }
 
     var registry = foreign_mod.Registry{};
     defer registry.deinit(alloc);
-    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
-        .ptr = undefined,
-        .vtable = &.{
-            .query = FakeExecutor.query,
-            .statistics = FakeExecutor.statistics,
-            .discover_columns = FakeExecutor.discoverColumns,
-            .begin_snapshot_query = FakeExecutor.beginSnapshotQuery,
-            .prepare_replication = FakeExecutor.prepareReplication,
-        },
-    });
+    try registry.register(alloc, .postgres, FakeSource.factory);
 
     var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
 
@@ -2119,12 +2101,12 @@ test "metadata replication backfill applies postgres snapshot rows through bound
     try std.testing.expectEqualStrings("antfly_postgres_users_docs", status_sink.records.items[status_sink.records.items.len - 1].slot_name);
     try std.testing.expectEqualStrings("antfly_pub_postgres_users_docs", status_sink.records.items[status_sink.records.items.len - 1].publication_name);
     try std.testing.expect(status_sink.records.items[status_sink.records.items.len - 1].updated_at_ms > 0);
-    try std.testing.expectEqual(@as(usize, 1), FakeExecutor.prepare_calls);
-    try std.testing.expectEqual(@as(usize, 1), FakeExecutor.snapshot_begin_calls);
-    try std.testing.expectEqual(@as(usize, 3), FakeExecutor.snapshot_query_calls);
-    try std.testing.expect(FakeExecutor.saw_order_by_id);
-    try std.testing.expectEqualStrings("antfly_postgres_users_docs", FakeExecutor.last_prepare_slot_name.?);
-    try std.testing.expectEqualStrings("antfly_pub_postgres_users_docs", FakeExecutor.last_prepare_publication_name.?);
+    try std.testing.expectEqual(@as(usize, 1), FakeSource.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 1), FakeSource.snapshot_begin_calls);
+    try std.testing.expectEqual(@as(usize, 3), FakeSource.snapshot_query_calls);
+    try std.testing.expect(FakeSource.saw_order_by_id);
+    try std.testing.expectEqualStrings("antfly_postgres_users_docs", FakeSource.last_prepare_slot_name.?);
+    try std.testing.expectEqualStrings("antfly_pub_postgres_users_docs", FakeSource.last_prepare_publication_name.?);
 
     var result_one = (try db.lookup(alloc, "doc:1", .{})).?;
     defer result_one.deinit(alloc);
@@ -2149,12 +2131,27 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     }
 
-    const FakeExecutor = struct {
+    const FakeSource = struct {
         const Parent = @This();
 
         var prepare_calls: usize = 0;
         var exact_cutover_calls: usize = 0;
         var snapshot_query_calls: usize = 0;
+
+        fn rowsForParams(inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+            const all_rows = [_][]const u8{
+                "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
+                "{\"id\":\"doc:2\",\"name\":\"beta\"}",
+            };
+            if (params.offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
+            const limit = params.limit orelse all_rows.len;
+            const count = @min(limit, all_rows.len - params.offset);
+            const rows = try inner_alloc.alloc(std.json.Value, count);
+            for (0..count) |i| {
+                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[params.offset + i], .{});
+            }
+            return .{ .rows = rows, .total = all_rows.len };
+        }
 
         const SnapshotSession = struct {
             fn destroy(ptr: *anyopaque, inner_alloc: Allocator) void {
@@ -2162,49 +2159,36 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
                 inner_alloc.destroy(self);
             }
 
-            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
-                var owned = prepared;
-                defer owned.deinit(inner_alloc);
+            fn query(_: *anyopaque, inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
                 Parent.snapshot_query_calls += 1;
-
-                const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-                const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
-                const all_rows = [_][]const u8{
-                    "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
-                    "{\"id\":\"doc:2\",\"name\":\"beta\"}",
-                };
-                if (offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
-                const count = @min(limit, all_rows.len - offset);
-                const rows = try inner_alloc.alloc(std.json.Value, count);
-                for (0..count) |i| {
-                    rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[offset + i], .{});
-                }
-                return .{ .rows = rows, .total = all_rows.len };
+                return try Parent.rowsForParams(inner_alloc, params);
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
-            var owned = prepared;
-            defer owned.deinit(inner_alloc);
+        fn destroy(ptr: *anyopaque, inner_alloc: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            inner_alloc.destroy(self);
+        }
+
+        fn query(_: *anyopaque, _: Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
             return .{ .rows = &.{}, .total = 0 };
         }
 
-        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+        fn statistics(_: *anyopaque, _: []const u8) !foreign_mod.TableStatistics {
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
         fn beginPreparedReplicationSnapshot(
             _: *anyopaque,
             inner_alloc: Allocator,
-            _: []const u8,
             _: foreign_mod.ReplicationPollParams,
-        ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
+        ) !foreign_mod.PreparedReplicationSnapshot {
             Parent.exact_cutover_calls += 1;
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
             return .{
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:exact"),
-                .snapshot_query = .{
+                .reader = .{
                     .ptr = session,
                     .vtable = &.{
                         .deinit = SnapshotSession.destroy,
@@ -2214,37 +2198,35 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             };
         }
 
-        fn prepareReplication(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPrepareResult {
+        fn prepareReplication(_: *anyopaque, inner_alloc: Allocator, _: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPrepareResult {
             Parent.prepare_calls += 1;
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:fallback") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
-            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
-            columns[0] = .{
-                .name = try inner_alloc.dupe(u8, "id"),
-                .data_type = try inner_alloc.dupe(u8, "text"),
-                .nullable = false,
+        fn factory(inner_alloc: Allocator, config: foreign_mod.Config) !foreign_mod.Source {
+            var owned_config = config;
+            defer owned_config.deinit(inner_alloc);
+            const source = try inner_alloc.create(@This());
+            source.* = .{};
+            return .{
+                .ptr = source,
+                .vtable = &.{
+                    .deinit = destroy,
+                    .query = query,
+                    .statistics = statistics,
+                    .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
+                    .prepare_replication = prepareReplication,
+                },
             };
-            return columns;
         }
     };
-    FakeExecutor.prepare_calls = 0;
-    FakeExecutor.exact_cutover_calls = 0;
-    FakeExecutor.snapshot_query_calls = 0;
+    FakeSource.prepare_calls = 0;
+    FakeSource.exact_cutover_calls = 0;
+    FakeSource.snapshot_query_calls = 0;
 
     var registry = foreign_mod.Registry{};
     defer registry.deinit(alloc);
-    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
-        .ptr = undefined,
-        .vtable = &.{
-            .query = FakeExecutor.query,
-            .statistics = FakeExecutor.statistics,
-            .discover_columns = FakeExecutor.discoverColumns,
-            .begin_prepared_replication_snapshot = FakeExecutor.beginPreparedReplicationSnapshot,
-            .prepare_replication = FakeExecutor.prepareReplication,
-        },
-    });
+    try registry.register(alloc, .postgres, FakeSource.factory);
 
     var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
 
@@ -2278,9 +2260,9 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
     }, 0);
 
-    try std.testing.expectEqual(@as(usize, 1), FakeExecutor.exact_cutover_calls);
-    try std.testing.expectEqual(@as(usize, 0), FakeExecutor.prepare_calls);
-    try std.testing.expectEqual(@as(usize, 3), FakeExecutor.snapshot_query_calls);
+    try std.testing.expectEqual(@as(usize, 1), FakeSource.exact_cutover_calls);
+    try std.testing.expectEqual(@as(usize, 0), FakeSource.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 3), FakeSource.snapshot_query_calls);
     try std.testing.expectEqualStrings("lsn:exact", status_sink.records.items[status_sink.records.items.len - 1].prepared_checkpoint);
     try std.testing.expectEqualStrings("exported_snapshot", status_sink.records.items[status_sink.records.items.len - 1].cutover_mode);
 }
@@ -2637,53 +2619,51 @@ test "metadata replication backfill coordinator resumes and then skips completed
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     }
 
-    const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
-            var owned = prepared;
-            defer owned.deinit(inner_alloc);
+    const FakeSource = struct {
+        fn destroy(ptr: *anyopaque, inner_alloc: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            inner_alloc.destroy(self);
+        }
 
-            const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-            const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
-
+        fn query(_: *anyopaque, inner_alloc: Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
             const all_rows = [_][]const u8{
                 "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
                 "{\"id\":\"doc:2\",\"name\":\"beta\"}",
             };
-            if (offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
+            if (params.offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
 
-            const count = @min(limit, all_rows.len - offset);
+            const limit = params.limit orelse all_rows.len;
+            const count = @min(limit, all_rows.len - params.offset);
             const rows = try inner_alloc.alloc(std.json.Value, count);
             for (0..count) |i| {
-                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[offset + i], .{});
+                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[params.offset + i], .{});
             }
             return .{ .rows = rows, .total = all_rows.len };
         }
 
-        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+        fn statistics(_: *anyopaque, _: []const u8) !foreign_mod.TableStatistics {
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
-            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
-            columns[0] = .{
-                .name = try inner_alloc.dupe(u8, "id"),
-                .data_type = try inner_alloc.dupe(u8, "text"),
-                .nullable = false,
+        fn factory(inner_alloc: Allocator, config: foreign_mod.Config) !foreign_mod.Source {
+            var owned_config = config;
+            defer owned_config.deinit(inner_alloc);
+            const source = try inner_alloc.create(@This());
+            source.* = .{};
+            return .{
+                .ptr = source,
+                .vtable = &.{
+                    .deinit = destroy,
+                    .query = query,
+                    .statistics = statistics,
+                },
             };
-            return columns;
         }
     };
 
     var registry = foreign_mod.Registry{};
     defer registry.deinit(alloc);
-    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
-        .ptr = undefined,
-        .vtable = &.{
-            .query = FakeExecutor.query,
-            .statistics = FakeExecutor.statistics,
-            .discover_columns = FakeExecutor.discoverColumns,
-        },
-    });
+    try registry.register(alloc, .postgres, FakeSource.factory);
 
     var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
 
@@ -4280,15 +4260,6 @@ test "metadata replication stream coordinator marks missing slot as terminal fai
     try std.testing.expectEqual(@as(u64, 1), status_sink.latest().consecutive_failures);
     try std.testing.expectEqualStrings("lsn:prepared", status_sink.latest().prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:10", status_sink.latest().stream_checkpoint);
-}
-
-fn parseSqlSuffixUsize(sql_text: []const u8, marker: []const u8) ?usize {
-    const start = std.mem.indexOf(u8, sql_text, marker) orelse return null;
-    const value_start = start + marker.len;
-    var value_end = value_start;
-    while (value_end < sql_text.len and std.ascii.isDigit(sql_text[value_end])) : (value_end += 1) {}
-    if (value_end == value_start) return null;
-    return std.fmt.parseInt(usize, sql_text[value_start..value_end], 10) catch null;
 }
 
 test "metadata replication live snapshot and later streaming insert through runner" {

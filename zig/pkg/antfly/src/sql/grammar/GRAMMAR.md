@@ -471,7 +471,11 @@ dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
 direct CTE query-plan lowering also preserves generated final set-operation
 metadata for same-source CTE set-operation arms and fails closed when retained
-set-operation payloads are malformed.
+set-operation payloads are malformed. CTE body set-operation AST construction
+now also splits the set-operation right query from result-tail `ORDER BY`,
+`LIMIT`, `OFFSET`, and `FETCH` clauses, retaining those tails as CTE body
+ordering and pagination metadata with the same fail-closed list/expression
+validation used by non-set CTE bodies.
 Recursive CTEs still dispatch through the recursive CTE family after validating
 their generated recursive flag.
 Unsupported read shapes

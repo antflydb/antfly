@@ -5111,10 +5111,13 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     cte.body_select_tokens = .{ .start = select_index, .end = select_index + 1 };
 
     const body_end = firstTopLevelSetOperation(tokens, select_index + 1, body_tokens.end) orelse body_tokens.end;
+    var set_operation_tail_start: ?usize = null;
     if (body_end < body_tokens.end) {
-        const set_operation_tokens = GeneratedSqlTokenRange{ .start = body_end, .end = body_tokens.end };
+        const tail_start = generatedSetOperationResultTailStart(tokens, .{ .start = body_end, .end = body_tokens.end }) orelse body_tokens.end;
+        const set_operation_tokens = GeneratedSqlTokenRange{ .start = body_end, .end = tail_start };
         cte.body_set_operation_tokens = set_operation_tokens;
         try buildGeneratedSetOperationAstInto(alloc, tokens, set_operation_tokens, &cte.body_set_operation);
+        set_operation_tail_start = tail_start;
     }
 
     const projection_start = generatedReadProjectionStartInRange(tokens, select_index, body_end, &cte.body_distinct_tokens);
@@ -5261,6 +5264,72 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     }
     if (row_lock_index) |idx| {
         if (idx + 1 < body_end) cte.body_row_lock_tokens = .{ .start = idx, .end = body_end };
+    }
+    if (set_operation_tail_start) |tail_start| {
+        try buildGeneratedCteBodyResultTailAst(alloc, tokens, tail_start, body_tokens.end, cte);
+    }
+}
+
+fn buildGeneratedCteBodyResultTailAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+    cte: *GeneratedSqlCteAst,
+) !void {
+    if (start >= end or end > tokens.len) return;
+
+    const order_index = findTopLevelKeyword(tokens, start, end, .order);
+    const limit_index = findTopLevelKeyword(tokens, start, end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, start, end, .offset);
+    const fetch_index = findTopLevelKeyword(tokens, start, end, .fetch);
+
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse end;
+        if (order_start < order_end) {
+            const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
+            cte.body_order_tokens = order_tokens;
+            cte.body_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
+            if (generatedListExpressionTokens(cte.body_order_items, 0)) |first_tokens| {
+                try buildGeneratedExpressionAstInto(alloc, tokens, first_tokens, &cte.body_order_first_expression);
+            }
+            if (generatedListExpressionTokens(cte.body_order_items, cte.body_order_items.count -| 1)) |last_tokens| {
+                try buildGeneratedExpressionAstInto(alloc, tokens, last_tokens, &cte.body_order_last_expression);
+            }
+        }
+    }
+    if (limit_index) |idx| {
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse end;
+        if (idx + 1 < limit_end) {
+            const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
+            cte.body_limit_tokens = limit_tokens;
+            if (limit_tokens.end == limit_tokens.start + 1 and tokens[limit_tokens.start].matchesKeywordTag(.all)) {
+                cte.body_limit_all = true;
+            } else {
+                try buildGeneratedExpressionAstInto(alloc, tokens, limit_tokens, &cte.body_limit_expression);
+            }
+        }
+    }
+    if (offset_index) |idx| {
+        const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse end;
+        if (idx + 1 < offset_end) {
+            const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
+            cte.body_offset_tokens = offset_tokens;
+            if (generatedOffsetExpressionTokens(tokens, offset_tokens)) |expression_tokens| {
+                try buildGeneratedExpressionAstInto(alloc, tokens, expression_tokens, &cte.body_offset_expression);
+            }
+        }
+    }
+    if (fetch_index) |idx| {
+        if (idx + 1 < end) {
+            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = end };
+            cte.body_fetch_tokens = fetch_tokens;
+            if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
+                cte.body_fetch_count_tokens = count_tokens;
+                try buildGeneratedExpressionAstInto(alloc, tokens, count_tokens, &cte.body_fetch_count_expression);
+            }
+        }
     }
 }
 
@@ -11571,6 +11640,26 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_set_operation.right_projection_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_set_operation.right_projection_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_set_operation.right_source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_set_operation_tail_read_sql = "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive ORDER BY id LIMIT 5) SELECT id FROM source_rows";
+    const cte_set_operation_tail_read_result = try parseSqlAlloc(alloc, cte_set_operation_tail_read_sql);
+    switch (cte_set_operation_tail_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlReadKind.set_operation, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 18 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.cte_items[0].body_set_operation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.cte_items[0].body_set_operation.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 13 }, read.cte_items[0].body_set_operation.right_query_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.cte_items[0].body_order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.cte_items[0].body_order_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, read.cte_items[0].body_limit_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, read.cte_items[0].body_limit_expression.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
