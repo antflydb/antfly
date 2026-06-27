@@ -6280,7 +6280,7 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, extension_index_ast.index_table_tokens.?);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, extension_index_ast.index_method_tokens.?);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, extension_index_ast.index_elements_tokens.?);
-            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 15 }, extension_index_ast.index_options_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 16 }, extension_index_ast.index_options_tokens.?);
             try std.testing.expect(!extension_index_ast.unique);
         },
         else => return error.TestUnexpectedResult,

@@ -1951,11 +1951,12 @@ pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
     const tokens = parsed_sql.items();
     const raw = parsed_sql.statement.raw();
     if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
-    const statement_tokens = tokens[raw.token_start..raw.token_end];
+    return try writeTargetTableNameFromTokensAlloc(alloc, tokens[raw.token_start..raw.token_end]);
+}
+
+fn writeTargetTableNameFromTokensAlloc(alloc: std.mem.Allocator, statement_tokens: []const Token) ![]const u8 {
     var pos = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
-    const statement_kind = parsed_sql.writeStatementKind() orelse
-        writeStatementKindFromFinalStatementTokens(statement_tokens, pos) orelse
-        return error.UnsupportedSqlShape;
+    const statement_kind = writeStatementKindFromFinalStatementTokens(statement_tokens, pos) orelse return error.UnsupportedSqlShape;
     switch (statement_kind) {
         .insert, .insert_source => {
             if (!consumeKeyword(statement_tokens, &pos, .insert)) return error.UnsupportedSqlShape;
@@ -2800,16 +2801,26 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
         if (index + 1 >= close_index) return error.UnsupportedSqlShape;
 
-        var cte_tables = (try selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0)) orelse return error.UnsupportedSqlShape;
-        defer cte_tables.deinit(alloc);
-        try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &cte_tables);
-        if (cte_tables.source) |source| {
-            if (!std.mem.eql(u8, cte_tables.left, source) and !std.mem.eql(u8, cte_name, source)) return error.UnsupportedSqlShape;
-        }
+        const cte_source = cte_source: {
+            var cte_tables = selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0) catch |err| switch (err) {
+                error.UnsupportedSqlShape => null,
+                else => return err,
+            };
+            if (cte_tables) |*tables| {
+                defer tables.deinit(alloc);
+                try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, tables);
+                if (tables.source) |source| {
+                    if (!std.mem.eql(u8, tables.left, source) and !std.mem.eql(u8, cte_name, source)) return error.UnsupportedSqlShape;
+                }
+                break :cte_source try alloc.dupe(u8, tables.left);
+            }
+            break :cte_source try writeTargetTableNameFromTokensAlloc(alloc, tokens[index + 1 .. close_index]);
+        };
+        errdefer alloc.free(cte_source);
 
         try cte_bindings.append(alloc, .{
             .name = cte_name,
-            .source = try alloc.dupe(u8, cte_tables.left),
+            .source = cte_source,
         });
         cte_name_transferred = true;
 

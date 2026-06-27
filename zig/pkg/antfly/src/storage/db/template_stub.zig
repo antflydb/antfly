@@ -280,7 +280,7 @@ pub const ErrorDirective = struct {
 
     pub fn isPermanent(self: ErrorDirective) bool {
         return self.status == 401 or self.status == 403 or
-            self.status == 404 or self.status == 410;
+            self.status == 404 or self.status == 410 or self.status == 413;
     }
 };
 

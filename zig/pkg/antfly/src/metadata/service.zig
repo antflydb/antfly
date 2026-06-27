@@ -54,20 +54,97 @@ const foreign_mod = @import("../foreign/mod.zig");
 const cdc_replication_round_interval_ms: u64 = 1_000;
 pub const default_fk_schema_controller_worker_id = "metadata-fk-schema-controller";
 pub const default_unique_schema_controller_worker_id = "metadata-unique-schema-controller";
+pub const metadata_run_round_slow_threshold_ns: u64 = std.time.ns_per_s;
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
+const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
 
-fn logMetadataRunRoundPhase(name: []const u8, start_ns: u64) void {
-    const elapsed_ns = platform_time.monotonicNs() -| start_ns;
+fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
-        std.log.debug("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
+        std.log.warn("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
             name,
             @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
     }
 }
+
+const MetadataRunRoundTrace = struct {
+    const Phase = struct {
+        name: []const u8,
+        elapsed_ns: u64,
+    };
+
+    start_ns: u64,
+    phases: [metadata_run_round_trace_max_phases]Phase = undefined,
+    phase_count: usize = 0,
+    dropped_phases: usize = 0,
+
+    fn init() MetadataRunRoundTrace {
+        return .{ .start_ns = platform_time.monotonicNs() };
+    }
+
+    fn recordSince(self: *MetadataRunRoundTrace, name: []const u8, start_ns: u64) void {
+        const elapsed_ns = platform_time.monotonicNs() -| start_ns;
+        if (self.phase_count < self.phases.len) {
+            self.phases[self.phase_count] = .{ .name = name, .elapsed_ns = elapsed_ns };
+            self.phase_count += 1;
+        } else {
+            self.dropped_phases += 1;
+        }
+        logMetadataRunRoundPhase(name, elapsed_ns);
+    }
+
+    fn logIfSlow(self: *const MetadataRunRoundTrace) void {
+        const total_elapsed_ns = platform_time.monotonicNs() -| self.start_ns;
+        if (total_elapsed_ns <= metadata_run_round_slow_threshold_ns) return;
+
+        const top = self.topPhaseIndexes();
+        const top0 = phaseOrEmpty(self, top[0]);
+        const top1 = phaseOrEmpty(self, top[1]);
+        const top2 = phaseOrEmpty(self, top[2]);
+        std.log.warn(
+            "metadata runRound phase summary slow elapsed_ms={d} phases={d} dropped_phases={d} top1_phase={s} top1_ms={d} top2_phase={s} top2_ms={d} top3_phase={s} top3_ms={d}",
+            .{
+                @divTrunc(total_elapsed_ns, std.time.ns_per_ms),
+                self.phase_count,
+                self.dropped_phases,
+                top0.name,
+                @divTrunc(top0.elapsed_ns, std.time.ns_per_ms),
+                top1.name,
+                @divTrunc(top1.elapsed_ns, std.time.ns_per_ms),
+                top2.name,
+                @divTrunc(top2.elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+    }
+
+    fn topPhaseIndexes(self: *const MetadataRunRoundTrace) [3]?usize {
+        var top: [3]?usize = .{ null, null, null };
+        for (self.phases[0..self.phase_count], 0..) |phase, idx| {
+            var insert_at: ?usize = null;
+            for (top, 0..) |existing, top_idx| {
+                if (existing == null or phase.elapsed_ns > self.phases[existing.?].elapsed_ns) {
+                    insert_at = top_idx;
+                    break;
+                }
+            }
+            if (insert_at) |slot| {
+                var move_idx: usize = top.len - 1;
+                while (move_idx > slot) : (move_idx -= 1) {
+                    top[move_idx] = top[move_idx - 1];
+                }
+                top[slot] = idx;
+            }
+        }
+        return top;
+    }
+
+    fn phaseOrEmpty(self: *const MetadataRunRoundTrace, idx: ?usize) Phase {
+        return if (idx) |value| self.phases[value] else .{ .name = "-", .elapsed_ns = 0 };
+    }
+};
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -3753,11 +3830,21 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
+        var run_round_trace = MetadataRunRoundTrace.init();
+        defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
         try self.ensureLifecycleListenerRegistered();
-        logMetadataRunRoundPhase("ensure_lifecycle_listener", phase_start_ns);
-        defer self.refreshMetadataStatusCacheIfDue();
-        defer self.lifecycle_signal.notify(null);
+        run_round_trace.recordSince("ensure_lifecycle_listener", phase_start_ns);
+        defer {
+            const status_cache_phase_start_ns = platform_time.monotonicNs();
+            self.refreshMetadataStatusCacheIfDue();
+            run_round_trace.recordSince("refresh_metadata_status_cache", status_cache_phase_start_ns);
+        }
+        defer {
+            const lifecycle_signal_phase_start_ns = platform_time.monotonicNs();
+            self.lifecycle_signal.notify(null);
+            run_round_trace.recordSince("lifecycle_signal_notify", lifecycle_signal_phase_start_ns);
+        }
         phase_start_ns = platform_time.monotonicNs();
         self.lockRuntime();
         {
@@ -3769,22 +3856,26 @@ pub const MetadataHttpService = struct {
             }
         }
         self.refreshProbeReady();
-        logMetadataRunRoundPhase("raft_round", phase_start_ns);
+        run_round_trace.recordSince("raft_round", phase_start_ns);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
-        logMetadataRunRoundPhase("ensure_reconcile_lease", phase_start_ns);
+        run_round_trace.recordSince("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
 
         phase_start_ns = platform_time.monotonicNs();
         var local_projection_inputs = try captureLocalProjectionInputs(self);
-        defer freeLocalProjectionInputs(self, &local_projection_inputs);
-        logMetadataRunRoundPhase("capture_projection_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalProjectionInputs(self, &local_projection_inputs);
+            run_round_trace.recordSince("free_projection_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_projection_inputs", phase_start_ns);
 
         phase_start_ns = platform_time.monotonicNs();
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
-        logMetadataRunRoundPhase("refresh_store_status_backfill_markers", phase_start_ns);
+        run_round_trace.recordSince("refresh_store_status_backfill_markers", phase_start_ns);
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
             self.store_status_ticks = 0;
             phase_start_ns = platform_time.monotonicNs();
@@ -3792,43 +3883,51 @@ pub const MetadataHttpService = struct {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
-            logMetadataRunRoundPhase("refresh_local_store_status", phase_start_ns);
+            run_round_trace.recordSince("refresh_local_store_status", phase_start_ns);
         }
         phase_start_ns = platform_time.monotonicNs();
         self.refreshLocalSchemaProgress(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
-        logMetadataRunRoundPhase("refresh_local_schema_progress", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_schema_progress", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         var local_placement_inputs = try captureLocalPlacementInputs(self);
-        defer freeLocalPlacementInputs(self, &local_placement_inputs);
-        logMetadataRunRoundPhase("capture_placement_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalPlacementInputs(self, &local_placement_inputs);
+            run_round_trace.recordSince("free_placement_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_placement_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer freeLocalTransitionInputs(self, &local_transition_inputs);
-        logMetadataRunRoundPhase("capture_transition_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalTransitionInputs(self, &local_transition_inputs);
+            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
-        logMetadataRunRoundPhase("refresh_local_placement_intents", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_placement_intents", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalTransitions(&local_transition_inputs);
-        logMetadataRunRoundPhase("refresh_local_transitions", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        logMetadataRunRoundPhase("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
         };
-        logMetadataRunRoundPhase("refresh_local_table_provisioning", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_table_provisioning", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.completeRestoreIntentsIfReady(&local_projection_inputs, &local_placement_inputs);
-        logMetadataRunRoundPhase("complete_restore_intents", phase_start_ns);
+        run_round_trace.recordSince("complete_restore_intents", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.runReplicationBackfillRound();
-        logMetadataRunRoundPhase("run_replication_backfill", phase_start_ns);
+        run_round_trace.recordSince("run_replication_backfill", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         self.runForeignKeySchemaControllerMaintenanceRound() catch |err| switch (err) {
             error.TableNotFound,
@@ -3841,7 +3940,7 @@ pub const MetadataHttpService = struct {
             => std.log.warn("metadata http fk schema-controller round skipped: {s}", .{@errorName(err)}),
             else => return err,
         };
-        logMetadataRunRoundPhase("run_fk_schema_controller", phase_start_ns);
+        run_round_trace.recordSince("run_fk_schema_controller", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         self.runUniqueConstraintSchemaControllerMaintenanceRound() catch |err| switch (err) {
             error.TableNotFound,
@@ -3854,13 +3953,13 @@ pub const MetadataHttpService = struct {
             => std.log.warn("metadata http unique schema-controller round skipped: {s}", .{@errorName(err)}),
             else => return err,
         };
-        logMetadataRunRoundPhase("run_unique_schema_controller", phase_start_ns);
+        run_round_trace.recordSince("run_unique_schema_controller", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.runLifecycleReconcileHookIfRequested();
-        logMetadataRunRoundPhase("run_lifecycle_reconcile_hook", phase_start_ns);
+        run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        logMetadataRunRoundPhase("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_transitions", phase_start_ns);
     }
 
     pub fn probeReady(self: *const MetadataHttpService) bool {

@@ -40,7 +40,7 @@ pub const RenderConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
 };
 
-pub const default_remote_fetch_max_download_size_bytes: u64 = 4 << 20;
+pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 
 const remote_fetch_security = scraping.ContentSecurityConfig{
     .block_private_ips = true,
@@ -83,6 +83,18 @@ pub fn renderJsonToTextWithConfig(
     defer active_render_context = prev_ctx;
 
     return try template_mod.renderDocumentWithHelpers(alloc, template_source, json_doc, &extra_helpers);
+}
+
+pub fn renderJsonToValidatedTextWithConfig(
+    alloc: Allocator,
+    template_source: []const u8,
+    json_doc: []const u8,
+    config: RenderConfig,
+) ![]const u8 {
+    const rendered = try renderJsonToTextWithConfig(alloc, template_source, json_doc, config);
+    errdefer alloc.free(rendered);
+    try validateRenderedTemplate(alloc, rendered);
+    return rendered;
 }
 
 pub fn renderJsonToParts(
@@ -136,7 +148,7 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
 
     const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
-        const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
     if (fetched == .http_error) {
@@ -197,7 +209,7 @@ fn remoteTextHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
 
     const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
-        const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
     if (fetched == .http_error) {
@@ -233,7 +245,7 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
 
     const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
-        const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
     if (fetched == .http_error) {
@@ -269,6 +281,13 @@ fn credentialName(ctx: hbs.HelperContext) ?[]const u8 {
     return switch (value) {
         .string => |text| if (text.len > 0) text else null,
         else => null,
+    };
+}
+
+fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 {
+    return switch (err) {
+        error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
+        else => try template_mod.formatErrorDirective(alloc, 0, @errorName(err)),
     };
 }
 
@@ -517,7 +536,7 @@ test "template remote applies remote content security to http urls" {
     defer resolved.deinit(alloc);
 
     try std.testing.expectEqual(@as(?bool, false), resolved.security.block_private_ips);
-    try std.testing.expectEqual(@as(?u64, 4 << 20), resolved.security.max_download_size_bytes);
+    try std.testing.expectEqual(@as(?u64, default_remote_fetch_max_download_size_bytes), resolved.security.max_download_size_bytes);
 }
 
 test "template remote renders remotePDF extract with injected pdf backend" {
@@ -718,4 +737,51 @@ test "template remote preserves http status from shared scraping fetches" {
     try std.testing.expectEqual(@as(usize, 1), directives.len);
     try std.testing.expectEqual(@as(u16, 404), directives[0].status);
     try std.testing.expectEqualStrings("remote fetch failed", directives[0].message);
+}
+
+test "template remote validated text rejects oversized remote media directive" {
+    const alloc = std.testing.allocator;
+
+    const ListenerApp = struct {
+        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+            return .{
+                .status = 200,
+                .content_type = try req_alloc.dupe(u8, "image/png"),
+                .body = try req_alloc.dupe(u8, "0123456789abcdef"),
+            };
+        }
+    };
+
+    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const photo_url = try std.fmt.allocPrint(alloc, "{s}/photo.png", .{base_uri});
+    defer alloc.free(photo_url);
+
+    const json_doc = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo_url, .{})});
+    defer alloc.free(json_doc);
+    var remote_content = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false, .max_download_size_bytes = 4 },
+    };
+    defer remote_content.deinit(alloc);
+
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=photo}} fallback text", json_doc, .{
+            .remote_content = &remote_content,
+        }),
+    );
 }
