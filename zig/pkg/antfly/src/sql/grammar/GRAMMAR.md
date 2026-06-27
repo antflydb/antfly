@@ -1153,7 +1153,11 @@ contract until storage and API row plans grow those outer-join semantics.
    across top-level reads, CTE bodies, set-operation right-hand reads, and
    subqueries, require generated `JOIN ... ON` predicate expressions to match
    their retained `ON` bodies, and validate retained subquery `FROM`/`WHERE`
-   keyword layout.
+   keyword layout. Executable predicate lowering now rejects generated
+   `EXISTS`, `NOT EXISTS`, and quantified-comparison read-subquery predicates
+   immediately after retained payload validation, so unsupported semijoin and
+   quantified-subquery forms fail closed instead of being reinterpreted by the
+   legacy scalar/list predicate parser.
    Ordinary select-list lowering now threads generated projection expression
    AST items into the typed projection parser and verifies unambiguous
    projection starts against the retained generated expression kind, so
@@ -1299,9 +1303,10 @@ body-clone validation to catch corrupted retained CTE payloads.
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,
-   and window function surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
-   subquery semantic planning/lowering beyond retained generated payload
-   validation, remaining specialized expression operator semantics beyond
+   and window function surfaces, broader boolean expression-tree coverage,
+   quantified and `EXISTS` subquery semantic planning/lowering beyond retained
+   generated payload validation and current executable fail-closed rejection,
+   remaining specialized expression operator semantics beyond
    exact generated token-layout validation, richer
    inline window-expression semantic planning beyond current generated exact `OVER`
    layout and argument-range validation, broader recursive CTE semantic planning beyond the

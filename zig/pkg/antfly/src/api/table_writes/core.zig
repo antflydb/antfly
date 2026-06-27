@@ -110,6 +110,16 @@ pub const GroupBatch = struct {
     }
 };
 
+pub const TableEmptyingRequest = struct {
+    primary_table_name: []const u8,
+    additional_table_names: []const []const u8 = &.{},
+    schema: storage_schema.TableSchema,
+    mutation: db_mod.types.RelationalRowsMutationSourceRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
+    restart_identity: bool = false,
+    cascade: bool = false,
+};
+
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -323,6 +333,11 @@ pub const TableWriteSource = struct {
             schema: storage_schema.TableSchema,
             req: db_mod.types.RelationalRowsMutationSourceRequest,
             sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
+        table_emptying: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            req: TableEmptyingRequest,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         mutate_rows_joined_from_source_rows: ?*const fn (
             ptr: *anyopaque,
@@ -771,6 +786,15 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const fn_ptr = self.vtable.mutate_rows_from_source_autocommit orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema, req, sync_level);
+    }
+
+    pub fn tableEmptying(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        req: TableEmptyingRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.table_emptying orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, req);
     }
 
     pub fn mutateRowsJoinedFromSourceRows(

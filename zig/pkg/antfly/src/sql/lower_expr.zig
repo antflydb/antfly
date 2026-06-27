@@ -26248,6 +26248,28 @@ fn validateGeneratedExpressionPredicateKind(
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
 }
 
+fn rejectGeneratedUnsupportedSubqueryPredicateExpression(
+    tokens: []const Token,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    switch (expression.kind) {
+        .exists_subquery,
+        .not_exists_subquery,
+        => {
+            try validateGeneratedExpressionPayloads(tokens, expression.*);
+            return error.UnsupportedSqlShape;
+        },
+        .quantified_comparison => {
+            if (expression.right_expression_kind == .subquery) {
+                try validateGeneratedExpressionPayloads(tokens, expression.*);
+                return error.UnsupportedSqlShape;
+            }
+        },
+        else => {},
+    }
+}
+
 fn validateGeneratedIsTailPredicateExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
     tokens: []const Token,
@@ -26541,6 +26563,8 @@ pub fn parseWhereAtomAlloc(
     realtime_ns: u64,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
+    try rejectGeneratedUnsupportedSubqueryPredicateExpression(tokens, generated_expression_ast);
+
     if (!negated and parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectToken(tokens, pos, .lparen);
         try parseWhereAtomAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, predicates, json_contains, json_path_eq, json_path_exists, array_any, array_contains, array_eq, in_predicates, text_patterns, or_predicates, true, realtime_ns, null);
@@ -33704,6 +33728,42 @@ fn setGeneratedReadWhereExpressionKind(
     return error.TestUnexpectedResult;
 }
 
+fn setGeneratedReadWhereRightExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.where_expression.right_expression_kind == null) return error.TestUnexpectedResult;
+                    read.where_expression.right_expression_kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadWhereOperatorRangeToExpression(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const expression_tokens = read.where_expression.tokens orelse return error.TestUnexpectedResult;
+                    if (read.where_expression.operator_tokens == null) return error.TestUnexpectedResult;
+                    read.where_expression.operator_tokens = expression_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn setGeneratedReadWhereLeftExpressionKind(
     parsed_sql: *tokenized.ParsedSql,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -36470,6 +36530,68 @@ test "sql adapter lower expr lowers array function projections" {
         "SELECT cardinality(id) FROM usage_records ORDER BY id",
         schema,
         &.{},
+    ));
+}
+
+test "sql adapter lower expr rejects unsupported generated subquery predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE active IS TRUE)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE active IS TRUE)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status <> ALL (SELECT status FROM usage_records)",
+        schema,
+        &.{},
+    ));
+
+    var malformed_exists_operator = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE active IS TRUE)",
+    );
+    defer malformed_exists_operator.deinit(alloc);
+    try corruptGeneratedReadWhereOperatorRangeToExpression(&malformed_exists_operator);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_exists_operator,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_quantified_subquery = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)",
+    );
+    defer malformed_quantified_subquery.deinit(alloc);
+    try setGeneratedReadWhereRightExpressionKind(&malformed_quantified_subquery, .token_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_quantified_subquery,
+        schema,
+        &.{},
+        .{},
     ));
 }
 

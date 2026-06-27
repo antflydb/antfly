@@ -75,6 +75,7 @@ const managed_embedder = @import("../../inference/managed_embedder.zig");
 const Io = std.Io;
 
 const TableWriteSource = table_write_core.TableWriteSource;
+const TableEmptyingRequest = table_write_core.TableEmptyingRequest;
 const RaftBatcher = table_write_core.RaftBatcher;
 const GroupBatch = table_write_core.GroupBatch;
 const WriteCoalesceQueue = table_write_bulk_ingest.WriteCoalesceQueue;
@@ -218,6 +219,10 @@ const buildForeignKeyIntegrityWorkStatuses = table_write_integrity.buildForeignK
 const foreignKeyIntegritySingleWorkUnit = table_write_integrity.foreignKeyIntegritySingleWorkUnit;
 const foreignKeyIntegrityPlannedUnitsContainGroupBefore = table_write_integrity.foreignKeyIntegrityPlannedUnitsContainGroupBefore;
 const foreignKeyIntegrityNowNs = table_write_integrity.foreignKeyIntegrityNowNs;
+
+fn tableEmptyingRequiresCatalogBarrier(req: TableEmptyingRequest) bool {
+    return req.additional_table_names.len != 0 or req.restart_identity or req.cascade;
+}
 const foreignKeyIntegrityWorkStatusClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusClaimable;
 const foreignKeyIntegrityWorkStatusesHaveClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusesHaveClaimable;
 const foreignKeyIntegrityWorkStatusesValid = table_write_integrity.foreignKeyIntegrityWorkStatusesValid;
@@ -7050,6 +7055,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .batch_catalog = HostedProvisionedTableWriteSource.batchCatalogNative,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                .table_emptying = tableEmptying,
                 .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
@@ -7577,6 +7583,15 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
         return try mutateRowsFromSourceAutocommitOnDb(alloc, cached.db, schema, req);
+    }
+
+    fn tableEmptying(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: TableEmptyingRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        if (tableEmptyingRequiresCatalogBarrier(req)) return error.UnsupportedOperation;
+        return try mutateRowsFromSourceAutocommit(ptr, alloc, req.primary_table_name, req.schema, req.mutation, req.sync_level);
     }
 
     fn mutateRowsJoinedFromSourceRowsAutocommit(
@@ -10288,6 +10303,7 @@ pub const BoundTableWriteSource = struct {
                 .batch = batch,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                .table_emptying = tableEmptying,
                 .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
                 .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
                 .merge_rows_from_source_rows = mergeRowsFromSourceRows,
@@ -11107,6 +11123,15 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try mutateRowsFromSourceAutocommitOnDb(alloc, self.db, schema, req);
+    }
+
+    fn tableEmptying(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: TableEmptyingRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        if (tableEmptyingRequiresCatalogBarrier(req)) return error.UnsupportedOperation;
+        return try mutateRowsFromSourceAutocommit(ptr, alloc, req.primary_table_name, req.schema, req.mutation, req.sync_level);
     }
 
     fn mutateRowsJoinedFromSourceRows(
