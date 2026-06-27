@@ -209,13 +209,29 @@ pub fn conflictReportAlloc(
 pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     var grammar: Grammar = .{};
     var active_rule: ?usize = null;
+    var skip_percent_prologue = false;
+    var skip_brace_block_depth: usize = 0;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
+        if (skip_percent_prologue) {
+            if (std.mem.indexOf(u8, raw_line, "%}") != null) skip_percent_prologue = false;
+            continue;
+        }
+        if (skip_brace_block_depth != 0) {
+            skip_brace_block_depth = try braceDepthAfterLine(raw_line, skip_brace_block_depth);
+            continue;
+        }
+
         const without_comment = stripLineComment(raw_line);
         var line = std.mem.trim(u8, without_comment, " \t\r");
         if (line.len == 0) continue;
 
+        if (std.mem.startsWith(u8, line, "%{")) {
+            if (std.mem.indexOf(u8, line, "%}") == null) skip_percent_prologue = true;
+            active_rule = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, line, "%reference ")) {
             try parseReference(&grammar, line);
             active_rule = null;
@@ -261,6 +277,11 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             active_rule = null;
             continue;
         }
+        if (isIgnoredBisonDirective(line)) {
+            skip_brace_block_depth = try braceDepthAfterLine(line, 0);
+            active_rule = null;
+            continue;
+        }
         if (std.mem.eql(u8, line, "%%")) {
             active_rule = null;
             continue;
@@ -288,6 +309,10 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
         }
 
         if (active_rule) |rule_idx| {
+            if (line[0] == '{') {
+                skip_brace_block_depth = try braceDepthAfterLine(line, 0);
+                continue;
+            }
             const alt = if (std.mem.startsWith(u8, line, "|"))
                 std.mem.trim(u8, line[1..], " \t\r")
             else
@@ -301,6 +326,54 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     }
 
     return grammar;
+}
+
+fn isIgnoredBisonDirective(line: []const u8) bool {
+    const prefixes = [_][]const u8{
+        "%code",
+        "%debug",
+        "%define",
+        "%destructor",
+        "%expect-rr",
+        "%glr-parser",
+        "%initial-action",
+        "%language",
+        "%lex-param",
+        "%locations",
+        "%name-prefix",
+        "%no-lines",
+        "%parse-param",
+        "%printer",
+        "%pure-parser",
+        "%require",
+        "%skeleton",
+        "%union",
+        "%verbose",
+        "%yacc",
+    };
+    for (prefixes) |prefix| {
+        if (std.mem.eql(u8, line, prefix)) return true;
+        if (line.len > prefix.len and std.mem.startsWith(u8, line, prefix) and std.ascii.isWhitespace(line[prefix.len])) return true;
+    }
+    return false;
+}
+
+fn braceDepthAfterLine(line: []const u8, initial_depth: usize) !usize {
+    var depth = initial_depth;
+    var index: usize = 0;
+    while (index < line.len) : (index += 1) {
+        switch (line[index]) {
+            '\'' => try skipQuotedFragment(line, &index, '\''),
+            '"' => try skipQuotedFragment(line, &index, '"'),
+            '{' => depth += 1,
+            '}' => {
+                if (depth == 0) return error.InvalidActionBlock;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return depth;
 }
 
 fn stripLineComment(line: []const u8) []const u8 {
@@ -1734,6 +1807,45 @@ test "parseGrammar splits same-line alternatives outside literals and actions" {
 
     const tables = try buildSlrTables(arena, grammar);
     try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+}
+
+test "parseGrammar skips multiline bison prologue directive and action blocks" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%{
+        \\#include "postgres.h"
+        \\%}
+        \\%union {
+        \\    int ival;
+        \\    const char *str;
+        \\}
+        \\%destructor {
+        \\    free($$);
+        \\} <str>
+        \\%start stmt
+        \\%token <str> IDENT
+        \\%%
+        \\stmt:
+        \\    IDENT
+        \\    {
+        \\        $$ = make_ident($1);
+        \\        note("{ not grammar }");
+        \\    }
+        \\  | /* empty */
+        \\  ;
+        \\%%
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqualStrings("stmt", grammar.start_symbol);
+    try std.testing.expectEqual(@as(usize, 1), grammar.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.rules.items[0].alternatives.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("IDENT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[1].symbols.len);
+    try validateGrammar(grammar);
 }
 
 test "buildSlrTables builds conflict-free tables for a small grammar" {

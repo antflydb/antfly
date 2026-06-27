@@ -52,7 +52,9 @@ tags such as `%token <str> IDENT`, ignored `%type` metadata, `%precedence`,
 `%%` section separators, literal precedence references through existing token
 aliases, declaration numeric token codes, double-quoted token display aliases
 such as `%token <str> IDENT 258 "identifier"`, and C/Bison semantic action
-blocks in rule alternatives. These source
+blocks in rule alternatives. It also skips multi-line Bison prologue blocks,
+ignored directive blocks such as `%union`/`%destructor`, and standalone
+multi-line semantic action blocks that follow a production alternative. These source
 compatibility features are stripped before table construction so Antfly still
 owns the generated runtime AST and parser facade instead of importing
 PostgreSQL semantic actions. Rule parsing also handles same-line alternatives
