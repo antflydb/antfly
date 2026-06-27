@@ -41215,6 +41215,16 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.join.order_by[0].direction);
     try std.testing.expectEqual(@as(u32, 5), lowered.join.limit.?);
 
+    var fetch_paginated_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC OFFSET 2 ROWS FETCH NEXT 4 ROWS ONLY",
+        schema,
+        &.{},
+    );
+    defer fetch_paginated_join.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), fetch_paginated_join.join.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), fetch_paginated_join.join.offset);
+
     const unsupported_generated_join_kinds = [_]struct {
         sql: []const u8,
         kind: generated_parser.GeneratedSqlJoinKind,
@@ -41880,6 +41890,16 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.order_by.len);
     try std.testing.expectEqualStrings("latest_amount", lowered.plan.lateral.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 10), lowered.plan.lateral.limit.?);
+
+    var fetch_paginated = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC FETCH FIRST 1 ROW ONLY) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC OFFSET 3 ROWS FETCH NEXT 4 ROWS ONLY",
+        schema,
+        &.{},
+    );
+    defer fetch_paginated.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), fetch_paginated.plan.lateral.limit.?);
+    try std.testing.expectEqual(@as(u32, 3), fetch_paginated.plan.lateral.offset);
 
     var malformed_generated_lateral_join = try tokenized.ParsedSql.initAlloc(
         alloc,

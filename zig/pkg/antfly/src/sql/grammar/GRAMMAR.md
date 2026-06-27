@@ -498,8 +498,10 @@ query-body AST payloads for expression-level projections and predicates,
 complete multi-join planning and richer join-tree semantics beyond the current
 validated left-associative generated join nodes, complete expression AST nodes,
 complete per-CTE body AST arrays, recursive CTE planning, aggregates, richer
-inline window-expression semantic planning, ordering, remaining pagination cutover, and
-direct generated read-plan lowering. Canonical Antfly query table functions
+inline window-expression semantic planning, ordering, and direct generated
+read-plan lowering. Generated `LIMIT`, `OFFSET`, and `FETCH` pagination
+metadata now feeds the simple query, set-operation, aggregate, window, join,
+and lateral lowerers with fail-closed retained-range validation. Canonical Antfly query table functions
 such as `antfly.full_text_search`, `antfly.semantic_search`,
 `antfly.vector_search`, `antfly.hybrid_search`, `antfly.graph_traverse`,
 `antfly.graph_match`, and `antfly.graph_metric` are now accepted as generated

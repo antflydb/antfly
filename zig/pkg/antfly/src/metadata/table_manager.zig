@@ -242,6 +242,28 @@ pub const SchemaRewriteJobInvalidateRequest = struct {
     last_error: []const u8,
 };
 
+pub const table_emptying_declared = "declared";
+pub const table_emptying_running = "running";
+pub const table_emptying_ready = "ready";
+pub const table_emptying_invalid = "invalid";
+
+pub const TableEmptyingJobRecord = struct {
+    job_id: u64,
+    table_id: u64,
+    group_id: u64,
+    schema_generation: u64,
+    affected_table_ids: []const u64 = &.{},
+    restart_identity: bool = false,
+    cascade: bool = false,
+    state: []const u8 = table_emptying_declared,
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
 pub const ForeignKeyReferenceRangeSelector = struct {
     child_table_id: u64,
     constraint_name: []const u8,
@@ -362,6 +384,17 @@ pub fn schemaRewriteJobStateValid(state: []const u8) bool {
 
 pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
     return std.mem.eql(u8, record.state, schema_rewrite_ready);
+}
+
+pub fn tableEmptyingJobStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, table_emptying_declared) or
+        std.mem.eql(u8, state, table_emptying_running) or
+        std.mem.eql(u8, state, table_emptying_ready) or
+        std.mem.eql(u8, state, table_emptying_invalid);
+}
+
+pub fn tableEmptyingJobComplete(record: TableEmptyingJobRecord) bool {
+    return std.mem.eql(u8, record.state, table_emptying_ready);
 }
 
 pub fn schemaRewriteGenerationForSchemaJson(schema_json: []const u8) u64 {
@@ -600,6 +633,7 @@ pub const TableManager = struct {
     unique_constraint_ranges: std.ArrayListUnmanaged(UniqueConstraintRangeRecord) = .empty,
     secondary_index_rebuild_ranges: std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord) = .empty,
     schema_rewrite_jobs: std.ArrayListUnmanaged(SchemaRewriteJobRecord) = .empty,
+    table_emptying_jobs: std.ArrayListUnmanaged(TableEmptyingJobRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
@@ -639,6 +673,9 @@ pub const TableManager = struct {
 
         for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
         self.schema_rewrite_jobs.deinit(self.alloc);
+
+        for (self.table_emptying_jobs.items) |record| freeTableEmptyingJob(self.alloc, record);
+        self.table_emptying_jobs.deinit(self.alloc);
 
         var split_it = self.split_intents.valueIterator();
         while (split_it.next()) |intent| freeSplitIntent(self.alloc, intent.*);
@@ -895,6 +932,9 @@ pub const TableManager = struct {
 
         for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
         self.schema_rewrite_jobs.clearRetainingCapacity();
+
+        for (self.table_emptying_jobs.items) |record| freeTableEmptyingJob(self.alloc, record);
+        self.table_emptying_jobs.clearRetainingCapacity();
     }
 
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
@@ -928,7 +968,7 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
     ) !void {
-        try self.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{});
+        try self.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{}, &.{});
     }
 
     pub fn replaceTopologyWithDerivedWork(
@@ -939,6 +979,7 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
         schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+        table_emptying_jobs: []const TableEmptyingJobRecord,
     ) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
@@ -947,6 +988,7 @@ pub const TableManager = struct {
         for (unique_constraint_ranges) |record| try self.upsertUniqueConstraintRange(record);
         for (secondary_index_rebuild_ranges) |record| try self.upsertSecondaryIndexRebuildRange(record);
         for (schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+        for (table_emptying_jobs) |record| try self.upsertTableEmptyingJob(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -984,7 +1026,7 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
     ) !ProjectedTopologyLoadResult {
-        return try self.replaceProjectedTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{});
+        return try self.replaceProjectedTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{}, &.{});
     }
 
     pub fn replaceProjectedTopologyWithDerivedWork(
@@ -995,6 +1037,7 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
         schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+        table_emptying_jobs: []const TableEmptyingJobRecord,
     ) !ProjectedTopologyLoadResult {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
@@ -1034,6 +1077,13 @@ pub const TableManager = struct {
                 continue;
             }
             try self.upsertSchemaRewriteJob(record);
+        }
+        for (table_emptying_jobs) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertTableEmptyingJob(record);
         }
         return result;
     }
