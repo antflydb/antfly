@@ -648,8 +648,8 @@ unsupported statements rather than generic syntax failures. Generated unsupporte
 heads that already have typed catalog/runtime support now enter the parsed DDL
 family directly and are accepted only through the validated generated
 unsupported boundary. Recognized generated-owned unsupported heads now require
-retained unsupported AST kind, statement/command span, subject-range, and
-`EXPLAIN` option-range validation before publishing unsupported, explain, or
+retained unsupported AST kind, matching reason, statement/command span,
+subject-range, and `EXPLAIN` option-range validation before publishing unsupported, explain, or
 DDL-family parsed statements. Unsupported/admin subject ranges are also
 checked against family-specific subject starts before classification, including
 trigger heads whose typed subject begins after `CREATE TRIGGER`/`DROP TRIGGER`,

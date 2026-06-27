@@ -436,6 +436,20 @@ pub const GeneratedSqlUnsupportedReason = enum {
     vacuum_not_planned_by_generated_parser,
 };
 
+pub fn generatedSqlUnsupportedReasonForKind(kind: GeneratedSqlUnsupportedKind) GeneratedSqlUnsupportedReason {
+    const suffix = "_not_planned_by_generated_parser";
+    const kind_name = @tagName(kind);
+    inline for (std.meta.fields(GeneratedSqlUnsupportedReason)) |field| {
+        if (field.name.len > suffix.len and
+            std.mem.endsWith(u8, field.name, suffix) and
+            std.mem.eql(u8, field.name[0 .. field.name.len - suffix.len], kind_name))
+        {
+            return @enumFromInt(field.value);
+        }
+    }
+    unreachable;
+}
+
 pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     session: GeneratedSqlSessionKind,
     transaction: GeneratedSqlTransactionKind,

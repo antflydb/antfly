@@ -2074,6 +2074,7 @@ fn generatedUnsupportedAstHasValidClassificationPayload(
         else => return false,
     };
     if (unsupported_ast.kind != expected_kind) return false;
+    if (unsupported_ast.reason != generated_parser.generatedSqlUnsupportedReasonForKind(unsupported_ast.kind)) return false;
     const end = generatedUnsupportedStatementEnd(tokens, unsupported_ast.statement_span) orelse return false;
     if (!std.meta.eql(unsupported_ast.command_span, tokens[0].sourceSpan())) return false;
     if (!generatedUnsupportedOptionalTokenRangeIsValid(tokens, end, unsupported_ast.subject_tokens)) return false;
@@ -6874,6 +6875,18 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, mismatched_unsupported_kind, &unsupported_copy.tokenized_sql)),
+    );
+
+    var mismatched_unsupported_reason = unsupported_copy.generated_statement.?;
+    if (mismatched_unsupported_reason.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.reason = .vacuum_not_planned_by_generated_parser,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, mismatched_unsupported_reason, &unsupported_copy.tokenized_sql)),
     );
 
     var malformed_unsupported_subject = unsupported_copy.generated_statement.?;
