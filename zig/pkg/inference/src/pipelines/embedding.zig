@@ -215,7 +215,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
         const text_session = self.textEncodingSession();
-        if (text_session.backend() == .onnx and texts.len > 1) {
+        if (textSessionRequiresSerialBatch(text_session, texts.len)) {
             return try self.embedSerial(texts);
         }
 
@@ -1616,9 +1616,34 @@ test "embedding text length follows fixed input_ids sequence dimension" {
     try std.testing.expectEqual(@as(usize, 77), textSequenceLengthForInputs(&input_info, 512));
 }
 
+test "embedding text serializes batches that exceed declared input_ids batch" {
+    const dynamic = fakeTextSession(.native, &.{ -1, 77 });
+    try std.testing.expect(!textSessionRequiresSerialBatch(dynamic, 2));
+
+    const fixed_one = fakeTextSession(.native, &.{ 1, 77 });
+    try std.testing.expect(!textSessionRequiresSerialBatch(fixed_one, 1));
+    try std.testing.expect(textSessionRequiresSerialBatch(fixed_one, 2));
+
+    const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
+    try std.testing.expect(textSessionRequiresSerialBatch(external_onnx, 2));
+}
+
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     for (session.inputInfo()) |info| {
         if (std.mem.eql(u8, info.name, name)) return true;
+    }
+    return false;
+}
+
+fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
+    if (requested_batch <= 1) return false;
+    if (session.backend() == .onnx) return true;
+    if (backends.imported_onnx_session.sharedBackendContext(session) != null) return true;
+    for (session.inputInfo()) |info| {
+        if (!std.mem.eql(u8, info.name, "input_ids")) continue;
+        if (info.shape.len == 0) return false;
+        const declared_batch = info.shape[0];
+        return declared_batch > 0 and @as(usize, @intCast(declared_batch)) < requested_batch;
     }
     return false;
 }
@@ -1645,6 +1670,41 @@ fn outputsContainBatchRows(outputs: []const Tensor, expected_batch: usize) bool 
         if (output.shape.len >= 2 and tensorHasBatchRows(output, expected_batch)) return true;
     }
     return false;
+}
+
+fn fakeTextSession(comptime backend_type: backends.BackendType, comptime input_shape: []const i64) backends.Session {
+    const VTable = struct {
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.TestUnexpectedResult;
+        }
+
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "input_ids", .dtype = .i64, .shape = input_shape }};
+        }
+
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+
+        fn backend(_: *anyopaque) backends.BackendType {
+            return backend_type;
+        }
+
+        fn close(_: *anyopaque) void {}
+    };
+    const state = struct {
+        var value: u8 = 0;
+    };
+    return .{
+        .ptr = @ptrCast(&state.value),
+        .vtable = &.{
+            .run = VTable.run,
+            .inputInfo = VTable.inputInfo,
+            .outputInfo = VTable.outputInfo,
+            .backend = VTable.backend,
+            .close = VTable.close,
+        },
+    };
 }
 
 fn embedTimingEnabled(explicit: bool) bool {

@@ -52,6 +52,8 @@ const GpuWeightStore = if (build_options.enable_metal) gpu_store_mod.WeightStore
 const MetalCompute = if (build_options.enable_metal) metal_compute_mod.MetalCompute else opaque {};
 const WasmCompute = if (build_options.enable_wasm) wasm_compute_mod.WasmCompute else opaque {};
 const clipclap_audio_input_frames: i64 = 1001;
+const clipclap_text_batch: i64 = 1;
+const clipclap_text_sequence_length: i64 = 77;
 
 const WasmGraphRuntime = struct {
     pub const Strategy = enum {
@@ -122,6 +124,11 @@ const WasmGraphRuntime = struct {
 fn shouldSpecializeClipclapAudioInputTime(path: []const u8) bool {
     const base = std.fs.path.basename(path);
     return std.mem.eql(u8, base, "audio_model.onnx");
+}
+
+fn shouldSpecializeClipclapTextInputShape(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.eql(u8, base, "text_model.onnx");
 }
 
 const BackendContext = union(enum) {
@@ -730,14 +737,19 @@ pub fn createSessionWithOptions(
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, model_bytes, model_dir);
     defer model.deinit();
 
-    var clipclap_audio_dim_overrides: onnx_graph.DimOverrides = .empty;
-    defer clipclap_audio_dim_overrides.deinit(allocator);
-    var use_clipclap_audio_dim_overrides = false;
+    var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
+    defer clipclap_dim_overrides.deinit(allocator);
+    var use_clipclap_dim_overrides = false;
     if (options.dim_overrides == null and shouldSpecializeClipclapAudioInputTime(onnx_path)) {
-        try clipclap_audio_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
-        use_clipclap_audio_dim_overrides = true;
+        try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
+        use_clipclap_dim_overrides = true;
     }
-    const dim_overrides = options.dim_overrides orelse if (use_clipclap_audio_dim_overrides) &clipclap_audio_dim_overrides else null;
+    if (options.dim_overrides == null and shouldSpecializeClipclapTextInputShape(onnx_path)) {
+        try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
+        try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
+        use_clipclap_dim_overrides = true;
+    }
+    const dim_overrides = options.dim_overrides orelse if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
 
     var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
     errdefer converted.deinit(allocator);
@@ -1814,8 +1826,14 @@ fn defaultClipclapTextModelPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn defaultClipclapModelPath(allocator: std.mem.Allocator, file_name: []const u8) ![]u8 {
+    if (std.c.getenv("ANTFLY_TEST_CLIPCLAP_ONNX_DIR")) |dir| {
+        return std.fs.path.join(allocator, &.{ std.mem.span(dir), file_name });
+    }
     const home = std.c.getenv("HOME") orelse return error.SkipZigTest;
-    return std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "models", "antflydb", "clipclap", file_name });
+    const preferred = try std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "models", "antflydb", "clipclap", file_name });
+    if (c_file.fileExists(allocator, preferred)) return preferred;
+    allocator.free(preferred);
+    return std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "inference", "models", "antflydb", "clipclap", file_name });
 }
 
 test "imported onnx session executes clipclap text model natively with padded mask" {
@@ -1848,6 +1866,17 @@ test "imported onnx session executes clipclap text model natively with padded ma
     }
 
     try std.testing.expect(outputs.len > 0);
+    if (std.c.getenv("ANTFLY_TEST_DUMP_CLIPCLAP_OUTPUTS") != null) {
+        std.debug.print("clipclap outputs={d}\n", .{outputs.len});
+        for (outputs, 0..) |*output, idx| {
+            const values = output.asFloat32();
+            std.debug.print("  output[{d}] name={s} shape={any} first=", .{ idx, output.name, output.shape });
+            for (values[0..@min(values.len, 8)]) |value| {
+                std.debug.print("{d:.6} ", .{value});
+            }
+            std.debug.print("\n", .{});
+        }
+    }
     try std.testing.expectEqual(DType.f32, outputs[0].dtype);
     try std.testing.expect(outputs[0].elementCount() > 0);
     for (outputs[0].asFloat32()) |value| {
@@ -2003,14 +2032,19 @@ fn expectClipclapOnnxPlansForMetal(file_name: []const u8, expectations: Clipclap
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, model_bytes, model_dir);
     defer model.deinit();
 
-    var clipclap_audio_dim_overrides: onnx_graph.DimOverrides = .empty;
-    defer clipclap_audio_dim_overrides.deinit(allocator);
-    var use_clipclap_audio_dim_overrides = false;
+    var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
+    defer clipclap_dim_overrides.deinit(allocator);
+    var use_clipclap_dim_overrides = false;
     if (shouldSpecializeClipclapAudioInputTime(path)) {
-        try clipclap_audio_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
-        use_clipclap_audio_dim_overrides = true;
+        try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
+        use_clipclap_dim_overrides = true;
     }
-    const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_audio_dim_overrides) &clipclap_audio_dim_overrides else null;
+    if (shouldSpecializeClipclapTextInputShape(path)) {
+        try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
+        try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
+        use_clipclap_dim_overrides = true;
+    }
+    const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
 
     var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
     defer converted.deinit(allocator);

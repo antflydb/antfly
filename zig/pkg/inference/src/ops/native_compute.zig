@@ -6100,7 +6100,8 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
             seq_len,
         });
     }
-    const bias_shared_len = num_heads * effective_seq_len * effective_seq_len;
+    const bias_seq_len = effective_seq_len * effective_seq_len;
+    const bias_shared_len = num_heads * bias_seq_len;
     const bias_batched_len = effective_batch * bias_shared_len;
     const bh = effective_batch * num_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -6116,7 +6117,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     // broadcasts; safer to keep that case on the legacy path.
     const flash_eligible = effective_seq_len >= 32 and
         mask.len >= effective_batch * effective_seq_len and
-        (bias == null or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
+        (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
         const flash_output = try linalg.flashAttentionHost(
             self.allocator,
@@ -6174,13 +6175,19 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
         // Add position bias if provided: bias[h, qi, ki]
         if (bias) |b_data| {
-            const head_offset = if (b_data.len == bias_batched_len)
+            const head_offset: ?usize = if (b_data.len == bias_batched_len)
                 bh_idx * effective_seq_len * effective_seq_len
+            else if (b_data.len == bias_shared_len)
+                h * effective_seq_len * effective_seq_len
+            else if (b_data.len == bias_seq_len)
+                0
             else
-                h * effective_seq_len * effective_seq_len;
-            for (0..effective_seq_len) |qi| {
-                for (0..effective_seq_len) |ki| {
-                    scores[qi * effective_seq_len + ki] += b_data[head_offset + qi * effective_seq_len + ki];
+                null;
+            if (head_offset) |off| {
+                for (0..effective_seq_len) |qi| {
+                    for (0..effective_seq_len) |ki| {
+                        scores[qi * effective_seq_len + ki] += b_data[off + qi * effective_seq_len + ki];
+                    }
                 }
             }
         }
