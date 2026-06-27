@@ -245,7 +245,11 @@ source `SELECT` body into a retained lightweight generated read-body payload bef
 insert-source lowering, with generated-direct coverage for computed source
 projections, expression predicates, ordering, pagination, `RETURNING *`
 plus expressions, cross-table sources, conflict-update predicates and
-expressions, and non-recursive CTE write prefixes. Single-table point `UPDATE`
+expressions, and non-recursive CTE write prefixes. Generated DML child-read
+metadata now also fails closed when the retained read kind disagrees with the
+retained `SELECT`/set-operation/relation-source clause shape, so insert-source
+and mutation-source wrappers cannot publish impossible child-read families for
+later lowerers to rediscover. Single-table point `UPDATE`
 and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches, including
@@ -777,8 +781,8 @@ Unsupported DDL remains on the existing parser until
    adjacency, target/source/assignment clause ranges, and required source
    child-read payloads before direct generated
    lowering, validates retained generated child-read `SELECT` source, `WHERE`,
-   and set-operation clause boundaries for insert-source and relation-source
-   writes, and fails closed when retained generated kind metadata is missing,
+   set-operation clause boundaries, and generated read-kind compatibility for
+   insert-source and relation-source writes, and fails closed when retained generated kind metadata is missing,
    internally inconsistent, or disagrees with the legacy classifier instead of
    falling back to legacy write-family classification.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,

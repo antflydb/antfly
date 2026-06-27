@@ -2192,6 +2192,7 @@ fn generatedDmlReadBodyIsValid(
     if (!std.meta.eql(read_body.tokens, range)) return false;
     if (!std.meta.eql(read_body.statement_span, generatedDmlSourceSpanForTokenRange(tokens, range))) return false;
     if (!std.meta.eql(read_body.command_span, tokens[range.start].sourceSpan())) return false;
+    if (!generatedDmlReadBodyKindIsValid(read_body, shape)) return false;
 
     switch (shape) {
         .select_body => {
@@ -2213,6 +2214,23 @@ fn generatedDmlReadBodyIsValid(
         },
     }
     return true;
+}
+
+fn generatedDmlReadBodyKindIsValid(
+    read_body: generated_parser.GeneratedSqlDmlReadBodyAst,
+    shape: GeneratedDmlReadBodyShape,
+) bool {
+    return switch (shape) {
+        .select_body => switch (read_body.kind) {
+            .query, .aggregate, .join, .lateral, .window => read_body.set_operation_tokens == null,
+            .set_operation => read_body.set_operation_tokens != null,
+            .cte => false,
+        },
+        .relation_source => switch (read_body.kind) {
+            .query, .join, .lateral => read_body.set_operation_tokens == null,
+            .aggregate, .window, .set_operation, .cte => false,
+        },
+    };
 }
 
 fn generatedDmlSelectReadBodyClauseLayoutIsValid(
@@ -6458,6 +6476,15 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     try std.testing.expect(generated_insert_select.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
 
+    var malformed_source_kind = generated_insert_select.generated_statement.?;
+    switch (malformed_source_kind.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.kind = .set_operation,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert_select.statement = parseStatement(generated_insert_select.raw_statement, malformed_source_kind, &generated_insert_select.tokenized_sql);
+    try std.testing.expect(generated_insert_select.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
+
     var generated_insert_set_operation = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage UNION SELECT id FROM archived_usage");
     defer generated_insert_set_operation.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_set_operation.generatedStatementKind().?);
@@ -6470,6 +6497,28 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     generated_insert_set_operation.statement = parseStatement(generated_insert_set_operation.raw_statement, malformed_source_set_operation, &generated_insert_set_operation.tokenized_sql);
     try std.testing.expect(generated_insert_set_operation.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_set_operation.statement));
+
+    var malformed_set_operation_kind = generated_insert_set_operation.generated_statement.?;
+    switch (malformed_set_operation_kind.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.kind = .query,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert_set_operation.statement = parseStatement(generated_insert_set_operation.raw_statement, malformed_set_operation_kind, &generated_insert_set_operation.tokenized_sql);
+    try std.testing.expect(generated_insert_set_operation.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_set_operation.statement));
+
+    var generated_update_from = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = source_rows.status FROM source_rows WHERE usage_records.id = source_rows.id");
+    defer generated_update_from.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_update_from.generatedStatementKind().?);
+
+    var malformed_relation_source_kind = generated_update_from.generated_statement.?;
+    switch (malformed_relation_source_kind.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.kind = .aggregate,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_update_from.statement = parseStatement(generated_update_from.raw_statement, malformed_relation_source_kind, &generated_update_from.tokenized_sql);
+    try std.testing.expect(generated_update_from.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_update_from.statement));
 
     var generated_recursive_insert = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
     defer generated_recursive_insert.deinit(alloc);
