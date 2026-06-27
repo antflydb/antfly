@@ -2384,6 +2384,7 @@ fn buildClipPlannedExportFiltered(
     name_filter: TensorNameFilter,
 ) !PlannedExport {
     const source_is_gguf = source_kind == .gguf;
+    const source_is_onnx = tensor_access_mod.isOnnxInitializerAccess(access);
     const names = try access.listNames(allocator);
     defer allocator.free(names);
     std.mem.sort([]const u8, names, {}, struct {
@@ -2410,10 +2411,10 @@ fn buildClipPlannedExportFiltered(
             try mapDenseTensorNameToClipGguf(allocator, record.descriptor.name);
         defer if (output_name_result.owned) allocator.free(output_name_result.name);
 
-        const transform = if (source_is_gguf)
+        const transform = if (source_is_gguf or !source_is_onnx)
             TensorTransform.none
         else
-            clipClapDenseExportTransformForTensor(name_filter, record.descriptor.name, record.descriptor.shape);
+            clipClapOnnxDenseExportTransformForTensor(record.descriptor.name, record.descriptor.shape);
         const dimensions = switch (transform) {
             .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
             .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
@@ -2505,6 +2506,7 @@ fn buildClapPlannedExportFiltered(
     name_filter: TensorNameFilter,
 ) !PlannedExport {
     const source_is_gguf = source_kind == .gguf;
+    const source_is_onnx = tensor_access_mod.isOnnxInitializerAccess(access);
     const names = try access.listNames(allocator);
     defer allocator.free(names);
     std.mem.sort([]const u8, names, {}, struct {
@@ -2531,10 +2533,10 @@ fn buildClapPlannedExportFiltered(
             try mapDenseTensorNameToClapGguf(allocator, record.descriptor.name);
         defer if (output_name_result.owned) allocator.free(output_name_result.name);
 
-        const transform = if (source_is_gguf)
+        const transform = if (source_is_gguf or !source_is_onnx)
             TensorTransform.none
         else
-            clipClapDenseExportTransformForTensor(name_filter, record.descriptor.name, record.descriptor.shape);
+            clipClapOnnxDenseExportTransformForTensor(record.descriptor.name, record.descriptor.shape);
         const dimensions = switch (transform) {
             .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
             .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
@@ -2628,12 +2630,10 @@ fn isExportableDenseRecord(record: tensor_access_mod.Record) bool {
     };
 }
 
-fn clipClapDenseExportTransformForTensor(
-    name_filter: TensorNameFilter,
+fn clipClapOnnxDenseExportTransformForTensor(
     source_name: []const u8,
     shape: []const i64,
 ) TensorTransform {
-    if (name_filter == .all) return .none;
     if (shape.len != 2) return .none;
     if (!std.mem.endsWith(u8, source_name, ".weight")) return .none;
     if (isClipOnnxMatMulWeight(source_name) or isClapOnnxMatMulWeight(source_name)) return .transpose_2d_dense;
@@ -2657,6 +2657,34 @@ fn isClapOnnxMatMulWeight(source_name: []const u8) bool {
         std.mem.indexOf(u8, source_name, ".downsample.reduction.") != null or
         std.mem.indexOf(u8, source_name, ".intermediate.dense.") != null or
         std.mem.indexOf(u8, source_name, ".output.dense.") != null;
+}
+
+test "clipclap ONNX export transforms MatMul weights independent of bundle filter" {
+    try std.testing.expectEqual(
+        TensorTransform.transpose_2d_dense,
+        clipClapOnnxDenseExportTransformForTensor(
+            "text_model.encoder.layers.0.self_attn.q_proj.weight",
+            &.{ 512, 512 },
+        ),
+    );
+    try std.testing.expectEqual(
+        TensorTransform.transpose_2d_dense,
+        clipClapOnnxDenseExportTransformForTensor(
+            "audio_model.audio_encoder.layers.0.intermediate.dense.weight",
+            &.{ 2048, 1024 },
+        ),
+    );
+    try std.testing.expectEqual(
+        TensorTransform.none,
+        clipClapOnnxDenseExportTransformForTensor("text_projection.weight", &.{ 512, 512 }),
+    );
+    try std.testing.expectEqual(
+        TensorTransform.none,
+        clipClapOnnxDenseExportTransformForTensor(
+            "text_model.encoder.layers.0.self_attn.q_proj.bias",
+            &.{512},
+        ),
+    );
 }
 
 fn appendGptNeoxSplitTensorPlans(

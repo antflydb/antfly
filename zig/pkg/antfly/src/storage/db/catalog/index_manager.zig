@@ -6792,6 +6792,7 @@ pub const IndexManager = struct {
             };
         } else |err| switch (err) {
             error.Unsupported => {},
+            error.EmptySegment => return .{ .segments = &.{} },
             else => {
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
@@ -10753,10 +10754,7 @@ pub const IndexManager = struct {
         candidate: []const f32,
         metric: vector_mod.DistanceMetric,
     ) f32 {
-        return switch (metric) {
-            .cosine => if (query_measure == 0) 1.0 else 1.0 - (vector_mod.dot(query, candidate) / query_measure),
-            else => vector_mod.distanceToQuery(query, query_measure, candidate, metric),
-        };
+        return vector_mod.distanceToQuery(query, query_measure, candidate, metric);
     }
 
     fn loadDenseVectorArtifactForHbc(
@@ -17402,6 +17400,86 @@ test "text merge task skips stale source after concurrent delete" {
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending);
     try std.testing.expect(entry.persistent.snapshot().segments.len >= 12);
+}
+
+test "text merge task retires all-deleted file-backed inputs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        },
+    });
+
+    const opts: IndexBatchOptions = .{
+        .compact_text = false,
+        .compact_text_segment_threshold = 2,
+        .defer_text_compaction = true,
+    };
+    var inserted_keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (inserted_keys.items) |key| alloc.free(key);
+        inserted_keys.deinit(alloc);
+    }
+    for (0..12) |i| {
+        var key_buf: [64]u8 = undefined;
+        const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge deleted {d}\"}}", .{i});
+        defer alloc.free(value);
+
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+        try inserted_keys.append(alloc, key);
+    }
+    try manager.deleteTextBatchByNameWithOptions("ft_v1", inserted_keys.items, opts);
+
+    var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer task.deinit(alloc);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.segments.len);
+    try std.testing.expectEqual(@as(usize, 0), result.prepared_segments.len);
+    try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+
+    const stats = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.in_flight_merges);
+}
+
+test "dense artifact rerank cosine distance includes candidate norm" {
+    const query = [_]f32{ 1.0, 0.0 };
+    const same_direction_large = [_]f32{ 10.0, 0.0 };
+    const orthogonal = [_]f32{ 0.0, 2.0 };
+    const query_measure = vector_mod.norm(&query);
+
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.0),
+        IndexManager.exactStoredVectorDistance(&query, query_measure, &same_direction_large, .cosine),
+        1e-6,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 1.0),
+        IndexManager.exactStoredVectorDistance(&query, query_measure, &orthogonal, .cosine),
+        1e-6,
+    );
 }
 
 test "force text compaction supersedes in-flight scheduled merge" {

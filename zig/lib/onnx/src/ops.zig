@@ -859,21 +859,21 @@ fn materializeConstantValues(builder: *Builder, node_id: NodeId, buf: []f32) ?[]
             const where_inputs = n.getInputs();
             if (where_inputs.len < 3) return null;
             var cond_buf: [8]f32 = undefined;
-            var false_buf: [8]f32 = undefined;
             var true_buf: [8]f32 = undefined;
+            var false_buf: [8]f32 = undefined;
             const cond = materializeConstantValues(builder, where_inputs[0], &cond_buf) orelse return null;
-            const on_false = materializeConstantValues(builder, where_inputs[1], &false_buf) orelse return null;
-            const on_true = materializeConstantValues(builder, where_inputs[2], &true_buf) orelse return null;
+            const on_true = materializeConstantValues(builder, where_inputs[1], &true_buf) orelse return null;
+            const on_false = materializeConstantValues(builder, where_inputs[2], &false_buf) orelse return null;
             const out_shape = n.output_shape;
             const total = shapeElementCount(out_shape) orelse return null;
             if (total > buf.len) return null;
             const cond_shape = builder.graph.node(where_inputs[0]).output_shape;
-            const false_shape = builder.graph.node(where_inputs[1]).output_shape;
-            const true_shape = builder.graph.node(where_inputs[2]).output_shape;
+            const true_shape = builder.graph.node(where_inputs[1]).output_shape;
+            const false_shape = builder.graph.node(where_inputs[2]).output_shape;
             for (0..total) |i| {
                 const cond_idx = if (cond.len == 1 and total > 1) 0 else broadcastLinearIndex(cond_shape, out_shape, i) orelse return null;
-                const false_idx = if (on_false.len == 1 and total > 1) 0 else broadcastLinearIndex(false_shape, out_shape, i) orelse return null;
                 const true_idx = if (on_true.len == 1 and total > 1) 0 else broadcastLinearIndex(true_shape, out_shape, i) orelse return null;
+                const false_idx = if (on_false.len == 1 and total > 1) 0 else broadcastLinearIndex(false_shape, out_shape, i) orelse return null;
                 if (cond_idx >= cond.len or false_idx >= on_false.len or true_idx >= on_true.len) return null;
                 buf[i] = if (cond[cond_idx] != 0.0) on_true[true_idx] else on_false[false_idx];
             }
@@ -1800,13 +1800,13 @@ fn convertGreater(builder: *Builder, a: NodeId, b: NodeId) ConvertError!NodeId {
 
 fn convertLessOrEqual(builder: *Builder, a: NodeId, b: NodeId) ConvertError!NodeId {
     // a <= b  ⟺  ¬(b < a)
-    const gt = try cmpLessThan(builder, b, a);
+    const gt = try broadcastBinaryOp(builder, .less_than, b, a);
     return convertNot(builder, gt);
 }
 
 fn convertGreaterOrEqual(builder: *Builder, a: NodeId, b: NodeId) ConvertError!NodeId {
     // a >= b  ⟺  ¬(a < b)
-    const lt = try cmpLessThan(builder, a, b);
+    const lt = try broadcastBinaryOp(builder, .less_than, a, b);
     return convertNot(builder, lt);
 }
 
@@ -1817,8 +1817,8 @@ fn convertEqual(builder: *Builder, a: NodeId, b: NodeId) ConvertError!NodeId {
     const dtype = out_shape.dtype;
     const zero = try builder.scalarConst(dtype, 0.0);
     const one = try builder.scalarConst(dtype, 1.0);
-    const lt = try cmpLessThan(builder, a, b);
-    const gt = try cmpLessThan(builder, b, a);
+    const lt = try broadcastBinaryOp(builder, .less_than, a, b);
+    const gt = try broadcastBinaryOp(builder, .less_than, b, a);
     const not_gt = try selectOp(builder, gt, zero, one);
     return selectOp(builder, lt, zero, not_gt);
 }
@@ -4907,7 +4907,7 @@ fn selectOp(builder: *Builder, cond: NodeId, on_true: NodeId, on_false: NodeId) 
     return builder.graph.addNode(.{
         .op = .{ .where_select = {} },
         .output_shape = out_shape,
-        .inputs = .{ cond_node, false_node, true_node, null_node },
+        .inputs = .{ cond_node, true_node, false_node, null_node },
         .num_inputs = 3,
     });
 }
@@ -6525,6 +6525,45 @@ test "convertNode Where broadcasts scalar branch" {
     try std.testing.expectEqual(@as(i64, 4), out_shape.dim(2));
 }
 
+test "convertNode Where preserves ONNX true false branch order" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const cond = try b.parameter("cond", Shape.init(.bool_, &.{2}));
+    const x = try b.parameter("x", Shape.init(.f32, &.{2}));
+    const y = try b.parameter("y", Shape.init(.f32, &.{2}));
+    const node = NodeProto{ .op_type = "Where" };
+    const result = try convertNode(allocator, &b, &node, &.{ cond, x, y }, null);
+
+    const inputs = g.node(result).getInputs();
+    try std.testing.expectEqual(cond, inputs[0]);
+    try std.testing.expectEqual(x, inputs[1]);
+    try std.testing.expectEqual(y, inputs[2]);
+}
+
+test "materializeConstantValues folds where_select using internal true false order" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const cond = try b.tensorConst(&.{ 1.0, 0.0, 1.0 }, Shape.init(.bool_, &.{3}));
+    const on_true = try b.tensorConst(&.{ 10.0, 20.0, 30.0 }, Shape.init(.f32, &.{3}));
+    const on_false = try b.tensorConst(&.{ 40.0, 50.0, 60.0 }, Shape.init(.f32, &.{3}));
+    const selected = try g.addNode(.{
+        .op = .{ .where_select = {} },
+        .output_shape = Shape.init(.f32, &.{3}),
+        .inputs = .{ cond, on_true, on_false, null_node },
+        .num_inputs = 3,
+    });
+
+    var buf: [8]f32 = undefined;
+    const values = materializeConstantValues(&b, selected, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(f32, &.{ 10.0, 50.0, 30.0 }, values);
+}
+
 test "materializeConstantValues folds broadcasted equal/where shape masks" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -6557,6 +6596,25 @@ test "convertNode Equal" {
     const result = try convertNode(allocator, &b, &node, &.{ x, y }, null);
     // Equal → ends with where_select
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .where_select);
+}
+
+test "convertNode LessOrEqual broadcasts operands before comparison" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const row = try b.parameter("row", Shape.init(.i64, &.{ 1, 1, 77, 1 }));
+    const col = try b.parameter("col", Shape.init(.i64, &.{ 1, 1, 1, 77 }));
+    const node = NodeProto{ .op_type = "LessOrEqual" };
+    const result = try convertNode(allocator, &b, &node, &.{ row, col }, null);
+    const out_shape = g.node(result).output_shape;
+
+    try std.testing.expectEqual(@as(u8, 4), out_shape.rank());
+    try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 1), out_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 77), out_shape.dim(2));
+    try std.testing.expectEqual(@as(i64, 77), out_shape.dim(3));
 }
 
 test "convertNode Not" {
