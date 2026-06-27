@@ -2162,17 +2162,17 @@ fn generatedDmlStatementKind(
     if (!generatedDmlAstHasValidClassificationPayload(tokens, dml_ast)) return null;
     return .{
         .kind = dml_ast.kind,
-        .write_kind = generatedDmlAstWriteKind(tokens, dml_ast),
+        .write_kind = generatedDmlAstWriteKind(dml_ast),
         .recursive = dml_ast.cte_recursive,
     };
 }
 
-fn generatedDmlAstWriteKind(tokens: []const Token, dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
     return switch (dml_ast.kind) {
         .insert_values => .insert,
         .insert_select => .insert_source,
-        .update => classifier.classifyWriteStatement(tokens) orelse if (dml_ast.source_tokens != null) .update_joined_source else .update,
-        .delete => classifier.classifyWriteStatement(tokens) orelse if (dml_ast.source_tokens != null) .delete_joined_source else .delete,
+        .update => if (dml_ast.source_tokens != null) .update_joined_source else .update,
+        .delete => if (dml_ast.source_tokens != null) .delete_joined_source else .delete,
         .truncate => .truncate,
         .merge => .merge,
     };

@@ -917,8 +917,8 @@ Unsupported DDL remains on the existing parser until
    child-read payloads before direct generated
    lowering, validates retained generated child-read `SELECT` source, `WHERE`,
    set-operation clause boundaries, recognized child-`SELECT` tail starts, and generated read-kind compatibility for
-   insert-source and relation-source writes, and fails closed when retained generated kind metadata is missing,
-   internally inconsistent, or disagrees with the legacy classifier instead of
+   insert-source and relation-source writes, and fails closed when retained
+   generated kind metadata is missing or internally inconsistent instead of
    falling back to legacy write-family classification.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
@@ -1034,7 +1034,7 @@ Unsupported DDL remains on the existing parser until
    read ASTs when the generated parser covers the statement, and generated read
    AST kind owns parsed-statement read-family classification for
    generated-covered reads, failing closed when retained generated kind
-   metadata disagrees with the legacy classifier. Generated read
+   metadata is missing or internally inconsistent. Generated read
    ASTs now have a generated-first lowering boundary for covered simple query,
    aggregate, join, lateral, window, set-operation, non-recursive CTE, and
    recursive CTE plans, reusing the current typed read lowerers only after
