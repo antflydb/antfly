@@ -1024,6 +1024,9 @@ pub const ProvisionedTableWriteCache = struct {
         const metadata = try self.getOrLoadMetadataLocked(catalog, table_name);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        if (mode != .status_only and mode != .query_readonly and self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
+            return error.LsmRootWriterAlreadyOpen;
+        }
         if (mode == .status_only) {
             const opened = try openDbForMode(
                 self.alloc,
@@ -1399,7 +1402,12 @@ pub const ProvisionedTableWriteCache = struct {
                 continue;
             }
             _ = self.entries.orderedRemove(i);
-            self.retireEntryLocked(entry);
+            if (entry.active_leases == 0) {
+                entry.deinit(self.alloc);
+                self.alloc.destroy(entry);
+            } else {
+                self.retireEntryLocked(entry);
+            }
         }
     }
 
@@ -1464,13 +1472,28 @@ pub const ProvisionedTableWriteCache = struct {
         return false;
     }
 
+    fn hasRetiredActiveLeaseForGroupTableLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.retired_entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (entry.active_leases == 0) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return true;
+        }
+        return false;
+    }
+
     fn hasForegroundStateForGroupTableLocked(
         self: *const ProvisionedTableWriteCache,
         group_id: u64,
         table_name: []const u8,
     ) bool {
         if (self.bulkIngestSessionActiveForTable(table_name)) return true;
-        return self.hasLiveEntryForGroupTableLocked(group_id, table_name);
+        if (self.hasLiveEntryForGroupTableLocked(group_id, table_name)) return true;
+        return self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name);
     }
 
     pub fn beginBulkIngestLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
@@ -4637,10 +4660,12 @@ pub const ProvisionedTableWriteSource = struct {
         try publishStartupCatchUpRuntimeStatusSnapshot(self, alloc, table_name, group_id, opening_db_startup, null, configured_indexes);
         errdefer publishStartupCatchUpRuntimeStatusSnapshot(self, alloc, table_name, group_id, .{}, null, null) catch {};
         _ = db_mod.DB.recoverIncompleteRestoreImportIfNeeded(alloc, path, .{}) catch |err| {
+            if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
             std.log.warn("managed startup catch-up restore import recovery failed table={s} err={}", .{ table_name, err });
             return err;
         };
         const restore_repair_needed = db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path) catch |err| {
+            if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
             std.log.warn("managed startup catch-up restore repair probe failed table={s} err={}", .{ table_name, err });
             return err;
         };
@@ -4652,7 +4677,10 @@ pub const ProvisionedTableWriteSource = struct {
         var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
         const db = db_blk: {
             if (startup_cache) |cache| {
-                cached_db = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, startup_open_mode, null, null);
+                cached_db = self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, startup_open_mode, null, null) catch |err| {
+                    if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    return err;
+                };
                 break :db_blk cached_db.?.db;
             }
 
@@ -4662,7 +4690,7 @@ pub const ProvisionedTableWriteSource = struct {
                 null;
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(startup_open_mode, self.ha_async_mirror);
             uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
                     path,
                     value,
@@ -4683,9 +4711,12 @@ pub const ProvisionedTableWriteSource = struct {
                         .ha_async_batch_mirror = effective_ha_mirror,
                         .ha_async_metadata_mirror = effective_ha_mirror,
                     },
-                )
+                ) catch |err| {
+                    if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    return err;
+                }
             else
-                try db_mod.DB.open(alloc, path, .{
+                db_mod.DB.open(alloc, path, .{
                     .open_mode = .writer_no_replay,
                     .lsm_root_generation = lsm_root_generation,
                     .backend_runtime = self.backend_runtime,
@@ -4700,7 +4731,10 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
                     .ha_async_metadata_mirror = effective_ha_mirror,
-                });
+                }) catch |err| {
+                    if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
+                    return err;
+                };
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
             self.applyRuntimeHooksToUncachedDb(&uncached_db.?, group_id, &uncached_promotion_owner_state);
@@ -12567,8 +12601,6 @@ test "provisioned table write source backs up and restores a local table" {
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -12646,8 +12678,8 @@ test "provisioned table write source backs up and restores a local table" {
     });
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
@@ -12673,8 +12705,6 @@ test "provisioned table write source backs up a portable local table" {
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -20682,7 +20712,7 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
-test "write cache reserves retirement slots when pruning multiple leased generations" {
+test "write cache blocks same-root generation replacement while stale lease is active" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -20733,15 +20763,21 @@ test "write cache reserves retirement slots when pruning multiple leased generat
     defer write_cache.deinit();
 
     var gen0 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
-    var gen1 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
-    var gen2 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 2, "docs");
-
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), write_cache.retired_entries.items.len);
+    try std.testing.expectError(
+        error.LsmRootWriterAlreadyOpen,
+        write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
 
     gen0.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+
+    var gen1 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+
     gen1.deinit(alloc);
-    gen2.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 

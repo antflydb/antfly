@@ -273,10 +273,67 @@ const wal_operation_lock_file_name = "wal.lock";
 
 const RootLockState = struct {
     key: []u8,
-    io_impl: std.Io.Threaded,
     ref_count: usize = 1,
     writer_open: bool = false,
-    wal_rwlock: std.Io.RwLock = .init,
+    wal_rwlock: ProcessRwLock = .{},
+};
+
+const ProcessRwLock = struct {
+    reader_gate: std.atomic.Mutex = .unlocked,
+    reader_mutex: std.atomic.Mutex = .unlocked,
+    resource_mutex: std.atomic.Mutex = .unlocked,
+    reader_count: usize = 0,
+
+    fn lockShared(self: *ProcessRwLock) void {
+        platform.sync.lockYielding(&self.reader_gate);
+        defer self.reader_gate.unlock();
+
+        platform.sync.lockYielding(&self.reader_mutex);
+        defer self.reader_mutex.unlock();
+
+        self.reader_count += 1;
+        if (self.reader_count == 1) platform.sync.lockYielding(&self.resource_mutex);
+    }
+
+    fn tryLockShared(self: *ProcessRwLock) bool {
+        if (!self.reader_gate.tryLock()) return false;
+        defer self.reader_gate.unlock();
+
+        if (!self.reader_mutex.tryLock()) return false;
+        defer self.reader_mutex.unlock();
+
+        if (self.reader_count == 0 and !self.resource_mutex.tryLock()) return false;
+        self.reader_count += 1;
+        return true;
+    }
+
+    fn unlockShared(self: *ProcessRwLock) void {
+        platform.sync.lockYielding(&self.reader_mutex);
+        defer self.reader_mutex.unlock();
+
+        std.debug.assert(self.reader_count > 0);
+        self.reader_count -= 1;
+        if (self.reader_count == 0) self.resource_mutex.unlock();
+    }
+
+    fn lockExclusive(self: *ProcessRwLock) void {
+        platform.sync.lockYielding(&self.reader_gate);
+        platform.sync.lockYielding(&self.resource_mutex);
+    }
+
+    fn tryLockExclusive(self: *ProcessRwLock) bool {
+        if (!self.reader_gate.tryLock()) return false;
+        if (!self.resource_mutex.tryLock()) {
+            self.reader_gate.unlock();
+            return false;
+        }
+        return true;
+    }
+
+    fn unlockExclusive(self: *ProcessRwLock) void {
+        self.resource_mutex.unlock();
+        self.reader_gate.unlock();
+    }
 };
 
 var root_lock_registry_mutex: std.atomic.Mutex = .unlocked;
@@ -297,9 +354,7 @@ fn retainRootLockState(root_identity: []const u8) !*RootLockState {
     errdefer std.heap.page_allocator.destroy(state);
     state.* = .{
         .key = key,
-        .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
     };
-    errdefer state.io_impl.deinit();
     try root_lock_registry.put(std.heap.page_allocator, state.key, state);
     return state;
 }
@@ -314,7 +369,6 @@ fn releaseProcessRootLockState(state: *RootLockState) void {
 
     std.debug.assert(!state.writer_open);
     if (root_lock_registry.fetchRemove(state.key)) |entry| {
-        entry.value.io_impl.deinit();
         std.heap.page_allocator.free(entry.key);
         std.heap.page_allocator.destroy(entry.value);
         if (root_lock_registry.count() == 0) {
@@ -1083,6 +1137,13 @@ pub const Backend = struct {
         recovery_mod.close(Backend, self);
     }
 
+    pub fn abandonAfterCrash(self: *Backend) void {
+        self.closing.store(true, .release);
+        self.background_executor.drain();
+        self.releaseTrackedResourceUsage();
+        recovery_mod.abandon(Backend, self);
+    }
+
     pub fn acquireRootLockState(self: *Backend, create_if_missing: bool) !void {
         if (self.root_dir == null or self.root_lock_state != null) return;
 
@@ -1148,11 +1209,12 @@ pub const Backend = struct {
 
         const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
         defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = try storage_io.openNativePathLockFile(self.allocator, lock_path, .{
-            // Read-only native opens may create this coordination file on
-            // legacy roots so WAL replay always contends with live appends.
-            .create_if_missing = true,
-        });
+        self.wal_operation_lock_file = storage_io.openNativePathLockFile(self.allocator, lock_path, .{
+            .create_if_missing = !self.options.backend.read_only,
+        }) catch |err| switch (err) {
+            error.FileNotFound => if (self.options.backend.read_only) return else return err,
+            else => return err,
+        };
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {
@@ -1175,8 +1237,8 @@ pub const Backend = struct {
             if (self.process_lock_mode) |mode| {
                 const state = self.backend.root_lock_state.?;
                 switch (mode) {
-                    .shared => state.wal_rwlock.unlockShared(state.io_impl.io()),
-                    .exclusive => state.wal_rwlock.unlock(state.io_impl.io()),
+                    .shared => state.wal_rwlock.unlockShared(),
+                    .exclusive => state.wal_rwlock.unlockExclusive(),
                 }
                 self.process_lock_mode = null;
             }
@@ -1189,8 +1251,8 @@ pub const Backend = struct {
 
         if (self.root_lock_state) |state| {
             switch (mode) {
-                .shared => state.wal_rwlock.lockSharedUncancelable(state.io_impl.io()),
-                .exclusive => state.wal_rwlock.lockUncancelable(state.io_impl.io()),
+                .shared => state.wal_rwlock.lockShared(),
+                .exclusive => state.wal_rwlock.lockExclusive(),
             }
             guard.process_lock_mode = mode;
         }
@@ -1212,8 +1274,8 @@ pub const Backend = struct {
 
         if (self.root_lock_state) |state| {
             const process_locked = switch (mode) {
-                .shared => state.wal_rwlock.tryLockShared(state.io_impl.io()),
-                .exclusive => state.wal_rwlock.tryLock(state.io_impl.io()),
+                .shared => state.wal_rwlock.tryLockShared(),
+                .exclusive => state.wal_rwlock.tryLockExclusive(),
             };
             if (!process_locked) return null;
             guard.process_lock_mode = mode;
@@ -4632,6 +4694,19 @@ pub const BackendHandle = struct {
             self.internal_flush_worker = null;
         }
         self.backend.close();
+        self.allocator.destroy(self.backend);
+        if (self.background_runtime) |*runtime| runtime.deinit();
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *BackendHandle) void {
+        if (self.internal_flush_worker) |worker| {
+            worker.stopAndJoin(false);
+            self.backend.options.maintenance_waker = null;
+            self.allocator.destroy(worker);
+            self.internal_flush_worker = null;
+        }
+        self.backend.abandonAfterCrash();
         self.allocator.destroy(self.backend);
         if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;
@@ -11980,7 +12055,7 @@ test "lsm backend wal operation lock blocks read-only replay during live append 
     defer acquired.release();
 }
 
-test "lsm backend read-only native open creates missing wal operation lock for legacy roots" {
+test "lsm backend read-only native open does not create missing wal operation lock for legacy roots" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     var path_buf: [256]u8 = undefined;
@@ -12013,12 +12088,13 @@ test "lsm backend read-only native open creates missing wal operation lock for l
         },
     });
     defer reader.close();
-    try std.testing.expect(pathExistsForTest(lock_path));
+    try std.testing.expect(!pathExistsForTest(lock_path));
 
     var writer = try Backend.open(std.testing.allocator, root_path, .{
         .flush_threshold = 1024,
     });
     defer writer.close();
+    try std.testing.expect(pathExistsForTest(lock_path));
 
     var held = try reader.acquireWalOperationLock(.shared);
     var held_active = true;

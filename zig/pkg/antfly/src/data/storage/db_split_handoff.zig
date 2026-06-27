@@ -133,6 +133,34 @@ pub const Destination = struct {
         };
     }
 
+    pub fn initReadOnly(alloc: std.mem.Allocator, root_dir_raw: []const u8) !Destination {
+        return try initReadOnlyWithOptions(alloc, root_dir_raw, .{});
+    }
+
+    pub fn initReadOnlyWithOptions(alloc: std.mem.Allocator, root_dir_raw: []const u8, db_options: db_mod.OpenOptions) !Destination {
+        return try initWithReadOnlyMode(alloc, root_dir_raw, db_options, .status_only);
+    }
+
+    pub fn initQueryReadOnlyWithOptions(alloc: std.mem.Allocator, root_dir_raw: []const u8, db_options: db_mod.OpenOptions) !Destination {
+        return try initWithReadOnlyMode(alloc, root_dir_raw, db_options, .query_readonly);
+    }
+
+    fn initWithReadOnlyMode(
+        alloc: std.mem.Allocator,
+        root_dir_raw: []const u8,
+        db_options: db_mod.OpenOptions,
+        mode: db_mod.OpenOptions.OpenMode,
+    ) !Destination {
+        var read_only_options = db_options;
+        read_only_options.open_mode = mode;
+        read_only_options.start_index_workers = false;
+        read_only_options.start_optional_runtimes = false;
+        return try init(alloc, .{
+            .root_dir = root_dir_raw,
+            .db = read_only_options,
+        });
+    }
+
     pub fn deinit(self: *Destination) void {
         self.db.close();
         self.alloc.free(self.root_dir);
@@ -422,39 +450,33 @@ pub const SyncCoordinator = struct {
     }
 
     pub fn prepareSourceSplit(self: *SyncCoordinator, split_key: []const u8, source_range_end: ?[]const u8) !bool {
-        var fresh_source = try data_store.RaftApplyStore.init(self.alloc, self.source_cfg);
-        defer fresh_source.deinit();
-        // Refresh the long-lived source view so later status calls reflect the same
-        // persisted image as the short-lived retry writer below.
-        try self.reopenSource();
         const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
         if (source_state) |state| {
             if (state.phase != .none) return false;
 
-            const current_range = try fresh_source.currentRange(self.alloc, self.source_group_id);
+            const current_range = try self.source.currentRange(self.alloc, self.source_group_id);
             defer range_state.freeRange(self.alloc, current_range);
             const restore = try std.fmt.allocPrint(self.alloc, "range:{s}:{s}", .{
                 current_range.start,
                 state.original_range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&fresh_source, restore);
+            try self.applySourceControlEntryVia(&self.source, restore);
         } else if (source_range_end) |range_end| {
-            const current_range = try fresh_source.currentRange(self.alloc, self.source_group_id);
+            const current_range = try self.source.currentRange(self.alloc, self.source_group_id);
             defer range_state.freeRange(self.alloc, current_range);
             const restore = try std.fmt.allocPrint(self.alloc, "range:{s}:{s}", .{
                 current_range.start,
                 range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&fresh_source, restore);
+            try self.applySourceControlEntryVia(&self.source, restore);
         }
 
         const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{s}", .{split_key});
         defer self.alloc.free(op);
-        try self.applySourceControlEntryVia(&fresh_source, op);
-        try self.reopenSource();
+        try self.applySourceControlEntryVia(&self.source, op);
         return true;
     }
 

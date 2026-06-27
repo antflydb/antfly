@@ -229,6 +229,13 @@ pub fn reconcileDbIndexesWithOptions(
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
 
+    if (db.open_mode == .query_readonly or db.open_mode == .status_only) {
+        return .{
+            .groups_considered = 0,
+            .dbs_opened = 0,
+        };
+    }
+
     const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,

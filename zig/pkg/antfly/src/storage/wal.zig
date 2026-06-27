@@ -175,6 +175,17 @@ const StoreOwner = union(enum) {
         self.* = undefined;
     }
 
+    fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
+        }
+        self.* = undefined;
+    }
+
     fn sync(self: *StoreOwner, force: bool) !void {
         switch (self.*) {
             .lmdb => |backend| try backend.sync(force),
@@ -388,6 +399,12 @@ pub const WAL = struct {
     pub fn close(self: *WAL) void {
         self.store.deinit();
         self.store_owner.close(std.heap.page_allocator);
+        self.* = undefined;
+    }
+
+    fn abandonAfterModeledCrash(self: *WAL) void {
+        self.store.deinit();
+        self.store_owner.abandonAfterCrash(std.heap.page_allocator);
         self.* = undefined;
     }
 
@@ -1826,13 +1843,14 @@ fn replayModeledWalCrashAfterAck(
         &runtime_next_lsn,
     );
     try device_model.device().crash();
+    if (wal_open) {
+        wal.abandonAfterModeledCrash();
+        wal_open = false;
+    }
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
     try verifyWalSimState(allocator, &reopened, model.items, runtime_next_lsn, 1);
-
-    wal_open = false;
-    wal = undefined;
 }
 
 fn replayModeledWalCrashFixture(
@@ -1899,8 +1917,10 @@ fn replayModeledWalCrashFixture(
     };
 
     try device_model.device().crash();
-    wal_open = false;
-    wal = undefined;
+    if (wal_open) {
+        wal.abandonAfterModeledCrash();
+        wal_open = false;
+    }
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2718,6 +2738,7 @@ test "wal modeled storage survives crash before close after acknowledged append"
     var crashed_wal = try WAL.open(path, opts);
     try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed-before-crash"));
     try device_model.device().crash();
+    crashed_wal.abandonAfterModeledCrash();
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2731,8 +2752,6 @@ test "wal modeled storage survives crash before close after acknowledged append"
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 1), entries[0].lsn);
     try std.testing.expectEqualStrings("committed-before-crash", entries[0].data);
-
-    crashed_wal = undefined;
 }
 
 test "wal modeled replay runner uses virtual storage and time" {

@@ -181,6 +181,10 @@ pub fn close(comptime BackendType: type, backend: *BackendType) void {
     cleanup(BackendType, backend, true);
 }
 
+pub fn abandon(comptime BackendType: type, backend: *BackendType) void {
+    cleanup(BackendType, backend, false);
+}
+
 fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool) void {
     if (finalize_deferred and backend.root_dir != null and !backend.options.backend.read_only) {
         if (@hasDecl(BackendType, "finalizeDeferredStorageWork")) {

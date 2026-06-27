@@ -6975,6 +6975,7 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         var apply_locked = true;
         errdefer if (apply_locked) self.core.unlockApply();

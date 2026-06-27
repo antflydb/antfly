@@ -246,9 +246,24 @@ pub fn nativeRealPathAlloc(allocator: Allocator, path: []const u8) ![:0]u8 {
 }
 
 fn nativeRootIdentityAlloc(_: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
-    const canonical = try nativeRealPathAlloc(allocator, root_dir);
+    const canonical = nativeRealPathAlloc(allocator, root_dir) catch |err| switch (err) {
+        error.FileNotFound => return try nativeMissingRootIdentityAlloc(allocator, root_dir),
+        else => return err,
+    };
     defer allocator.free(canonical);
     return try allocator.dupe(u8, canonical);
+}
+
+fn nativeMissingRootIdentityAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(root_dir)) {
+        return try std.fs.path.resolve(allocator, &.{root_dir});
+    }
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", allocator);
+    defer allocator.free(cwd);
+    return try std.fs.path.resolve(allocator, &.{ cwd, root_dir });
 }
 
 fn openNativePathFile(io: std.Io, path: []const u8) !std.Io.File {

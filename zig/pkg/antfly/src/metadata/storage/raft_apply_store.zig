@@ -247,6 +247,7 @@ pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
+    read_only: bool = false,
     // Metadata apply traffic is many tiny durable WAL-backed writes. Flushing
     // every commit amplifies manifest churn and makes simulation/runtime costs
     // pathological without improving durability.
@@ -339,15 +340,17 @@ pub const RaftApplyStore = struct {
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
         errdefer alloc.free(root_dir);
-        try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
 
         const path = try std.fmt.allocPrint(alloc, "{s}/metadata-apply-store", .{root_dir});
         errdefer alloc.free(path);
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), path);
 
         var backend = try lsm_backend.BackendHandle.open(alloc, path, .{
             .backend = .{
                 .durability = if (cfg.no_sync) .none else .full,
+                .read_only = cfg.read_only,
+                .create_if_missing = !cfg.read_only,
             },
             .flush_threshold = cfg.flush_threshold,
         });
