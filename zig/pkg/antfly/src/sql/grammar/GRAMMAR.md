@@ -57,7 +57,10 @@ tags such as `%token <str> IDENT`, ignored `%type` and `%nterm` metadata,
 `%precedence`, `%%` section separators, literal precedence references through
 existing token aliases, declaration numeric token codes, double-quoted token
 display aliases such as `%token <str> IDENT 258 "identifier"`, and C/Bison
-semantic action blocks in rule alternatives. It also skips multi-line Bison
+semantic action blocks in rule alternatives. Production-local GLR metadata
+such as `%dprec` and `%merge` is accepted and stripped from the structural RHS
+because Antfly's current generator records unresolved conflicts explicitly
+rather than importing Bison merge actions. It also skips multi-line Bison
 prologue blocks, ignored directive blocks such as `%union`/`%destructor`, and
 multi-line semantic action blocks that follow a production alternative,
 including actions that start after production symbols on the same line. Bison
@@ -75,8 +78,8 @@ continues the previous alternative, including continuation-line `%prec`
 overrides, while `|` starts a new alternative. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
-intentional grammar update, and the checked-in generated metadata records both
-actual and expected conflict counts. The
+intentional grammar update, and the checked-in generated metadata records
+nullable-symbol metadata alongside both actual and expected conflict counts. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus

@@ -118,6 +118,7 @@ pub const Tables = struct {
     terminal_count: usize,
     nonterminal_count: usize,
     productions: []const Production,
+    nullable_symbols: []const bool,
     states: []const State,
     actions: []const Action,
     gotos: []const Goto,
@@ -597,6 +598,10 @@ fn appendAlternative(allocator: std.mem.Allocator, grammar: *Grammar, rule: *Rul
             precedence_symbol = try dupToken(allocator, override);
             continue;
         }
+        if (std.mem.eql(u8, symbol, "%dprec") or std.mem.eql(u8, symbol, "%merge")) {
+            _ = (try nextGrammarSymbol(trimmed, &index)) orelse return error.InvalidProductionAnnotation;
+            continue;
+        }
         if (isLiteralAlias(symbol)) _ = try ensureLiteralTerminal(allocator, grammar, symbol);
         try symbols.append(allocator, try dupToken(allocator, symbol));
     }
@@ -849,6 +854,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         .terminal_count = terminal_count,
         .nonterminal_count = symbol_count - terminal_count,
         .productions = try productions.toOwnedSlice(allocator),
+        .nullable_symbols = nullable,
         .states = try states.toOwnedSlice(allocator),
         .actions = try actions.toOwnedSlice(allocator),
         .gotos = try gotos.toOwnedSlice(allocator),
@@ -1134,6 +1140,7 @@ fn emitZigMetadata(
         \\pub const token_count = {d};
         \\pub const rule_count = {d};
         \\pub const production_count = {d};
+        \\pub const nullable_symbol_count = {d};
         \\pub const state_count = {d};
         \\pub const action_count = {d};
         \\pub const goto_count = {d};
@@ -1158,6 +1165,7 @@ fn emitZigMetadata(
         grammar.tokens.items.len,
         grammar.rules.items.len,
         tables.productions.len - 1,
+        nullableSymbolCount(tables.nullable_symbols),
         tables.states.len,
         tables.actions.len,
         tables.gotos.len,
@@ -1169,6 +1177,14 @@ fn emitZigMetadata(
     });
     for (tables.symbols) |symbol| {
         try appendFmt(allocator, &out, "    .{{ .name = \"{s}\", .kind = .{s} }},\n", .{ symbol.name, @tagName(symbol.kind) });
+    }
+    try out.appendSlice(allocator,
+        \\};
+        \\const nullable_symbols = [_]bool{
+        \\
+    );
+    for (tables.nullable_symbols) |nullable_symbol| {
+        try appendFmt(allocator, &out, "    {s},\n", .{if (nullable_symbol) "true" else "false"});
     }
     try out.appendSlice(allocator,
         \\};
@@ -1295,6 +1311,7 @@ fn emitZigMetadata(
         \\pub const goto_range_max = {d};
         \\pub const parse_table_static_bytes =
         \\    @sizeOf(@TypeOf(symbols)) +
+        \\    @sizeOf(@TypeOf(nullable_symbols)) +
         \\    @sizeOf(@TypeOf(production_rhs)) +
         \\    @sizeOf(@TypeOf(productions)) +
         \\    @sizeOf(@TypeOf(state_items)) +
@@ -1567,6 +1584,14 @@ fn maxActionRangeLen(state_count: usize, actions: []const Action) usize {
 
 fn maxGotoRangeLen(state_count: usize, gotos: []const Goto) usize {
     return maxTableRangeLen(state_count, gotos, gotoState);
+}
+
+fn nullableSymbolCount(nullable_symbols: []const bool) usize {
+    var count: usize = 0;
+    for (nullable_symbols) |nullable_symbol| {
+        if (nullable_symbol) count += 1;
+    }
+    return count;
 }
 
 fn actionState(action: Action) u16 {
@@ -1986,6 +2011,25 @@ test "parseGrammar treats non-pipe rule lines as alternative continuations" {
     try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
 }
 
+test "parseGrammar ignores bison production conflict annotations" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start stmt
+        \\%token ID
+        \\stmt:
+        \\    ID %dprec 1 %merge <merge_nodes>
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("ID", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try validateGrammar(grammar);
+}
+
 test "parseGrammar accepts bison typed declarations and strips semantic actions" {
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_impl.deinit();
@@ -2140,6 +2184,7 @@ test "buildSlrTables builds conflict-free tables for a small grammar" {
     try std.testing.expect(tables.states.len > 0);
     try std.testing.expect(tables.actions.len > 0);
     try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+    try std.testing.expectEqual(@as(usize, 1), nullableSymbolCount(tables.nullable_symbols));
 }
 
 test "buildSlrTables detects shift reduce conflicts" {
@@ -2201,6 +2246,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     const first = try generateZigMetadata(arena, "fixture.y", source);
     const second = try generateZigMetadata(arena, "fixture.y", source);
     try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub const nullable_symbol_count = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const nullable_symbols = [_]bool") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const state_count = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "const actions = [_]Action") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "const conflicts = [_]Conflict") != null);
