@@ -324,16 +324,27 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 skip_brace_block_depth = try braceDepthAfterLine(line, 0);
                 continue;
             }
+            const starts_new_alternative = std.mem.startsWith(u8, line, "|");
             const alt = if (std.mem.startsWith(u8, line, "|"))
                 std.mem.trim(u8, line[1..], " \t\r")
             else
                 line;
             if (try splitUnclosedActionBlockPrefix(alt)) |split| {
                 const prefix = std.mem.trim(u8, split.prefix, " \t\r");
-                if (prefix.len != 0) try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], prefix);
+                if (prefix.len != 0) {
+                    if (starts_new_alternative or grammar.rules.items[rule_idx].alternatives.items.len == 0) {
+                        try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], prefix);
+                    } else {
+                        try appendAlternativeContinuation(allocator, &grammar, &grammar.rules.items[rule_idx], prefix);
+                    }
+                }
                 skip_brace_block_depth = split.depth;
             } else {
-                try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], alt);
+                if (starts_new_alternative or grammar.rules.items[rule_idx].alternatives.items.len == 0) {
+                    try appendAlternatives(allocator, &grammar, &grammar.rules.items[rule_idx], alt);
+                } else {
+                    try appendAlternativeContinuation(allocator, &grammar, &grammar.rules.items[rule_idx], alt);
+                }
             }
             if (ends_rule) active_rule = null;
             continue;
@@ -615,6 +626,30 @@ fn appendAlternatives(allocator: std.mem.Allocator, grammar: *Grammar, rule: *Ru
         }
     }
     try appendAlternative(allocator, grammar, rule, text[start..]);
+}
+
+fn appendAlternativeContinuation(allocator: std.mem.Allocator, grammar: *Grammar, rule: *Rule, text: []const u8) !void {
+    if (rule.alternatives.items.len == 0) {
+        try appendAlternatives(allocator, grammar, rule, text);
+        return;
+    }
+
+    var parsed: Rule = .{ .name = rule.name };
+    try appendAlternative(allocator, grammar, &parsed, text);
+    if (parsed.alternatives.items.len == 0) return;
+    const continuation = parsed.alternatives.items[0];
+    if (continuation.symbols.len == 0 and continuation.precedence_symbol == null) return;
+
+    const target = &rule.alternatives.items[rule.alternatives.items.len - 1];
+    if (continuation.symbols.len != 0) {
+        var symbols = try allocator.alloc([]const u8, target.symbols.len + continuation.symbols.len);
+        @memcpy(symbols[0..target.symbols.len], target.symbols);
+        @memcpy(symbols[target.symbols.len..], continuation.symbols);
+        target.symbols = symbols;
+    }
+    if (continuation.precedence_symbol) |precedence_symbol| {
+        target.precedence_symbol = precedence_symbol;
+    }
 }
 
 fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
@@ -1919,6 +1954,36 @@ test "parseGrammar creates stable terminals for unaliased bison literals" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_2B,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_28,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    '+',") == null);
+}
+
+test "parseGrammar treats non-pipe rule lines as alternative continuations" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID
+        \\%left '+'
+        \\expr:
+        \\    expr '+'
+        \\    expr
+        \\    %prec '+'
+        \\  | ID
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.rules.items[0].alternatives.items.len);
+    try std.testing.expectEqual(@as(usize, 3), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("expr", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try std.testing.expectEqualStrings("'+'", grammar.rules.items[0].alternatives.items[0].symbols[1]);
+    try std.testing.expectEqualStrings("expr", grammar.rules.items[0].alternatives.items[0].symbols[2]);
+    try std.testing.expectEqualStrings("'+'", grammar.rules.items[0].alternatives.items[0].precedence_symbol.?);
+    try std.testing.expectEqualStrings("ID", grammar.rules.items[0].alternatives.items[1].symbols[0]);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
 }
 
 test "parseGrammar accepts bison typed declarations and strips semantic actions" {
