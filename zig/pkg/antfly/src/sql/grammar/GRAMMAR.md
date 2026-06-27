@@ -249,7 +249,15 @@ expressions, and non-recursive CTE write prefixes. Generated DML child-read
 metadata now also fails closed when the retained read kind disagrees with the
 retained `SELECT`/set-operation/relation-source clause shape, so insert-source
 and mutation-source wrappers cannot publish impossible child-read families for
-later lowerers to rediscover. Single-table point `UPDATE`
+later lowerers to rediscover. Parsed-statement classification also validates
+generated top-level DML clause layout before publishing a write family:
+`INSERT` target/column/value/default/conflict/returning ranges must align with
+`INTO`, `VALUES`, `DEFAULT VALUES`, `ON CONFLICT`, and `RETURNING`; `UPDATE`
+assignment/source/predicate/returning ranges must align with `SET`, `FROM`,
+`WHERE`, and `RETURNING`; `DELETE` source/predicate/returning ranges must align
+with `FROM`, `USING`, `WHERE`, and `RETURNING`; `TRUNCATE` extra targets must
+remain comma-delimited after the primary target; and `MERGE` source and match
+predicate ranges must align with `USING` and `ON`. Single-table point `UPDATE`
 and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches, including
@@ -479,7 +487,7 @@ such as `antfly.full_text_search`, `antfly.semantic_search`,
 `antfly.vector_search`, `antfly.hybrid_search`, `antfly.graph_traverse`,
 `antfly.graph_match`, and `antfly.graph_metric` are now accepted as generated
 read sources with named `=`/`=>` arguments, retained source/name/argument token
-ranges, owned named-argument item/name/operator/value ranges, list-based
+ranges, owned comma-adjacent named-argument item/name/operator/value ranges, list-based
 Antfly function kind metadata across joined sources, graph function subset
 metadata, exact named-argument operator validation for `=` and `=>`,
 graph-specific semantic argument payloads for table/index selectors,
@@ -779,7 +787,8 @@ Unsupported DDL remains on the existing parser until
    metadata at the parsed boundary, validates top-level command source spans
    for plain and `WITH`-prefixed writes, checks retained CTE prefix
    count/first/last/body-read compatibility plus CTE item layout and comma
-   adjacency, target/source/assignment clause ranges, and required source
+   adjacency, target/source/assignment clause ranges, top-level DML keyword
+   layout for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE`, and required source
    child-read payloads before direct generated
    lowering, validates retained generated child-read `SELECT` source, `WHERE`,
    set-operation clause boundaries, and generated read-kind compatibility for
