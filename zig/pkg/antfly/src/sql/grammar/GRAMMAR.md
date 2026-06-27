@@ -95,7 +95,10 @@ That
 is the production bridge for later generated AST construction: AST builders can
 push token leaves on shifts and combine production-shaped children on
 reductions without rediscovering syntax from SQL text or depending on table
-internals. The
+internals. The SQL generated-parser facade now exposes an opt-in accepted
+reduction trace for tokenized statements, letting runtime tests and later AST
+builders retain a compact grammar-derived proof of the production path without
+changing the normal parse result or exposing parser tables. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus

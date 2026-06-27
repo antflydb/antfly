@@ -1880,6 +1880,26 @@ pub const GeneratedSqlParseResult = struct {
     }
 };
 
+pub const GeneratedSqlGrammarRule = generated.RuleId;
+
+pub const GeneratedSqlReductionEvent = struct {
+    production: u16,
+    rule: ?GeneratedSqlGrammarRule,
+    lhs: u16,
+    rhs_len: u16,
+    rhs: []const u16,
+};
+
+pub const GeneratedSqlReductionTrace = struct {
+    reductions: []GeneratedSqlReductionEvent,
+    accepted_token_count: usize,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.reductions);
+        self.* = .{ .reductions = &.{}, .accepted_token_count = 0 };
+    }
+};
+
 pub const GeneratedSqlAstMode = enum {
     full,
     skip_read,
@@ -2323,6 +2343,63 @@ fn parseGeneratedTokenIds(alloc: std.mem.Allocator, token_ids: []const u16) !voi
         return try generated.parseWithStackBuffer(token_ids, &stack_buffer);
     }
     return try generated.parse(alloc, token_ids);
+}
+
+pub fn parseReductionTraceAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !GeneratedSqlReductionTrace {
+    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
+        return try parseGeneratedTokenIdReductionTraceAlloc(alloc, token_ids);
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {
+            const token_ids = try tokenIdsAlloc(alloc, tokens);
+            defer alloc.free(token_ids);
+            return try parseGeneratedTokenIdReductionTraceAlloc(alloc, token_ids);
+        },
+        else => return err,
+    }
+}
+
+const ReductionTraceHandler = struct {
+    reductions: *std.ArrayListUnmanaged(GeneratedSqlReductionEvent),
+    alloc: std.mem.Allocator,
+    accepted_token_count: ?usize = null,
+
+    pub fn shift(_: *@This(), _: generated.Shift) !void {}
+
+    pub fn reduce(self: *@This(), reduction: generated.Reduction) !void {
+        const info = generated.productionInfo(reduction.production) orelse return error.UnsupportedSqlShape;
+        try self.reductions.append(self.alloc, .{
+            .production = reduction.production,
+            .rule = info.rule,
+            .lhs = reduction.lhs,
+            .rhs_len = reduction.rhs_len,
+            .rhs = generated.productionRhs(reduction.production) orelse return error.UnsupportedSqlShape,
+        });
+    }
+
+    pub fn accept(self: *@This(), accepted: generated.Accept) !void {
+        self.accepted_token_count = accepted.token_count;
+    }
+};
+
+fn parseGeneratedTokenIdReductionTraceAlloc(alloc: std.mem.Allocator, token_ids: []const u16) !GeneratedSqlReductionTrace {
+    var reductions: std.ArrayListUnmanaged(GeneratedSqlReductionEvent) = .empty;
+    errdefer reductions.deinit(alloc);
+    var handler = ReductionTraceHandler{ .reductions = &reductions, .alloc = alloc };
+
+    if (token_ids.len + 1 <= generated_parse_stack_capacity) {
+        var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
+        try generated.parseWithEvents(token_ids, &stack_buffer, &handler);
+    } else {
+        const stack_buffer = try alloc.alloc(u16, token_ids.len + 1);
+        defer alloc.free(stack_buffer);
+        try generated.parseWithEvents(token_ids, stack_buffer, &handler);
+    }
+
+    return .{
+        .reductions = try reductions.toOwnedSlice(alloc),
+        .accepted_token_count = handler.accepted_token_count orelse token_ids.len,
+    };
 }
 
 fn buildGeneratedParseResult(
@@ -12941,6 +13018,30 @@ test "generated SQL parser reports source-aware diagnostics" {
     try std.testing.expect(diagnostic.expected.len > 0);
     try std.testing.expectEqualStrings(")", diagnostic.actual);
     try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+}
+
+test "generated SQL parser exposes accepted reduction traces" {
+    var tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SET search_path TO public");
+    defer lexer.freeTokens(std.testing.allocator, &tokens);
+
+    var trace = try parseReductionTraceAlloc(std.testing.allocator, tokens.items);
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), trace.accepted_token_count);
+    try std.testing.expect(trace.reductions.len > 0);
+
+    var saw_session_statement = false;
+    var saw_statement = false;
+    for (trace.reductions) |event| {
+        try std.testing.expectEqual(event.rhs_len, @as(u16, @intCast(event.rhs.len)));
+        if (event.rule) |rule| switch (rule) {
+            .session_statement => saw_session_statement = true,
+            .statement => saw_statement = true,
+            else => {},
+        };
+    }
+    try std.testing.expect(saw_session_statement);
+    try std.testing.expect(saw_statement);
 }
 
 test "generated SQL parser diagnostics map generated token indexes to source tokens" {
