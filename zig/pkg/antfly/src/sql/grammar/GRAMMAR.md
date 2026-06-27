@@ -38,6 +38,11 @@ grammar parsing, production validation, nullable/FIRST/FOLLOW sets, LR(0)
 states, indexed action/goto tables, source-aware syntax diagnostics, and
 structured conflict reporting. Generator tests cover URL-bearing reference
 metadata so `https://` references are not confused with grammar comments. The
+generator also accepts PostgreSQL/Yacc-style quoted literal terminals through
+symbolic `%token NAME 'literal'` aliases. Literal symbols may appear in rule
+alternatives while the checked-in generated API continues to expose stable Zig
+identifier token names, which keeps PostgreSQL-style grammar migration from
+polluting the runtime token enum with punctuation-shaped symbols. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records both

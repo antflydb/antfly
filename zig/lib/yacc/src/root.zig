@@ -25,7 +25,13 @@ pub const Grammar = struct {
     postgres_scan_l: []const u8 = "",
     cockroach_sql_y: []const u8 = "",
     tokens: std.ArrayListUnmanaged([]const u8) = .empty,
+    token_aliases: std.ArrayListUnmanaged(TokenAlias) = .empty,
     rules: std.ArrayListUnmanaged(Rule) = .empty,
+};
+
+pub const TokenAlias = struct {
+    literal: []const u8,
+    token: []const u8,
 };
 
 pub const Rule = struct {
@@ -251,9 +257,16 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
 
 fn stripLineComment(line: []const u8) []const u8 {
     var index: usize = 0;
-    while (std.mem.indexOfPos(u8, line, index, "//")) |idx| {
-        if (idx == 0 or std.ascii.isWhitespace(line[idx - 1])) return line[0..idx];
-        index = idx + 2;
+    var quoted = false;
+    while (index + 1 < line.len) : (index += 1) {
+        if (line[index] == '\'' and (index == 0 or line[index - 1] != '\\')) {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted and line[index] == '/' and line[index + 1] == '/') {
+            if (index == 0 or std.ascii.isWhitespace(line[index - 1])) return line[0..index];
+            index += 1;
+        }
     }
     return line;
 }
@@ -282,10 +295,14 @@ fn parseReference(grammar: *Grammar, line: []const u8) !void {
 
 fn parseTokens(allocator: std.mem.Allocator, grammar: *Grammar, text: []const u8) !void {
     var parts = std.mem.tokenizeAny(u8, text, " \t\r");
+    var previous_token: ?[]const u8 = null;
     while (parts.next()) |name| {
-        if (!containsName(grammar.tokens.items, name)) {
-            try grammar.tokens.append(allocator, try dupToken(allocator, name));
+        if (isQuotedLiteral(name)) {
+            const token_name = previous_token orelse return error.InvalidTokenAlias;
+            try appendTokenAlias(allocator, grammar, name, token_name);
+            continue;
         }
+        previous_token = try appendTokenName(allocator, grammar, name);
     }
 }
 
@@ -297,10 +314,26 @@ fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8
     }
 
     var symbols: std.ArrayListUnmanaged([]const u8) = .empty;
-    var parts = std.mem.tokenizeAny(u8, trimmed, " \t\r");
-    while (parts.next()) |symbol| {
-        if (std.mem.startsWith(u8, symbol, "/*")) break;
-        try symbols.append(allocator, try dupToken(allocator, symbol));
+    var index: usize = 0;
+    while (index < trimmed.len) {
+        while (index < trimmed.len and std.ascii.isWhitespace(trimmed[index])) index += 1;
+        if (index >= trimmed.len) break;
+        if (index + 1 < trimmed.len and trimmed[index] == '/' and trimmed[index + 1] == '*') break;
+
+        const start = index;
+        if (trimmed[index] == '\'') {
+            index += 1;
+            while (index < trimmed.len) : (index += 1) {
+                if (trimmed[index] == '\'' and trimmed[index - 1] != '\\') {
+                    index += 1;
+                    break;
+                }
+            }
+            if (index > trimmed.len or trimmed[index - 1] != '\'') return error.UnterminatedLiteralTerminal;
+        } else {
+            while (index < trimmed.len and !std.ascii.isWhitespace(trimmed[index])) index += 1;
+        }
+        try symbols.append(allocator, try dupToken(allocator, trimmed[start..index]));
     }
     try rule.alternatives.append(allocator, .{ .symbols = try symbols.toOwnedSlice(allocator) });
 }
@@ -314,7 +347,7 @@ pub fn validateGrammar(grammar: Grammar) !void {
         if (rule.alternatives.items.len == 0) return error.EmptyRule;
         for (rule.alternatives.items) |alt| {
             for (alt.symbols) |symbol| {
-                if (!containsName(grammar.tokens.items, symbol) and findRule(grammar, symbol) == null) {
+                if (resolveTerminalName(grammar, symbol) == null and findRule(grammar, symbol) == null) {
                     return error.UnknownSymbol;
                 }
             }
@@ -1121,9 +1154,7 @@ fn copySymbolIds(allocator: std.mem.Allocator, symbols: []const u16) ![]const u1
 }
 
 fn symbolId(grammar: Grammar, terminal_count: usize, symbol: []const u8) !u16 {
-    for (grammar.tokens.items, 0..) |token, idx| {
-        if (std.mem.eql(u8, token, symbol)) return @intCast(idx + 1);
-    }
+    if (resolveTerminalIndex(grammar, symbol)) |idx| return @intCast(idx + 1);
     if (findRule(grammar, symbol)) |rule_idx| return ruleSymbolId(terminal_count, rule_idx);
     return error.UnknownSymbol;
 }
@@ -1144,6 +1175,55 @@ fn containsName(names: []const []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, existing, name)) return true;
     }
     return false;
+}
+
+fn appendTokenName(allocator: std.mem.Allocator, grammar: *Grammar, name: []const u8) ![]const u8 {
+    for (grammar.tokens.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return existing;
+    }
+    const owned = try dupToken(allocator, name);
+    try grammar.tokens.append(allocator, owned);
+    return owned;
+}
+
+fn appendTokenAlias(
+    allocator: std.mem.Allocator,
+    grammar: *Grammar,
+    literal: []const u8,
+    token_name: []const u8,
+) !void {
+    for (grammar.token_aliases.items) |alias| {
+        if (std.mem.eql(u8, alias.literal, literal)) {
+            if (!std.mem.eql(u8, alias.token, token_name)) return error.ConflictingTokenAlias;
+            return;
+        }
+    }
+    try grammar.token_aliases.append(allocator, .{
+        .literal = try dupToken(allocator, literal),
+        .token = token_name,
+    });
+}
+
+fn isQuotedLiteral(symbol: []const u8) bool {
+    return symbol.len >= 2 and symbol[0] == '\'' and symbol[symbol.len - 1] == '\'';
+}
+
+fn resolveTerminalName(grammar: Grammar, symbol: []const u8) ?[]const u8 {
+    for (grammar.tokens.items) |token| {
+        if (std.mem.eql(u8, token, symbol)) return token;
+    }
+    for (grammar.token_aliases.items) |alias| {
+        if (std.mem.eql(u8, alias.literal, symbol)) return alias.token;
+    }
+    return null;
+}
+
+fn resolveTerminalIndex(grammar: Grammar, symbol: []const u8) ?usize {
+    const token_name = resolveTerminalName(grammar, symbol) orelse return null;
+    for (grammar.tokens.items, 0..) |token, idx| {
+        if (std.mem.eql(u8, token, token_name)) return idx;
+    }
+    return null;
 }
 
 fn appendSet(allocator: std.mem.Allocator, target: *std.ArrayListUnmanaged(u16), source: []const u16) !bool {
@@ -1277,6 +1357,43 @@ test "parseGrammar preserves reference URLs while stripping real comments" {
     try std.testing.expectEqualStrings("https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y", grammar.cockroach_sql_y);
     try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
     try std.testing.expectEqualStrings("SELECT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+}
+
+test "parseGrammar resolves yacc literal terminals through symbolic token aliases" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start stmt
+        \\%token SELECT IDENT COMMA ',' SLASHES '//'
+        \\stmt:
+        \\    SELECT identifier_list
+        \\  | SLASHES IDENT
+        \\  ;
+        \\identifier_list:
+        \\    IDENT
+        \\  | identifier_list ',' IDENT
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 4), grammar.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 2), grammar.token_aliases.items.len);
+    try std.testing.expectEqualStrings("','", grammar.token_aliases.items[0].literal);
+    try std.testing.expectEqualStrings("COMMA", grammar.token_aliases.items[0].token);
+    try std.testing.expectEqualStrings("'//'", grammar.token_aliases.items[1].literal);
+    try std.testing.expectEqualStrings("SLASHES", grammar.token_aliases.items[1].token);
+    try validateGrammar(grammar);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+    try std.testing.expectEqual(@as(u16, 3), try symbolId(grammar, grammar.tokens.items.len + 1, "COMMA"));
+    try std.testing.expectEqual(@as(u16, 3), try symbolId(grammar, grammar.tokens.items.len + 1, "','"));
+
+    const generated = try generateZigMetadata(arena, "literal.y", source);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "    COMMA,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "    ',',") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "terminalIdByName") != null);
 }
 
 test "buildSlrTables builds conflict-free tables for a small grammar" {
