@@ -8783,6 +8783,11 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
 
+    var generated_prefixed_multi_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id LEFT JOIN tenants ON accounts.tenant_id = tenants.id");
+    defer generated_prefixed_multi_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_prefixed_multi_join_query.generatedStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.join, generated_prefixed_multi_join_query.readStatementKind().?);
+
     var generated_using_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)");
     defer generated_using_join_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_using_join_query.generatedStatementKind().?);

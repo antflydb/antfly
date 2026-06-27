@@ -5454,6 +5454,20 @@ pub const ApiHttpServer = struct {
         if (trigger != null) return error.UnsupportedOperation;
     }
 
+    fn publicSqlUnsupportedTruncateSourceDiagnostic(
+        truncate_source: sql_adapter.LoweredMutationSource,
+    ) sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        const missing_native_model: []const u8 = if (truncate_source.additional_table_names.len != 0)
+            "catalog-owned multi-table truncate generation barrier"
+        else if (truncate_source.truncate_cascade)
+            "catalog-owned truncate cascade expansion and generation barrier"
+        else if (truncate_source.restart_identity)
+            "catalog-owned identity allocator reset for truncate"
+        else
+            "catalog-owned table-emptying generation barrier";
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
+    }
+
     fn applyLoweredPublicSqlMutationSource(
         self: *ApiHttpServer,
         target_table_name: []const u8,
@@ -5927,7 +5941,7 @@ pub const ApiHttpServer = struct {
 
         if (lowered == .truncate_source) {
             if (lowered.truncate_source.additional_table_names.len != 0 or lowered.truncate_source.truncate_cascade or lowered.truncate_source.restart_identity) {
-                return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.truncate_source)) };
             }
             const truncate_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, &lowered.truncate_source, authenticated_identity)) {
                 .failure => |failure| return .{ .response = failure },
@@ -27973,6 +27987,17 @@ fn expectPublicSqlDiagnosticBody(
     if (expected_span_end) |span_end| try std.testing.expectEqual(span_end, span.get("end").?.integer);
 }
 
+fn expectPublicSqlDiagnosticMissingNativeModel(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    expected_missing_native_model: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const err_obj = parsed.value.object.get("error") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_missing_native_model, err_obj.object.get("missing_native_model").?.string);
+}
+
 test "api http server binds public sql authorization to resolved statement targets" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -30455,6 +30480,30 @@ test "api http server executes SQL point writes through typed row batch ingress"
     });
     defer truncate_cascade_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), truncate_cascade_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, truncate_cascade_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_cascade_resp.body, "catalog-owned truncate cascade expansion and generation barrier");
+
+    var truncate_restart_identity_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
+    });
+    defer truncate_restart_identity_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), truncate_restart_identity_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, truncate_restart_identity_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_restart_identity_resp.body, "catalog-owned identity allocator reset for truncate");
+
+    var truncate_multi_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"TRUNCATE usage_records, usage_archive;\"}",
+    });
+    defer truncate_multi_table_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), truncate_multi_table_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, truncate_multi_table_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_multi_table_resp.body, "catalog-owned multi-table truncate generation barrier");
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {

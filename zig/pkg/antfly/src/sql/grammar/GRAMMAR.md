@@ -784,7 +784,10 @@ Unsupported DDL remains on the existing parser until
    matched/not-matched `DO NOTHING`, expression-filtered matched `UPDATE`,
    filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE` has a direct
    generated AST-to-plan lowerer for the supported table-list, identity, and
-   drop-behavior surface.
+   drop-behavior surface. Public SQL execution accepts the generated simple
+   table-emptying truncate path and returns structured plan diagnostics for
+   unsupported generated truncate variants that still need catalog-owned
+   multi-table expansion, identity allocator reset, or cascade expansion.
    The write-plan lowering context now dispatches through retained generated
    DML ASTs when the generated parser covers the statement, using direct
    generated AST-to-plan lowerers and failing closed when that generated
@@ -1239,7 +1242,12 @@ kind before typed join planning consumes the metadata. Parsed-statement
 classification now also validates retained generated join-item arrays,
 left-associative tree root/depth/child links, first-join compatibility fields,
 and top-level/CTE-body `ON`/`USING` payload consistency before publishing a
-generated read family. Read CTE classification now also validates CTE item
+generated read family. Generated join AST construction now also ends each
+multi-join item at the next join operator start rather than the next `JOIN`
+keyword, so prefixed operators such as `LEFT JOIN`, `RIGHT JOIN`, and
+`FULL OUTER JOIN` do not leak their prefix tokens into the previous `ON`
+condition span before parsed-statement classification validates the join tree.
+Read CTE classification now also validates CTE item
 layout, comma adjacency, optional column-list payloads, and materialization
 keyword metadata before publishing a generated read family. It also validates top-level and CTE-body generated
 projection, `DISTINCT ON`, grouping, and ordering list payloads, including
@@ -1267,8 +1275,8 @@ generated read family is published.
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-   conditionless cartesian payload layout, remaining exact join-item
-   segment/tail validation and fail-closed right/full plus conditionless
+   conditionless cartesian payload layout, remaining join-tail validation and
+   fail-closed right/full plus conditionless
    `NATURAL JOIN` executable-contract coverage, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
