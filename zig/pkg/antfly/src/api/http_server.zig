@@ -7079,13 +7079,17 @@ pub const ApiHttpServer = struct {
                 };
                 errdefer cursor_read.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                const cursor_rows = cursor_read.rows;
+                cursor_read.rows = &.{};
+                const cursor_columns = cursor_read.columns;
+                cursor_read.columns = &.{};
                 return .{ .result = .{
                     .session_id = session_id,
                     .statement_kind = "cursor",
                     .transaction_status = self.publicSqlTransactionStatus(session),
                     .result = .{ .read = .{
-                        .result = cursor_read.result,
-                        .columns = cursor_read.columns,
+                        .result = .{ .query = .{ .rows = cursor_rows, .total = cursor_read.total } },
+                        .columns = cursor_columns,
                     } },
                 } };
             },
@@ -7277,12 +7281,20 @@ pub const ApiHttpServer = struct {
             },
             .result => |*result| switch (result.result) {
                 .read => |*read| {
-                    self.sql_cursor_runtime.declareReadPortal(session_id, declare_plan, &read.result, &read.columns) catch |err| switch (err) {
+                    const taken = table_reads.takeLoweredSqlReadRows(&read.result);
+                    var rows = taken.rows;
+                    self.sql_cursor_runtime.declareReadPortal(session_id, declare_plan, &rows, &read.columns) catch |err| switch (err) {
                         error.CursorPortalAlreadyExists, error.InvalidSqlSession => {
+                            for (rows) |row| self.alloc.free(@constCast(row));
+                            if (rows.len > 0) self.alloc.free(rows);
                             read_outcome.deinit(self.alloc);
                             return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) };
                         },
-                        else => return err,
+                        else => {
+                            for (rows) |row| self.alloc.free(@constCast(row));
+                            if (rows.len > 0) self.alloc.free(rows);
+                            return err;
+                        },
                     };
                     read_outcome.deinit(self.alloc);
                     return null;

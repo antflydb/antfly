@@ -13,7 +13,12 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("../../sql/mod.zig");
+const ddl_plan = @import("ddl.zig");
+
+const sql_adapter = struct {
+    const NotificationChannelPlan = ddl_plan.NotificationChannelPlan;
+    const UnlistenNotificationPlan = ddl_plan.UnlistenNotificationPlan;
+};
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,

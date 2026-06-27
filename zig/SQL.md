@@ -1618,6 +1618,18 @@ Current implementation status:
   metadata before lowering insert, insert-source, update, delete, truncate,
   joined mutation-source, and merge plans, so mismatched generated DML ASTs fail
   closed instead of flowing into token fallback.
+- DDL planner entrypoints reject generated-owned DDL/session/prepared/cursor/
+  graph metadata when the retained generated AST is missing, preserving
+  token fallback only for non-generated statements and explicit valid-AST
+  compatibility boundaries.
+- Direct generated-DML lowering validates both write family and recursive-CTE
+  state from the published generated-aware write record before dispatching
+  recursive or non-recursive write plans.
+- Session, savepoint, notification, prepared-statement, and cursor state
+  runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
+  re-exports those protocol-neutral runtimes while API-owned routine execution
+  stays in `api/sql/routines.zig` until its table/catalog dependencies are
+  split.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

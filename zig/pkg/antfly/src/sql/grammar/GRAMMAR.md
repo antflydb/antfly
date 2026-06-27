@@ -133,7 +133,11 @@ before they can publish a parsed statement. The old handwritten classifier
 implementation and its token-probing tests have been removed. The remaining
 shared statement-family/read-kind/write-kind enums now live in
 `statement_kind.zig`, making the typed plan boundary explicit without keeping a
-classifier module in the public SQL facade.
+classifier module in the public SQL facade. DDL, session, prepared, cursor,
+graph, and unsupported generated statement metadata now also fails closed at
+the DDL planner entrypoints when the retained generated AST is missing, so
+generated-owned DDL cannot recover by re-entering token fallback merely because
+its AST payload was dropped or corrupted.
 The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
@@ -958,6 +962,9 @@ Unsupported DDL remains on the existing parser until
    statement record carrying both write family and recursive-CTE state, so typed
    write lowering cannot validate the generated DML family and then route
    recursive mutations from a separate handwritten-only flag.
+   Direct generated-DML AST lowering validates both values from that published
+   record before dispatching recursive or non-recursive write plans, so callers
+   cannot pass a detached generated AST with stale recursive metadata.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
    now use generated fail-closed diagnostics instead of classifier fallback.

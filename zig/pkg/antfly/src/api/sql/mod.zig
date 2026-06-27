@@ -12,9 +12,9 @@
 // the Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const cursors = @import("cursors.zig");
-pub const notifications = @import("notifications.zig");
-pub const prepared_statements = @import("prepared_statements.zig");
+pub const cursors = @import("../../sql/cursors.zig");
+pub const notifications = @import("../../sql/notifications.zig");
+pub const prepared_statements = @import("../../sql/prepared_statements.zig");
 pub const routines = @import("routines.zig");
-pub const savepoints = @import("savepoints.zig");
-pub const sessions = @import("sessions.zig");
+pub const savepoints = @import("../../sql/savepoints.zig");
+pub const sessions = @import("../../sql/sessions.zig");

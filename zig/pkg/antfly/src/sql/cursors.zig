@@ -13,18 +13,24 @@
 // limitations.
 
 const std = @import("std");
-const relational_rows_api = @import("../relational_rows.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const sql_adapter = @import("../../sql/mod.zig");
-const table_reads = @import("../table_reads.zig");
+const ddl_plan = @import("ddl.zig");
+const runtime_schema = @import("../storage/schema.zig");
+
+const sql_adapter = struct {
+    const CloseCursorPortalPlan = ddl_plan.CloseCursorPortalPlan;
+    const CursorScrollMode = ddl_plan.CursorScrollMode;
+    const DeclareCursorPortalPlan = ddl_plan.DeclareCursorPortalPlan;
+    const FetchCursorPortalPlan = ddl_plan.FetchCursorPortalPlan;
+};
 
 pub const ReadResult = struct {
-    result: table_reads.LoweredSqlReadPlanResult,
+    rows: [][]const u8 = &.{},
+    total: u32 = 0,
     columns: []const runtime_schema.RelationalColumn = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.result.deinit(alloc);
-        relational_rows_api.freeRowsOutputColumns(alloc, self.columns);
+        freeRows(alloc, self.rows);
+        freeColumns(alloc, self.columns);
         self.* = undefined;
     }
 };
@@ -66,7 +72,7 @@ pub const Runtime = struct {
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             for (self.rows) |row| alloc.free(@constCast(row));
             if (self.rows.len > 0) alloc.free(self.rows);
-            relational_rows_api.freeRowsOutputColumns(alloc, self.columns);
+            freeColumns(alloc, self.columns);
             self.* = undefined;
         }
     };
@@ -86,7 +92,7 @@ pub const Runtime = struct {
         self: *@This(),
         session_id: u64,
         plan: sql_adapter.DeclareCursorPortalPlan,
-        read_result: *table_reads.LoweredSqlReadPlanResult,
+        rows_ptr: *[][]const u8,
         columns_ptr: *[]const runtime_schema.RelationalColumn,
     ) !void {
         if (session_id == 0) return error.InvalidSqlSession;
@@ -97,16 +103,16 @@ pub const Runtime = struct {
 
         const key = try self.alloc.dupe(u8, plan.portal_name);
         errdefer self.alloc.free(key);
-        const taken = table_reads.takeLoweredSqlReadRows(read_result);
+        const rows = rows_ptr.*;
+        rows_ptr.* = &.{};
         const columns = columns_ptr.*;
         columns_ptr.* = &.{};
         errdefer {
-            for (taken.rows) |row| self.alloc.free(@constCast(row));
-            if (taken.rows.len > 0) self.alloc.free(taken.rows);
-            relational_rows_api.freeRowsOutputColumns(self.alloc, columns);
+            freeRows(self.alloc, rows);
+            freeColumns(self.alloc, columns);
         }
         try session.portals.put(self.alloc, key, .{
-            .rows = taken.rows,
+            .rows = rows,
             .columns = columns,
             .scroll = plan.scroll,
             .hold = plan.hold,
@@ -161,10 +167,7 @@ pub const Runtime = struct {
         const portal_value = try self.portal(session_id, plan.portal_name);
         var read = try self.fetchFromPortal(portal_value, plan, false);
         defer read.deinit(self.alloc);
-        return switch (read.result) {
-            .query => |query| query.total,
-            else => 0,
-        };
+        return read.total;
     }
 
     pub fn portalCountForTest(self: *@This(), session_id: u64) usize {
@@ -209,13 +212,28 @@ pub const Runtime = struct {
             }
         }
         const columns = try cloneColumnsAlloc(self.alloc, portal_value.columns);
-        errdefer relational_rows_api.freeRowsOutputColumns(self.alloc, columns);
+        errdefer freeColumns(self.alloc, columns);
         return .{
-            .result = .{ .query = .{ .rows = rows, .total = @intCast(row_count) } },
+            .rows = rows,
+            .total = @intCast(row_count),
             .columns = columns,
         };
     }
 };
+
+fn freeRows(alloc: std.mem.Allocator, rows: [][]const u8) void {
+    for (rows) |row| alloc.free(@constCast(row));
+    if (rows.len > 0) alloc.free(rows);
+}
+
+fn freeColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+    for (columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+        if (column.collation) |collation| alloc.free(collation);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
 
 const CursorFetchBounds = struct {
     start: usize,
@@ -330,14 +348,6 @@ test "sql cursor runtime owns portals and fetch positions" {
     rows[1] = try alloc.dupe(u8, "{\"id\":\"b\"}");
     rows[2] = try alloc.dupe(u8, "{\"id\":\"c\"}");
 
-    var result = table_reads.LoweredSqlReadPlanResult{
-        .query = .{
-            .rows = rows,
-            .total = @intCast(rows.len),
-        },
-    };
-    defer result.deinit(alloc);
-
     var columns = try alloc.alloc(runtime_schema.RelationalColumn, 1);
     columns[0] = .{
         .name = try alloc.dupe(u8, "id"),
@@ -349,28 +359,28 @@ test "sql cursor runtime owns portals and fetch positions" {
     try runtime.declareReadPortal(session_id, .{
         .portal_name = "usage_cursor",
         .statement_kind = .read,
-    }, &result, &columns_slice);
-    try std.testing.expectEqual(@as(usize, 0), result.query.rows.len);
+    }, &rows, &columns_slice);
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
     try std.testing.expectEqual(@as(usize, 0), columns_slice.len);
     try std.testing.expectEqual(@as(usize, 1), runtime.portalCountForTest(session_id));
 
     var first = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .next });
     defer first.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), first.result.query.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a\"}", first.result.query.rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", first.rows[0]);
     try std.testing.expectEqual(@as(usize, 1), first.columns.len);
     try std.testing.expectEqualStrings("id", first.columns[0].name);
 
     var next_two = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .forward, .count = 2 });
     defer next_two.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), next_two.result.query.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"b\"}", next_two.result.query.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"c\"}", next_two.result.query.rows[1]);
+    try std.testing.expectEqual(@as(usize, 2), next_two.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", next_two.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", next_two.rows[1]);
 
     try std.testing.expectEqual(@as(usize, 1), try runtime.move(session_id, .{ .portal_name = "usage_cursor", .direction = .backward, .count = 1 }));
     var last_again = try runtime.fetch(session_id, .{ .portal_name = "usage_cursor", .direction = .next });
     defer last_again.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"id\":\"c\"}", last_again.result.query.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", last_again.rows[0]);
 
     try runtime.close(session_id, .{ .portal_name = "usage_cursor" });
     try std.testing.expectEqual(@as(usize, 0), runtime.portalCountForTest(session_id));

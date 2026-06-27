@@ -13,8 +13,21 @@
 // limitations.
 
 const std = @import("std");
-const catalog_resources = @import("../catalog_resources.zig");
-const sql_adapter = @import("../../sql/mod.zig");
+const catalog_apply = @import("catalog_apply.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const ddl_plan = @import("ddl.zig");
+const tokenized = @import("tokenized.zig");
+
+const sql_adapter = struct {
+    const OwnedSqlCatalogSession = catalog_apply.OwnedSqlCatalogSession;
+    const ParsedSql = tokenized.ParsedSql;
+    const SessionCatalogPlan = ddl_plan.SessionCatalogPlan;
+    const TransactionControlPlan = ddl_plan.TransactionControlPlan;
+    const TransactionModePlan = ddl_plan.TransactionModePlan;
+    const parseSqlBoolSetting = catalog_apply.parseSqlBoolSetting;
+    const sqlDefaultTransactionReadOnlyFromSession = catalog_apply.sqlDefaultTransactionReadOnlyFromSession;
+    const sqlEffectiveTransactionReadOnlyFromSession = catalog_apply.sqlEffectiveTransactionReadOnlyFromSession;
+};
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,

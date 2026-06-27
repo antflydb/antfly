@@ -13,7 +13,23 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("../../sql/mod.zig");
+const ddl_plan = @import("ddl.zig");
+const sql_read_kind = @import("statement_kind.zig");
+const sql_value = @import("value.zig");
+const tokenized = @import("tokenized.zig");
+
+const sql_adapter = struct {
+    const ParsedSql = tokenized.ParsedSql;
+    const PreparedStatementPlan = ddl_plan.PreparedStatementPlan;
+    const PrepareStatementPlan = ddl_plan.PrepareStatementPlan;
+    const ExecutePreparedStatementPlan = ddl_plan.ExecutePreparedStatementPlan;
+    const DeallocatePreparedStatementPlan = ddl_plan.DeallocatePreparedStatementPlan;
+    const PreparedStatementSubjectKind = ddl_plan.PreparedStatementSubjectKind;
+    const PreparedStatementStatementKind = ddl_plan.PreparedStatementStatementKind;
+    const SqlReadStatementKind = sql_read_kind.SqlReadStatementKind;
+    const SqlValue = sql_value.SqlValue;
+    const preparedStatementPlanFromGeneratedAstAlloc = ddl_plan.preparedStatementPlanFromGeneratedAstAlloc;
+};
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,

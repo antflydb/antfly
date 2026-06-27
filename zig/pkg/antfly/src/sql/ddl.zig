@@ -12702,20 +12702,23 @@ pub fn parseLogicalDdlPlanAlloc(
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
     };
     if (parsed_sql.generated_statement) |generated_statement| {
-        if (generated_statement.ast) |generated_ast| {
-            if (planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
-                error.UnsupportedSqlShape => blk: {
-                    if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
-                    state.pos = 0;
-                    break :blk null;
-                },
-                else => return err,
-            }) |logical_plan| {
-                return logical_plan;
-            }
+        const generated_ast = try generatedAstOrUnsupported(generated_statement);
+        if (planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
+            error.UnsupportedSqlShape => blk: {
+                if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
+                state.pos = 0;
+                break :blk null;
+            },
+            else => return err,
+        }) |logical_plan| {
+            return logical_plan;
         }
     }
     return try parseLogicalDdlPlanTokensAlloc(alloc, tokens, &state.pos, options);
+}
+
+fn generatedAstOrUnsupported(generated_statement: tokenized.GeneratedRawSqlStatement) !generated_parser.GeneratedSqlAst {
+    return generated_statement.ast orelse error.UnsupportedSqlShape;
 }
 
 pub fn planGeneratedLogicalDdlAstAlloc(
@@ -12954,17 +12957,16 @@ fn legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
     };
     if (parsed_sql.generated_statement) |generated_statement| {
-        if (generated_statement.ast) |generated_ast| {
-            if (legacyDdlParserPlanFromGeneratedAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
-                error.UnsupportedSqlShape => blk: {
-                    if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
-                    state.pos = 0;
-                    break :blk null;
-                },
-                else => return err,
-            }) |plan| {
-                return plan;
-            }
+        const generated_ast = try generatedAstOrUnsupported(generated_statement);
+        if (legacyDdlParserPlanFromGeneratedAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
+            error.UnsupportedSqlShape => blk: {
+                if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
+                state.pos = 0;
+                break :blk null;
+            },
+            else => return err,
+        }) |plan| {
+            return plan;
         }
     }
     return try parseLegacyDdlParserPlanAlloc(alloc, tokens, &state.pos, options);
@@ -18142,6 +18144,17 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_session));
+
+    var missing_ast_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
+    defer missing_ast_session.deinit(alloc);
+    if (missing_ast_session.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            generated_ast.deinit(alloc);
+            generated_statement.ast = null;
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &missing_ast_session));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &missing_ast_session, .{}));
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {

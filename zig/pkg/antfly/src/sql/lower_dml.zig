@@ -12827,7 +12827,9 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     options: plan_mod.LowerWritePlanOptions,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
-    const write_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    const published_write = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    const write_kind = published_write.kind;
+    if (dml_ast.cte_recursive != published_write.recursive) return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
     if (dml_ast.cte_recursive) {
         return try lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind);
@@ -15013,6 +15015,36 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_cte_command_span_dml, schema, &.{}, options),
+    );
+
+    var nonrecursive_with_recursive_ast = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u2', 'active', 'o1', 7) RETURNING id",
+    );
+    defer nonrecursive_with_recursive_ast.deinit(alloc);
+    var mutated_recursive_ast = switch ((nonrecursive_with_recursive_ast.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    mutated_recursive_ast.cte_recursive = true;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &nonrecursive_with_recursive_ast, mutated_recursive_ast, schema, &.{}, options),
+    );
+
+    var recursive_with_nonrecursive_ast = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO usage_records(id) SELECT id FROM source_rows",
+    );
+    defer recursive_with_nonrecursive_ast.deinit(alloc);
+    var mutated_nonrecursive_ast = switch ((recursive_with_nonrecursive_ast.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    mutated_nonrecursive_ast.cte_recursive = false;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &recursive_with_nonrecursive_ast, mutated_nonrecursive_ast, schema, &.{}, options),
     );
 
     const resolver_free_options = plan_mod.LowerWritePlanOptions{

@@ -14,8 +14,14 @@
 
 const std = @import("std");
 
-const catalog_resources = @import("../catalog_resources.zig");
-const sql_adapter = @import("../../sql/mod.zig");
+const catalog_apply = @import("catalog_apply.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const ddl_plan = @import("ddl.zig");
+
+const sql_adapter = struct {
+    const OwnedSqlCatalogSession = catalog_apply.OwnedSqlCatalogSession;
+    const SavepointTransactionPlan = ddl_plan.SavepointTransactionPlan;
+};
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
