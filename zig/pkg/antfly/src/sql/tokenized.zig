@@ -2232,9 +2232,16 @@ fn generatedReadAstHasValidClassificationPayload(
     if (read_ast.projection_tokens) |projection| {
         if (!generatedReadTokenRangeIsValidThrough(tokens, end, projection)) return false;
         if (projection.start <= select_index) return false;
+        if (!generatedReadListPayloadIsValid(tokens, end, projection, read_ast.projection_items, .{
+            .allow_aliases = true,
+            .reject_order_modifiers = true,
+            .first_expression = read_ast.projection_first_expression,
+            .last_expression = read_ast.projection_last_expression,
+        })) return false;
     } else return false;
 
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.distinct_tokens)) return false;
+    if (!generatedReadDistinctPayloadIsValid(tokens, end, read_ast.distinct_tokens, read_ast.distinct_on_items)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_name_tokens)) return false;
@@ -2264,9 +2271,21 @@ fn generatedReadAstHasValidClassificationPayload(
     )) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.where_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.group_tokens)) return false;
+    if (!generatedReadOptionalListPayloadIsValid(tokens, end, read_ast.group_tokens, read_ast.group_items, .{
+        .reject_aliases = true,
+        .reject_order_modifiers = true,
+        .first_expression = read_ast.group_first_expression,
+        .last_expression = read_ast.group_last_expression,
+    })) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.having_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.window_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.order_tokens)) return false;
+    if (!generatedReadOptionalListPayloadIsValid(tokens, end, read_ast.order_tokens, read_ast.order_items, .{
+        .reject_aliases = true,
+        .allow_order_modifiers = true,
+        .first_expression = read_ast.order_first_expression,
+        .last_expression = read_ast.order_last_expression,
+    })) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.limit_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.offset_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_tokens)) return false;
@@ -2379,7 +2398,14 @@ fn generatedReadCtePayloadIsValid(
         if (!std.meta.eql(cte.body_select_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = body.start, .end = body.start + 1 })) return false;
         if (!tokens[body.start].matchesKeywordTag(.select)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_distinct_tokens)) return false;
+        if (!generatedReadDistinctPayloadIsValid(tokens, end, cte.body_distinct_tokens, cte.body_distinct_on_items)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_projection_tokens)) return false;
+        if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_projection_tokens, cte.body_projection_items, .{
+            .allow_aliases = true,
+            .reject_order_modifiers = true,
+            .first_expression = cte.body_projection_first_expression,
+            .last_expression = cte.body_projection_last_expression,
+        })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_operator_tokens)) return false;
@@ -2403,9 +2429,21 @@ fn generatedReadCtePayloadIsValid(
         )) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_where_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_group_tokens)) return false;
+        if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_group_tokens, cte.body_group_items, .{
+            .reject_aliases = true,
+            .reject_order_modifiers = true,
+            .first_expression = cte.body_group_first_expression,
+            .last_expression = cte.body_group_last_expression,
+        })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_having_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_window_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_order_tokens)) return false;
+        if (!generatedReadOptionalListPayloadIsValid(tokens, end, cte.body_order_tokens, cte.body_order_items, .{
+            .reject_aliases = true,
+            .allow_order_modifiers = true,
+            .first_expression = cte.body_order_first_expression,
+            .last_expression = cte.body_order_last_expression,
+        })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_limit_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_offset_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_tokens)) return false;
@@ -2540,7 +2578,7 @@ fn generatedReadJoinUsingColumnListIsValid(
     if (!tokens[condition_tokens.start].matchesKeywordTag(.using)) return false;
     if (tokens[condition_tokens.start + 1].kind != .lparen or tokens[condition_tokens.end - 1].kind != .rparen) return false;
     if (column_tokens.start != condition_tokens.start + 2 or column_tokens.end != condition_tokens.end - 1) return false;
-    return generatedReadDelimitedListIsValid(tokens, column_tokens, columns, .{
+    return generatedReadDelimitedListIsValid(tokens, tokens.len, column_tokens, columns, .{
         .single_token_items = true,
         .reject_aliases = true,
         .reject_order_modifiers = true,
@@ -2549,35 +2587,99 @@ fn generatedReadJoinUsingColumnListIsValid(
 
 const GeneratedReadDelimitedListValidationOptions = struct {
     single_token_items: bool = false,
+    allow_aliases: bool = false,
     reject_aliases: bool = false,
+    allow_order_modifiers: bool = false,
     reject_order_modifiers: bool = false,
+    first_expression: generated_parser.GeneratedSqlExpressionAst = .{},
+    last_expression: generated_parser.GeneratedSqlExpressionAst = .{},
 };
 
-fn generatedReadDelimitedListIsValid(
+fn generatedReadOptionalListPayloadIsValid(
     tokens: []const Token,
+    end: usize,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    options: GeneratedReadDelimitedListValidationOptions,
+) bool {
+    if (maybe_range) |range| return generatedReadListPayloadIsValid(tokens, end, range, list, options);
+    return generatedReadListPayloadIsEmpty(list, options.first_expression, options.last_expression);
+}
+
+fn generatedReadListPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
     range: generated_parser.GeneratedSqlTokenRange,
     list: generated_parser.GeneratedSqlListAst,
     options: GeneratedReadDelimitedListValidationOptions,
 ) bool {
-    if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+    if (!generatedReadDelimitedListIsValid(tokens, end, range, list, options)) return false;
+    if (!generatedReadExpressionTokensEqualRange(options.first_expression, list.expression_items[0])) return false;
+    if (!generatedReadExpressionTokensEqualRange(options.last_expression, list.expression_items[list.expression_items.len - 1])) return false;
+    return true;
+}
+
+fn generatedReadListPayloadIsEmpty(
+    list: generated_parser.GeneratedSqlListAst,
+    first_expression: generated_parser.GeneratedSqlExpressionAst,
+    last_expression: generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    return list.count == 0 and
+        list.items.len == 0 and
+        list.expression_items.len == 0 and
+        list.alias_items.len == 0 and
+        list.alias_name_items.len == 0 and
+        list.direction_items.len == 0 and
+        list.directions.len == 0 and
+        list.order_using_operator_items.len == 0 and
+        list.nulls_order_items.len == 0 and
+        list.nulls_orders.len == 0 and
+        list.expressions.len == 0 and
+        list.first_tokens == null and
+        list.last_tokens == null and
+        first_expression.tokens == null and
+        last_expression.tokens == null;
+}
+
+fn generatedReadDistinctPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_distinct_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    distinct_on_items: generated_parser.GeneratedSqlListAst,
+) bool {
+    const distinct_tokens = maybe_distinct_tokens orelse return generatedReadListPayloadIsEmpty(distinct_on_items, .{}, .{});
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, distinct_tokens)) return false;
+    if (distinct_tokens.start >= distinct_tokens.end or !tokens[distinct_tokens.start].matchesKeywordTag(.distinct)) return false;
+    if (distinct_tokens.end == distinct_tokens.start + 1) return generatedReadListPayloadIsEmpty(distinct_on_items, .{}, .{});
+    if (distinct_tokens.start + 4 > distinct_tokens.end) return false;
+    if (!tokens[distinct_tokens.start + 1].matchesKeywordTag(.on)) return false;
+    if (tokens[distinct_tokens.start + 2].kind != .lparen or tokens[distinct_tokens.end - 1].kind != .rparen) return false;
+    const expression_tokens = generated_parser.GeneratedSqlTokenRange{ .start = distinct_tokens.start + 3, .end = distinct_tokens.end - 1 };
+    return generatedReadDelimitedListIsValid(tokens, end, expression_tokens, distinct_on_items, .{
+        .reject_aliases = true,
+        .reject_order_modifiers = true,
+    });
+}
+
+fn generatedReadDelimitedListIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    options: GeneratedReadDelimitedListValidationOptions,
+) bool {
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, range)) return false;
     if (list.count == 0 or
         list.items.len != list.count or
         list.expression_items.len != list.count or
+        list.alias_items.len != list.count or
+        list.alias_name_items.len != list.count or
+        list.direction_items.len != list.count or
+        list.directions.len != list.count or
+        list.order_using_operator_items.len != list.count or
+        list.nulls_order_items.len != list.count or
+        list.nulls_orders.len != list.count or
         list.expressions.len != list.count)
-    {
-        return false;
-    }
-    if (options.reject_aliases and
-        (list.alias_items.len != list.count or list.alias_name_items.len != list.count))
-    {
-        return false;
-    }
-    if (options.reject_order_modifiers and
-        (list.direction_items.len != list.count or
-            list.directions.len != list.count or
-            list.order_using_operator_items.len != list.count or
-            list.nulls_order_items.len != list.count or
-            list.nulls_orders.len != list.count))
     {
         return false;
     }
@@ -2586,11 +2688,14 @@ fn generatedReadDelimitedListIsValid(
 
     var expected_start = range.start;
     for (list.items, 0..) |item, index| {
-        if (!generatedReadNestedRangeIsValid(tokens, tokens.len, range, item)) return false;
+        if (!generatedReadNestedRangeIsValid(tokens, end, range, item)) return false;
         if (item.start != expected_start or item.start >= item.end) return false;
         if (options.single_token_items and item.end != item.start + 1) return false;
-        if (!std.meta.eql(list.expression_items[index], item)) return false;
-        if (!generatedReadExpressionTokensEqualRange(list.expressions[index], item)) return false;
+        if (!generatedReadNestedRangeIsValid(tokens, end, item, list.expression_items[index])) return false;
+        if (list.expression_items[index].start != item.start) return false;
+        if (!generatedReadExpressionTokensEqualRange(list.expressions[index], list.expression_items[index])) return false;
+        if (!generatedReadListAliasPayloadIsValid(tokens, end, item, list.expression_items[index], list.alias_items[index], list.alias_name_items[index], options)) return false;
+        if (!generatedReadListOrderPayloadIsValid(tokens, end, item, list.expression_items[index], list.direction_items[index], list.directions[index], list.order_using_operator_items[index], list.nulls_order_items[index], list.nulls_orders[index], options)) return false;
         if (options.reject_aliases and (list.alias_items[index] != null or list.alias_name_items[index] != null)) return false;
         if (options.reject_order_modifiers and
             (list.direction_items[index] != null or
@@ -2609,6 +2714,81 @@ fn generatedReadDelimitedListIsValid(
         }
     }
     return expected_start == range.end;
+}
+
+fn generatedReadListAliasPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlTokenRange,
+    maybe_alias: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_alias_name: ?generated_parser.GeneratedSqlTokenRange,
+    options: GeneratedReadDelimitedListValidationOptions,
+) bool {
+    if (maybe_alias == null and maybe_alias_name == null) return expression.end == item.end;
+    if (!options.allow_aliases) return false;
+    const alias = maybe_alias orelse return false;
+    const alias_name = maybe_alias_name orelse return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, item, alias)) return false;
+    if (!generatedReadNestedRangeIsValid(tokens, end, alias, alias_name)) return false;
+    if (alias.start != expression.end or alias.end != item.end) return false;
+    if (alias.start >= alias.end or alias_name.start >= alias_name.end) return false;
+    if (tokens[alias.start].matchesKeywordTag(.as)) return alias_name.start == alias.start + 1 and alias_name.end == alias.end;
+    return alias_name.start == alias.start and alias_name.end == alias.end;
+}
+
+fn generatedReadListOrderPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlTokenRange,
+    maybe_direction: ?generated_parser.GeneratedSqlTokenRange,
+    direction: ?generated_parser.GeneratedSqlOrderDirection,
+    maybe_using_operator: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_nulls_order: ?generated_parser.GeneratedSqlTokenRange,
+    nulls_order: ?generated_parser.GeneratedSqlNullsOrder,
+    options: GeneratedReadDelimitedListValidationOptions,
+) bool {
+    if (maybe_direction == null and direction == null and maybe_using_operator == null and maybe_nulls_order == null and nulls_order == null) {
+        return expression.end == item.end;
+    }
+    if (!options.allow_order_modifiers) return false;
+    var cursor = expression.end;
+    if (maybe_direction) |direction_tokens| {
+        if (!generatedReadNestedRangeIsValid(tokens, end, item, direction_tokens)) return false;
+        if (direction_tokens.start != cursor) return false;
+        if (maybe_using_operator) |operator_tokens| {
+            if (direction != null) return false;
+            if (!std.meta.eql(direction_tokens, generated_parser.GeneratedSqlTokenRange{ .start = cursor, .end = cursor + 2 })) return false;
+            if (!tokens[cursor].matchesKeywordTag(.using)) return false;
+            if (!std.meta.eql(operator_tokens, generated_parser.GeneratedSqlTokenRange{ .start = cursor + 1, .end = cursor + 2 })) return false;
+            cursor += 2;
+        } else {
+            const value = direction orelse return false;
+            if (!std.meta.eql(direction_tokens, generated_parser.GeneratedSqlTokenRange{ .start = cursor, .end = cursor + 1 })) return false;
+            switch (value) {
+                .asc => if (!tokens[cursor].matchesKeywordTag(.asc)) return false,
+                .desc => if (!tokens[cursor].matchesKeywordTag(.desc)) return false,
+            }
+            cursor += 1;
+        }
+    } else if (direction != null or maybe_using_operator != null) {
+        return false;
+    }
+    if (maybe_nulls_order) |nulls_tokens| {
+        const value = nulls_order orelse return false;
+        if (!generatedReadNestedRangeIsValid(tokens, end, item, nulls_tokens)) return false;
+        if (!std.meta.eql(nulls_tokens, generated_parser.GeneratedSqlTokenRange{ .start = cursor, .end = cursor + 2 })) return false;
+        if (!tokens[cursor].matchesKeywordTag(.nulls)) return false;
+        switch (value) {
+            .first => if (!tokens[cursor + 1].matchesKeywordTag(.first)) return false,
+            .last => if (!tokens[cursor + 1].matchesKeywordTag(.last)) return false,
+        }
+        cursor += 2;
+    } else if (nulls_order != null) {
+        return false;
+    }
+    return cursor == item.end;
 }
 
 fn generatedReadOptionalRangesEqual(
@@ -6803,6 +6983,57 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
 
+    var generated_projection_alias_query = try ParsedSql.initAlloc(alloc, "SELECT status AS state, id FROM usage_records");
+    defer generated_projection_alias_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_projection_alias_query.generatedStatementKind().?);
+
+    var malformed_projection_alias_generated = generated_projection_alias_query.generated_statement.?;
+    if (malformed_projection_alias_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.projection_items.alias_name_items[0].?.start -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_projection_alias_query.statement = parseStatement(generated_projection_alias_query.raw_statement, malformed_projection_alias_generated, &generated_projection_alias_query.tokenized_sql);
+    try std.testing.expect(generated_projection_alias_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_projection_alias_query.statement));
+
+    var generated_distinct_on_query = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (status) status FROM usage_records");
+    defer generated_distinct_on_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_distinct_on_query.generatedStatementKind().?);
+
+    var malformed_distinct_on_generated = generated_distinct_on_query.generated_statement.?;
+    if (malformed_distinct_on_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.distinct_on_items.items[0].end += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_distinct_on_query.statement = parseStatement(generated_distinct_on_query.raw_statement, malformed_distinct_on_generated, &generated_distinct_on_query.tokenized_sql);
+    try std.testing.expect(generated_distinct_on_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_distinct_on_query.statement));
+
+    var generated_order_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY status DESC NULLS LAST");
+    defer generated_order_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_order_query.generatedStatementKind().?);
+
+    var malformed_order_generated = generated_order_query.generated_statement.?;
+    if (malformed_order_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.order_items.nulls_orders[0] = .first,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_order_query.statement = parseStatement(generated_order_query.raw_statement, malformed_order_generated, &generated_order_query.tokenized_sql);
+    try std.testing.expect(generated_order_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_order_query.statement));
+
     var generated_offset_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records OFFSET 2 ROWS");
     defer generated_offset_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_offset_query.generatedStatementKind().?);
@@ -6870,6 +7101,36 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_row_lock_query.statement = parseStatement(generated_cte_row_lock_query.raw_statement, malformed_cte_row_lock_generated, &generated_cte_row_lock_query.tokenized_sql);
     try std.testing.expect(generated_cte_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_row_lock_query.statement));
+
+    var generated_cte_projection_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT status AS state FROM usage_records) SELECT state FROM source_rows");
+    defer generated_cte_projection_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_projection_query.generatedStatementKind().?);
+
+    var malformed_cte_projection_generated = generated_cte_projection_query.generated_statement.?;
+    if (malformed_cte_projection_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_projection_items.alias_items[0].?.end -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_projection_query.statement = parseStatement(generated_cte_projection_query.raw_statement, malformed_cte_projection_generated, &generated_cte_projection_query.tokenized_sql);
+    try std.testing.expect(generated_cte_projection_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_projection_query.statement));
+
+    var malformed_cte_projection_alias_slice = generated_cte_projection_query.generated_statement.?;
+    if (malformed_cte_projection_alias_slice.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_projection_items.alias_items = &.{},
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_projection_query.statement = parseStatement(generated_cte_projection_query.raw_statement, malformed_cte_projection_alias_slice, &generated_cte_projection_query.tokenized_sql);
+    try std.testing.expect(generated_cte_projection_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_projection_query.statement));
 
     var generated_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id");
     defer generated_join_query.deinit(alloc);

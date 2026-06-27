@@ -6265,7 +6265,7 @@ fn lowerWritePlanForSqlAdapterEdgeCaseAlloc(
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{ .unique_resolver = resolver });
 }
 
-fn planDdlLogicalPlanParsedSqlAllocForEdgeCase(
+fn planLogicalDdlParsedSqlAllocForEdgeCase(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
@@ -6297,7 +6297,7 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
         .lower_update = lowerUpdateParsedSqlAlloc,
         .lower_delete = lowerDeleteParsedSqlAlloc,
         .lower_insert = lowerInsertWithResolverParsedSqlAlloc,
-        .plan_ddl = planDdlLogicalPlanParsedSqlAllocForEdgeCase,
+        .plan_ddl = planLogicalDdlParsedSqlAllocForEdgeCase,
         .lower_write_plan = lowerWritePlanForSqlAdapterEdgeCaseAlloc,
     };
     for (root.cases) |edge_case| {

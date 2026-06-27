@@ -1191,6 +1191,10 @@ kind before typed join planning consumes the metadata. Parsed-statement
 classification now also validates retained generated join-item arrays,
 left-associative tree root/depth/child links, first-join compatibility fields,
 and top-level/CTE-body `ON`/`USING` payload consistency before publishing a
+generated read family. It also validates top-level and CTE-body generated
+projection, `DISTINCT ON`, grouping, and ordering list payloads, including
+first/last expression summaries, alias spans, direction/`USING` operator
+ordering, `NULLS` ordering, and delimiter adjacency before publishing a
 generated read family.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
