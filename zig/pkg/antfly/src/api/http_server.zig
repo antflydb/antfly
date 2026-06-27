@@ -1593,7 +1593,7 @@ const TableEmptyingWakeJob = struct {
             made_progress = true;
         }
         if (!made_progress or self.runtime.backend == .manual) return;
-        TableEmptyingWakeJob.submitWithRegistry(
+        TableEmptyingWakeJob.submitWithCatalogAndRegistry(
             self.runtime,
             self.owner_id,
             self.source,
@@ -9294,10 +9294,11 @@ pub const ApiHttpServer = struct {
         if (!try self.table_emptying_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
         var acquired = true;
         errdefer if (acquired) self.table_emptying_wake_registry.release(table.table_id);
-        try TableEmptyingWakeJob.submitWithRegistry(
+        try TableEmptyingWakeJob.submitWithCatalogAndRegistry(
             runtime,
             self.tableEmptyingWakeOwnerId(runtime),
             write_source,
+            self.catalogSource(),
             table.name,
             &self.table_emptying_wake_registry,
             table.table_id,
