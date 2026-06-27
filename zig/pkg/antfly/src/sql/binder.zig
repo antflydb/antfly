@@ -24,7 +24,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
 const table_catalog = @import("../api/table_catalog.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -1657,8 +1657,8 @@ pub const OtherDdlLogicalPlan = union(enum) {
 };
 
 pub const LogicalSqlPlan = union(enum) {
-    read: classifier.SqlReadStatementKind,
-    write: classifier.SqlWriteStatementKind,
+    read: sql_statement_kind.SqlReadStatementKind,
+    write: sql_statement_kind.SqlWriteStatementKind,
     catalog_read: CatalogLogicalReadPlan,
     catalog_write: CatalogLogicalWritePlan,
     table_ddl: TableDdlLogicalPlan,
@@ -1991,7 +1991,7 @@ fn writeTargetTableNameFromTokensAlloc(alloc: std.mem.Allocator, statement_token
     return try normalizeSqlObjectIdentifierAlloc(alloc, statement_tokens[pos].text);
 }
 
-fn writeStatementKindFromFinalStatementTokens(tokens: []const Token, pos: usize) ?classifier.SqlWriteStatementKind {
+fn writeStatementKindFromFinalStatementTokens(tokens: []const Token, pos: usize) ?sql_statement_kind.SqlWriteStatementKind {
     if (pos >= tokens.len or tokens[pos].kind != .identifier) return null;
     if (tokens[pos].matchesKeywordTag(.insert)) return .insert_source;
     if (tokens[pos].matchesKeywordTag(.update)) return .update_joined_source;
@@ -3483,7 +3483,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     var bound_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_read, catalog.iface());
     defer bound_read.deinit(alloc);
     switch (bound_read.statement) {
-        .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.join, statement.kind),
+        .read => |statement| try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, statement.kind),
         else => return error.TestUnexpectedResult,
     }
     const read = try bound_read.readCatalog();
@@ -3517,7 +3517,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     switch (logical_read) {
         .catalog_read => |logical| {
             switch (logical.statement) {
-                .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.join, statement.kind),
+                .read => |statement| try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, statement.kind),
                 else => return error.TestUnexpectedResult,
             }
             try std.testing.expect(logical.target_binding != null);
@@ -3576,7 +3576,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     var bound_write = try bindWritePlanCatalogStatementAlloc(alloc, &parsed_write, .{}, catalog.iface());
     defer bound_write.deinit(alloc);
     switch (bound_write.statement) {
-        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+        .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, statement.kind),
         else => return error.TestUnexpectedResult,
     }
     const write = try bound_write.writeCatalog();
@@ -3596,7 +3596,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     switch (logical_write) {
         .catalog_write => |logical| {
             switch (logical.statement) {
-                .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+                .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, statement.kind),
                 else => return error.TestUnexpectedResult,
             }
             try std.testing.expect(logical.options.insert_source_schema != null);

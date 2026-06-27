@@ -16,7 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -97,7 +97,7 @@ pub const ReadPlanLoweringContext = struct {
     params: []const value_mod.SqlValue,
     function_bindings: lower_expr.SqlFunctionBindings,
     callbacks: ReadPlanLoweringCallbacks,
-    statement_kind: ?classifier.SqlReadStatementKind = null,
+    statement_kind: ?sql_statement_kind.SqlReadStatementKind = null,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
     pub fn lower(self: *@This()) !plan.LoweredReadPlan {
@@ -283,7 +283,7 @@ pub fn validateGeneratedReadAstForStatement(
 fn generatedReadStatementKind(
     tokens: []const tokenized.Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-) !classifier.SqlReadStatementKind {
+) !sql_statement_kind.SqlReadStatementKind {
     return switch (read_ast.kind) {
         .query => .query,
         .aggregate => .aggregate,
@@ -301,7 +301,7 @@ fn generatedReadStatementKind(
 fn generatedCteFinalReadStatementKind(
     tokens: []const tokenized.Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-) !classifier.SqlReadStatementKind {
+) !sql_statement_kind.SqlReadStatementKind {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     if (read_ast.set_operation_tokens != null) return .set_operation;
     if (read_ast.source_tokens) |source| {
@@ -1230,7 +1230,7 @@ fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: *const
 fn validateGeneratedCteFinalReadKind(
     tokens: []const tokenized.Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-    final_read_kind: classifier.SqlReadStatementKind,
+    final_read_kind: sql_statement_kind.SqlReadStatementKind,
 ) !void {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     switch (final_read_kind) {
@@ -1297,7 +1297,7 @@ fn validateGeneratedCteFinalReadKind(
 fn lowerGeneratedCteReadPlanAlloc(
     context: *ReadPlanLoweringContext,
     parsed_sql: *const tokenized.ParsedSql,
-    read_kind: classifier.SqlReadStatementKind,
+    read_kind: sql_statement_kind.SqlReadStatementKind,
 ) !plan.LoweredReadPlan {
     return switch (read_kind) {
         .query => .{ .query = try context.callbacks.lower_query_plan(
@@ -6783,7 +6783,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, try generatedReadStatementKind(cte_query_sql.items(), cte_query_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, try generatedReadStatementKind(cte_query_sql.items(), cte_query_read_ast));
 
     var cte_set_operation_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6795,7 +6795,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.set_operation, try generatedReadStatementKind(cte_set_operation_sql.items(), cte_set_operation_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, try generatedReadStatementKind(cte_set_operation_sql.items(), cte_set_operation_read_ast));
 
     var cte_count_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6807,7 +6807,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_count_sql.items(), cte_count_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_count_sql.items(), cte_count_read_ast));
 
     var cte_join_aggregate_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6819,7 +6819,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_join_aggregate_sql.items(), cte_join_aggregate_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_join_aggregate_sql.items(), cte_join_aggregate_read_ast));
 
     var recursive_cte_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -6831,7 +6831,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.recursive_cte, try generatedReadStatementKind(recursive_cte_sql.items(), recursive_cte_read_ast));
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.recursive_cte, try generatedReadStatementKind(recursive_cte_sql.items(), recursive_cte_read_ast));
 
     var malformed_cte_read_ast = cte_query_read_ast;
     malformed_cte_read_ast.source_tokens = null;

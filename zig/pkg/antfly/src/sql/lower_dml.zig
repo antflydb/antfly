@@ -16,7 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl.zig");
@@ -12945,7 +12945,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    write_kind: classifier.SqlWriteStatementKind,
+    write_kind: sql_statement_kind.SqlWriteStatementKind,
 ) !plan_mod.LoweredWritePlan {
     if (!ast.cte_recursive) return error.UnsupportedSqlShape;
     const tokens = parsed_sql.items();
@@ -13491,7 +13491,7 @@ fn updateSourceFromGeneratedDmlAstAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    write_kind: classifier.SqlWriteStatementKind,
+    write_kind: sql_statement_kind.SqlWriteStatementKind,
 ) !plan_mod.LoweredMutationSource {
     if (ast.kind != .update) return error.UnsupportedSqlShape;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -13525,7 +13525,7 @@ fn deleteSourceFromGeneratedDmlAstAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    write_kind: classifier.SqlWriteStatementKind,
+    write_kind: sql_statement_kind.SqlWriteStatementKind,
 ) !plan_mod.LoweredMutationSource {
     if (ast.kind != .delete) return error.UnsupportedSqlShape;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -14303,7 +14303,7 @@ fn generatedDmlTableReferenceIdentifierAlloc(
 
 fn generatedDmlAstMatchesWriteKind(
     generated_kind: generated_parser.GeneratedSqlDmlKind,
-    write_kind: classifier.SqlWriteStatementKind,
+    write_kind: sql_statement_kind.SqlWriteStatementKind,
 ) bool {
     return switch (generated_kind) {
         .insert_values => write_kind == .insert,

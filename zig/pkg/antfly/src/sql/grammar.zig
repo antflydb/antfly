@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl.zig");
 const generated_parser = @import("generated_parser.zig");
@@ -126,8 +126,8 @@ pub const SavepointNameSyntax = struct {
     savepoint_name: []const u8,
 };
 
-pub const PreparedStatementSubjectSyntax = classifier.SqlPreparedStatementSubjectKind;
-pub const PreparedStatementStatementSyntax = classifier.SqlPreparedStatementStatementKind;
+pub const PreparedStatementSubjectSyntax = sql_statement_kind.SqlPreparedStatementSubjectKind;
+pub const PreparedStatementStatementSyntax = sql_statement_kind.SqlPreparedStatementStatementKind;
 
 pub const PrepareStatementSyntax = struct {
     statement_name: []const u8,

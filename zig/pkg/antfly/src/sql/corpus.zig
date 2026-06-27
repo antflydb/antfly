@@ -16,7 +16,7 @@ const std = @import("std");
 const sql_adapter = @This();
 
 const binder = @import("binder.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const ddl_plan = @import("ddl.zig");
@@ -1111,7 +1111,7 @@ pub const SqlAdapterEdgeCase = struct {
     expected_first_predicate_field: ?[]const u8 = null,
     expected_first_predicate_value_json: ?[]const u8 = null,
     expected_transformed: ?u32 = null,
-    expected_write_kind: ?classifier.SqlWriteStatementKind = null,
+    expected_write_kind: ?sql_statement_kind.SqlWriteStatementKind = null,
     expected_inserted: ?u32 = null,
     expected_ddl_tag: ?SqlAdapterEdgeCaseDdlTag = null,
     expected_if_not_exists: ?bool = null,
@@ -1862,7 +1862,7 @@ fn sqlAdapterEdgeCaseExpectedErrorCoverageName(expected_error: []const u8) !?[]c
     return error.TestUnexpectedResult;
 }
 
-fn sqlAdapterEdgeCaseWriteKindCoverageName(kind: classifier.SqlWriteStatementKind) []const u8 {
+fn sqlAdapterEdgeCaseWriteKindCoverageName(kind: sql_statement_kind.SqlWriteStatementKind) []const u8 {
     return switch (kind) {
         .delete => "write_kind_delete",
         .delete_source => "write_kind_delete_source",
@@ -2023,7 +2023,7 @@ fn parseSqlAdapterEdgeCaseAlloc(
         .expected_first_predicate_value_json = try fixtureJsonOptionalStringField(object, "expected_first_predicate_value_json"),
         .expected_transformed = try fixtureJsonOptionalU32(object, "expected_transformed"),
         .expected_write_kind = if (try fixtureJsonOptionalStringField(object, "expected_write_kind")) |kind|
-            std.meta.stringToEnum(classifier.SqlWriteStatementKind, kind) orelse return error.TestUnexpectedResult
+            std.meta.stringToEnum(sql_statement_kind.SqlWriteStatementKind, kind) orelse return error.TestUnexpectedResult
         else
             null,
         .expected_inserted = try fixtureJsonOptionalU32(object, "expected_inserted"),
@@ -6970,7 +6970,7 @@ test "sql adapter corpus parses adapter edge case fixtures" {
     const valid_root = try parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_valid.value);
     defer freeSqlAdapterEdgeCaseRoot(alloc, valid_root);
     try std.testing.expectEqual(SqlAdapterEdgeCaseAction.classify_write, valid_root.cases[0].action);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, valid_root.cases[0].expected_write_kind.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, valid_root.cases[0].expected_write_kind.?);
     try std.testing.expectEqual(@as(usize, 1), valid_root.cases[0].params.len);
 
     const duplicate_json =

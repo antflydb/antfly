@@ -17,7 +17,7 @@ const std = @import("std");
 const catalog_resources = @import("../api/catalog_resources.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const binder = @import("binder.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const logical_ddl_plan = @import("logical_ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
@@ -124,12 +124,12 @@ test "sql executor classifies statement families and owns ddl plans" {
     var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
     defer read_sql.deinit(alloc);
     const read_plan = classifyParsedSql(&read_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, read_plan.read);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, read_plan.read);
 
     var write_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('evt-1')");
     defer write_sql.deinit(alloc);
     const write_plan = classifyParsedSql(&write_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, write_plan.write);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, write_plan.write);
 
     var ddl_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
     defer ddl_sql.deinit(alloc);

@@ -1307,9 +1307,11 @@ Current implementation status:
 - `src/sql/tokenized.zig` owns reusable `TokenizedSql` state for a SQL input,
   including the borrowed token stream, top-level statement family, read
   statement kind, and write statement kind.
-- `classifier.zig` classifies read families (`query`, `set_operation`,
-  `recursive_cte`, `aggregate`, `join`, `lateral`, and `window`) and write
-  families from the shared token stream.
+- Generated parser payloads and tokenized SQL state derive read families
+  (`query`, `set_operation`, `recursive_cte`, `aggregate`, `join`, `lateral`,
+  and `window`) and write families from the shared token stream. The shared
+  family/kind enum definitions live in `statement_kind.zig`; there is no
+  standalone classifier module in the production SQL facade.
 - Parsed read lowering dispatches strictly through the parsed statement
   variant. The lower-level hook API fails closed when a caller does not supply
   a statement kind. Set-operation-shaped SQL routes through the parsed

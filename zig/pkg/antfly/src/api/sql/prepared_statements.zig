@@ -175,3 +175,62 @@ pub const Runtime = struct {
         return error.PreparedStatementNotFound;
     }
 };
+
+test "sql prepared statement runtime stores session scoped plans" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const session_a: u64 = 101;
+    const session_b: u64 = 202;
+    const prepare_read = sql_adapter.PrepareStatementPlan{
+        .statement_name = "usage_plan",
+        .parameter_count = 1,
+        .statement_kind = .read,
+        .statement_family = .read,
+        .subject_sql = "SELECT id FROM usage_records WHERE status = $1;",
+    };
+
+    try runtime.apply(.{ .prepare = prepare_read }, session_a);
+    try std.testing.expectEqual(@as(usize, 1), runtime.statementCountForTest(session_a));
+    try std.testing.expectError(error.PreparedStatementAlreadyExists, runtime.apply(.{ .prepare = prepare_read }, session_a));
+
+    const args = [_]sql_adapter.SqlValue{.{ .string = "open" }};
+    const execute_read = sql_adapter.ExecutePreparedStatementPlan{
+        .statement_name = "usage_plan",
+        .argument_count = args.len,
+        .arguments = &args,
+    };
+    const executable = try runtime.executableForExecute(session_a, execute_read);
+    try std.testing.expectEqual(sql_adapter.PreparedStatementSubjectKind.read, executable.statement_kind);
+    try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, executable.statement_family);
+    try std.testing.expectEqualStrings("usage_plan", executable.parsed_sql.statement.raw().text);
+
+    try runtime.apply(.{ .execute = execute_read }, session_a);
+    try std.testing.expectError(
+        error.PreparedStatementArgumentMismatch,
+        runtime.apply(.{ .execute = .{ .statement_name = "usage_plan" } }, session_a),
+    );
+    try std.testing.expectError(error.PreparedStatementNotFound, runtime.apply(.{ .execute = execute_read }, session_b));
+
+    try runtime.apply(.{ .deallocate = .{ .statement_name = "usage_plan" } }, session_a);
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(session_a));
+    try std.testing.expectError(error.PreparedStatementNotFound, runtime.apply(.{ .execute = execute_read }, session_a));
+
+    try runtime.apply(.{ .prepare = .{
+        .statement_name = "read_plan",
+        .statement_kind = .read,
+        .statement_family = .read,
+        .subject_sql = "SELECT id FROM usage_records;",
+    } }, session_a);
+    try runtime.apply(.{ .prepare = .{
+        .statement_name = "write_plan",
+        .parameter_count = 1,
+        .statement_kind = .write,
+        .statement_family = .insert,
+        .subject_sql = "INSERT INTO usage_records(id, status) VALUES ($1, 'prepared');",
+    } }, session_a);
+    try std.testing.expectEqual(@as(usize, 2), runtime.statementCountForTest(session_a));
+    try runtime.apply(.{ .deallocate = .{ .all = true } }, session_a);
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(session_a));
+}

@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
@@ -30,7 +30,7 @@ pub const TokenRange = struct {
 };
 
 pub const RawSqlStatement = struct {
-    family: ?classifier.SqlStatementFamily = null,
+    family: ?sql_statement_kind.SqlStatementFamily = null,
     token_start: usize = 0,
     token_end: usize = 0,
     source_span: SourceSpan = .{},
@@ -42,12 +42,12 @@ pub const RawSqlStatement = struct {
 };
 
 pub const ParsedReadStatement = struct {
-    kind: classifier.SqlReadStatementKind,
+    kind: sql_statement_kind.SqlReadStatementKind,
     raw: RawSqlStatement,
 };
 
 pub const ParsedWriteStatement = struct {
-    kind: classifier.SqlWriteStatementKind,
+    kind: sql_statement_kind.SqlWriteStatementKind,
     raw: RawSqlStatement,
     recursive: bool = false,
 };
@@ -128,14 +128,14 @@ pub const ParsedStatement = union(enum) {
         };
     }
 
-    pub fn readKind(self: ParsedStatement) ?classifier.SqlReadStatementKind {
+    pub fn readKind(self: ParsedStatement) ?sql_statement_kind.SqlReadStatementKind {
         return switch (self) {
             .read => |statement| statement.kind,
             else => null,
         };
     }
 
-    pub fn writeKind(self: ParsedStatement) ?classifier.SqlWriteStatementKind {
+    pub fn writeKind(self: ParsedStatement) ?sql_statement_kind.SqlWriteStatementKind {
         return switch (self) {
             .write => |statement| statement.kind,
             else => null,
@@ -282,19 +282,19 @@ pub const ParsedSql = struct {
         return self.raw_statement.sql(self.sql());
     }
 
-    pub fn readStatementKind(self: *const ParsedSql) ?classifier.SqlReadStatementKind {
+    pub fn readStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
         return self.statement.readKind();
     }
 
-    pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?classifier.SqlReadStatementKind {
+    pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
         return self.readStatementKind() orelse self.generatedReadStatementKind();
     }
 
-    pub fn generatedReadStatementKind(self: *const ParsedSql) ?classifier.SqlReadStatementKind {
+    pub fn generatedReadStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
         return generatedReadStatementKindFromRaw(self.items(), self.generated_statement orelse return null);
     }
 
-    pub fn writeStatementKind(self: *const ParsedSql) ?classifier.SqlWriteStatementKind {
+    pub fn writeStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlWriteStatementKind {
         return self.statement.writeKind();
     }
 
@@ -2156,7 +2156,7 @@ fn generatedUnsupportedOptionalTokenRangeIsValid(
 
 const GeneratedDmlStatementKind = struct {
     kind: generated_parser.GeneratedSqlDmlKind,
-    write_kind: classifier.SqlWriteStatementKind,
+    write_kind: sql_statement_kind.SqlWriteStatementKind,
     recursive: bool = false,
 };
 
@@ -2177,7 +2177,7 @@ fn generatedDmlStatementKind(
     };
 }
 
-fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) sql_statement_kind.SqlWriteStatementKind {
     return switch (dml_ast.kind) {
         .insert_values => .insert,
         .insert_select => .insert_source,
@@ -2188,13 +2188,13 @@ fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classi
     };
 }
 
-fn generatedUpdateDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+fn generatedUpdateDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) sql_statement_kind.SqlWriteStatementKind {
     if (dml_ast.mutation_join_source) return .update_joined_source;
     if (dml_ast.mutation_source_tail) return .update_source;
     return .update;
 }
 
-fn generatedDeleteDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) classifier.SqlWriteStatementKind {
+fn generatedDeleteDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) sql_statement_kind.SqlWriteStatementKind {
     if (dml_ast.mutation_join_source) return .delete_joined_source;
     if (dml_ast.mutation_source_tail) return .delete_source;
     return .delete;
@@ -2775,7 +2775,7 @@ fn generatedDmlCommandKeywordMatchesKind(token: Token, kind: generated_parser.Ge
 fn generatedReadStatementKindFromRaw(
     tokens: []const Token,
     generated_raw: GeneratedRawSqlStatement,
-) ?classifier.SqlReadStatementKind {
+) ?sql_statement_kind.SqlReadStatementKind {
     const ast_value = generated_raw.ast orelse return null;
     const read_ast = switch (ast_value) {
         .read => |read| read,
@@ -4212,7 +4212,7 @@ fn generatedReadOffsetExpressionTokensMatchRange(
 fn generatedCteReadStatementKind(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-) ?classifier.SqlReadStatementKind {
+) ?sql_statement_kind.SqlReadStatementKind {
     if (read_ast.projection_tokens == null) return null;
     if (read_ast.cte_recursive) return .recursive_cte;
     return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
@@ -4221,7 +4221,7 @@ fn generatedCteReadStatementKind(
 fn generatedReadStatementKindFromAst(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-) ?classifier.SqlReadStatementKind {
+) ?sql_statement_kind.SqlReadStatementKind {
     if (read_ast.kind == .cte) return generatedCteReadStatementKind(tokens, read_ast);
     return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
 }
@@ -4229,7 +4229,7 @@ fn generatedReadStatementKindFromAst(
 fn generatedReadStatementKindFromStructuredClauses(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
-) classifier.SqlReadStatementKind {
+) sql_statement_kind.SqlReadStatementKind {
     if (read_ast.set_operation_tokens != null) return .set_operation;
     if (read_ast.kind == .lateral) return .lateral;
     if (read_ast.source_tokens) |source| {
@@ -4670,7 +4670,7 @@ fn rawStatementFamily(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
     generated_statement: ?GeneratedRawSqlStatement,
-) ?classifier.SqlStatementFamily {
+) ?sql_statement_kind.SqlStatementFamily {
     if (generated_statement) |generated_raw| {
         if (rawStatementFamilyFromGenerated(tokens, raw_statement, generated_raw)) |family| return family;
     }
@@ -4681,7 +4681,7 @@ fn rawStatementFamilyFromGenerated(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
     generated_raw: GeneratedRawSqlStatement,
-) ?classifier.SqlStatementFamily {
+) ?sql_statement_kind.SqlStatementFamily {
     if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return null;
     const first = tokens[raw_statement.token_start];
     return switch (generated_raw.statement) {
@@ -4701,7 +4701,7 @@ fn rawStatementFamilyFromGenerated(
     };
 }
 
-fn generatedDmlFamilyFromHead(first: Token) ?classifier.SqlStatementFamily {
+fn generatedDmlFamilyFromHead(first: Token) ?sql_statement_kind.SqlStatementFamily {
     if (tokenMatchesKeyword(first, .with)) return .with;
     if (tokenMatchesKeyword(first, .insert)) return .insert;
     if (tokenMatchesKeyword(first, .update)) return .update;
@@ -4711,7 +4711,7 @@ fn generatedDmlFamilyFromHead(first: Token) ?classifier.SqlStatementFamily {
     return null;
 }
 
-fn rawStatementFamilyFromHead(tokens: []const Token) ?classifier.SqlStatementFamily {
+fn rawStatementFamilyFromHead(tokens: []const Token) ?sql_statement_kind.SqlStatementFamily {
     const first = firstStatementToken(tokens) orelse return null;
     if (first.keyword) |keyword| {
         return switch (keyword) {
@@ -4763,12 +4763,12 @@ test "sql adapter parsed sql derives raw family from generated statements first"
     var parsed_joined = try ParsedSql.initAlloc(alloc, "SELECT o.id FROM usage_records AS o JOIN customers AS c ON o.customer_id = c.id");
     defer parsed_joined.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, parsed_joined.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlStatementFamily.select, parsed_joined.raw_statement.family.?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.join, parsed_joined.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, parsed_joined.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, parsed_joined.readStatementKind().?);
 
     var distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
     defer distinct_on.deinit(alloc);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, distinct_on.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, distinct_on.readStatementKind().?);
 
     var write = try TokenizedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer write.deinit(alloc);
@@ -4777,8 +4777,8 @@ test "sql adapter parsed sql derives raw family from generated statements first"
     var parsed_write = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer parsed_write.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed_write.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlStatementFamily.with, parsed_write.raw_statement.family.?);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.with, parsed_write.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
 }
 
 test "sql adapter parsed sql exposes raw statement source spans" {
@@ -4788,7 +4788,7 @@ test "sql adapter parsed sql exposes raw statement source spans" {
     var parsed = try ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
 
-    try std.testing.expectEqual(classifier.SqlStatementFamily.select, parsed.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, parsed.raw_statement.family.?);
     try std.testing.expectEqualStrings("SELECT id FROM usage_records", parsed.statementSql());
     try std.testing.expectEqual(@as(usize, 2), parsed.raw_statement.source_span.start);
     try std.testing.expectEqual(@as(usize, 30), parsed.raw_statement.source_span.end);
@@ -4817,7 +4817,7 @@ test "sql adapter parsed sql keeps DDL fallback outside generated grammar parity
     var select = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
     defer select.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, select.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, select.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, select.readStatementKind().?);
 }
 
 test "sql adapter parsed sql requires generated grammar for first migrated control family" {
@@ -5076,8 +5076,8 @@ test "sql adapter parsed sql builds non-contiguous child statements from parent 
     var child = try ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges);
     defer child.deinit(alloc);
 
-    try std.testing.expectEqual(classifier.SqlStatementFamily.select, child.raw_statement.family.?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, child.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, child.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, child.readStatementKind().?);
     try std.testing.expectEqual(@as(usize, parent.items().len - 2), child.items().len);
     try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
     try std.testing.expectEqualStrings("FROM", child.items()[4].text);
@@ -5091,7 +5091,7 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer read.deinit(alloc);
     switch (read.statement) {
         .read => |statement| {
-            try std.testing.expectEqual(classifier.SqlReadStatementKind.query, statement.kind);
+            try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, statement.kind);
             try std.testing.expectEqualStrings("SELECT id FROM usage_records", statement.raw.sql(read.sql()));
         },
         else => return error.TestUnexpectedResult,
@@ -5101,7 +5101,7 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer write.deinit(alloc);
     switch (write.statement) {
         .write => |statement| {
-            try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, statement.kind);
+            try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, statement.kind);
             try std.testing.expect(!statement.recursive);
             try std.testing.expect(!write.isRecursiveWriteStatement());
         },
@@ -5112,7 +5112,7 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer recursive_write.deinit(alloc);
     switch (recursive_write.statement) {
         .write => |statement| {
-            try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, statement.kind);
+            try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, statement.kind);
             try std.testing.expect(statement.recursive);
             try std.testing.expect(recursive_write.isRecursiveWriteStatement());
         },
@@ -7178,7 +7178,7 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
     const cases = [_]struct {
         sql: []const u8,
         generated: generated_parser.GeneratedSqlDmlKind,
-        write: classifier.SqlWriteStatementKind,
+        write: sql_statement_kind.SqlWriteStatementKind,
     }{
         .{ .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')", .generated = .insert_values, .write = .insert },
         .{ .sql = "INSERT INTO usage_records (id) SELECT id FROM incoming_usage", .generated = .insert_select, .write = .insert_source },
@@ -7220,14 +7220,14 @@ test "sql adapter parsed sql write statement kind can come from generated AST" {
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_source.generatedStatementKind().?);
 
     generated_insert_source.statement = parseStatement(generated_insert_source.raw_statement, generated_insert_source.generated_statement, &generated_insert_source.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, generated_insert_source.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_insert_source.writeStatementKind().?);
 
     var generated_recursive_insert = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
     defer generated_recursive_insert.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_recursive_insert.generatedStatementKind().?);
 
     generated_recursive_insert.statement = parseStatement(generated_recursive_insert.raw_statement, generated_recursive_insert.generated_statement, &generated_recursive_insert.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, generated_recursive_insert.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_recursive_insert.writeStatementKind().?);
     try std.testing.expect(generated_recursive_insert.isRecursiveWriteStatement());
 
     var generated_recursive_update = try ParsedSql.initAlloc(
@@ -7236,7 +7236,7 @@ test "sql adapter parsed sql write statement kind can come from generated AST" {
     );
     defer generated_recursive_update.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_recursive_update.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.update_joined_source, generated_recursive_update.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update_joined_source, generated_recursive_update.writeStatementKind().?);
     try std.testing.expect(generated_recursive_update.isRecursiveWriteStatement());
 }
 
@@ -7248,9 +7248,9 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert.generatedStatementKind().?);
 
     generated_insert.statement = parseStatement(generated_insert.raw_statement, generated_insert.generated_statement, &generated_insert.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, generated_insert.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, generated_insert.writeStatementKind().?);
     switch (generated_insert.statement) {
-        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+        .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, statement.kind),
         else => return error.TestUnexpectedResult,
     }
 
@@ -7471,7 +7471,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
     const cases = [_]struct {
         sql: []const u8,
         generated: generated_parser.GeneratedSqlReadKind,
-        read: classifier.SqlReadStatementKind,
+        read: sql_statement_kind.SqlReadStatementKind,
     }{
         .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .generated = .query, .read = .query },
         .{ .sql = "SELECT status AS state, id FROM usage_records", .generated = .query, .read = .query },
@@ -8416,7 +8416,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
     var generated_distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
     defer generated_distinct_on.deinit(alloc);
     try std.testing.expect(generated_distinct_on.generated_statement != null);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_distinct_on.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_distinct_on.readStatementKind().?);
 }
 
 test "sql adapter parsed sql read statement kind can come from generated AST" {
@@ -8427,14 +8427,14 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_query.generatedStatementKind().?);
 
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_query.readStatementKind().?);
 
     var generated_cte_aggregate = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT status FROM usage_records) SELECT count(*) FROM source_rows");
     defer generated_cte_aggregate.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_aggregate.generatedStatementKind().?);
 
     generated_cte_aggregate.statement = parseStatement(generated_cte_aggregate.raw_statement, generated_cte_aggregate.generated_statement, &generated_cte_aggregate.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, generated_cte_aggregate.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.aggregate, generated_cte_aggregate.readStatementKind().?);
 
     var generated_cte_without_final_source = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT 1");
     defer generated_cte_without_final_source.deinit(alloc);
@@ -8445,7 +8445,7 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
         generated_cte_without_final_source.generated_statement,
         &generated_cte_without_final_source.tokenized_sql,
     );
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_cte_without_final_source.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_cte_without_final_source.readStatementKind().?);
 }
 
 test "sql adapter parsed sql read statement kind is generated-owned for covered reads" {
@@ -8456,9 +8456,9 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_query.generatedStatementKind().?);
 
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_query.readStatementKind().?);
     switch (generated_query.statement) {
-        .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.query, statement.kind),
+        .read => |statement| try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, statement.kind),
         else => return error.TestUnexpectedResult,
     }
 
@@ -8756,7 +8756,7 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     var generated_cte_set_operation_tail_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive ORDER BY id LIMIT 5) SELECT id FROM source_rows");
     defer generated_cte_set_operation_tail_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_set_operation_tail_query.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_cte_set_operation_tail_query.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_cte_set_operation_tail_query.readStatementKind().?);
 
     var malformed_cte_set_operation_tail_generated = generated_cte_set_operation_tail_query.generated_statement.?;
     if (malformed_cte_set_operation_tail_generated.ast) |*generated_ast| {
@@ -8953,7 +8953,7 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     var generated_prefixed_multi_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id LEFT JOIN tenants ON accounts.tenant_id = tenants.id");
     defer generated_prefixed_multi_join_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_prefixed_multi_join_query.generatedStatementKind().?);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.join, generated_prefixed_multi_join_query.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.join, generated_prefixed_multi_join_query.readStatementKind().?);
 
     var generated_using_join_query = try ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)");
     defer generated_using_join_query.deinit(alloc);

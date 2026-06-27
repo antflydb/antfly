@@ -12,7 +12,7 @@ SQL bytes
   -> Antfly SQL scanner
   -> generated Antfly SQL parser
   -> catalog-free Antfly SQL AST
-  -> statement-family classifier
+  -> generated statement-kind dispatch
   -> binder
   -> typed logical plan
   -> shared Antfly service
@@ -130,8 +130,10 @@ first-token family mapper before entering the legacy DDL planner boundary.
 Generated read variants now come from the retained generated read AST kind
 directly, and `SELECT`/`WITH` heads must be accepted by the generated parser
 before they can publish a parsed statement. The old handwritten classifier
-implementation and its token-probing tests have been removed; `classifier.zig`
-now only carries the shared statement-kind enums used by typed plan boundaries.
+implementation and its token-probing tests have been removed. The remaining
+shared statement-family/read-kind/write-kind enums now live in
+`statement_kind.zig`, making the typed plan boundary explicit without keeping a
+classifier module in the public SQL facade.
 The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator

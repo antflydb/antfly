@@ -1283,11 +1283,12 @@ validation, rebuild, repair, and parity fingerprints.
 The split should happen incrementally to avoid a risky parser rewrite. First
 extract `token.zig` and `lexer.zig` behind the existing entrypoints, preserving
 the current zero-copy token behavior, source spans, dollar-quoted literal
-handling, and strict placeholder validation. Statement-family classification
-then belongs in `classifier.zig`, so raw SQL dispatch is owned by the adapter
-module before the large lowerers create typed plans. `WITH` dispatch must parse
-past the non-recursive CTE list and classify by the final statement rather than
-treating every CTE-backed write as an insert-source plan; CTE-backed
+handling, and strict placeholder validation. Statement-family dispatch is owned
+by the adapter's tokenized/generated-parser path before the large lowerers
+create typed plans; the remaining shared family/kind enum definitions live in
+`statement_kind.zig`. `WITH` dispatch must parse past the non-recursive CTE list
+and classify by the final statement rather than treating every CTE-backed write
+as an insert-source plan; CTE-backed
 `UPDATE`/`DELETE`/`MERGE` syntax can still fail closed until each family has a
 typed execution contract, but it must fail closed under the right native family.
 Stable unsupported-shape and adapter-noop reason tokens belong in

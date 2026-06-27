@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
-const classifier = @import("classifier.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl.zig");
 const grammar = @import("grammar.zig");
@@ -813,7 +813,7 @@ pub const WritePlanLoweringHooks = struct {
 };
 
 fn lowerRecursiveWritePlanWithHooksAlloc(
-    recursive_write_kind: classifier.SqlWriteStatementKind,
+    recursive_write_kind: sql_statement_kind.SqlWriteStatementKind,
     schema: runtime_schema.TableSchema,
     options: LowerWritePlanOptions,
     hooks: WritePlanLoweringHooks,
@@ -2348,7 +2348,7 @@ pub const LoweredReadPlan = union(enum) {
 
 pub const ReadPlanLoweringHooks = struct {
     ptr: *anyopaque,
-    statement_kind: ?classifier.SqlReadStatementKind = null,
+    statement_kind: ?sql_statement_kind.SqlReadStatementKind = null,
     lower_lateral: *const fn (*anyopaque) anyerror!LoweredLateralPlan,
     lower_window: *const fn (*anyopaque) anyerror!LoweredWindowPlan,
     lower_aggregate: *const fn (*anyopaque) anyerror!LoweredAggregatePlan,
@@ -2358,7 +2358,7 @@ pub const ReadPlanLoweringHooks = struct {
     lower_set_operation: *const fn (*anyopaque) anyerror!LoweredSetOperationPlan,
 };
 
-fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: classifier.SqlReadStatementKind) !LoweredReadPlan {
+fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: sql_statement_kind.SqlReadStatementKind) !LoweredReadPlan {
     return switch (kind) {
         .lateral => .{ .lateral = try hooks.lower_lateral(hooks.ptr) },
         .window => .{ .window = try hooks.lower_window(hooks.ptr) },
