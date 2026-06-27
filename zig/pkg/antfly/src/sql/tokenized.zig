@@ -2087,10 +2087,32 @@ fn generatedUnsupportedShapePayloadIsValid(
     end: usize,
     unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) bool {
+    if (!generatedUnsupportedSubjectRangeMatchesKind(end, unsupported_ast)) return false;
     return switch (unsupported_ast.kind) {
         .graph_query => generatedGraphQueryUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         else => true,
     };
+}
+
+fn generatedUnsupportedSubjectRangeMatchesKind(
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.kind == .explain) return true;
+    const start = generatedUnsupportedSubjectStartForKind(unsupported_ast.kind, end) orelse
+        return unsupported_ast.subject_tokens == null;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    return subject.start == start and subject.end == end;
+}
+
+fn generatedUnsupportedSubjectStartForKind(kind: generated_parser.GeneratedSqlUnsupportedKind, end: usize) ?usize {
+    const start: usize = switch (kind) {
+        .create_trigger,
+        .drop_trigger,
+        => 2,
+        else => 1,
+    };
+    return if (end > start) start else null;
 }
 
 fn generatedGraphQueryUnsupportedPayloadIsValid(
@@ -6852,6 +6874,32 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, mismatched_unsupported_kind, &unsupported_copy.tokenized_sql)),
+    );
+
+    var malformed_unsupported_subject = unsupported_copy.generated_statement.?;
+    if (malformed_unsupported_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.subject_tokens = .{ .start = 2, .end = unsupported_copy.items().len },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, malformed_unsupported_subject, &unsupported_copy.tokenized_sql)),
+    );
+
+    var unsupported_trigger = try ParsedSql.initAlloc(alloc, "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()");
+    defer unsupported_trigger.deinit(alloc);
+    var malformed_trigger_subject = unsupported_trigger.generated_statement.?;
+    if (malformed_trigger_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.subject_tokens = .{ .start = 1, .end = unsupported_trigger.items().len },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_trigger.raw_statement, malformed_trigger_subject, &unsupported_trigger.tokenized_sql)),
     );
 
     var graph_query = try ParsedSql.initAlloc(alloc, "MATCH (doc) RETURN doc");

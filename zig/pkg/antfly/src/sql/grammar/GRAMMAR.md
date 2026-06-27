@@ -650,7 +650,11 @@ family directly and are accepted only through the validated generated
 unsupported boundary. Recognized generated-owned unsupported heads now require
 retained unsupported AST kind, statement/command span, subject-range, and
 `EXPLAIN` option-range validation before publishing unsupported, explain, or
-DDL-family parsed statements, and generated parser success at SQL ingress,
+DDL-family parsed statements. Unsupported/admin subject ranges are also
+checked against family-specific subject starts before classification, including
+trigger heads whose typed subject begins after `CREATE TRIGGER`/`DROP TRIGGER`,
+so corrupted generated unsupported payloads fail closed before reaching typed
+catalog or utility planning. These heads require generated parser success at SQL ingress,
 including incomplete routine,
 transform, text-search, and foreign-schema forms, so grammar regressions cannot
 silently re-enter the legacy DDL classifier. Generated trigger DDL uses a tighter subject span that
