@@ -37,6 +37,7 @@ pub const SqlDiagnosticPhase = enum {
 
 pub const SqlDiagnosticCode = enum {
     current_transaction_aborted,
+    document_sql_write_unsupported,
     document_sql_view_mapping_unsupported,
     invalid_role_setting,
     invalid_sql_catalog,
@@ -110,6 +111,7 @@ pub fn diagnosticCodeToken(code: SqlDiagnosticCode) []const u8 {
 pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
     return switch (code) {
         .current_transaction_aborted => "current transaction is aborted",
+        .document_sql_write_unsupported => "document_sql_write_unsupported",
         .document_sql_view_mapping_unsupported => "document_sql_view_mapping_unsupported",
         .invalid_role_setting => "invalid sql setting",
         .invalid_sql_catalog => "invalid sql catalog",
@@ -133,6 +135,7 @@ pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
 
 pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
     return switch (code) {
+        .document_sql_write_unsupported => "document SQL write execution",
         .document_sql_view_mapping_unsupported => "document-to-SQL view mapping execution",
         .unsupported_sql_statement => "typed Antfly logical plan for this SQL shape",
         else => null,
@@ -141,6 +144,7 @@ pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
 
 pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagnosticEnvelope {
     const code: SqlDiagnosticCode = switch (err) {
+        error.DocumentSqlWriteUnsupported => .document_sql_write_unsupported,
         error.DocumentSqlViewMappingUnsupported => .document_sql_view_mapping_unsupported,
         error.InvalidRoleSetting => .invalid_role_setting,
         error.InvalidSqlCatalog => .invalid_sql_catalog,

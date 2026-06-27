@@ -1921,33 +1921,41 @@ fn recursiveInsertSourceTableNamesFromTokensAlloc(
 }
 
 pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
-    switch (parsed_sql.statement) {
-        .write => |statement| switch (statement.kind) {
-            .update,
-            .update_source,
-            .update_joined_source,
-            .delete,
-            .delete_source,
-            .delete_joined_source,
-            .merge,
-            => {},
-            .insert,
-            .insert_source,
-            .truncate,
-            => return null,
-        },
-        else => return error.UnsupportedSqlShape,
+    const tokens = parsed_sql.items();
+    const raw = parsed_sql.statement.raw();
+    if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
+    const statement_tokens = tokens[raw.token_start..raw.token_end];
+    const final_statement_index = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
+    const statement_kind = switch (parsed_sql.statement) {
+        .write => |statement| statement.kind,
+        else => writeStatementKindFromFinalStatementTokens(statement_tokens, final_statement_index) orelse return error.UnsupportedSqlShape,
+    };
+    switch (statement_kind) {
+        .update,
+        .update_source,
+        .update_joined_source,
+        .delete,
+        .delete_source,
+        .delete_joined_source,
+        .merge,
+        => {},
+        .insert,
+        .insert_source,
+        .truncate,
+        => return null,
     }
-    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, statement_tokens);
 }
 
 pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) ![]const u8 {
-    const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
     const tokens = parsed_sql.items();
     const raw = parsed_sql.statement.raw();
     if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
     const statement_tokens = tokens[raw.token_start..raw.token_end];
     var pos = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
+    const statement_kind = parsed_sql.writeStatementKind() orelse
+        writeStatementKindFromFinalStatementTokens(statement_tokens, pos) orelse
+        return error.UnsupportedSqlShape;
     switch (statement_kind) {
         .insert, .insert_source => {
             if (!consumeKeyword(statement_tokens, &pos, .insert)) return error.UnsupportedSqlShape;
@@ -1976,6 +1984,16 @@ pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
     }
     if (pos >= statement_tokens.len or statement_tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
     return try normalizeSqlObjectIdentifierAlloc(alloc, statement_tokens[pos].text);
+}
+
+fn writeStatementKindFromFinalStatementTokens(tokens: []const Token, pos: usize) ?classifier.SqlWriteStatementKind {
+    if (pos >= tokens.len or tokens[pos].kind != .identifier) return null;
+    if (tokens[pos].matchesKeywordTag(.insert)) return .insert_source;
+    if (tokens[pos].matchesKeywordTag(.update)) return .update_joined_source;
+    if (tokens[pos].matchesKeywordTag(.delete)) return .delete_joined_source;
+    if (tokens[pos].matchesKeywordTag(.truncate)) return .truncate;
+    if (tokens[pos].matchesKeywordTag(.merge)) return .merge;
+    return null;
 }
 
 fn writeFinalStatementIndex(tokens: []const Token) ?usize {
@@ -2757,7 +2775,7 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
     tokens: []const Token,
 ) !?InsertSourceTableNames {
     var index: usize = 1;
-    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
+    _ = consumeKeyword(tokens, &index, .recursive);
 
     var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
     defer {
@@ -2786,7 +2804,7 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
         defer cte_tables.deinit(alloc);
         try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &cte_tables);
         if (cte_tables.source) |source| {
-            if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
+            if (!std.mem.eql(u8, cte_tables.left, source) and !std.mem.eql(u8, cte_name, source)) return error.UnsupportedSqlShape;
         }
 
         try cte_bindings.append(alloc, .{

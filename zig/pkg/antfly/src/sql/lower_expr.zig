@@ -2183,7 +2183,6 @@ fn generatedSelectItemStartAllowsExpressionKind(
         .ends_with,
         .date_trunc,
         .date_bin,
-        .date_part,
         .abs,
         .round,
         .trunc,
@@ -2195,6 +2194,7 @@ fn generatedSelectItemStartAllowsExpressionKind(
         .power,
         .greatest_least,
         => kind == .function_call,
+        .date_part => kind == .function_call or kind == .extract_expression,
         .now => kind == .function_call or kind == .current_timestamp,
         .current_date => kind == .current_date,
         .typed_datetime_literal => kind == .timestamp_literal,
@@ -2374,7 +2374,10 @@ fn validateGeneratedSimpleOrderExpression(
     generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const expression = generated_expression orelse return;
-    if (expression.kind != .token_range) return error.UnsupportedSqlShape;
+    switch (expression.kind) {
+        .token_range, .function_call => {},
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn validateGeneratedWindowOverClauseForSpec(
@@ -14689,8 +14692,15 @@ pub fn parseSelectOutputOrderByAlloc(
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             break :blk try selectOutputOrderByOrdinalAlloc(alloc, options.schema, select, ordinal);
         } else if (try parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, select)) |named_order| blk: {
+            const order_candidate = named_order;
+            var order_candidate_transferred = false;
+            errdefer if (!order_candidate_transferred) {
+                if (order_candidate.field.len > 0) alloc.free(order_candidate.field);
+                if (order_candidate.expression) |expression| freeExpression(alloc, expression);
+            };
             try validateGeneratedSimpleOrderExpression(generated_expression);
-            break :blk named_order;
+            order_candidate_transferred = true;
+            break :blk order_candidate;
         } else try parseOrderExpressionAlloc(
             alloc,
             tokens,
@@ -18991,7 +19001,7 @@ fn parseGraphTableFunctionSourceAtAlloc(
     const function = query_function.antflyQueryFunctionFromSqlToken(tokens[function_start]) orelse return null;
     switch (function) {
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {},
-        .graph_metric => {},
+        .graph_metric, .graph_metric_rerank => {},
         else => return null,
     }
     const close_index = parser.findMatchingRParenIndex(tokens, function_start + 1) orelse return error.UnsupportedSqlShape;
@@ -34008,7 +34018,10 @@ fn setGeneratedExpressionFirstBooleanConditionKind(
             const inner = expression.inner_expression orelse return false;
             return setGeneratedExpressionFirstBooleanConditionKind(inner, kind);
         },
-        else => return false,
+        else => {
+            expression.kind = kind;
+            return true;
+        },
     }
 }
 
@@ -34236,10 +34249,12 @@ fn corruptGeneratedReadFirstProjectionFilterExpressionKind(
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .read => |read| {
-                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
-                    const filter_expression = read.projection_items.expressions[0].filter_expression orelse return error.TestUnexpectedResult;
-                    filter_expression.kind = kind;
-                    return;
+                    for (read.projection_items.expressions) |expression| {
+                        const filter_expression = expression.filter_expression orelse continue;
+                        filter_expression.kind = kind;
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
                 },
                 else => return error.TestUnexpectedResult,
             }

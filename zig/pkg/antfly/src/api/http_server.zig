@@ -6841,7 +6841,7 @@ pub const ApiHttpServer = struct {
                 std.log.err("public sql write lower not found table={s} err={}", .{ target_table, err });
                 return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
-            error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .invalid_sql_write).withMessage("document_sql_write_unsupported").withMissingNativeModel("document SQL write execution")) },
+            error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_write_unsupported)) },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.plan, .unique_owner_unavailable)) },
@@ -31078,7 +31078,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer bounded_scan_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), bounded_scan_resp.status);
-    try std.testing.expectEqualStrings("document_sql_requires_bounded_scan", bounded_scan_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, bounded_scan_resp.body, "plan", "invalid_sql_request", "document_sql_requires_bounded_scan", 0, 0);
 
     var array_resp = try server.handle(.{
         .method = .POST,
@@ -31088,7 +31088,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer array_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), array_resp.status);
-    try std.testing.expectEqualStrings("document_sql_array_requires_unnest", array_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, array_resp.body, "plan", "invalid_sql_request", "document_sql_array_requires_unnest", 0, 0);
 
     var join_resp = try server.handle(.{
         .method = .POST,
@@ -31098,7 +31098,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer join_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), join_resp.status);
-    try std.testing.expectEqualStrings("document_sql_unsupported_join", join_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, join_resp.body, "plan", "invalid_sql_request", "document_sql_unsupported_join", 0, 0);
 
     var distinct_resp = try server.handle(.{
         .method = .POST,
@@ -31108,7 +31108,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer distinct_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), distinct_resp.status);
-    try std.testing.expectEqualStrings("document_sql_projection_modifier_unsupported", distinct_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, distinct_resp.body, "plan", "invalid_sql_request", "document_sql_projection_modifier_unsupported", 0, 0);
 
     var offset_resp = try server.handle(.{
         .method = .POST,
@@ -31118,7 +31118,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer offset_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), offset_resp.status);
-    try std.testing.expectEqualStrings("document_sql_pagination_unsupported", offset_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, offset_resp.body, "plan", "invalid_sql_request", "document_sql_pagination_unsupported", 0, 0);
 
     var locking_tail_resp = try server.handle(.{
         .method = .POST,
@@ -31128,7 +31128,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer locking_tail_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
-    try std.testing.expectEqualStrings("document_sql_locking_unsupported", locking_tail_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, locking_tail_resp.body, "plan", "invalid_sql_request", "document_sql_locking_unsupported", 0, 0);
 
     var native_search_predicate_resp = try server.handle(.{
         .method = .POST,
@@ -31138,7 +31138,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer native_search_predicate_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), native_search_predicate_resp.status);
-    try std.testing.expectEqualStrings("document_sql_native_search_requires_table_function", native_search_predicate_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, native_search_predicate_resp.body, "plan", "invalid_sql_request", "document_sql_native_search_requires_table_function", 0, 0);
 
     var write_resp = try server.handle(.{
         .method = .POST,
@@ -31148,7 +31148,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), write_resp.status);
-    try std.testing.expectEqualStrings("document_sql_write_unsupported", write_resp.body);
+    try expectPublicSqlDiagnosticBody(alloc, write_resp.body, "plan", "document_sql_write_unsupported", "document_sql_write_unsupported", 0, 0);
 
     var view_resp = try server.handle(.{
         .method = .POST,
@@ -31158,7 +31158,7 @@ test "api http server executes document SQL reads through typed document plan in
     });
     defer view_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), view_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, view_resp.body, "plan", "document_sql_view_mapping_unsupported", "document_sql_view_mapping_unsupported", 0, 68);
+    try expectPublicSqlDiagnosticBody(alloc, view_resp.body, "plan", "document_sql_view_mapping_unsupported", "document_sql_view_mapping_unsupported", 0, 67);
 }
 
 test "api http server executes SQL point writes through typed row batch ingress" {

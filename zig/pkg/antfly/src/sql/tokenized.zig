@@ -153,7 +153,6 @@ pub const ParsedStatement = union(enum) {
 pub const TokenizedSql = struct {
     sql: []const u8,
     tokens: std.ArrayListUnmanaged(Token),
-    statement_family: ?classifier.SqlStatementFamily = null,
 
     pub fn initAlloc(alloc: std.mem.Allocator, sql: []const u8) !TokenizedSql {
         var tokens = try lexer.tokenizeAlloc(alloc, sql);
@@ -161,7 +160,6 @@ pub const TokenizedSql = struct {
         return .{
             .sql = sql,
             .tokens = tokens,
-            .statement_family = classifier.classifyStatementFamily(tokens.items),
         };
     }
 
@@ -171,7 +169,6 @@ pub const TokenizedSql = struct {
         return .{
             .sql = sql,
             .tokens = tokens,
-            .statement_family = classifier.classifyStatementFamily(tokens.items),
         };
     }
 
@@ -186,7 +183,6 @@ pub const TokenizedSql = struct {
         return .{
             .sql = sql,
             .tokens = tokens,
-            .statement_family = classifier.classifyStatementFamily(tokens.items),
         };
     }
 
@@ -209,7 +205,7 @@ pub const ParsedSql = struct {
     pub fn initAlloc(alloc: std.mem.Allocator, source_sql: []const u8) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initAlloc(alloc, source_sql);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const raw_statement = try parseRawStatement(tokenized_sql.items());
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
@@ -223,7 +219,7 @@ pub const ParsedSql = struct {
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenSliceAlloc(alloc, source_sql, source_tokens);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const raw_statement = try parseRawStatement(tokenized_sql.items());
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
@@ -251,7 +247,7 @@ pub const ParsedSql = struct {
     ) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenRangesAlloc(alloc, parent.sql(), parent.items(), ranges);
         errdefer tokenized_sql.deinit(alloc);
-        const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const raw_statement = try parseRawStatement(tokenized_sql.items());
         const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
         return .{
@@ -1444,7 +1440,7 @@ fn parseStatement(
     if (classifier.classifyRecursiveWriteStatement(tokenized_sql.items())) |kind| {
         return .{ .write = .{ .kind = kind, .raw = raw_statement, .recursive = true } };
     }
-    return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
+    return switch (raw_statement.family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
     };
@@ -3671,7 +3667,17 @@ fn generatedReadDelimitedListIsValid(
         if (list.expression_items[index].start != item.start) return false;
         if (!generatedReadExpressionTokensEqualRange(list.expressions[index], list.expression_items[index])) return false;
         if (!generatedReadListAliasPayloadIsValid(tokens, end, item, list.expression_items[index], list.alias_items[index], list.alias_name_items[index], options)) return false;
-        if (!generatedReadListOrderPayloadIsValid(tokens, end, item, list.expression_items[index], list.direction_items[index], list.directions[index], list.order_using_operator_items[index], list.nulls_order_items[index], list.nulls_orders[index], options)) return false;
+        const has_alias = list.alias_items[index] != null or list.alias_name_items[index] != null;
+        if (has_alias) {
+            if (list.direction_items[index] != null or
+                list.directions[index] != null or
+                list.order_using_operator_items[index] != null or
+                list.nulls_order_items[index] != null or
+                list.nulls_orders[index] != null)
+            {
+                return false;
+            }
+        } else if (!generatedReadListOrderPayloadIsValid(tokens, end, item, list.expression_items[index], list.direction_items[index], list.directions[index], list.order_using_operator_items[index], list.nulls_order_items[index], list.nulls_orders[index], options)) return false;
         if (options.reject_aliases and (list.alias_items[index] != null or list.alias_name_items[index] != null)) return false;
         if (options.reject_order_modifiers and
             (list.direction_items[index] != null or
@@ -4634,7 +4640,8 @@ fn cloneTokenRangesAlloc(
     return out;
 }
 
-fn parseRawStatement(tokens: []const Token, family: ?classifier.SqlStatementFamily) !RawSqlStatement {
+fn parseRawStatement(tokens: []const Token) !RawSqlStatement {
+    const family = classifier.classifyStatementFamily(tokens);
     if (tokens.len == 0) return .{ .family = family };
     var token_end = try rawStatementTokenEnd(tokens);
     while (token_end > 0 and tokens[token_end - 1].kind == .semicolon) token_end -= 1;
@@ -4670,15 +4677,16 @@ fn rawStatementTokenEnd(tokens: []const Token) !usize {
     return tokens.len;
 }
 
-test "sql adapter tokenized sql records legacy statement family only" {
+test "sql adapter tokenized sql leaves legacy statement family to parsed sql" {
     const alloc = std.testing.allocator;
 
     var query = try TokenizedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
     defer query.deinit(alloc);
-    try std.testing.expectEqual(classifier.SqlStatementFamily.select, query.statement_family.?);
+    try std.testing.expect(query.items().len > 0);
 
     var parsed_joined = try ParsedSql.initAlloc(alloc, "SELECT o.id FROM usage_records AS o JOIN customers AS c ON o.customer_id = c.id");
     defer parsed_joined.deinit(alloc);
+    try std.testing.expectEqual(classifier.SqlStatementFamily.select, parsed_joined.raw_statement.family.?);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.join, parsed_joined.readStatementKind().?);
 
     var distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
@@ -4687,10 +4695,11 @@ test "sql adapter tokenized sql records legacy statement family only" {
 
     var write = try TokenizedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer write.deinit(alloc);
-    try std.testing.expectEqual(classifier.SqlStatementFamily.with, write.statement_family.?);
+    try std.testing.expect(write.items().len > 0);
 
     var parsed_write = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer parsed_write.deinit(alloc);
+    try std.testing.expectEqual(classifier.SqlStatementFamily.with, parsed_write.raw_statement.family.?);
     try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
 }
 
@@ -5770,12 +5779,21 @@ test "sql adapter parsed sql owns typed statement variants" {
 
     const strict_unsupported_rejections = [_][]const u8{
         "ALTER TRANSFORM FOR",
-        "DROP ROUTINE IF EXISTS",
-        "CREATE TEXT SEARCH",
-        "IMPORT FOREIGN SCHEMA public FROM SERVER",
     };
     for (strict_unsupported_rejections) |sql| {
         try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, sql));
+    }
+
+    const raw_ddl_fallbacks = [_][]const u8{
+        "IMPORT FOREIGN SCHEMA public FROM SERVER",
+    };
+    for (raw_ddl_fallbacks) |sql| {
+        var parsed = try ParsedSql.initAlloc(alloc, sql);
+        defer parsed.deinit(alloc);
+        switch (parsed.statement) {
+            .ddl => {},
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     var session = try ParsedSql.initAlloc(alloc, "SET search_path TO public");

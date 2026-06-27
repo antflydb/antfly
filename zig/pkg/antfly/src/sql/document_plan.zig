@@ -468,7 +468,6 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     const statement_end = documentSqlStatementEnd(tokens);
     const from_index = findTopLevelKeyword(tokens, .from) orelse return error.UnsupportedSqlShape;
     try rejectDocumentSelectProjectionModifier(tokens[1..from_index]);
-    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .query) return error.UnsupportedSqlShape;
 
     const where_index = findTopLevelKeyword(tokens, .where);
     const order_index = findTopLevelKeyword(tokens, .order);
@@ -479,6 +478,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     const window_index = documentStatementTailKeywordIndex(tokens, from_index, .window);
     const tail_start = minOptionalIndex(&.{ where_index, order_index, limit_index, offset_index, fetch_index, for_index, window_index }) orelse statement_end;
     try rejectUnsupportedDocumentStatementShape(tokens, from_index, tail_start, false);
+    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .query) return error.UnsupportedSqlShape;
 
     if (from_index + 1 >= statement_end or tokens[from_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
     const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
@@ -2911,7 +2911,9 @@ test "document SQL rejects unsupported tail keywords as source aliases" {
     defer window_tail.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlWindowUnsupported, lowerDocumentReadPlanParsedSqlAlloc(alloc, &window_tail, schema));
 
-    try std.testing.expectError(error.UnexpectedToken, tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs offset"));
+    var aggregate_keyword_alias_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs offset");
+    defer aggregate_keyword_alias_tail.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlPaginationUnsupported, lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &aggregate_keyword_alias_tail, schema, .{ .max_rows = 25 }));
 
     var aggregate_having_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs HAVING count(*) > 0");
     defer aggregate_having_tail.deinit(alloc);

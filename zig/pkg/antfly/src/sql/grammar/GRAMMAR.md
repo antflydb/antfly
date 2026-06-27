@@ -118,6 +118,10 @@ fallbacks no longer steal supported DDL such as `CREATE VIEW`. Generated-gate
 admission now comes from the grammar parse itself rather than the hand-written
 token-head classifier, so production ingress no longer decides generated
 coverage by probing legacy statement heads before running the generated parser.
+Tokenization is now scanner-only for concrete read/write dispatch:
+`TokenizedSql` no longer caches legacy read/write statement variants, and those
+compatibility variants are derived from the parsed/generated statement for
+remaining fallback surfaces.
 The remaining legacy classifier dependency is the detailed statement-variant
 builder used after grammar family validation for families that have not yet
 migrated concrete variant dispatch; generated read variants now come from the

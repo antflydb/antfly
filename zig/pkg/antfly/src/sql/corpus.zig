@@ -528,6 +528,12 @@ fn appParityBindingCoverageTableNamesAlloc(
     entry: AppParityCorpusEntry,
     parsed_sql: *const tokenized.ParsedSql,
 ) !?AppParityBindingCoverageTableNames {
+    if (appParityPreparedInnerStatementRange(parsed_sql)) |inner| {
+        var inner_parsed = try tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, inner.start, inner.end);
+        defer inner_parsed.deinit(alloc);
+        return try appParityBindingCoverageTableNamesAlloc(alloc, entry, &inner_parsed);
+    }
+
     switch (entry.family) {
         .read, .query, .aggregate, .join, .lateral, .window => {
             const resolved = (try binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return null;
@@ -561,6 +567,23 @@ fn appParityBindingCoverageTableNamesAlloc(
         },
         else => return null,
     }
+}
+
+const AppParityPreparedInnerStatementRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn appParityPreparedInnerStatementRange(parsed_sql: *const tokenized.ParsedSql) ?AppParityPreparedInnerStatementRange {
+    const generated_raw = parsed_sql.generated_statement orelse return null;
+    const ast = generated_raw.ast orelse return null;
+    const prepared = switch (ast) {
+        .prepared => |prepared_ast| prepared_ast,
+        else => return null,
+    };
+    if (prepared.kind != .prepare) return null;
+    const inner = prepared.inner_statement_tokens orelse return null;
+    return .{ .start = inner.start, .end = inner.end };
 }
 
 fn appParityBindingCoverageWriteSourceTableNameAlloc(
