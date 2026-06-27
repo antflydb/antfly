@@ -2209,6 +2209,8 @@ fn generatedDmlAstHasValidClassificationPayload(
     if (!std.meta.eql(dml_ast.command_span, tokens[command_start].sourceSpan())) return false;
 
     if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.target_table_tokens)) return false;
+    if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.target_alias_tokens)) return false;
+    if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.target_alias_name_tokens)) return false;
     if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.insert_columns_tokens)) return false;
     if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.values_tokens)) return false;
     if (!generatedDmlOptionalTokenRangeIsValid(tokens, end, dml_ast.source_tokens)) return false;
@@ -2270,7 +2272,7 @@ fn generatedDmlInsertLayoutIsValid(
     const target_start = generatedDmlOptionalOnlyTargetStart(tokens, command_start + 2, end);
     const target = dml_ast.target_table_tokens orelse return false;
     if (target.start != target_start or target.end > end) return false;
-    var body_start = generatedDmlAfterOptionalAlias(tokens, target.end, end);
+    var body_start = generatedDmlTargetAliasEnd(tokens, end, target, dml_ast.target_alias_tokens, dml_ast.target_alias_name_tokens) orelse return false;
 
     if (dml_ast.insert_columns_tokens) |columns| {
         if (columns.start != body_start or columns.end <= columns.start + 1) return false;
@@ -2318,10 +2320,11 @@ fn generatedDmlUpdateLayoutIsValid(
     const target_start = generatedDmlOptionalOnlyTargetStart(tokens, command_start + 1, end);
     const target = dml_ast.target_table_tokens orelse return false;
     if (target.start != target_start or target.end > end) return false;
+    const target_alias_end = generatedDmlTargetAliasEnd(tokens, end, target, dml_ast.target_alias_tokens, dml_ast.target_alias_name_tokens) orelse return false;
     const assignments = dml_ast.assignments_tokens orelse return false;
     if (assignments.start == 0 or assignments.start >= assignments.end or assignments.end > end) return false;
     if (!tokens[assignments.start - 1].matchesKeywordTag(.set)) return false;
-    if (assignments.start - 1 < generatedDmlAfterOptionalAlias(tokens, target.end, end)) return false;
+    if (assignments.start - 1 != target_alias_end) return false;
     if (dml_ast.source_tokens) |source| {
         if (source.start == 0 or source.start >= source.end or source.end > end) return false;
         if (!tokens[source.start - 1].matchesKeywordTag(.from)) return false;
@@ -2346,13 +2349,14 @@ fn generatedDmlDeleteLayoutIsValid(
     const target_start = generatedDmlOptionalOnlyTargetStart(tokens, command_start + 2, end);
     const target = dml_ast.target_table_tokens orelse return false;
     if (target.start != target_start or target.end > end) return false;
+    const target_alias_end = generatedDmlTargetAliasEnd(tokens, end, target, dml_ast.target_alias_tokens, dml_ast.target_alias_name_tokens) orelse return false;
     if (dml_ast.source_tokens) |source| {
         if (source.start == 0 or source.start >= source.end or source.end > end) return false;
         if (!tokens[source.start - 1].matchesKeywordTag(.using)) return false;
-        if (source.start - 1 < target.end) return false;
+        if (source.start - 1 != target_alias_end) return false;
         return generatedDmlWhereReturningTailIsValid(tokens, end, source.end, dml_ast.where_tokens, dml_ast.returning_tokens, true);
     }
-    return generatedDmlWhereReturningTailIsValid(tokens, end, target.end, dml_ast.where_tokens, dml_ast.returning_tokens, false);
+    return generatedDmlWhereReturningTailIsValid(tokens, end, target_alias_end, dml_ast.where_tokens, dml_ast.returning_tokens, false);
 }
 
 fn generatedDmlTruncateLayoutIsValid(
@@ -2397,12 +2401,14 @@ fn generatedDmlMergeLayoutIsValid(
     {
         return false;
     }
+    const target_start = generatedDmlOptionalOnlyTargetStart(tokens, command_start + 2, end);
     const target = dml_ast.target_table_tokens orelse return false;
-    if (target.start != command_start + 2 or target.end > end) return false;
+    if (target.start != target_start or target.end > end) return false;
+    const target_alias_end = generatedDmlTargetAliasEnd(tokens, end, target, dml_ast.target_alias_tokens, dml_ast.target_alias_name_tokens) orelse return false;
     const source = dml_ast.source_tokens orelse return false;
     if (source.start == 0 or source.start >= source.end or source.end > end) return false;
     if (!tokens[source.start - 1].matchesKeywordTag(.using)) return false;
-    if (source.start - 1 < target.end) return false;
+    if (source.start - 1 != target_alias_end) return false;
     const predicate = dml_ast.where_tokens orelse return false;
     if (predicate.start == 0 or predicate.start >= predicate.end or predicate.end > end) return false;
     if (!tokens[predicate.start - 1].matchesKeywordTag(.on)) return false;
@@ -2413,9 +2419,50 @@ fn generatedDmlOptionalOnlyTargetStart(tokens: []const Token, start: usize, end:
     return if (start < end and tokens[start].matchesKeywordTag(.only)) start + 1 else start;
 }
 
-fn generatedDmlAfterOptionalAlias(tokens: []const Token, start: usize, end: usize) usize {
-    if (start + 1 < end and tokens[start].matchesKeywordTag(.as) and tokens[start + 1].kind == .identifier) return start + 2;
-    return start;
+fn generatedDmlTargetAliasEnd(
+    tokens: []const Token,
+    end: usize,
+    target: generated_parser.GeneratedSqlTokenRange,
+    target_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    target_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    if (target.start >= target.end or target.end > end or end > tokens.len) return null;
+    const alias = target_alias_tokens orelse {
+        if (target_alias_name_tokens != null) return null;
+        return target.end;
+    };
+    const alias_name = target_alias_name_tokens orelse return null;
+    if (alias.start != target.end or alias.start >= alias.end or alias.end > end) return null;
+    const expected_name = if (alias.end == target.end + 2 and
+        tokens[target.end].matchesKeywordTag(.as) and
+        tokens[target.end + 1].kind == .identifier)
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = target.end + 1, .end = target.end + 2 };
+    } else if (alias.end == target.end + 1 and
+        tokens[target.end].kind == .identifier and
+        !generatedDmlTargetTailKeyword(tokens, target.end))
+    blk: {
+        break :blk alias;
+    } else return null;
+    if (alias_name.start != expected_name.start or alias_name.end != expected_name.end) return null;
+    return alias.end;
+}
+
+fn generatedDmlTargetTailKeyword(tokens: []const Token, index: usize) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    return token.matchesKeywordTag(.default) or
+        token.matchesKeywordTag(.values) or
+        token.matchesKeywordTag(.conflict) or
+        token.matchesKeywordTag(.set) or
+        token.matchesKeywordTag(.from) or
+        token.matchesKeywordTag(.using) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch);
 }
 
 fn generatedDmlInsertTailStart(

@@ -2379,30 +2379,45 @@ fn parseGeneratedDmlTargetAliasAlloc(
     return target_table;
 }
 
-fn generatedDmlTargetAliasRangeValid(
+fn generatedDmlTargetAliasEnd(
     tokens: []const Token,
     target_range: generated_parser.GeneratedSqlTokenRange,
-    target_alias_end: usize,
-) bool {
-    if (target_range.start >= target_range.end or target_range.end > target_alias_end or target_alias_end > tokens.len) return false;
-    if (target_alias_end == target_range.end) return true;
-    if (target_alias_end == target_range.end + 2 and
+    target_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    target_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !usize {
+    if (target_range.start >= target_range.end or target_range.end > end or end > tokens.len) return error.UnsupportedSqlShape;
+    const alias = target_alias_tokens orelse {
+        if (target_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        return target_range.end;
+    };
+    const alias_name = target_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.start != target_range.end or alias.start >= alias.end or alias.end > end) return error.UnsupportedSqlShape;
+    const expected_name = if (alias.end == target_range.end + 2 and
         tokens[target_range.end].matchesKeywordTag(.as) and
         tokens[target_range.end + 1].kind == .identifier)
-    {
-        return true;
-    }
-    return target_alias_end == target_range.end + 1 and
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = target_range.end + 1, .end = target_range.end + 2 };
+    } else if (alias.end == target_range.end + 1 and
         tokens[target_range.end].kind == .identifier and
-        !plan_mod.nextIsDmlTargetTailKeyword(tokens, target_range.end);
+        !plan_mod.nextIsDmlTargetTailKeyword(tokens, target_range.end))
+    blk: {
+        break :blk alias;
+    } else return error.UnsupportedSqlShape;
+    if (alias_name.start != expected_name.start or alias_name.end != expected_name.end) return error.UnsupportedSqlShape;
+    return alias.end;
 }
 
-fn validateGeneratedDmlTargetAliasRange(
+fn validateGeneratedDmlTargetAliasBoundary(
     tokens: []const Token,
     target_range: generated_parser.GeneratedSqlTokenRange,
-    target_alias_end: usize,
-) !void {
-    if (!generatedDmlTargetAliasRangeValid(tokens, target_range, target_alias_end)) return error.UnsupportedSqlShape;
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+    expected_target_alias_end: usize,
+) !usize {
+    const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
+    if (target_alias_end != expected_target_alias_end) return error.UnsupportedSqlShape;
+    return target_alias_end;
 }
 
 fn generatedUpdateTargetAliasEnd(
@@ -2414,9 +2429,7 @@ fn generatedUpdateTargetAliasEnd(
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
-    const target_alias_end = assignments_range.start - 1;
-    try validateGeneratedDmlTargetAliasRange(tokens, target_range, target_alias_end);
-    return target_alias_end;
+    return try validateGeneratedDmlTargetAliasBoundary(tokens, target_range, ast, end, assignments_range.start - 1);
 }
 
 fn generatedDeleteTargetAliasEnd(
@@ -2425,7 +2438,7 @@ fn generatedDeleteTargetAliasEnd(
     target_range: generated_parser.GeneratedSqlTokenRange,
     end: usize,
 ) !usize {
-    const target_alias_end = if (ast.source_tokens) |source_range| blk: {
+    const expected_target_alias_end = if (ast.source_tokens) |source_range| blk: {
         if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
         break :blk source_range.start - 1;
@@ -2438,8 +2451,19 @@ fn generatedDeleteTargetAliasEnd(
         if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
         break :blk returning_range.start - 1;
     } else end;
-    try validateGeneratedDmlTargetAliasRange(tokens, target_range, target_alias_end);
-    return target_alias_end;
+    return try validateGeneratedDmlTargetAliasBoundary(tokens, target_range, ast, end, expected_target_alias_end);
+}
+
+fn generatedMergeTargetAliasEnd(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !usize {
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+    return try validateGeneratedDmlTargetAliasBoundary(tokens, target_range, ast, end, source_range.start - 1);
 }
 
 fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
@@ -13530,6 +13554,10 @@ fn generatedDeleteTargetTableStart(tokens: []const Token, start: usize, end: usi
     return start + 2;
 }
 
+fn generatedDmlOptionalOnlyTargetStart(tokens: []const Token, start: usize, end: usize) usize {
+    return if (start < end and tokens[start].matchesKeywordTag(.only)) start + 1 else start;
+}
+
 fn validateGeneratedDmlRelationSourceBody(
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
@@ -13883,11 +13911,13 @@ fn validateGeneratedMergeRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 9 >= end or !tokens[start].matchesKeywordTag(.merge) or !tokens[start + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = generatedDmlOptionalOnlyTargetStart(tokens, start + 2, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_alias_end = try generatedMergeTargetAliasEnd(tokens, ast, target_range, end);
     const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
-    if (source_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
+    if (source_range.start - 1 != target_alias_end) return error.UnsupportedSqlShape;
     const body_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
     if (body_range.start == 0 or body_range.start >= body_range.end or body_range.end != end) return error.UnsupportedSqlShape;
     if (!tokens[body_range.start - 1].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
@@ -15106,6 +15136,28 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+    var parsed_generated_aliased_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records AS u SET status = 'ready' WHERE u.id = 'u1' RETURNING id",
+    );
+    defer parsed_generated_aliased_update.deinit(alloc);
+    var corrupted_aliased_update_ast = switch ((parsed_generated_aliased_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    corrupted_aliased_update_ast.target_alias_tokens = null;
+    corrupted_aliased_update_ast.target_alias_name_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &parsed_generated_aliased_update,
+            corrupted_aliased_update_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 
     var parsed_generated_delete = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -15447,6 +15499,20 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(usize, 1), generated_merge.not_matched_arms.len);
     try std.testing.expectEqual(@as(usize, 3), generated_merge.not_matched_arms[0].insert.len);
     try std.testing.expectEqual(@as(usize, 2), generated_merge.returning.fields.len);
+
+    var generated_implicit_alias_merge = try lowerGeneratedMergeForDmlTestAlloc(
+        alloc,
+        "MERGE INTO usage_records target USING usage_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_implicit_alias_merge.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_implicit_alias_merge.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_implicit_alias_merge.source_table_name);
+    try std.testing.expectEqual(@as(usize, 1), generated_implicit_alias_merge.match_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_implicit_alias_merge.matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_implicit_alias_merge.returning.fields.len);
 
     var generated_cte_merge = try lowerGeneratedMergeForDmlTestAlloc(
         alloc,

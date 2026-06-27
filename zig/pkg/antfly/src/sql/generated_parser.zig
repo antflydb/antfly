@@ -1775,6 +1775,8 @@ pub const GeneratedSqlDmlAst = struct {
     cte_tokens: ?GeneratedSqlTokenRange = null,
     cte_prefix: ?GeneratedSqlDmlCteAst = null,
     target_table_tokens: ?GeneratedSqlTokenRange = null,
+    target_alias_tokens: ?GeneratedSqlTokenRange = null,
+    target_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     insert_columns_tokens: ?GeneratedSqlTokenRange = null,
     values_tokens: ?GeneratedSqlTokenRange = null,
     source_tokens: ?GeneratedSqlTokenRange = null,
@@ -6302,8 +6304,10 @@ fn buildInsertDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
     if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
     var index: usize = if (ast.target_table_tokens) |target| target.end else start + 3;
-    if (index + 1 < end and tokens[index].matchesKeywordTag(.as) and tokens[index + 1].kind == .identifier) {
-        index += 2;
+    if (generatedDmlTargetAlias(tokens, index, end)) |alias| {
+        ast.target_alias_tokens = alias.alias_tokens;
+        ast.target_alias_name_tokens = alias.alias_name_tokens;
+        index = alias.end;
     }
     if (index + 1 < end and tokens[index].matchesKeywordTag(.default) and tokens[index + 1].matchesKeywordTag(.values)) {
         ast.default_values = true;
@@ -6350,8 +6354,10 @@ fn buildUpdateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
     if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
     var search_start: usize = if (ast.target_table_tokens) |target| target.end else start + 2;
-    if (search_start + 1 < end and tokens[search_start].matchesKeywordTag(.as) and tokens[search_start + 1].kind == .identifier) {
-        search_start += 2;
+    if (generatedDmlTargetAlias(tokens, search_start, end)) |alias| {
+        ast.target_alias_tokens = alias.alias_tokens;
+        ast.target_alias_name_tokens = alias.alias_name_tokens;
+        search_start = alias.end;
     }
     const set_index = findTopLevelKeyword(tokens, search_start, end, .set) orelse return;
     const from_index = findTopLevelKeyword(tokens, set_index + 1, end, .from);
@@ -6382,7 +6388,12 @@ fn buildDeleteDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
     var target_index = start + 2;
     if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
-    const scan_start = if (ast.target_table_tokens) |target| target.end else target_index;
+    var scan_start = if (ast.target_table_tokens) |target| target.end else target_index;
+    if (generatedDmlTargetAlias(tokens, scan_start, end)) |alias| {
+        ast.target_alias_tokens = alias.alias_tokens;
+        ast.target_alias_name_tokens = alias.alias_name_tokens;
+        scan_start = alias.end;
+    }
     const using_index = findTopLevelKeyword(tokens, scan_start, end, .using);
     const where_index = findTopLevelKeyword(tokens, scan_start, end, .where);
     const returning_index = findTopLevelKeyword(tokens, scan_start, end, .returning);
@@ -6423,12 +6434,63 @@ fn buildTruncateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize
 
 fn buildMergeDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
     if (start + 3 >= end or !tokens[start + 1].matchesKeywordTag(.into)) return;
-    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, start + 2, end);
-    if (findTopLevelKeyword(tokens, start + 3, end, .using)) |using_index| {
+    var target_index: usize = start + 2;
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
+    var search_start: usize = if (ast.target_table_tokens) |target| target.end else start + 3;
+    if (generatedDmlTargetAlias(tokens, search_start, end)) |alias| {
+        ast.target_alias_tokens = alias.alias_tokens;
+        ast.target_alias_name_tokens = alias.alias_name_tokens;
+        search_start = alias.end;
+    }
+    if (findTopLevelKeyword(tokens, search_start, end, .using)) |using_index| {
         const on_index = findTopLevelKeyword(tokens, using_index + 1, end, .on) orelse end;
         if (using_index + 1 < on_index) ast.source_tokens = .{ .start = using_index + 1, .end = on_index };
         if (on_index + 1 < end) ast.where_tokens = .{ .start = on_index + 1, .end = end };
     }
+}
+
+const GeneratedDmlTargetAlias = struct {
+    alias_tokens: GeneratedSqlTokenRange,
+    alias_name_tokens: GeneratedSqlTokenRange,
+    end: usize,
+};
+
+fn generatedDmlTargetAlias(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedDmlTargetAlias {
+    if (start >= end or end > tokens.len) return null;
+    if (start + 1 < end and tokens[start].matchesKeywordTag(.as) and tokens[start + 1].kind == .identifier) {
+        return .{
+            .alias_tokens = .{ .start = start, .end = start + 2 },
+            .alias_name_tokens = .{ .start = start + 1, .end = start + 2 },
+            .end = start + 2,
+        };
+    }
+    if (tokens[start].kind == .identifier and !generatedDmlTargetTailKeyword(tokens, start)) {
+        const alias_tokens = GeneratedSqlTokenRange{ .start = start, .end = start + 1 };
+        return .{
+            .alias_tokens = alias_tokens,
+            .alias_name_tokens = alias_tokens,
+            .end = start + 1,
+        };
+    }
+    return null;
+}
+
+fn generatedDmlTargetTailKeyword(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    return token.matchesKeywordTag(.default) or
+        token.matchesKeywordTag(.values) or
+        token.matchesKeywordTag(.conflict) or
+        token.matchesKeywordTag(.set) or
+        token.matchesKeywordTag(.from) or
+        token.matchesKeywordTag(.using) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch);
 }
 
 fn firstTopLevelTruncateOption(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
@@ -9066,6 +9128,19 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const aliased_update_sql = "UPDATE usage_records AS u SET status = 'done'";
+    const aliased_update_result = try parseSqlAlloc(alloc, aliased_update_sql);
+    switch (aliased_update_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 4 }, dml.target_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, dml.target_alias_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, dml.assignments_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const joined_update_sql = "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE usage_records.source_id = source.archive_id";
     const joined_update_result = try parseSqlAlloc(alloc, joined_update_sql);
     switch (joined_update_result.ast.?) {
@@ -9096,6 +9171,19 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const aliased_delete_sql = "DELETE FROM usage_records u WHERE id = 'u1'";
+    const aliased_delete_result = try parseSqlAlloc(alloc, aliased_delete_sql);
+    switch (aliased_delete_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.delete, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, dml.target_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, dml.target_alias_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, dml.where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const merge_sql = "MERGE INTO usage_records USING archived_records AS source ON usage_records.source_id = source.archive_id WHEN MATCHED THEN DELETE";
     const merge_result = try parseSqlAlloc(alloc, merge_sql);
     switch (merge_result.ast.?) {
@@ -9107,6 +9195,32 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
             try std.testing.expect(source_read.wrapper_projection_star);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aliased_merge_sql = "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN DELETE";
+    const aliased_merge_result = try parseSqlAlloc(alloc, aliased_merge_sql);
+    switch (aliased_merge_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.merge, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, dml.target_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, dml.target_alias_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, dml.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const qualified_only_merge_sql = "MERGE INTO ONLY public.usage_records AS target USING ONLY public.archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN DELETE";
+    const qualified_only_merge_result = try parseSqlAlloc(alloc, qualified_only_merge_sql);
+    switch (qualified_only_merge_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.merge, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 6 }, dml.target_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, dml.target_alias_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, dml.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9185,6 +9299,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
             try std.testing.expect(dml.insert_columns_tokens == null);
             try std.testing.expect(dml.values_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aliased_insert_sql = "INSERT INTO usage_records AS target DEFAULT VALUES";
+    const aliased_insert_result = try parseSqlAlloc(alloc, aliased_insert_sql);
+    switch (aliased_insert_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_values, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, dml.target_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, dml.target_alias_name_tokens.?);
+            try std.testing.expect(dml.default_values);
         },
         else => return error.TestUnexpectedResult,
     }
