@@ -27,48 +27,31 @@ pub fn executeRelationalSqlDdlOnService(
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+    var plan = try sql_adapter.planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
     defer plan.deinit(alloc);
-    return try executeRelationalSqlLogicalPlanOnService(service, alloc, plan);
+    return try executeRelationalSqlDurablePlanOrAdapterNoopOnService(service, alloc, &plan);
 }
 
-pub fn executeRelationalSqlLogicalPlanOnService(
+pub fn executeRelationalSqlDurablePlanOrAdapterNoopOnService(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: sql_adapter.LogicalSqlPlan,
+    plan: *sql_adapter.durable_plan.DurableSqlPlanOrAdapterNoop,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    switch (plan) {
-        .other_ddl => |other| switch (other) {
-            .adapter_noop => |noop| {
-                if (noop.reason != .extension) return null;
-                return try noopRecordAlloc(alloc);
-            },
-            .moved => return null,
-        },
-        .extension => |extension_plan| return try executeRelationalSqlExtensionPlanOnService(service, alloc, extension_plan),
-        else => return null,
-    }
-}
-
-pub fn executeRelationalSqlOtherDdlPlanOnService(
-    alloc: std.mem.Allocator,
-    plan: sql_adapter.OtherDdlLogicalPlan,
-) !?tables_api.AppliedRelationalSqlDdlRecord {
-    switch (plan) {
+    switch (plan.*) {
+        .durable => |*durable_plan| return try executeRelationalSqlDurablePlanOnService(service, alloc, durable_plan),
         .adapter_noop => |noop| {
             if (noop.reason != .extension) return null;
             return try noopRecordAlloc(alloc);
         },
-        .moved => return null,
     }
 }
 
-pub fn executeRelationalSqlExtensionLogicalPlanOnService(
+pub fn executeRelationalSqlDurablePlanOnService(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: sql_adapter.LogicalSqlPlan,
+    plan: *sql_adapter.DurableSqlPlan,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    switch (plan) {
+    switch (plan.*) {
         .extension => |extension_plan| return try executeRelationalSqlExtensionPlanOnService(service, alloc, extension_plan),
         else => return null,
     }
@@ -355,6 +338,17 @@ test "sql extension adapter installs query function members through lifecycle" {
     try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
     try std.testing.expectEqual(@as(usize, 1), service.extension_member_upserts);
     try std.testing.expect(service.saw_gen_random_uuid_function);
+}
+
+test "sql extension adapter preserves built-in extension compatibility no-op" {
+    const alloc = std.testing.allocator;
+    var service = TestService{};
+    var applied = (try executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;")).?;
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(applied.noop);
+    try std.testing.expectEqual(@as(usize, 0), service.proposed);
+    try std.testing.expectEqual(@as(usize, 0), service.installed_upserts);
 }
 
 test "sql extension adapter requires manifest sql name aliases" {

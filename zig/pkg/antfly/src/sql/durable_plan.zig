@@ -71,6 +71,45 @@ pub fn takeDurableSqlPlanFromLogical(logical: *binder.LogicalSqlPlan) !DurableSq
     return try DurableSqlPlan.fromLogical(logical);
 }
 
+pub const DurableSqlPlanOrAdapterNoop = union(enum) {
+    durable: DurableSqlPlan,
+    adapter_noop: ddl_plan.AdapterNoopDdlPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .durable => |*plan| plan.deinit(alloc),
+            .adapter_noop => {},
+        }
+        self.* = undefined;
+    }
+
+    fn fromLogical(logical: *binder.LogicalSqlPlan) !DurableSqlPlanOrAdapterNoop {
+        return switch (logical.*) {
+            .other_ddl => |plan| switch (plan) {
+                .adapter_noop => |noop| blk: {
+                    logical.* = .{ .other_ddl = .{ .moved = {} } };
+                    break :blk .{ .adapter_noop = noop };
+                },
+                .moved => error.UnsupportedSqlShape,
+            },
+            else => .{ .durable = try DurableSqlPlan.fromLogical(logical) },
+        };
+    }
+};
+
+pub fn planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !DurableSqlPlanOrAdapterNoop {
+    var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+        .catalog = table_catalog.unavailableCatalogSource(),
+        .function_bindings = function_bindings,
+    });
+    errdefer logical_plan.deinit(alloc);
+    return try DurableSqlPlanOrAdapterNoop.fromLogical(&logical_plan);
+}
+
 pub fn planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     bound: *binder.BoundSqlStatement,
@@ -215,6 +254,20 @@ test "durable sql planner returns typed routine catalog plan from parsed sql" {
             },
             else => return error.TestUnexpectedResult,
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "durable sql planner or adapter noop preserves extension compatibility no-op" {
+    const alloc = std.testing.allocator;
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto");
+    defer parsed.deinit(alloc);
+
+    var planned = try planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{});
+    defer planned.deinit(alloc);
+
+    switch (planned) {
+        .adapter_noop => |noop| try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, noop.reason),
         else => return error.TestUnexpectedResult,
     }
 }
