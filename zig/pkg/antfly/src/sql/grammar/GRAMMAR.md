@@ -42,7 +42,11 @@ generator also accepts PostgreSQL/Yacc-style quoted literal terminals through
 symbolic `%token NAME 'literal'` aliases. Literal symbols may appear in rule
 alternatives while the checked-in generated API continues to expose stable Zig
 identifier token names, which keeps PostgreSQL-style grammar migration from
-polluting the runtime token enum with punctuation-shaped symbols. The
+polluting the runtime token enum with punctuation-shaped symbols. The generator
+also supports Yacc precedence declarations, including `%left`, `%right`,
+`%nonassoc`, and production-level `%prec` overrides, so intentional
+shift/reduce ambiguity can be resolved in table construction instead of being
+left as broad `%expect` debt. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records both

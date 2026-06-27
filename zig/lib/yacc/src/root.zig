@@ -26,12 +26,30 @@ pub const Grammar = struct {
     cockroach_sql_y: []const u8 = "",
     tokens: std.ArrayListUnmanaged([]const u8) = .empty,
     token_aliases: std.ArrayListUnmanaged(TokenAlias) = .empty,
+    token_precedences: std.ArrayListUnmanaged(TokenPrecedence) = .empty,
+    precedence_level_count: u16 = 0,
     rules: std.ArrayListUnmanaged(Rule) = .empty,
 };
 
 pub const TokenAlias = struct {
     literal: []const u8,
     token: []const u8,
+};
+
+pub const PrecedenceAssociativity = enum {
+    left,
+    right,
+    nonassoc,
+};
+
+pub const Precedence = struct {
+    level: u16,
+    associativity: PrecedenceAssociativity,
+};
+
+pub const TokenPrecedence = struct {
+    token: []const u8,
+    precedence: Precedence,
 };
 
 pub const Rule = struct {
@@ -41,6 +59,7 @@ pub const Rule = struct {
 
 pub const Alternative = struct {
     symbols: []const []const u8,
+    precedence_symbol: ?[]const u8 = null,
 };
 
 pub const SymbolKind = enum {
@@ -56,6 +75,7 @@ pub const Symbol = struct {
 pub const Production = struct {
     lhs: u16,
     rhs: []const u16,
+    precedence: ?Precedence = null,
 };
 
 pub const Item = struct {
@@ -212,6 +232,21 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             active_rule = null;
             continue;
         }
+        if (std.mem.startsWith(u8, line, "%left ")) {
+            try parsePrecedenceDeclaration(allocator, &grammar, .left, line["%left ".len..]);
+            active_rule = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "%right ")) {
+            try parsePrecedenceDeclaration(allocator, &grammar, .right, line["%right ".len..]);
+            active_rule = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "%nonassoc ")) {
+            try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%nonassoc ".len..]);
+            active_rule = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, line, "%token ")) {
             try parseTokens(allocator, &grammar, line["%token ".len..]);
             active_rule = null;
@@ -306,6 +341,28 @@ fn parseTokens(allocator: std.mem.Allocator, grammar: *Grammar, text: []const u8
     }
 }
 
+fn parsePrecedenceDeclaration(
+    allocator: std.mem.Allocator,
+    grammar: *Grammar,
+    associativity: PrecedenceAssociativity,
+    text: []const u8,
+) !void {
+    grammar.precedence_level_count += 1;
+    const level = grammar.precedence_level_count;
+    var parts = std.mem.tokenizeAny(u8, text, " \t\r");
+    var previous_token: ?[]const u8 = null;
+    while (parts.next()) |name| {
+        if (isQuotedLiteral(name)) {
+            const token_name = previous_token orelse return error.InvalidTokenAlias;
+            try appendTokenAlias(allocator, grammar, name, token_name);
+            continue;
+        }
+        const token_name = try appendTokenName(allocator, grammar, name);
+        try setTokenPrecedence(allocator, grammar, token_name, .{ .level = level, .associativity = associativity });
+        previous_token = token_name;
+    }
+}
+
 fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8) !void {
     const trimmed = std.mem.trim(u8, text, " \t\r");
     if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "/* empty */")) {
@@ -315,27 +372,39 @@ fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8
 
     var symbols: std.ArrayListUnmanaged([]const u8) = .empty;
     var index: usize = 0;
+    var precedence_symbol: ?[]const u8 = null;
     while (index < trimmed.len) {
-        while (index < trimmed.len and std.ascii.isWhitespace(trimmed[index])) index += 1;
-        if (index >= trimmed.len) break;
-        if (index + 1 < trimmed.len and trimmed[index] == '/' and trimmed[index + 1] == '*') break;
-
-        const start = index;
-        if (trimmed[index] == '\'') {
-            index += 1;
-            while (index < trimmed.len) : (index += 1) {
-                if (trimmed[index] == '\'' and trimmed[index - 1] != '\\') {
-                    index += 1;
-                    break;
-                }
-            }
-            if (index > trimmed.len or trimmed[index - 1] != '\'') return error.UnterminatedLiteralTerminal;
-        } else {
-            while (index < trimmed.len and !std.ascii.isWhitespace(trimmed[index])) index += 1;
+        const symbol = (try nextGrammarSymbol(trimmed, &index)) orelse break;
+        if (std.mem.eql(u8, symbol, "%prec")) {
+            const override = (try nextGrammarSymbol(trimmed, &index)) orelse return error.InvalidPrecedenceOverride;
+            precedence_symbol = try dupToken(allocator, override);
+            if ((try nextGrammarSymbol(trimmed, &index)) != null) return error.InvalidPrecedenceOverride;
+            break;
         }
-        try symbols.append(allocator, try dupToken(allocator, trimmed[start..index]));
+        try symbols.append(allocator, try dupToken(allocator, symbol));
     }
-    try rule.alternatives.append(allocator, .{ .symbols = try symbols.toOwnedSlice(allocator) });
+    try rule.alternatives.append(allocator, .{ .symbols = try symbols.toOwnedSlice(allocator), .precedence_symbol = precedence_symbol });
+}
+
+fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
+    while (index.* < text.len and std.ascii.isWhitespace(text[index.*])) index.* += 1;
+    if (index.* >= text.len) return null;
+    if (index.* + 1 < text.len and text[index.*] == '/' and text[index.* + 1] == '*') return null;
+
+    const start = index.*;
+    if (text[index.*] == '\'') {
+        index.* += 1;
+        while (index.* < text.len) : (index.* += 1) {
+            if (text[index.*] == '\'' and text[index.* - 1] != '\\') {
+                index.* += 1;
+                break;
+            }
+        }
+        if (index.* > text.len or text[index.* - 1] != '\'') return error.UnterminatedLiteralTerminal;
+    } else {
+        while (index.* < text.len and !std.ascii.isWhitespace(text[index.*])) index.* += 1;
+    }
+    return text[start..index.*];
 }
 
 pub fn validateGrammar(grammar: Grammar) !void {
@@ -346,6 +415,9 @@ pub fn validateGrammar(grammar: Grammar) !void {
     for (grammar.rules.items) |rule| {
         if (rule.alternatives.items.len == 0) return error.EmptyRule;
         for (rule.alternatives.items) |alt| {
+            if (alt.precedence_symbol) |precedence_symbol| {
+                if (tokenPrecedenceForSymbol(grammar, precedence_symbol) == null) return error.UnknownPrecedenceSymbol;
+            }
             for (alt.symbols) |symbol| {
                 if (resolveTerminalName(grammar, symbol) == null and findRule(grammar, symbol) == null) {
                     return error.UnknownSymbol;
@@ -378,10 +450,15 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         for (rule.alternatives.items) |alt| {
             var rhs: std.ArrayListUnmanaged(u16) = .empty;
             for (alt.symbols) |symbol| try rhs.append(allocator, try symbolId(grammar, terminal_count, symbol));
-            try productions.append(allocator, .{ .lhs = lhs, .rhs = try rhs.toOwnedSlice(allocator) });
+            try productions.append(allocator, .{
+                .lhs = lhs,
+                .rhs = try rhs.toOwnedSlice(allocator),
+                .precedence = productionPrecedence(grammar, alt),
+            });
         }
     }
 
+    const terminal_precedences = try terminalPrecedences(allocator, grammar, terminal_count);
     const nullable = try computeNullable(allocator, symbols.items.len, productions.items);
     const first = try computeFirst(allocator, symbols.items, productions.items, nullable);
     const follow = try computeFollow(allocator, symbols.items, productions.items, nullable, first, start_symbol, eof_symbol);
@@ -421,7 +498,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
                     .terminal = transition.nonterminal,
                     .kind = .shift,
                     .target = transition.target,
-                });
+                }, productions.items, terminal_precedences);
             } else {
                 try gotos.append(allocator, transition);
             }
@@ -436,7 +513,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
                     .terminal = eof_symbol,
                     .kind = .accept,
                     .target = 0,
-                });
+                }, productions.items, terminal_precedences);
                 continue;
             }
             for (follow[production.lhs]) |terminal| {
@@ -445,7 +522,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
                     .terminal = terminal,
                     .kind = .reduce,
                     .target = item.production,
-                });
+                }, productions.items, terminal_precedences);
             }
         }
     }
@@ -625,10 +702,20 @@ fn addAction(
     actions: *std.ArrayListUnmanaged(Action),
     conflicts: *std.ArrayListUnmanaged(Conflict),
     candidate: Action,
+    productions: []const Production,
+    terminal_precedences: []const ?Precedence,
 ) !void {
-    for (actions.items) |*existing| {
+    for (actions.items, 0..) |*existing, idx| {
         if (existing.state != candidate.state or existing.terminal != candidate.terminal) continue;
         if (std.meta.eql(existing.*, candidate)) return;
+        if (precedenceResolution(candidate, existing.*, productions, terminal_precedences)) |resolution| {
+            switch (resolution) {
+                .candidate => existing.* = candidate,
+                .existing => {},
+                .none => _ = actions.orderedRemove(idx),
+            }
+            return;
+        }
         try conflicts.append(allocator, .{
             .state = candidate.state,
             .terminal = candidate.terminal,
@@ -639,6 +726,43 @@ fn addAction(
         return;
     }
     try actions.append(allocator, candidate);
+}
+
+const ActionResolution = enum {
+    candidate,
+    existing,
+    none,
+};
+
+fn precedenceResolution(
+    candidate: Action,
+    existing: Action,
+    productions: []const Production,
+    terminal_precedences: []const ?Precedence,
+) ?ActionResolution {
+    if (candidate.kind == existing.kind) return null;
+    const shift_action = if (candidate.kind == .shift and existing.kind == .reduce)
+        candidate
+    else if (existing.kind == .shift and candidate.kind == .reduce)
+        existing
+    else
+        return null;
+    const reduce_action = if (candidate.kind == .reduce) candidate else existing;
+    if (shift_action.terminal >= terminal_precedences.len or reduce_action.target >= productions.len) return null;
+    const shift_precedence = terminal_precedences[shift_action.terminal] orelse return null;
+    const reduce_precedence = productions[reduce_action.target].precedence orelse return null;
+
+    const chosen = if (shift_precedence.level > reduce_precedence.level)
+        shift_action
+    else if (shift_precedence.level < reduce_precedence.level)
+        reduce_action
+    else switch (shift_precedence.associativity) {
+        .left => reduce_action,
+        .right => shift_action,
+        .nonassoc => return .none,
+    };
+    if (std.meta.eql(chosen, candidate)) return .candidate;
+    return .existing;
 }
 
 fn preferAction(candidate: Action, existing: Action) bool {
@@ -1204,6 +1328,24 @@ fn appendTokenAlias(
     });
 }
 
+fn setTokenPrecedence(
+    allocator: std.mem.Allocator,
+    grammar: *Grammar,
+    token_name: []const u8,
+    precedence: Precedence,
+) !void {
+    for (grammar.token_precedences.items) |*entry| {
+        if (std.mem.eql(u8, entry.token, token_name)) {
+            entry.precedence = precedence;
+            return;
+        }
+    }
+    try grammar.token_precedences.append(allocator, .{
+        .token = token_name,
+        .precedence = precedence,
+    });
+}
+
 fn isQuotedLiteral(symbol: []const u8) bool {
     return symbol.len >= 2 and symbol[0] == '\'' and symbol[symbol.len - 1] == '\'';
 }
@@ -1224,6 +1366,34 @@ fn resolveTerminalIndex(grammar: Grammar, symbol: []const u8) ?usize {
         if (std.mem.eql(u8, token, token_name)) return idx;
     }
     return null;
+}
+
+fn tokenPrecedenceForSymbol(grammar: Grammar, symbol: []const u8) ?Precedence {
+    const token_name = resolveTerminalName(grammar, symbol) orelse return null;
+    for (grammar.token_precedences.items) |entry| {
+        if (std.mem.eql(u8, entry.token, token_name)) return entry.precedence;
+    }
+    return null;
+}
+
+fn productionPrecedence(grammar: Grammar, alt: Alternative) ?Precedence {
+    if (alt.precedence_symbol) |symbol| return tokenPrecedenceForSymbol(grammar, symbol);
+    var index = alt.symbols.len;
+    while (index > 0) {
+        index -= 1;
+        if (tokenPrecedenceForSymbol(grammar, alt.symbols[index])) |precedence| return precedence;
+    }
+    return null;
+}
+
+fn terminalPrecedences(allocator: std.mem.Allocator, grammar: Grammar, terminal_count: usize) ![]?Precedence {
+    const out = try allocator.alloc(?Precedence, terminal_count);
+    @memset(out, null);
+    for (grammar.token_precedences.items) |entry| {
+        const idx = resolveTerminalIndex(grammar, entry.token) orelse return error.UnknownPrecedenceSymbol;
+        out[idx + 1] = entry.precedence;
+    }
+    return out;
 }
 
 fn appendSet(allocator: std.mem.Allocator, target: *std.ArrayListUnmanaged(u16), source: []const u16) !bool {
@@ -1433,6 +1603,28 @@ test "buildSlrTables detects shift reduce conflicts" {
     const grammar = try parseGrammar(arena, source);
     const tables = try buildSlrTables(arena, grammar);
     try std.testing.expect(tables.conflicts.len > 0);
+}
+
+test "buildSlrTables resolves shift reduce conflicts with yacc precedence" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID
+        \\%left PLUS '+'
+        \\expr:
+        \\    expr '+' expr
+        \\  | ID
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 2), grammar.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.token_aliases.items.len);
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+    _ = try generateZigMetadata(arena, "precedence.y", source);
 }
 
 test "generateZigMetadata emits deterministic parser table metadata" {
