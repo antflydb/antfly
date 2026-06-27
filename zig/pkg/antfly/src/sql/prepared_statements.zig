@@ -129,12 +129,11 @@ pub const Runtime = struct {
         if (!result.found_existing) result.value_ptr.* = .{};
         const session = result.value_ptr;
         if (session.statements.contains(plan.statement_name)) return error.PreparedStatementAlreadyExists;
-        const subject_sql = plan.subject_sql orelse return error.UnsupportedSqlShape;
         const key = try self.alloc.dupe(u8, plan.statement_name);
         errdefer self.alloc.free(key);
-        const owned_subject_sql = try self.alloc.dupe(u8, subject_sql);
+        const owned_subject_sql = try self.ownedSubjectSqlForPreparePlanAlloc(plan);
         errdefer self.alloc.free(owned_subject_sql);
-        var subject_parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, owned_subject_sql);
+        var subject_parsed_sql = try self.ownedSubjectParsedSqlForPreparePlanAlloc(plan, owned_subject_sql);
         errdefer subject_parsed_sql.deinit(self.alloc);
         const subject_family = preparedStatementFamilyFromParsedSql(&subject_parsed_sql) orelse return error.UnsupportedSqlShape;
         if (subject_family != plan.statement_family or preparedStatementSubjectKindFromFamily(subject_family) != plan.statement_kind) {
@@ -147,6 +146,22 @@ pub const Runtime = struct {
             .subject_sql = owned_subject_sql,
             .subject_parsed_sql = subject_parsed_sql,
         });
+    }
+
+    fn ownedSubjectSqlForPreparePlanAlloc(self: *@This(), plan: sql_adapter.PrepareStatementPlan) ![]const u8 {
+        if (plan.subject_parsed_sql) |parsed| return try self.alloc.dupe(u8, parsed.sql());
+        return try self.alloc.dupe(u8, plan.subject_sql orelse return error.UnsupportedSqlShape);
+    }
+
+    fn ownedSubjectParsedSqlForPreparePlanAlloc(
+        self: *@This(),
+        plan: sql_adapter.PrepareStatementPlan,
+        owned_subject_sql: []const u8,
+    ) !sql_adapter.ParsedSql {
+        if (plan.subject_parsed_sql) |parsed| {
+            return try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_subject_sql, parsed.items());
+        }
+        return try sql_adapter.ParsedSql.initAlloc(self.alloc, owned_subject_sql);
     }
 
     fn execute(
@@ -268,6 +283,28 @@ test "sql prepared statement runtime stores session scoped plans" {
     try runtime.apply(.{ .deallocate = .{ .statement_name = "usage_plan" } }, session_a);
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(session_a));
     try std.testing.expectError(error.PreparedStatementNotFound, runtime.apply(.{ .execute = execute_read }, session_a));
+
+    const generated_prepare_sql = "PREPARE generated_usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;";
+    var generated_prepare_parsed = try sql_adapter.ParsedSql.initAlloc(alloc, generated_prepare_sql);
+    defer generated_prepare_parsed.deinit(alloc);
+    const generated_raw = generated_prepare_parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = switch (generated_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_prepare_plan = try sql_adapter.preparedStatementPlanFromGeneratedAstAlloc(alloc, &generated_prepare_parsed, generated_ast);
+    defer generated_prepare_plan.deinit(alloc);
+    try runtime.apply(generated_prepare_plan, session_a);
+    const generated_execute = sql_adapter.ExecutePreparedStatementPlan{
+        .statement_name = "generated_usage_plan",
+        .argument_count = args.len,
+        .arguments = &args,
+    };
+    const generated_executable = try runtime.executableForExecute(session_a, generated_execute);
+    try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, generated_executable.statement_family);
+    try std.testing.expectEqualStrings(generated_prepare_sql, generated_executable.parsed_sql.sql());
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.statementSql());
+    try runtime.apply(.{ .deallocate = .{ .statement_name = "generated_usage_plan" } }, session_a);
 
     try runtime.apply(.{ .prepare = .{
         .statement_name = "read_plan",

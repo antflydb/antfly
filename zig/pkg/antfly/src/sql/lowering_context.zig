@@ -108,6 +108,7 @@ pub const ReadPlanLoweringContext = struct {
 
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
         if (generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
+            try validateGeneratedReadPublishedKind(parsed_sql);
             return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast);
         }
         return try self.lowerParsedWithClassifier(parsed_sql);
@@ -187,6 +188,12 @@ fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const 
         }
     }
     return null;
+}
+
+fn validateGeneratedReadPublishedKind(parsed_sql: *const tokenized.ParsedSql) !void {
+    const parsed_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
+    const generated_kind = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
+    if (parsed_kind != generated_kind) return error.UnsupportedSqlShape;
 }
 
 pub fn lowerReadPlanFromGeneratedReadAstAlloc(
@@ -4482,6 +4489,39 @@ test "sql adapter lowering context lowers generated read AST through typed read 
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
     }
+}
+
+test "sql adapter lowering context requires generated read publication before generated lowering" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT u.id FROM usage_records AS u WHERE u.kind = 'order'",
+    );
+    defer parsed_sql.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, parsed_sql.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, parsed_sql.generatedReadStatementKind().?);
+
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read_ast| read_ast.source_alias_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+
+    try std.testing.expect(parsed_sql.generatedReadStatementKind() == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedReadPublishedKind(&parsed_sql));
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
+    );
 }
 
 test "sql adapter lowering context rejects malformed generated read AST ranges" {

@@ -3303,12 +3303,13 @@ pub fn preparedTransactionPlanFromGeneratedAstAlloc(
 
 pub fn preparedStatementPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
+    parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlPreparedAst,
 ) !PreparedStatementPlan {
+    const tokens = parsed_sql.items();
     try validateGeneratedPreparedAstRanges(tokens, ast);
     return switch (ast.kind) {
-        .prepare => .{ .prepare = try prepareStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .prepare => .{ .prepare = try prepareStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, ast) },
         .execute => .{ .execute = try executePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .deallocate => .{ .deallocate = try deallocatePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
@@ -3381,9 +3382,10 @@ fn validateGeneratedPreparedRequiredRangeAt(
 
 pub fn prepareStatementPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
+    parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlPreparedAst,
 ) !PrepareStatementPlan {
+    const tokens = parsed_sql.items();
     const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
     const inner = ast.inner_statement_tokens orelse return error.UnsupportedSqlShape;
     const statement_family = try generatedPreparedStatementFamilyAlloc(alloc, tokens, inner);
@@ -3398,14 +3400,12 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
         .statement_family = statement_family,
     };
     errdefer plan.deinit(alloc);
-    plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[inner.start..inner.end]);
-    errdefer {
-        if (plan.subject_sql) |subject_sql| {
-            alloc.free(@constCast(subject_sql));
-            plan.subject_sql = null;
-        }
-    }
-    plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+    plan.subject_parsed_sql = try tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, inner.start, inner.end);
+    errdefer if (plan.subject_parsed_sql) |*subject| {
+        subject.deinit(alloc);
+        plan.subject_parsed_sql = null;
+    };
+    plan.subject_sql = try alloc.dupe(u8, plan.subject_parsed_sql.?.statementSql());
     return plan;
 }
 
@@ -12729,7 +12729,7 @@ pub fn planGeneratedLogicalDdlAstAlloc(
 ) !?binder.LogicalSqlPlan {
     switch (generated_ast) {
         .session => |session_ast| return .{ .session = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, session_ast) },
-        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, prepared_ast) },
         .prepared_transaction => |prepared_transaction_ast| return .{ .transaction = .{ .prepared = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) } },
         .transaction => |transaction_ast| {
             const transaction = transactionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast) catch |err| switch (err) {
@@ -12997,7 +12997,7 @@ fn legacyDdlParserPlanFromGeneratedAstAlloc(
 ) !?LegacyDdlParserPlan {
     switch (generated_ast) {
         .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
-        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+        .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, prepared_ast) },
         .prepared_transaction => |prepared_transaction_ast| return .{ .prepared_transaction = try preparedTransactionPlanFromGeneratedAstAlloc(alloc, tokens, prepared_transaction_ast) },
         .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAstAlloc(alloc, tokens, transaction_ast),
         .cursor => |cursor_ast| return try cursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, cursor_ast),
@@ -18808,9 +18808,10 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
 test "sql adapter generated prepared AST lowers to prepared statement plans" {
     const alloc = std.testing.allocator;
 
-    var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    const generated_prepare_sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;";
+    var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, generated_prepare_sql);
     defer generated_prepare.deinit(alloc);
-    var legacy_prepare = try legacyDdlParserPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    var legacy_prepare = try legacyDdlParserPlanForTestAlloc(alloc, generated_prepare_sql);
     defer legacy_prepare.deinit(alloc);
     switch (generated_prepare) {
         .prepare => |generated| switch (legacy_prepare) {
@@ -18820,6 +18821,9 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
                     try std.testing.expectEqual(legacy.parameter_count, generated.parameter_count);
                     try std.testing.expectEqual(legacy.statement_kind, generated.statement_kind);
                     try std.testing.expectEqual(legacy.statement_family, generated.statement_family);
+                    const subject = generated.subject_parsed_sql orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqualStrings(generated_prepare_sql, subject.sql());
+                    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.statementSql());
                 },
                 else => return error.TestUnexpectedResult,
             },
@@ -18935,7 +18939,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
     malformed_span_ast.statement_span.start += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_span.items(), malformed_span_ast),
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_span, malformed_span_ast),
     );
 
     var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "EXECUTE usage_plan('open');");
@@ -18948,7 +18952,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
     malformed_command_ast.command_span.end += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_command.items(), malformed_command_ast),
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_command, malformed_command_ast),
     );
 
     var malformed_prepare_layout = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records;");
@@ -18961,7 +18965,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
     malformed_prepare_layout_ast.inner_statement_tokens.?.start -= 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_prepare_layout.items(), malformed_prepare_layout_ast),
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_prepare_layout, malformed_prepare_layout_ast),
     );
 
     var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE usage_plan;");
@@ -18974,7 +18978,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
     mismatched_kind_ast.kind = .execute;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, mismatched_kind.items(), mismatched_kind_ast),
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &mismatched_kind, mismatched_kind_ast),
     );
 }
 
@@ -18986,7 +18990,7 @@ fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []c
         .prepared => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    return try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed.items(), prepared_ast);
+    return try preparedStatementPlanFromGeneratedAstAlloc(alloc, &parsed, prepared_ast);
 }
 
 fn generatedSessionCatalogPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !SessionCatalogPlan {

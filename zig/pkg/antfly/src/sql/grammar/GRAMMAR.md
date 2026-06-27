@@ -1173,6 +1173,11 @@ contract until storage and API row plans grow those outer-join semantics.
    with missing or invalid retained AST payloads now become unknown parsed
    statements at the parsed-statement boundary even when the legacy classifier
    can still name the same read family.
+   Read-plan lowering also rechecks that the current generated read AST still
+   publishes the same read family as the parsed statement before dispatching
+   through the generated-AST path, so corrupted retained read metadata cannot
+   bypass parsed-statement publication and be reinterpreted by typed token
+   planning.
    Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now

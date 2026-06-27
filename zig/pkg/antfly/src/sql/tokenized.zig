@@ -164,7 +164,7 @@ pub const TokenizedSql = struct {
     }
 
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, sql: []const u8, source_tokens: []const Token) !TokenizedSql {
-        var tokens = try cloneTokensAlloc(alloc, source_tokens);
+        var tokens = try cloneTokensForSourceSqlAlloc(alloc, sql, source_tokens);
         errdefer lexer.freeTokens(alloc, &tokens);
         return .{
             .sql = sql,
@@ -178,7 +178,7 @@ pub const TokenizedSql = struct {
         source_tokens: []const Token,
         ranges: []const TokenRange,
     ) !TokenizedSql {
-        var tokens = try cloneTokenRangesAlloc(alloc, source_tokens, ranges);
+        var tokens = try cloneTokenRangesForSourceSqlAlloc(alloc, sql, source_tokens, ranges);
         errdefer lexer.freeTokens(alloc, &tokens);
         return .{
             .sql = sql,
@@ -4864,16 +4864,14 @@ fn matchToken(tokens: []const Token, index: *usize, end: usize, kind: token_mod.
 }
 
 fn cloneTokensAlloc(alloc: std.mem.Allocator, source_tokens: []const Token) !std.ArrayListUnmanaged(Token) {
+    return try cloneTokensForSourceSqlAlloc(alloc, null, source_tokens);
+}
+
+fn cloneTokensForSourceSqlAlloc(alloc: std.mem.Allocator, source_sql: ?[]const u8, source_tokens: []const Token) !std.ArrayListUnmanaged(Token) {
     var out = try std.ArrayListUnmanaged(Token).initCapacity(alloc, source_tokens.len);
     errdefer lexer.freeTokens(alloc, &out);
     for (source_tokens) |token| {
-        var cloned = token;
-        if (token.owned) {
-            cloned.text = try alloc.dupe(u8, token.text);
-            cloned.owned = true;
-        } else {
-            cloned.owned = false;
-        }
+        const cloned = try cloneTokenForSourceSqlAlloc(alloc, source_sql, token);
         out.appendAssumeCapacity(cloned);
     }
     return out;
@@ -4881,6 +4879,15 @@ fn cloneTokensAlloc(alloc: std.mem.Allocator, source_tokens: []const Token) !std
 
 fn cloneTokenRangesAlloc(
     alloc: std.mem.Allocator,
+    source_tokens: []const Token,
+    ranges: []const TokenRange,
+) !std.ArrayListUnmanaged(Token) {
+    return try cloneTokenRangesForSourceSqlAlloc(alloc, null, source_tokens, ranges);
+}
+
+fn cloneTokenRangesForSourceSqlAlloc(
+    alloc: std.mem.Allocator,
+    source_sql: ?[]const u8,
     source_tokens: []const Token,
     ranges: []const TokenRange,
 ) !std.ArrayListUnmanaged(Token) {
@@ -4893,17 +4900,27 @@ fn cloneTokenRangesAlloc(
     errdefer lexer.freeTokens(alloc, &out);
     for (ranges) |range| {
         for (source_tokens[range.start..range.end]) |token| {
-            var cloned = token;
-            if (token.owned) {
-                cloned.text = try alloc.dupe(u8, token.text);
-                cloned.owned = true;
-            } else {
-                cloned.owned = false;
-            }
+            const cloned = try cloneTokenForSourceSqlAlloc(alloc, source_sql, token);
             out.appendAssumeCapacity(cloned);
         }
     }
     return out;
+}
+
+fn cloneTokenForSourceSqlAlloc(alloc: std.mem.Allocator, source_sql: ?[]const u8, token: Token) !Token {
+    var cloned = token;
+    if (token.owned) {
+        cloned.text = try alloc.dupe(u8, token.text);
+        cloned.owned = true;
+        return cloned;
+    }
+    cloned.owned = false;
+    if (source_sql) |sql| {
+        if (token.source_start < token.source_end and token.source_end <= sql.len) {
+            cloned.text = sql[token.source_start..token.source_end];
+        }
+    }
+    return cloned;
 }
 
 fn parseRawStatementBounds(tokens: []const Token) !RawSqlStatement {
