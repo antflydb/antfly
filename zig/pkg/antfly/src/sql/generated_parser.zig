@@ -2377,8 +2377,32 @@ pub fn parseTokensAllocWithAstMode(
     }
 
     const statement = classifyStatement(tokens);
-    if (grammar_statement_kind != std.meta.activeTag(statement)) return error.UnsupportedSqlShape;
+    if (!generatedGrammarKindMatchesStatement(grammar_statement_kind, statement, tokens)) return error.UnsupportedSqlShape;
     return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
+}
+
+fn generatedGrammarKindMatchesStatement(
+    grammar_statement_kind: GeneratedSqlStatementKind,
+    statement: GeneratedSqlStatement,
+    tokens: []const token_mod.Token,
+) bool {
+    const statement_kind = std.meta.activeTag(statement);
+    if (grammar_statement_kind == statement_kind) return true;
+    if (grammar_statement_kind != .unsupported) return false;
+    return generatedUnsupportedGrammarRoleAliasMatchesDdl(statement, tokens);
+}
+
+fn generatedUnsupportedGrammarRoleAliasMatchesDdl(statement: GeneratedSqlStatement, tokens: []const token_mod.Token) bool {
+    if (tokens.len < 2 or !tokens[1].matchesKeywordTag(.user)) return false;
+    return switch (statement) {
+        .ddl => |ddl| switch (ddl) {
+            .create_role => tokens[0].matchesKeywordTag(.create) and !(tokens.len > 2 and tokens[2].matchesKeyword("mapping")),
+            .alter_role => tokens[0].matchesKeywordTag(.alter) and !(tokens.len > 2 and tokens[2].matchesKeyword("mapping")),
+            .drop_role => tokens[0].matchesKeywordTag(.drop) and !(tokens.len > 2 and tokens[2].matchesKeyword("mapping")),
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn parseGeneratedTokenIds(alloc: std.mem.Allocator, token_ids: []const u16) !void {
@@ -2537,7 +2561,11 @@ fn generatedTokenEnd(tokens: []const token_mod.Token) usize {
 }
 
 pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
-    if (!isFirstFamilyTokens(tokens)) return null;
+    const kind = parseStatementKindFromGrammarAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => return null,
+        else => return err,
+    };
+    if (!generatedStatementKindIsFirstFamily(kind)) return null;
     return try parseTokensAlloc(alloc, tokens);
 }
 
@@ -2573,14 +2601,16 @@ pub fn parseGeneratedGateTokensStrictAllocWithAstMode(
     tokens: []const token_mod.Token,
     ast_mode: GeneratedSqlAstMode,
 ) !?GeneratedSqlParseResult {
-    const kind = classifyTokens(tokens);
-    if (kind == .other) return null;
+    if (tokens.len == 0) return null;
     return try parseTokensAllocWithAstMode(alloc, tokens, ast_mode);
 }
 
-pub fn isFirstFamilyTokens(tokens: []const token_mod.Token) bool {
-    const kind = classifyTokens(tokens);
+fn generatedStatementKindIsFirstFamily(kind: GeneratedSqlStatementKind) bool {
     return kind == .session or kind == .transaction or kind == .prepared or kind == .prepared_transaction;
+}
+
+pub fn isFirstFamilyTokens(tokens: []const token_mod.Token) bool {
+    return generatedStatementKindIsFirstFamily(classifyTokens(tokens));
 }
 
 pub fn isGeneratedGateTokens(tokens: []const token_mod.Token) bool {
@@ -11307,17 +11337,17 @@ test "generated SQL parser facade builds null logical and join AST spans" {
         switch (result.ast.?) {
             .read => |read| {
                 try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.source_tokens.?);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.join_tokens.?);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, read.join_operator_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, read.source_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, read.join_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 6 }, read.join_operator_tokens.?);
                 try std.testing.expectEqual(case.kind, read.join_kind.?);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_left_tokens.?);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.join_right_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_left_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.join_right_tokens.?);
                 try std.testing.expect(read.join_predicate_tokens == null);
                 try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
                 try std.testing.expectEqual(case.kind, read.join_items[0].kind);
                 try std.testing.expectEqual(GeneratedSqlJoinConditionKind.none, read.join_items[0].condition_kind);
-                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 9 }, read.join_items[0].condition_tokens);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 7 }, read.join_items[0].condition_tokens);
                 try std.testing.expect(read.join_items[0].predicate_tokens == null);
                 try std.testing.expect(read.join_items[0].using_tokens == null);
             },
@@ -13228,6 +13258,29 @@ test "generated SQL parser validates normal parse path against grammar family" {
     }
 }
 
+test "generated SQL gate is admitted by grammar family" {
+    const cases = [_]GeneratedSqlCorpusCase{
+        .{ .sql = "RELEASE before_retry", .kind = .transaction },
+        .{ .sql = "MOVE FROM usage_cursor", .kind = .cursor },
+        .{ .sql = "CREATE VIEW active_usage AS SELECT id FROM usage_records", .kind = .ddl },
+        .{ .sql = "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard')", .kind = .extension_index },
+        .{ .sql = "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3)", .kind = .extension_index },
+        .{ .sql = "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384)", .kind = .extension_index },
+        .{ .sql = "SET ROLE app_user", .kind = .unsupported },
+        .{ .sql = "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)", .kind = .unsupported },
+        .{ .sql = "DROP ROUTINE IF EXISTS normalize_status(text) CASCADE", .kind = .unsupported },
+    };
+
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(std.testing.allocator, case.sql);
+        defer lexer.freeTokens(std.testing.allocator, &tokens);
+
+        var result = (try parseGeneratedGateTokensStrictAlloc(std.testing.allocator, tokens.items)) orelse return error.TestUnexpectedResult;
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.kind, result.kind);
+    }
+}
+
 test "generated SQL parser diagnostics map generated token indexes to source tokens" {
     const sql = "SELECT public.docs. FROM public.docs";
     var tokens = try lexer.tokenizeAlloc(std.testing.allocator, sql);
@@ -13369,7 +13422,19 @@ fn exerciseGeneratedParserFuzzSql(alloc: std.mem.Allocator, sql: []const u8) !vo
     defer lexer.freeTokens(alloc, &tokens);
 
     var parsed = parseTokensAlloc(alloc, tokens.items) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => {
+        error.UnsupportedSqlShape => {
+            const diagnostic = diagnosticAlloc(alloc, tokens.items) catch |diagnostic_err| switch (diagnostic_err) {
+                error.UnsupportedSqlShape => return,
+                else => return diagnostic_err,
+            } orelse return;
+            defer alloc.free(diagnostic.expected);
+            try std.testing.expect(diagnostic.token_index <= tokens.items.len);
+            try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+            try std.testing.expect(diagnostic.source_end <= sql.len);
+            try std.testing.expect(diagnostic.expected.len > 0);
+            return;
+        },
+        error.UnexpectedToken => {
             const diagnostic = diagnosticAlloc(alloc, tokens.items) catch |diagnostic_err| switch (diagnostic_err) {
                 error.UnsupportedSqlShape => return,
                 else => return diagnostic_err,

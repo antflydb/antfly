@@ -1147,7 +1147,12 @@ index_element_list:
   ;
 
 index_element:
-    expression index_element_temporal_opt order_modifier_opt nulls_order_opt
+    expression index_element_opclass_opt index_element_temporal_opt order_modifier_opt nulls_order_opt
+  ;
+
+index_element_opclass_opt:
+    /* empty */
+  | identifier_name
   ;
 
 index_element_temporal_opt:

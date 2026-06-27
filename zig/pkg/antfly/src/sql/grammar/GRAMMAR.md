@@ -114,7 +114,12 @@ the grammar fallbacks to be narrower: valid savepoint release and cursor `MOVE`
 forms reduce through transaction/cursor families, role/session authorization
 controls reduce as unsupported, symbolic `CREATE/DROP OPERATOR` remains DDL
 while operator class/family forms remain unsupported, and generic `CREATE`
-fallbacks no longer steal supported DDL such as `CREATE VIEW`. The
+fallbacks no longer steal supported DDL such as `CREATE VIEW`. Generated-gate
+admission now comes from the grammar parse itself rather than the hand-written
+token-head classifier, so production ingress no longer decides generated
+coverage by probing legacy statement heads before running the generated parser.
+The remaining legacy classifier dependency is the detailed statement-variant
+builder used after grammar family validation. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
