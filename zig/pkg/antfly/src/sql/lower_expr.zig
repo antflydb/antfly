@@ -26380,6 +26380,24 @@ fn validateGeneratedExpressionPredicateKind(
     if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedNullishPredicateKind(
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    op: runtime_schema.RelationalCheckOp,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    switch (op) {
+        .is_null => switch (expression.kind) {
+            .is_null, .is_unknown => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        .is_not_null => switch (expression.kind) {
+            .is_not_null, .is_not_unknown => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 fn rejectGeneratedUnsupportedSubqueryPredicateExpression(
     tokens: []const Token,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
@@ -26668,6 +26686,7 @@ fn validateGeneratedRelationalPredicateExpression(
 ) !void {
     switch (op) {
         .eq, .ne, .gt, .gte, .lt, .lte => try validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, operator_token_index, op),
+        .is_null, .is_not_null => try validateGeneratedNullishPredicateKind(generated_expression_ast, op),
         else => try validateGeneratedExpressionPredicateKind(generated_expression_ast, generatedComparisonExpressionKindForOp(op)),
     }
 }
