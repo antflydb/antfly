@@ -4566,9 +4566,9 @@ pub const ApiHttpServer = struct {
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         try self.rejectUnsupportedDocumentSqlViewMappingForDurablePlan(durable_plan.*, session.session());
         switch (durable_plan.*) {
-            .auth => {
+            .auth => |auth_plan| {
                 if (self.cfg.user_manager) |manager| {
-                    var catalog = try self.sqlAuthCatalogForDurablePlanWithSession(durable_plan.*, session.session());
+                    var catalog = try auth_sql_adapter.authCatalogForPlanWithSessionAlloc(self.alloc, self.catalogSource(), auth_plan, session.session());
                     defer catalog.deinit(self.alloc);
                     if (try auth_sql_adapter.executeRelationalSqlDurablePlanOnUserManagerWithCatalog(manager, self.alloc, durable_plan, catalog.value)) |applied_value| {
                         var applied = applied_value;
@@ -4597,13 +4597,6 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
         }
-    }
-
-    fn sqlAuthCatalogForDurablePlanWithSession(self: *ApiHttpServer, plan: sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
-        return switch (plan) {
-            .auth => |auth_plan| try self.sqlAuthCatalogForAuthLogicalPlanWithSession(auth_plan, session),
-            else => error.UnsupportedSqlShape,
-        };
     }
 
     fn applyTriggerCatalogPlanWithUpdatePolicyFallback(
@@ -9335,94 +9328,6 @@ pub const ApiHttpServer = struct {
             query.expression_predicates.len != 0 or
             query.access_or_predicates.len != 0 or
             query.expression_or_predicates.len != 0;
-    }
-
-    const OwnedSqlAuthCatalog = struct {
-        value: auth_sql_adapter.SqlAuthCatalog = .{},
-        public_table_names: []const []const u8 = &.{},
-        tables: []const auth_sql_adapter.SqlAuthTableRef = &.{},
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            for (self.public_table_names) |name| alloc.free(@constCast(name));
-            if (self.public_table_names.len > 0) alloc.free(self.public_table_names);
-            for (self.tables) |table| {
-                alloc.free(@constCast(table.database_name));
-                alloc.free(@constCast(table.namespace_name));
-                alloc.free(@constCast(table.table_name));
-                alloc.free(@constCast(table.schema_json));
-            }
-            if (self.tables.len > 0) alloc.free(self.tables);
-            self.* = undefined;
-        }
-    };
-
-    fn sqlAuthCatalogForAuthLogicalPlanWithSession(self: *ApiHttpServer, plan: sql_adapter.AuthorizationLogicalPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
-        const needs_table_catalog = switch (plan) {
-            .authorization_catalog => |authorization_plan| switch (authorization_plan) {
-                .grant_privilege => |grant| std.ascii.eqlIgnoreCase(grant.object_kind, "table") or std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"),
-                .revoke_privilege => |revoke| std.ascii.eqlIgnoreCase(revoke.object_kind, "table") or std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema"),
-                else => false,
-            },
-            .row_security_catalog => true,
-        };
-        if (!needs_table_catalog) return .{
-            .value = .{
-                .database_name = session.currentDatabase(),
-                .search_path = session.search_path,
-                .settings = session.settings,
-            },
-        };
-
-        var snapshot = (try self.source.adminSnapshot()) orelse return error.UnsupportedOperation;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const names = try self.alloc.alloc([]const u8, snapshot.tables.len);
-        const table_refs = try self.alloc.alloc(auth_sql_adapter.SqlAuthTableRef, snapshot.tables.len);
-        var filled: usize = 0;
-        errdefer {
-            for (names[0..filled]) |name| self.alloc.free(@constCast(name));
-            self.alloc.free(names);
-            for (table_refs[0..filled]) |table| {
-                self.alloc.free(@constCast(table.database_name));
-                self.alloc.free(@constCast(table.namespace_name));
-                self.alloc.free(@constCast(table.table_name));
-                self.alloc.free(@constCast(table.schema_json));
-            }
-            self.alloc.free(table_refs);
-        }
-        for (snapshot.tables) |table| {
-            {
-                const name = try self.alloc.dupe(u8, table.name);
-                errdefer self.alloc.free(name);
-                const database_name = try self.alloc.dupe(u8, table.database_name);
-                errdefer self.alloc.free(database_name);
-                const namespace_name = try self.alloc.dupe(u8, table.namespace_name);
-                errdefer self.alloc.free(namespace_name);
-                const table_name = try self.alloc.dupe(u8, table.name);
-                errdefer self.alloc.free(table_name);
-                const schema_json = try self.alloc.dupe(u8, table.schema_json);
-                errdefer self.alloc.free(schema_json);
-
-                names[filled] = name;
-                table_refs[filled] = .{
-                    .database_name = database_name,
-                    .namespace_name = namespace_name,
-                    .table_name = table_name,
-                    .schema_json = schema_json,
-                };
-                filled += 1;
-            }
-        }
-        return .{
-            .value = .{
-                .database_name = session.currentDatabase(),
-                .search_path = session.search_path,
-                .settings = session.settings,
-                .public_table_names = names[0..filled],
-                .tables = table_refs[0..filled],
-            },
-            .public_table_names = names,
-            .tables = table_refs,
-        };
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
@@ -27119,8 +27024,8 @@ test "api http server applies authorization SQL DDL through user manager" {
     ;
     const FakeSource = struct {
         tables: [2]metadata_table_manager.TableRecord = .{
-            .{ .table_id = 1, .name = "usage_records", .schema_json = usage_schema_json },
-            .{ .table_id = 2, .name = "docs" },
+            .{ .table_id = 1, .name = "usage_records", .database_name = "default", .namespace_name = "public", .schema_json = usage_schema_json },
+            .{ .table_id = 2, .name = "docs", .database_name = "default", .namespace_name = "public", .schema_json = usage_schema_json },
         },
 
         fn iface(self: *@This()) StatusSource {
@@ -27522,6 +27427,9 @@ test "api http server derives public SQL DDL command tags from parsed statements
 
 test "api http server applies SQL DDL with explicit catalog session" {
     const alloc = std.testing.allocator;
+    const events_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
     const FakeSource = struct {
         saw_session_create: bool = false,
         tables: [1]metadata_table_manager.TableRecord = .{.{
@@ -27529,6 +27437,7 @@ test "api http server applies SQL DDL with explicit catalog session" {
             .name = "events",
             .database_name = "tenant_ops",
             .namespace_name = "analytics",
+            .schema_json = events_schema_json,
         }},
 
         fn iface(self: *@This()) StatusSource {
@@ -27536,6 +27445,8 @@ test "api http server applies SQL DDL with explicit catalog session" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 },
             };

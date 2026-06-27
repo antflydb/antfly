@@ -573,7 +573,11 @@ kind, span, role name, operation tail, or `IF EXISTS` metadata is corrupted
 before delegating to the typed authorization catalog planner; role validation
 also requires the generated role-name range to start after the exact
 role/user/group alias header and any generated operation tail to begin at the
-recorded role-name boundary. Legacy-supported
+recorded role-name boundary. API durable execution and direct adapter execution
+share the same auth catalog construction for generated auth and row-security
+DDL, so `GRANT`/`REVOKE` table resolution and row-security policy validation
+see the same live table names, database/schema qualifiers, session settings,
+and schema JSON. Legacy-supported
 type-system catalog operations use validated generated DDL AST nodes for
 `CREATE/ALTER/DROP COLLATION`, `CREATE/DROP OPERATOR`,
 `CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, while

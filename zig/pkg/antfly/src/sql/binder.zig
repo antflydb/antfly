@@ -896,7 +896,7 @@ fn boundCatalogObjectForCatalogTableAlloc(
     errdefer deinitCatalogTableRef(alloc, target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
     if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
     defer parsed.deinit(alloc);
@@ -2240,7 +2240,19 @@ fn collectAuthDdlBoundCatalogObjectsAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !void {
     switch (plan) {
-        .authorization_catalog => {},
+        .authorization_catalog => |authorization| switch (authorization) {
+            .grant_privilege => |grant| {
+                if (std.ascii.eqlIgnoreCase(grant.object_kind, "table")) {
+                    try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, grant.object_name, session, false);
+                }
+            },
+            .revoke_privilege => |revoke| {
+                if (std.ascii.eqlIgnoreCase(revoke.object_kind, "table")) {
+                    try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, revoke.object_name, session, false);
+                }
+            },
+            else => {},
+        },
         .row_security_catalog => |row_security| switch (row_security) {
             .alter_table => |alter| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, false),
             .create_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
@@ -3457,7 +3469,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         "VACUUM missing_usage_records",
     );
     defer parsed_missing_maintenance.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_maintenance, catalog.iface()));
+    try std.testing.expectError(error.TableNotFound, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_maintenance, catalog.iface()));
 
     var parsed_missing_reindex_index = try tokenized.ParsedSql.initAlloc(
         alloc,

@@ -57,6 +57,123 @@ pub const SqlAuthCatalog = struct {
     }
 };
 
+pub const OwnedSqlAuthCatalog = struct {
+    value: SqlAuthCatalog = .{},
+    public_table_names: []const []const u8 = &.{},
+    tables: []const SqlAuthTableRef = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.public_table_names) |name| alloc.free(@constCast(name));
+        if (self.public_table_names.len > 0) alloc.free(self.public_table_names);
+        for (self.tables) |table| {
+            alloc.free(@constCast(table.database_name));
+            alloc.free(@constCast(table.namespace_name));
+            alloc.free(@constCast(table.table_name));
+            alloc.free(@constCast(table.schema_json));
+        }
+        if (self.tables.len > 0) alloc.free(self.tables);
+        self.* = undefined;
+    }
+};
+
+pub fn authCatalogForPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    plan: sql_adapter.AuthorizationLogicalPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !OwnedSqlAuthCatalog {
+    const CatalogRequirement = enum { none, optional, required };
+    const catalog_requirement: CatalogRequirement = switch (plan) {
+        .authorization_catalog => |authorization_plan| switch (authorization_plan) {
+            .grant_privilege => |grant| if (std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"))
+                .required
+            else if (std.ascii.eqlIgnoreCase(grant.object_kind, "table"))
+                .optional
+            else
+                .none,
+            .revoke_privilege => |revoke| if (std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema"))
+                .required
+            else if (std.ascii.eqlIgnoreCase(revoke.object_kind, "table"))
+                .optional
+            else
+                .none,
+            else => .none,
+        },
+        .row_security_catalog => .required,
+    };
+    if (catalog_requirement == .none) return .{
+        .value = .{
+            .database_name = session.currentDatabase(),
+            .search_path = session.search_path,
+            .settings = session.settings,
+        },
+    };
+
+    var snapshot = catalog.adminSnapshot() catch |err| switch (err) {
+        error.UnsupportedOperation => if (catalog_requirement == .optional) return .{
+            .value = .{
+                .database_name = session.currentDatabase(),
+                .search_path = session.search_path,
+                .settings = session.settings,
+            },
+        } else return err,
+        else => return err,
+    };
+    defer catalog.freeAdminSnapshot(&snapshot);
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    var table_refs = std.ArrayListUnmanaged(SqlAuthTableRef).empty;
+    errdefer {
+        for (names.items) |name| alloc.free(@constCast(name));
+        names.deinit(alloc);
+        for (table_refs.items) |table| {
+            alloc.free(@constCast(table.database_name));
+            alloc.free(@constCast(table.namespace_name));
+            alloc.free(@constCast(table.table_name));
+            alloc.free(@constCast(table.schema_json));
+        }
+        table_refs.deinit(alloc);
+    }
+    try names.ensureTotalCapacity(alloc, snapshot.tables.len);
+    try table_refs.ensureTotalCapacity(alloc, snapshot.tables.len);
+    for (snapshot.tables) |table| {
+        const name = try alloc.dupe(u8, table.name);
+        errdefer alloc.free(name);
+        const database_name = try alloc.dupe(u8, table.database_name);
+        errdefer alloc.free(database_name);
+        const namespace_name = try alloc.dupe(u8, table.namespace_name);
+        errdefer alloc.free(namespace_name);
+        const table_name = try alloc.dupe(u8, table.name);
+        errdefer alloc.free(table_name);
+        const schema_json = try alloc.dupe(u8, table.schema_json);
+        errdefer alloc.free(schema_json);
+
+        names.appendAssumeCapacity(name);
+        table_refs.appendAssumeCapacity(.{
+            .database_name = database_name,
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+            .schema_json = schema_json,
+        });
+    }
+    const owned_names = try names.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_names) |name| alloc.free(@constCast(name));
+        if (owned_names.len > 0) alloc.free(owned_names);
+    }
+    const owned_tables = try table_refs.toOwnedSlice(alloc);
+    return .{
+        .value = .{
+            .database_name = session.currentDatabase(),
+            .search_path = session.search_path,
+            .settings = session.settings,
+            .public_table_names = owned_names,
+            .tables = owned_tables,
+        },
+        .public_table_names = owned_names,
+        .tables = owned_tables,
+    };
+}
+
 const SqlAuthCatalogSource = struct {
     tables: []metadata_table_manager.TableRecord = &.{},
 
@@ -154,13 +271,19 @@ pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindin
     catalog: SqlAuthCatalog,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var catalog_source = try SqlAuthCatalogSource.initAlloc(alloc, catalog);
-    defer catalog_source.deinit(alloc);
+    var catalog_source_storage: SqlAuthCatalogSource = undefined;
+    var catalog_source_initialized = false;
+    defer if (catalog_source_initialized) catalog_source_storage.deinit(alloc);
+    const catalog_source = if (catalog.tables.len > 0 or catalog.public_table_names != null) blk: {
+        catalog_source_storage = try SqlAuthCatalogSource.initAlloc(alloc, catalog);
+        catalog_source_initialized = true;
+        break :blk catalog_source_storage.iface();
+    } else table_catalog.unavailableCatalogSource();
 
     var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         parsed_sql,
-        catalog_source.iface(),
+        catalog_source,
         catalog.session(),
         function_bindings,
     );
@@ -880,6 +1003,145 @@ fn emptyTableRecordAlloc(alloc: std.mem.Allocator) !metadata_table_manager.Table
     });
 }
 
+const auth_test_usage_schema_json =
+    \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"region":{"type":"keyword"},"visibility":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+;
+
+const auth_test_catalog_tables = [_]SqlAuthTableRef{
+    .{ .database_name = "default", .namespace_name = "public", .table_name = "usage_records", .schema_json = auth_test_usage_schema_json },
+    .{ .database_name = "default", .namespace_name = "public", .table_name = "docs", .schema_json = auth_test_usage_schema_json },
+    .{ .database_name = "default", .namespace_name = "analytics", .table_name = "events", .schema_json = auth_test_usage_schema_json },
+    .{ .database_name = "tenant_ops", .namespace_name = "analytics", .table_name = "usage_records", .schema_json = auth_test_usage_schema_json },
+};
+
+fn authTestCatalog() SqlAuthCatalog {
+    return .{ .tables = auth_test_catalog_tables[0..] };
+}
+
+fn executeTestRelationalSqlDdlOnUserManager(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    return try executeRelationalSqlDdlOnUserManagerWithCatalog(manager, alloc, sql, authTestCatalog());
+}
+
+test "sql auth catalog builder shares live catalog tables for table-aware auth plans" {
+    const alloc = std.testing.allocator;
+    const search_path = [_][]const u8{"analytics"};
+    const settings = [_]catalog_resources.SqlSessionSetting{.{
+        .name = "application_name",
+        .value = "auth-catalog-test",
+    }};
+    const session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = search_path[0..],
+        .settings = settings[0..],
+    };
+
+    const FailingCatalogSource = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var failing_catalog = FailingCatalogSource{};
+    var create_role_plan: sql_adapter.AuthorizationLogicalPlan = .{ .authorization_catalog = .{ .create_role = .{
+        .role_name = try alloc.dupe(u8, "app_writer"),
+    } } };
+    defer create_role_plan.deinit(alloc);
+    var role_catalog = try authCatalogForPlanWithSessionAlloc(alloc, failing_catalog.iface(), create_role_plan, session);
+    defer role_catalog.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_ops", role_catalog.value.database_name);
+    try std.testing.expectEqual(@as(usize, 1), role_catalog.value.search_path.len);
+    try std.testing.expectEqualStrings("analytics", role_catalog.value.search_path[0]);
+    try std.testing.expectEqual(@as(usize, 1), role_catalog.value.settings.len);
+    try std.testing.expect(role_catalog.value.public_table_names == null);
+    try std.testing.expectEqual(@as(usize, 0), role_catalog.value.tables.len);
+
+    const catalog_tables = [_]SqlAuthTableRef{
+        .{
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .table_name = "events",
+            .schema_json = "{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"string\"}}}",
+        },
+        .{
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .table_name = "rollups",
+            .schema_json = "{\"type\":\"object\",\"properties\":{\"bucket\":{\"type\":\"string\"}}}",
+        },
+    };
+    var source = try SqlAuthCatalogSource.initAlloc(alloc, .{
+        .database_name = "tenant_ops",
+        .search_path = search_path[0..],
+        .settings = settings[0..],
+        .tables = catalog_tables[0..],
+    });
+    defer source.deinit(alloc);
+
+    var grant_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO app_writer;");
+    defer grant_sql.deinit(alloc);
+    var grant_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        &grant_sql,
+        source.iface(),
+        session,
+        .{},
+    );
+    defer grant_plan.deinit(alloc);
+    switch (grant_plan) {
+        .auth => |auth_plan| {
+            var grant_catalog = try authCatalogForPlanWithSessionAlloc(alloc, source.iface(), auth_plan, session);
+            defer grant_catalog.deinit(alloc);
+            const public_names = grant_catalog.value.public_table_names orelse return error.ExpectedPublicTableNames;
+            try std.testing.expectEqual(@as(usize, 2), public_names.len);
+            try std.testing.expectEqualStrings("events", public_names[0]);
+            try std.testing.expectEqualStrings("rollups", public_names[1]);
+            try std.testing.expectEqual(@as(usize, 2), grant_catalog.value.tables.len);
+            try std.testing.expectEqualStrings("tenant_ops", grant_catalog.value.tables[0].database_name);
+            try std.testing.expectEqualStrings("analytics", grant_catalog.value.tables[0].namespace_name);
+            try std.testing.expectEqualStrings("events", grant_catalog.value.tables[0].table_name);
+            try std.testing.expectEqualStrings(catalog_tables[0].schema_json, grant_catalog.value.tables[0].schema_json);
+        },
+        else => return error.ExpectedAuthPlan,
+    }
+
+    var row_security_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "ALTER TABLE events ENABLE ROW LEVEL SECURITY;");
+    defer row_security_sql.deinit(alloc);
+    var row_security_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        &row_security_sql,
+        source.iface(),
+        session,
+        .{},
+    );
+    defer row_security_plan.deinit(alloc);
+    switch (row_security_plan) {
+        .auth => |auth_plan| {
+            var row_security_catalog = try authCatalogForPlanWithSessionAlloc(alloc, source.iface(), auth_plan, session);
+            defer row_security_catalog.deinit(alloc);
+            try std.testing.expect(row_security_catalog.value.public_table_names != null);
+            try std.testing.expectEqual(@as(usize, 2), row_security_catalog.value.tables.len);
+            try std.testing.expectEqualStrings("rollups", row_security_catalog.value.tables[1].table_name);
+        },
+        else => return error.ExpectedAuthPlan,
+    }
+}
+
 test "sql auth adapter creates roles and applies table grants through user manager" {
     const alloc = std.testing.allocator;
 
@@ -897,7 +1159,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
     var user = try manager.createUser("alice", "secret", &.{});
     defer user.deinit(alloc);
 
-    try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE usage_records TO app_writer;"));
+    try std.testing.expectError(error.RoleNotFound, executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE usage_records TO app_writer;"));
 
     var create_role_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "CREATE ROLE app_writer;");
     defer create_role_sql.deinit(alloc);
@@ -969,23 +1231,23 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.analytics.events", .read)));
     try manager.removeRoleFromUser("alice", "role:app_writer");
 
-    var granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;")).?;
+    var granted = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;")).?;
     defer granted.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .write));
 
-    var revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;")).?;
+    var revoked = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;")).?;
     defer revoked.deinit(alloc);
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .write)));
     try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
 
-    var qualified_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE analytics.events TO app_writer;")).?;
+    var qualified_granted = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE analytics.events TO app_writer;")).?;
     defer qualified_granted.deinit(alloc);
     try std.testing.expect(try manager.enforce("alice", .table, "default.analytics.events", .read));
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.events", .read)));
-    var qualified_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE SELECT ON TABLE analytics.events FROM app_writer;")).?;
+    var qualified_revoked = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE SELECT ON TABLE analytics.events FROM app_writer;")).?;
     defer qualified_revoked.deinit(alloc);
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.analytics.events", .read)));
 
@@ -996,13 +1258,13 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expect(try manager.enforce("alice", .database, "tenant_ops", .read));
     try std.testing.expect(try manager.enforce("alice", .namespace, "default.analytics", .read));
 
-    var all_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;")).?;
+    var all_granted = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;")).?;
     defer all_granted.deinit(alloc);
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .write));
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .admin));
 
-    var all_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE ALL PRIVILEGES ON TABLE usage_records FROM app_writer;")).?;
+    var all_revoked = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE ALL PRIVILEGES ON TABLE usage_records FROM app_writer;")).?;
     defer all_revoked.deinit(alloc);
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .read)));
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .write)));
@@ -1013,8 +1275,8 @@ test "sql auth adapter creates roles and applies table grants through user manag
     defer schema_usage_revoked.deinit(alloc);
     try std.testing.expect(!(try manager.enforce("alice", .database, "tenant_ops", .read)));
     try std.testing.expect(!(try manager.enforce("alice", .namespace, "default.analytics", .read)));
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
 
     try manager.removeRoleFromUser("alice", "role:app_writer");
@@ -1191,7 +1453,7 @@ test "sql auth adapter grants directly to existing antfly users" {
     var user = try manager.createUser("alice", "secret", &.{});
     defer user.deinit(alloc);
 
-    var granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE docs TO alice;")).?;
+    var granted = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE docs TO alice;")).?;
     defer granted.deinit(alloc);
 
     try std.testing.expect(try manager.enforce("alice", .table, "default.public.docs", .read));
@@ -1229,12 +1491,12 @@ test "sql auth adapter applies row security policies through user manager" {
 
     const usage_records_resource = "default.public.usage_records";
 
-    var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    var enabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
     defer enabled.deinit(alloc);
     try std.testing.expect(try manager.sqlRowSecurityEnabled(usage_records_resource));
     try std.testing.expect(!(try manager.sqlRowSecurityEnabled("usage_records")));
 
-    var created = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));")).?;
+    var created = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));")).?;
     defer created.deinit(alloc);
 
     const stored = try manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", usage_records_resource);
@@ -1242,13 +1504,13 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"tenant_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"$auth\":\"settings.app.tenant_id\"") != null);
 
-    var literal_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_literal_policy ON usage_records USING (status = 'active');")).?;
+    var literal_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_literal_policy ON usage_records USING (status = 'active');")).?;
     defer literal_policy.deinit(alloc);
     const stored_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", usage_records_resource);
     defer alloc.free(stored_literal);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", stored_literal);
 
-    var check_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_check_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');")).?;
+    var check_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_check_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');")).?;
     defer check_policy.deinit(alloc);
     const stored_check_read = try manager.getSqlRowSecurityPolicy("usage_records_check_policy", usage_records_resource);
     defer alloc.free(stored_check_read);
@@ -1257,7 +1519,7 @@ test "sql auth adapter applies row security policies through user manager" {
     defer alloc.free(stored_check_write);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", stored_check_write);
 
-    var expression_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');")).?;
+    var expression_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');")).?;
     defer expression_policy.deinit(alloc);
     const stored_expression = try manager.getSqlRowSecurityPolicy("usage_records_lower_policy", usage_records_resource);
     defer alloc.free(stored_expression);
@@ -1265,24 +1527,24 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expect(std.mem.indexOf(u8, stored_expression, "\"op\":\"lower\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored_expression, "\"field\":\"status\"") != null);
 
-    var compound_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');")).?;
+    var compound_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');")).?;
     defer compound_policy.deinit(alloc);
     const stored_compound = try manager.getSqlRowSecurityPolicy("usage_records_compound_policy", usage_records_resource);
     defer alloc.free(stored_compound);
     try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_compound);
 
-    var disjunction_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');")).?;
+    var disjunction_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');")).?;
     defer disjunction_policy.deinit(alloc);
     const stored_disjunction = try manager.getSqlRowSecurityPolicy("usage_records_or_policy", usage_records_resource);
     defer alloc.free(stored_disjunction);
     try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_disjunction);
-    var mixed_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');")).?;
+    var mixed_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');")).?;
     defer mixed_policy.deinit(alloc);
     const stored_mixed = try manager.getSqlRowSecurityPolicy("usage_records_mixed_policy", usage_records_resource);
     defer alloc.free(stored_mixed);
     try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"region\":\"us\"}}]}]}", stored_mixed);
 
-    var altered_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
+    var altered_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
     defer altered_policy.deinit(alloc);
     const altered_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", usage_records_resource);
     defer alloc.free(altered_literal);
@@ -1291,7 +1553,7 @@ test "sql auth adapter applies row security policies through user manager" {
     defer alloc.free(altered_literal_check);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", altered_literal_check);
 
-    var altered_check_only_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_check_policy ON usage_records WITH CHECK (status = 'ready');")).?;
+    var altered_check_only_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_check_policy ON usage_records WITH CHECK (status = 'ready');")).?;
     defer altered_check_only_policy.deinit(alloc);
     const preserved_check_read = try manager.getSqlRowSecurityPolicy("usage_records_check_policy", usage_records_resource);
     defer alloc.free(preserved_check_read);
@@ -1299,7 +1561,7 @@ test "sql auth adapter applies row security policies through user manager" {
     const altered_check_only = try manager.getSqlRowSecurityPolicyCheck("usage_records_check_policy", usage_records_resource);
     defer alloc.free(altered_check_only);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"ready\"}}", altered_check_only);
-    try std.testing.expectError(error.RowFilterNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY missing_policy ON usage_records USING (status = 'active');"));
+    try std.testing.expectError(error.RowFilterNotFound, executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY missing_policy ON usage_records USING (status = 'active');"));
 
     const filters = try manager.getRowFilters("alice");
     defer {
@@ -1324,8 +1586,8 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expect(std.mem.indexOf(u8, write_filters[0].filter, "\"status\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_filters[0].filter, "\"status\":\"ready\"") != null);
 
-    try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
-    var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    try std.testing.expectError(error.PolicyExists, executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
+    var disabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
     defer disabled.deinit(alloc);
     try std.testing.expect(!disabled.noop);
     try std.testing.expect(!(try manager.sqlRowSecurityEnabled(usage_records_resource)));
@@ -1335,15 +1597,15 @@ test "sql auth adapter applies row security policies through user manager" {
         alloc.free(filters_after_disable);
     }
     try std.testing.expectEqual(@as(usize, 0), filters_after_disable.len);
-    var disabled_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    var disabled_again = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
     defer disabled_again.deinit(alloc);
     try std.testing.expect(disabled_again.noop);
 
-    var dropped = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;")).?;
+    var dropped = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;")).?;
     defer dropped.deinit(alloc);
     try std.testing.expectError(error.RowFilterNotFound, manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", usage_records_resource));
 
-    var missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;")).?;
+    var missing = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;")).?;
     defer missing.deinit(alloc);
     try std.testing.expect(missing.noop);
 }
@@ -1373,14 +1635,14 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     defer writer.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_reader");
 
-    var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;")).?;
+    var enabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;")).?;
     defer enabled.deinit(alloc);
     try std.testing.expectError(
         error.RoleNotFound,
-        executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY unknown_target ON docs TO missing_role USING (tenant_id = 'missing');"),
+        executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY unknown_target ON docs TO missing_role USING (tenant_id = 'missing');"),
     );
 
-    var targeted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_reader_policy ON docs TO app_reader USING (tenant_id = 'reader');")).?;
+    var targeted = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_reader_policy ON docs TO app_reader USING (tenant_id = 'reader');")).?;
     defer targeted.deinit(alloc);
 
     const alice_reader_filters = try manager.getRowFilters("alice");
@@ -1398,7 +1660,7 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     }
     try std.testing.expectEqual(@as(usize, 0), bob_reader_filters.len);
 
-    var public_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_public_policy ON docs TO PUBLIC USING (visibility = 'public');")).?;
+    var public_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_public_policy ON docs TO PUBLIC USING (visibility = 'public');")).?;
     defer public_policy.deinit(alloc);
     const bob_public_filters = try manager.getRowFilters("bob");
     defer {
@@ -1410,7 +1672,7 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     try std.testing.expect(std.mem.indexOf(u8, bob_public_filters[0].filter, "\"tenant_id\":\"reader\"") == null);
 
     try manager.addRoleToUser("bob", "role:app_writer");
-    var altered_target_only = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer;")).?;
+    var altered_target_only = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer;")).?;
     defer altered_target_only.deinit(alloc);
     const docs_resource = try sqlAuthTableResourceNameAlloc(alloc, "docs", .{});
     defer alloc.free(docs_resource);
@@ -1427,7 +1689,7 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     try std.testing.expect(std.mem.indexOf(u8, bob_writer_reader_filters[0].filter, "\"tenant_id\":\"reader\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bob_writer_reader_filters[0].filter, "\"visibility\":\"public\"") != null);
 
-    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer USING (tenant_id = 'writer');")).?;
+    var altered = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer USING (tenant_id = 'writer');")).?;
     defer altered.deinit(alloc);
 
     const alice_writer_filters = try manager.getRowFilters("alice");
@@ -1449,7 +1711,7 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     try std.testing.expect(std.mem.indexOf(u8, bob_writer_filters[0].filter, "\"visibility\":\"public\"") != null);
 
     try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
-    var dropped_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY docs_reader_policy ON docs;")).?;
+    var dropped_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY docs_reader_policy ON docs;")).?;
     defer dropped_policy.deinit(alloc);
     try manager.removeRoleFromUser("bob", "role:app_writer");
     var dropped_writer = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
@@ -1476,13 +1738,13 @@ test "sql auth adapter row security uses qualified catalog table resources" {
     const default_resource = "default.public.usage_records";
     const tenant_resource = "tenant_ops.analytics.usage_records";
 
-    var default_enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    var default_enabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
     defer default_enabled.deinit(alloc);
     var tenant_enabled = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
         &manager,
         alloc,
         "ALTER TABLE analytics.usage_records ENABLE ROW LEVEL SECURITY;",
-        .{ .database_name = "tenant_ops" },
+        .{ .database_name = "tenant_ops", .tables = auth_test_catalog_tables[0..] },
     )).?;
     defer tenant_enabled.deinit(alloc);
 
@@ -1490,13 +1752,13 @@ test "sql auth adapter row security uses qualified catalog table resources" {
     try std.testing.expect(try manager.sqlRowSecurityEnabled(tenant_resource));
     try std.testing.expect(!(try manager.sqlRowSecurityEnabled("usage_records")));
 
-    var default_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_default_policy ON usage_records USING (tenant_id = 'default');")).?;
+    var default_policy = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_default_policy ON usage_records USING (tenant_id = 'default');")).?;
     defer default_policy.deinit(alloc);
     var tenant_policy = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
         &manager,
         alloc,
         "CREATE POLICY usage_tenant_policy ON analytics.usage_records USING (tenant_id = 'tenant_ops');",
-        .{ .database_name = "tenant_ops" },
+        .{ .database_name = "tenant_ops", .tables = auth_test_catalog_tables[0..] },
     )).?;
     defer tenant_policy.deinit(alloc);
 
@@ -1543,7 +1805,7 @@ test "sql row security policies are inert until row security is enabled" {
 
     const usage_records_resource = "default.public.usage_records";
 
-    var created = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));")).?;
+    var created = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));")).?;
     defer created.deinit(alloc);
     const filters_before_enable = try manager.getRowFilters("alice");
     defer {
@@ -1552,13 +1814,13 @@ test "sql row security policies are inert until row security is enabled" {
     }
     try std.testing.expectEqual(@as(usize, 0), filters_before_enable.len);
 
-    var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    var disabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
     defer disabled.deinit(alloc);
     try std.testing.expect(!(try manager.sqlRowSecurityEnabled(usage_records_resource)));
 
-    var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    var enabled = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
     defer enabled.deinit(alloc);
-    var enabled_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    var enabled_again = (try executeTestRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
     defer enabled_again.deinit(alloc);
     try std.testing.expect(enabled_again.noop);
     try std.testing.expect(try manager.sqlRowSecurityEnabled(usage_records_resource));
