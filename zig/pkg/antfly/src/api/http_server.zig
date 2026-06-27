@@ -5468,6 +5468,86 @@ pub const ApiHttpServer = struct {
         return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
     }
 
+    fn publicSqlReadRequestRowClaimMissingNativeModel(
+        request: db_mod.types.RelationalRowsQueryRequest,
+        source_kind: []const u8,
+    ) ?[]const u8 {
+        if (request.row_claim == null) return null;
+        if (request.source_cte.len != 0) return "lockable base-row source for CTE row claim";
+        if (request.distinct_on.len != 0 or request.distinct_on_expressions.len != 0) return "lockable base-row source for DISTINCT ON row claim";
+        if (std.mem.eql(u8, source_kind, "base")) return null;
+        return if (std.mem.eql(u8, source_kind, "aggregate"))
+            "lockable base-row source for aggregate row claim"
+        else if (std.mem.eql(u8, source_kind, "join"))
+            "lockable base-row source for join row claim"
+        else if (std.mem.eql(u8, source_kind, "lateral"))
+            "lockable base-row source for lateral row claim"
+        else if (std.mem.eql(u8, source_kind, "window"))
+            "lockable base-row source for window row claim"
+        else if (std.mem.eql(u8, source_kind, "set operation"))
+            "lockable base-row source for set-operation row claim"
+        else if (std.mem.eql(u8, source_kind, "recursive CTE"))
+            "lockable base-row source for recursive CTE row claim"
+        else
+            "lockable base-row source for derived row claim";
+    }
+
+    fn publicSqlReadCtesRowClaimMissingNativeModel(ctes: []const db_mod.types.RelationalRowsCte) ?[]const u8 {
+        for (ctes) |cte| {
+            if (publicSqlReadRequestRowClaimMissingNativeModel(cte.query, "CTE")) |_| {
+                return "lockable base-row source for materialized CTE row claim";
+            }
+        }
+        return null;
+    }
+
+    fn publicSqlQueryPlanRowClaimMissingNativeModel(plan: db_mod.types.RelationalRowsQueryPlan) ?[]const u8 {
+        if (publicSqlReadCtesRowClaimMissingNativeModel(plan.ctes)) |model| return model;
+        return publicSqlReadRequestRowClaimMissingNativeModel(plan.query, "base");
+    }
+
+    fn publicSqlReadPlanRowClaimMissingNativeModel(plan: *const sql_adapter.LoweredReadPlan) ?[]const u8 {
+        return switch (plan.*) {
+            .query => |query| publicSqlQueryPlanRowClaimMissingNativeModel(query.plan),
+            .aggregate => |aggregate| blk: {
+                if (publicSqlReadCtesRowClaimMissingNativeModel(aggregate.plan.ctes)) |model| break :blk model;
+                break :blk publicSqlReadRequestRowClaimMissingNativeModel(aggregate.plan.aggregate.source, "aggregate");
+            },
+            .join => |join| blk: {
+                if (publicSqlReadCtesRowClaimMissingNativeModel(join.ctes)) |model| break :blk model;
+                if (publicSqlReadRequestRowClaimMissingNativeModel(join.join.left, "join")) |model| break :blk model;
+                break :blk publicSqlReadRequestRowClaimMissingNativeModel(join.join.right, "join");
+            },
+            .lateral => |lateral| blk: {
+                if (publicSqlReadCtesRowClaimMissingNativeModel(lateral.plan.ctes)) |model| break :blk model;
+                if (publicSqlReadRequestRowClaimMissingNativeModel(lateral.plan.lateral.left, "lateral")) |model| break :blk model;
+                break :blk publicSqlReadRequestRowClaimMissingNativeModel(lateral.plan.lateral.right, "lateral");
+            },
+            .window => |window| blk: {
+                if (publicSqlReadCtesRowClaimMissingNativeModel(window.plan.ctes)) |model| break :blk model;
+                break :blk publicSqlReadRequestRowClaimMissingNativeModel(window.plan.window.source, "window");
+            },
+            .set_operation => |set_operation| blk: {
+                if (publicSqlQueryPlanRowClaimMissingNativeModel(set_operation.left.plan)) |model| break :blk model;
+                if (publicSqlQueryPlanRowClaimMissingNativeModel(set_operation.right.plan)) |model| break :blk model;
+                break :blk null;
+            },
+            .recursive_cte => |recursive_cte| blk: {
+                if (publicSqlQueryPlanRowClaimMissingNativeModel(recursive_cte.anchor.plan)) |model| break :blk model;
+                if (publicSqlReadRequestRowClaimMissingNativeModel(recursive_cte.final_query, "recursive CTE")) |model| break :blk model;
+                break :blk null;
+            },
+            .document_query, .document_aggregate => null,
+        };
+    }
+
+    fn publicSqlReadUnsupportedRowClaimDiagnostic(
+        lowered: *const sql_adapter.LoweredReadPlan,
+    ) ?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        const missing_native_model = publicSqlReadPlanRowClaimMissingNativeModel(lowered) orelse return null;
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
+    }
+
     fn applyLoweredPublicSqlMutationSource(
         self: *ApiHttpServer,
         target_table_name: []const u8,
@@ -6217,7 +6297,13 @@ pub const ApiHttpServer = struct {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .invalid_sql_request).withMessage(message).withMissingNativeModel("document SQL read execution")) };
             switch (err) {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
-                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
+                error.UnsupportedQueryRequest => {
+                    if (publicSqlReadUnsupportedRowClaimDiagnostic(&lowered)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+                    }
+                    return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) };
+                },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
                 error.RelationalRowsCteSpillRequired => return .{ .response = try self.publicSqlDiagnosticResponse(429, .init(.execute, .sql_read_backpressured)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
                 error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
@@ -29308,6 +29394,28 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
     try std.testing.expectEqualStrings("u1", rows[1].object.get("id").?.string);
     try std.testing.expectEqual(@as(i64, 10), rows[1].object.get("amount").?.integer);
+
+    var aggregate_claim_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT status, COUNT(*) AS count FROM usage_records GROUP BY status FOR UPDATE;\"}",
+    });
+    defer aggregate_claim_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), aggregate_claim_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, aggregate_claim_resp.body, "execute", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, aggregate_claim_resp.body, "lockable base-row source for aggregate row claim");
+
+    var join_claim_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT target.id FROM usage_records AS target JOIN usage_records AS source ON target.status = source.status FOR UPDATE;\"}",
+    });
+    defer join_claim_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), join_claim_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, join_claim_resp.body, "execute", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, join_claim_resp.body, "lockable base-row source for join row claim");
 }
 
 test "api http server executes document SQL reads through typed document plan ingress" {

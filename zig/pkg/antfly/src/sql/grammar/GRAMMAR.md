@@ -1272,7 +1272,12 @@ policy layout instead of only checking the leading `FOR` token. Read
 classification also verifies that top-level and CTE-body clause body ranges are
 preceded by the expected clause keywords, including `FROM`, `WHERE`, `GROUP BY`,
 `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH`, before a
-generated read family is published.
+generated read family is published. The shared generated read lowerer
+validation now mirrors those CTE-body checks before typed planning starts,
+including body-local table-function items, join-tree payloads, named windows,
+pagination with `OFFSET ... ROWS`, row-lock tails, and body set-operation
+metadata, so direct generated read lowering no longer depends on later
+body-clone validation to catch corrupted retained CTE payloads.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
