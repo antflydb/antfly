@@ -7280,7 +7280,7 @@ pub fn parsePrepareStatementPlanTailAlloc(
     tokens: []const grammar.Token,
     pos: *usize,
 ) !PrepareStatementPlan {
-    const syntax = try grammar.parsePrepareStatementTail(tokens, pos);
+    const syntax = try grammar.parsePrepareStatementTailAlloc(alloc, tokens, pos);
     return try prepareStatementPlanFromSyntaxAlloc(alloc, syntax);
 }
 
@@ -7307,7 +7307,7 @@ pub fn parseDeclareCursorPortalPlanTailAlloc(
     tokens: []const grammar.Token,
     pos: *usize,
 ) !DeclareCursorPortalPlan {
-    const syntax = try grammar.parseDeclareCursorPortalTail(tokens, pos);
+    const syntax = try grammar.parseDeclareCursorPortalTailAlloc(alloc, tokens, pos);
     return try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
 }
 

@@ -6191,7 +6191,7 @@ pub const ApiHttpServer = struct {
             if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
         }
         if (read.row_lock_tokens == null) return null;
-        return switch (parsed_sql.readStatementKind() orelse return "lockable base-row source for derived row claim") {
+        return switch (parsed_sql.readStatementKind() orelse publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read)) {
             .query => null,
             .aggregate => "lockable base-row source for aggregate row claim",
             .join => "lockable base-row source for join row claim",
@@ -6200,6 +6200,67 @@ pub const ApiHttpServer = struct {
             .set_operation => "lockable base-row source for set-operation row claim",
             .recursive_cte => "lockable base-row source for recursive CTE row claim",
         };
+    }
+
+    fn publicSqlGeneratedReadKindForRowClaimDiagnostic(
+        tokens: []const sql_adapter.Token,
+        read: *const sql_adapter.generated_parser.GeneratedSqlReadAst,
+    ) sql_adapter.SqlReadStatementKind {
+        if (read.set_operation_tokens != null) return .set_operation;
+        if (read.kind == .lateral) return .lateral;
+        if (read.source_tokens) |source| {
+            if (publicSqlGeneratedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
+        }
+        if (read.kind == .window or read.window_tokens != null) return .window;
+        if (read.projection_tokens) |projection| {
+            if (publicSqlGeneratedReadRangeContainsKeyword(tokens, projection, .over)) return .window;
+        }
+        if (read.kind == .aggregate or
+            (read.distinct_tokens != null and read.distinct_on_items.count == 0) or
+            read.group_tokens != null or
+            read.having_tokens != null or
+            (if (read.projection_tokens) |projection| publicSqlGeneratedReadRangeHasAggregateFunction(tokens, projection) else false))
+        {
+            return .aggregate;
+        }
+        if (read.kind == .join or read.join_tokens != null) return .join;
+        if (read.source_tokens) |source| {
+            if (publicSqlGeneratedReadRangeContainsKeyword(tokens, source, .join)) return .join;
+        }
+        return .query;
+    }
+
+    fn publicSqlGeneratedReadRangeContainsKeyword(
+        tokens: []const sql_adapter.Token,
+        range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+        keyword: sql_adapter.TokenKeyword,
+    ) bool {
+        if (range.end > tokens.len or range.start > range.end) return false;
+        var index = range.start;
+        while (index < range.end) : (index += 1) {
+            if (tokens[index].matchesKeywordTag(keyword)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlGeneratedReadRangeHasAggregateFunction(
+        tokens: []const sql_adapter.Token,
+        range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+    ) bool {
+        if (range.end > tokens.len or range.start > range.end) return false;
+        var index = range.start;
+        while (index < range.end) : (index += 1) {
+            const token = tokens[index];
+            if (token.matchesKeywordTag(.count) or
+                token.matchesKeywordTag(.sum) or
+                token.matchesKeywordTag(.avg) or
+                token.matchesKeywordTag(.min) or
+                token.matchesKeywordTag(.max))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn publicSqlGeneratedReadRowClaimDiagnostic(
@@ -9069,6 +9130,23 @@ pub const ApiHttpServer = struct {
             return;
         }
         return error.PermissionDenied;
+    }
+
+    fn enforceAntflyQueryFunctionReadPermissionBeforeCatalogPlanning(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        const query_table_name = sql_adapter.antflyQueryFunctionReadTableNameAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return,
+            else => return err,
+        };
+        defer self.alloc.free(query_table_name);
+        const target = session.tableTargetFromObjectName(query_table_name) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return,
+        };
+        try self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, target, .read);
     }
 
     fn publicSqlLogicalPlanRequiresDatabaseAdmin(logical_plan: sql_adapter.LogicalSqlPlan) bool {

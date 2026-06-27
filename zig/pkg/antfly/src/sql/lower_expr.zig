@@ -3111,6 +3111,13 @@ fn generatedExpressionForExactRange(
     if (expression.tokens) |tokens_range| {
         if (generatedTokenRangeEqual(tokens_range, range)) return expression;
     }
+    return generatedChildExpressionForExactRange(expression, range);
+}
+
+fn generatedChildExpressionForExactRange(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
     if (expression.inner_expression) |inner| {
         if (generatedExpressionForExactRange(inner, range)) |found| return found;
     }
