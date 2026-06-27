@@ -85,9 +85,9 @@ nullable-symbol metadata alongside both actual and expected conflict counts.
 The emitted parser now also has bounded stack-buffer callback paths for
 reduction-only and full shift/reduce/accept event parsing. Shift events report
 the input token index and terminal id; reduction events report compact
-production/lhs/rhs-length metadata; accept events report the consumed token
-count, while raw parser states, action/goto tables, and symbol tables stay
-private. Public `RuleId`, `ProductionInfo`,
+production/lhs/rhs-length metadata; optional accept callbacks report the
+consumed token count, while raw parser states, action/goto tables, and symbol
+tables stay private. Public `RuleId`, `ProductionInfo`,
 `terminalName`, `ruleName`, `productionInfo`, and `symbolIsNullable` helpers
 provide stable compact interpretation of event ids without exposing the
 underlying parse tables. That

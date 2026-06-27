@@ -216384,11 +216384,19 @@ pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handle
                 stack_len += 1;
             },
             .accept => {
-                try event_handler.accept(.{ .token_count = index });
+                try maybeAccept(event_handler, .{ .token_count = index });
                 return;
             },
         }
     }
+}
+
+fn maybeAccept(event_handler: anytype, accept: Accept) !void {
+    const Handler = switch (@typeInfo(@TypeOf(event_handler))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(event_handler),
+    };
+    if (comptime @hasDecl(Handler, "accept")) try event_handler.accept(accept);
 }
 
 pub fn parseDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseDiagnostic {
