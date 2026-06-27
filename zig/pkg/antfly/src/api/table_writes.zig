@@ -59,6 +59,9 @@ pub const SecondaryIndexRebuildGroupRequest = table_write_schema_jobs.SecondaryI
 pub const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 pub const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 pub const SchemaRewriteGroupRequest = table_write_schema_jobs.SchemaRewriteGroupRequest;
+pub const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerResult;
+pub const TableEmptyingWorkerPassResult = table_write_schema_jobs.TableEmptyingWorkerPassResult;
+pub const TableEmptyingGroupRequest = table_write_schema_jobs.TableEmptyingGroupRequest;
 
 pub const TableWriteSource = table_write_core.TableWriteSource;
 pub const RaftBatcher = table_write_core.RaftBatcher;

@@ -46,6 +46,8 @@ const SecondaryIndexRebuildWorkerResult = table_write_schema_jobs.SecondaryIndex
 const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerPassResult;
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
+const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerResult;
+const TableEmptyingWorkerPassResult = table_write_schema_jobs.TableEmptyingWorkerPassResult;
 
 pub const backend_current_root_generation: u64 = 0;
 
@@ -694,6 +696,23 @@ pub const TableWriteSource = struct {
             worker_id: []const u8,
             lease_ms: u64,
         ) anyerror!?SchemaRewriteWorkerResult = null,
+        table_emptying_worker_pass: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?TableEmptyingWorkerPassResult = null,
+        table_emptying_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            record: metadata_table_manager.TableEmptyingJobRecord,
+            worker_id: []const u8,
+            lease_ms: u64,
+        ) anyerror!?TableEmptyingWorkerResult = null,
         foreign_key_integrity_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -795,6 +814,31 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const fn_ptr = self.vtable.table_emptying orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, req);
+    }
+
+    pub fn tableEmptyingWorkerPass(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const fn_ptr = self.vtable.table_emptying_worker_pass orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn tableEmptyingGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?TableEmptyingWorkerResult {
+        const fn_ptr = self.vtable.table_emptying_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     pub fn mutateRowsJoinedFromSourceRows(

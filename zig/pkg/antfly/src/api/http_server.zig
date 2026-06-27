@@ -608,6 +608,7 @@ pub const StatusSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         compare_and_swap_table_schema: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) anyerror!void = null,
+        upsert_table_emptying_job: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) anyerror!void = null,
         apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_tablespace_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.TablespaceCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
@@ -719,6 +720,14 @@ pub const StatusSource = struct {
     ) !void {
         const fn_ptr = self.vtable.compare_and_swap_table_schema orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn upsertTableEmptyingJob(
+        self: StatusSource,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+    ) !void {
+        const fn_ptr = self.vtable.upsert_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, record);
     }
 
     pub fn applyPreparedTransactionPlan(
@@ -947,6 +956,14 @@ pub const StatusSource = struct {
                 return error.UnsupportedOperation;
             }
 
+            fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "upsertTableEmptyingJob")) {
+                    return try svc.upsertTableEmptyingJob(record);
+                }
+                return error.UnsupportedOperation;
+            }
+
             fn applyPreparedTransactionPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult {
                 const svc = cast(ptr);
                 if (comptime @hasDecl(T, "applyPreparedTransactionPlan")) {
@@ -1082,6 +1099,7 @@ pub const StatusSource = struct {
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl_plan_with_session = Gen.applyRelationalSqlDdlPlanWithSession,
             .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
+            .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
             .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .apply_tablespace_catalog_plan = Gen.applyTablespaceCatalogPlan,
@@ -1472,6 +1490,110 @@ const SchemaRewriteWakeJob = struct {
         const alloc = std.heap.page_allocator;
         if (self.registry) |registry| registry.release(self.table_id);
         if (self.promoted_table) |table| metadata_table_manager.freeTable(alloc, table);
+        alloc.free(self.table_name);
+        alloc.destroy(self);
+    }
+};
+
+const TableEmptyingWakeJob = struct {
+    runtime: *db_mod.background_runtime.BackendRuntime,
+    owner_id: u64,
+    source: table_writes.TableWriteSource,
+    registry: ?*SchemaRewriteWakeRegistry = null,
+    table_name: []const u8,
+    table_id: u64 = 0,
+    worker_id: []const u8 = "api-table-emptying",
+    lease_ms: u64 = 60_000,
+    max_work_units_per_pass: usize = 16,
+    max_passes: usize = 64,
+
+    fn submit(
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        owner_id: u64,
+        source: table_writes.TableWriteSource,
+        table_name: []const u8,
+    ) !void {
+        return try TableEmptyingWakeJob.submitWithRegistry(runtime, owner_id, source, table_name, null, 0);
+    }
+
+    fn submitWithRegistry(
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        owner_id: u64,
+        source: table_writes.TableWriteSource,
+        table_name: []const u8,
+        registry: ?*SchemaRewriteWakeRegistry,
+        table_id: u64,
+    ) !void {
+        const alloc = std.heap.page_allocator;
+        const work = try alloc.create(TableEmptyingWakeJob);
+        var work_transferred = false;
+        errdefer if (!work_transferred) alloc.destroy(work);
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        var table_name_transferred = false;
+        errdefer if (!table_name_transferred) alloc.free(owned_table_name);
+        work.* = .{
+            .runtime = runtime,
+            .owner_id = owner_id,
+            .source = source,
+            .registry = registry,
+            .table_name = owned_table_name,
+            .table_id = table_id,
+        };
+        table_name_transferred = true;
+        work_transferred = true;
+        var submitted = false;
+        errdefer if (!submitted) TableEmptyingWakeJob.deinit(work);
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = TableEmptyingWakeJob.run,
+            .deinit = TableEmptyingWakeJob.deinit,
+        });
+        submitted = true;
+    }
+
+    fn run(ptr: *anyopaque) !void {
+        const self: *TableEmptyingWakeJob = @ptrCast(@alignCast(ptr));
+        const alloc = std.heap.page_allocator;
+        var pass_count: usize = 0;
+        var made_progress = false;
+        while (pass_count < self.max_passes) : (pass_count += 1) {
+            var pass = (try self.source.tableEmptyingWorkerPass(
+                alloc,
+                self.table_name,
+                self.worker_id,
+                self.lease_ms,
+                self.max_work_units_per_pass,
+            )) orelse return;
+            defer pass.deinit(alloc);
+
+            if (pass.complete) return;
+            const pass_made_progress = pass.jobs_claimed != 0 or
+                pass.jobs_completed != 0 or
+                pass.jobs_invalidated != 0;
+            if (!pass_made_progress) return;
+            made_progress = true;
+        }
+        if (!made_progress or self.runtime.backend == .manual) return;
+        TableEmptyingWakeJob.submitWithRegistry(
+            self.runtime,
+            self.owner_id,
+            self.source,
+            self.table_name,
+            self.registry,
+            self.table_id,
+        ) catch |err| switch (err) {
+            error.BackgroundOwnerClosing => return,
+            else => return err,
+        };
+        self.registry = null;
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *TableEmptyingWakeJob = @ptrCast(@alignCast(ptr));
+        const alloc = std.heap.page_allocator;
+        if (self.registry) |registry| registry.release(self.table_id);
         alloc.free(self.table_name);
         alloc.destroy(self);
     }
@@ -2273,6 +2395,130 @@ test "api schema rewrite wake stops on busy-only pass" {
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
 
+test "api table emptying wake continues after terminal progress" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .table_emptying_worker_pass = tableEmptyingWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn tableEmptyingWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.TableEmptyingWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-table-emptying")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            if (self.pass_count == 1) {
+                return .{
+                    .complete = false,
+                    .jobs_scanned = 2,
+                    .jobs_completed = 1,
+                };
+            }
+            return .{
+                .complete = true,
+                .jobs_scanned = 0,
+            };
+        }
+    };
+
+    var writes = FakeWrites{};
+    try TableEmptyingWakeJob.submit(
+        runtime.ptr(),
+        runtime.ptr().allocOwnerId(),
+        writes.iface(),
+        "audit_log",
+    );
+    try std.testing.expectEqual(@as(usize, 2), writes.pass_count);
+}
+
+test "api table emptying wake stops on busy-only pass" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .table_emptying_worker_pass = tableEmptyingWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn tableEmptyingWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.TableEmptyingWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-table-emptying")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            return .{
+                .complete = false,
+                .jobs_scanned = 1,
+                .jobs_busy = 1,
+            };
+        }
+    };
+
+    var writes = FakeWrites{};
+    try TableEmptyingWakeJob.submit(
+        runtime.ptr(),
+        runtime.ptr().allocOwnerId(),
+        writes.iface(),
+        "audit_log",
+    );
+    try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
+}
+
 test "api session maintenance runs schema rewrite catalog catch-up" {
     const alloc = std.testing.allocator;
 
@@ -3058,6 +3304,8 @@ pub const ApiHttpServer = struct {
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
     schema_rewrite_wake_registry: SchemaRewriteWakeRegistry = .{},
+    table_emptying_wake_owner_id: u64 = 0,
+    table_emptying_wake_registry: SchemaRewriteWakeRegistry = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -3433,7 +3681,13 @@ pub const ApiHttpServer = struct {
                 runtime.durable_jobs.closeOwner(self.schema_rewrite_wake_owner_id);
             }
         }
+        if (self.table_emptying_wake_owner_id != 0) {
+            if (self.cfg.backend_runtime) |runtime| {
+                runtime.durable_jobs.closeOwner(self.table_emptying_wake_owner_id);
+            }
+        }
         self.schema_rewrite_wake_registry.deinit(self.alloc);
+        self.table_emptying_wake_registry.deinit(self.alloc);
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -4019,6 +4273,7 @@ pub const ApiHttpServer = struct {
             .vtable = &.{
                 .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                 .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
+                .upsert_table_emptying_job = apiHttpServerCatalogUpsertTableEmptyingJob,
             },
         };
     }
@@ -5468,6 +5723,117 @@ pub const ApiHttpServer = struct {
         return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
     }
 
+    fn publicSqlTableEmptyingRequiresCatalogBarrier(truncate_source: sql_adapter.LoweredMutationSource) bool {
+        return truncate_source.additional_table_names.len != 0 or truncate_source.restart_identity or truncate_source.truncate_cascade;
+    }
+
+    const PublicSqlTableEmptyingDuplicatePolicy = enum {
+        reject,
+        ignore,
+    };
+
+    fn appendPublicSqlTableEmptyingTarget(
+        self: *ApiHttpServer,
+        snapshot: *const metadata_api.AdminSnapshot,
+        table_name: []const u8,
+        affected_table_ids: *std.ArrayListUnmanaged(u64),
+        affected_tables: *std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord),
+        duplicate_policy: PublicSqlTableEmptyingDuplicatePolicy,
+    ) !bool {
+        const table = tables_api.findTableByName(snapshot, table_name) orelse return error.TableNotFound;
+        for (affected_table_ids.items) |table_id| {
+            if (table_id == table.table_id) {
+                return switch (duplicate_policy) {
+                    .reject => error.InvalidArgument,
+                    .ignore => false,
+                };
+            }
+        }
+        try affected_table_ids.append(self.alloc, table.table_id);
+        errdefer _ = affected_table_ids.pop();
+        try affected_tables.append(self.alloc, table);
+        return true;
+    }
+
+    fn appendPublicSqlTableEmptyingCascadeTargets(
+        self: *ApiHttpServer,
+        snapshot: *const metadata_api.AdminSnapshot,
+        affected_table_ids: *std.ArrayListUnmanaged(u64),
+        affected_tables: *std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord),
+    ) !void {
+        var cursor: usize = 0;
+        while (cursor < affected_tables.items.len) : (cursor += 1) {
+            const parent_table = affected_tables.items[cursor].*;
+            for (snapshot.tables) |candidate_table| {
+                if (candidate_table.schema_json.len == 0) continue;
+                var parsed_child = try tables_api.parseValidatedTableSchema(self.alloc, candidate_table.schema_json);
+                defer parsed_child.deinit(self.alloc);
+                const child_schema = try tables_api.deriveRuntimeTableSchema(self.alloc, parsed_child);
+                defer runtime_schema_mod.freeSchema(self.alloc, child_schema);
+                if (child_schema.storage_mode != .relational) continue;
+
+                for (child_schema.foreign_keys) |foreign_key| {
+                    const parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, child_schema.default_type))
+                        candidate_table.name
+                    else
+                        foreign_key.parent_table;
+                    if (!std.mem.eql(u8, parent_table_name, parent_table.name)) continue;
+                    _ = try self.appendPublicSqlTableEmptyingTarget(
+                        snapshot,
+                        candidate_table.name,
+                        affected_table_ids,
+                        affected_tables,
+                        .ignore,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    fn schedulePublicSqlTableEmptyingJobsWithSession(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        lowered: sql_adapter.LoweredMutationSource,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const catalog = self.catalogSource();
+        var snapshot = try catalog.adminSnapshot();
+        defer catalog.freeAdminSnapshot(&snapshot);
+
+        var affected_table_ids = std.ArrayListUnmanaged(u64).empty;
+        defer affected_table_ids.deinit(self.alloc);
+        var affected_tables = std.ArrayListUnmanaged(*const metadata_table_manager.TableRecord).empty;
+        defer affected_tables.deinit(self.alloc);
+
+        _ = try self.appendPublicSqlTableEmptyingTarget(&snapshot, target_table_name, &affected_table_ids, &affected_tables, .reject);
+        for (lowered.additional_table_names) |additional_table_name| {
+            _ = try self.appendPublicSqlTableEmptyingTarget(&snapshot, additional_table_name, &affected_table_ids, &affected_tables, .reject);
+        }
+        if (lowered.truncate_cascade) {
+            try self.appendPublicSqlTableEmptyingCascadeTargets(&snapshot, &affected_table_ids, &affected_tables);
+        }
+
+        var scheduled_jobs: usize = 0;
+        for (affected_tables.items) |table| {
+            scheduled_jobs += try catalog_jobs.scheduleTableEmptyingJobsForTableSnapshot(
+                catalog,
+                snapshot.ranges,
+                table.*,
+                affected_table_ids.items,
+                lowered.restart_identity,
+                lowered.truncate_cascade,
+            );
+        }
+        if (scheduled_jobs == 0) return error.UnsupportedOperation;
+        try self.scheduleTableEmptyingRuntimeHintsForTables(affected_tables.items);
+
+        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+        errdefer applied.deinit(self.alloc);
+        metadata_table_manager.freeTable(self.alloc, applied.table);
+        applied.table = try metadata_table_manager.cloneTable(self.alloc, affected_tables.items[0].*);
+        return applied;
+    }
+
     fn publicSqlReadRequestRowClaimMissingNativeModel(
         request: db_mod.types.RelationalRowsQueryRequest,
         source_kind: []const u8,
@@ -5671,23 +6037,39 @@ pub const ApiHttpServer = struct {
     ) !union(enum) {
         failure: http_common.HttpResponse,
         result: db_mod.types.RelationalRowsMutationSourceResult,
+        accepted: tables_api.AppliedRelationalSqlDdlRecord,
     } {
-        const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
             error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             else => return err,
         };
 
+        const needs_catalog_barrier = publicSqlTableEmptyingRequiresCatalogBarrier(lowered.*);
         var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
             else => return err,
         };
         defer if (filter) |*value| value.deinit(self.alloc);
+        if (needs_catalog_barrier and filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
         if (filter) |active| {
             try self.applyRowsAuthFilterToQuery(target_schema, active, &lowered.mutation.req.source);
         }
 
+        if (needs_catalog_barrier) {
+            const applied = self.schedulePublicSqlTableEmptyingJobsWithSession(target_table_name, lowered.*) catch |err| switch (err) {
+                error.UnsupportedOperation => return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) },
+                error.InvalidArgument, error.InvalidQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+                error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                else => {
+                    std.log.err("public sql table emptying admission failed table={s} err={}", .{ target_table_name, err });
+                    return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+                },
+            };
+            return .{ .accepted = applied };
+        }
+
+        const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
         const result = (source.tableEmptying(self.alloc, .{
             .primary_table_name = target_table_name,
             .additional_table_names = lowered.additional_table_names,
@@ -6136,16 +6518,33 @@ pub const ApiHttpServer = struct {
         }
 
         if (lowered == .truncate_source) {
+            var accepted_applied: ?tables_api.AppliedRelationalSqlDdlRecord = null;
             const truncate_result = switch (try self.applyLoweredPublicSqlTableEmptying(target_table, schema, &lowered.truncate_source, authenticated_identity, parsed_sql)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
+                .accepted => |applied| blk: {
+                    accepted_applied = applied;
+                    break :blk null;
+                },
             };
+            errdefer if (accepted_applied) |*applied| applied.deinit(self.alloc);
             try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            if (accepted_applied) |applied| {
+                return .{ .result = .{
+                    .session_id = self.ensureSqlProtocolSessionId(session),
+                    .statement_kind = @tagName(statement_kind),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = publicSqlDdlCommandTag(parsed_sql),
+                    } },
+                } };
+            }
 
             return .{ .result = .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = @tagName(statement_kind),
-                .result = .{ .mutation_source = .{ .result = truncate_result } },
+                .result = .{ .mutation_source = .{ .result = truncate_result.? } },
             } };
         }
 
@@ -8830,6 +9229,13 @@ pub const ApiHttpServer = struct {
         return self.schema_rewrite_wake_owner_id;
     }
 
+    fn tableEmptyingWakeOwnerId(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
+        if (self.table_emptying_wake_owner_id == 0) {
+            self.table_emptying_wake_owner_id = runtime.allocOwnerId();
+        }
+        return self.table_emptying_wake_owner_id;
+    }
+
     fn submitSchemaRewriteWakeForTable(
         self: *ApiHttpServer,
         runtime: *db_mod.background_runtime.BackendRuntime,
@@ -8853,6 +9259,27 @@ pub const ApiHttpServer = struct {
         return true;
     }
 
+    fn submitTableEmptyingWakeForTable(
+        self: *ApiHttpServer,
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        write_source: table_writes.TableWriteSource,
+        table: metadata_table_manager.TableRecord,
+    ) !bool {
+        if (!try self.table_emptying_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
+        var acquired = true;
+        errdefer if (acquired) self.table_emptying_wake_registry.release(table.table_id);
+        try TableEmptyingWakeJob.submitWithRegistry(
+            runtime,
+            self.tableEmptyingWakeOwnerId(runtime),
+            write_source,
+            table.name,
+            &self.table_emptying_wake_registry,
+            table.table_id,
+        );
+        acquired = false;
+        return true;
+    }
+
     fn scheduleSchemaRewriteRuntimeHintForAppliedDdl(
         self: *ApiHttpServer,
         applied: tables_api.AppliedRelationalSqlDdlRecord,
@@ -8861,6 +9288,17 @@ pub const ApiHttpServer = struct {
         const runtime = self.cfg.backend_runtime orelse return;
         const write_source = self.table_writes orelse return;
         _ = try self.submitSchemaRewriteWakeForTable(runtime, write_source, applied.table);
+    }
+
+    fn scheduleTableEmptyingRuntimeHintsForTables(
+        self: *ApiHttpServer,
+        tables: []const *const metadata_table_manager.TableRecord,
+    ) !void {
+        const runtime = self.cfg.backend_runtime orelse return;
+        const write_source = self.table_writes orelse return;
+        for (tables) |table| {
+            _ = try self.submitTableEmptyingWakeForTable(runtime, write_source, table.*);
+        }
     }
 
     fn refreshSqlExtensionQueryFunctions(self: *ApiHttpServer) !void {
@@ -14076,6 +14514,11 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn apiHttpServerCatalogUpsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.upsertTableEmptyingJob(record);
     }
 
     fn waitForTableMetadata(
@@ -30268,6 +30711,9 @@ test "api http server executes SQL point writes through typed row batch ingress"
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+    const child_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"usage_children_parent_fkey","columns":["parent_id"],"references":{"table":"usage_records","columns":["id"]},"on_delete":"restrict"}]}
+    ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -30282,7 +30728,14 @@ test "api http server executes SQL point writes through typed row batch ingress"
     var write_source = table_writes.BoundTableWriteSource.init("usage_records", &db);
 
     const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
+        tables: [3]metadata_table_manager.TableRecord,
+        ranges: [3]metadata_table_manager.RangeRecord,
+        table_emptying_jobs: std.ArrayListUnmanaged(metadata_table_manager.TableEmptyingJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.table_emptying_jobs.items) |record| metadata_table_manager.freeTableEmptyingJob(allocator, record);
+            self.table_emptying_jobs.deinit(allocator);
+        }
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -30291,6 +30744,7 @@ test "api http server executes SQL point writes through typed row batch ingress"
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .upsert_table_emptying_job = upsertTableEmptyingJob,
                 },
             };
         }
@@ -30304,7 +30758,7 @@ test "api http server executes SQL point writes through typed row batch ingress"
             return .{
                 .status = try status(ptr),
                 .tables = self.tables[0..],
-                .ranges = &.{},
+                .ranges = self.ranges[0..],
                 .stores = &.{},
                 .placement_intents = &.{},
                 .split_transitions = &.{},
@@ -30313,14 +30767,49 @@ test "api http server executes SQL point writes through typed row batch ingress"
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const owned = try metadata_table_manager.cloneTableEmptyingJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, owned);
+            for (self.table_emptying_jobs.items, 0..) |existing, i| {
+                if (existing.job_id != owned.job_id) continue;
+                metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, self.table_emptying_jobs.items[i]);
+                self.table_emptying_jobs.items[i] = owned;
+                return;
+            }
+            try self.table_emptying_jobs.append(std.testing.allocator, owned);
+        }
     };
 
-    var source = FakeSource{ .tables = .{.{
-        .table_id = 1,
-        .name = "usage_records",
-        .schema_json = schema_json,
-        .desired_replica_count = 1,
-    }} };
+    var source = FakeSource{
+        .tables = .{
+            .{
+                .table_id = 1,
+                .name = "usage_records",
+                .schema_json = schema_json,
+                .desired_replica_count = 1,
+            },
+            .{
+                .table_id = 2,
+                .name = "usage_archive",
+                .schema_json = schema_json,
+                .desired_replica_count = 1,
+            },
+            .{
+                .table_id = 3,
+                .name = "usage_children",
+                .schema_json = child_schema_json,
+                .desired_replica_count = 1,
+            },
+        },
+        .ranges = .{
+            .{ .group_id = 11, .range_id = 101, .table_id = 1, .start_key = "", .end_key = null },
+            .{ .group_id = 12, .range_id = 102, .table_id = 2, .start_key = "", .end_key = null },
+            .{ .group_id = 13, .range_id = 103, .table_id = 3, .start_key = "", .end_key = null },
+        },
+    };
+    defer source.deinit(alloc);
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
 
@@ -30786,9 +31275,23 @@ test "api http server executes SQL point writes through typed row batch ingress"
         .body = "{\"sql\":\"TRUNCATE usage_records CASCADE;\"}",
     });
     defer truncate_cascade_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), truncate_cascade_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, truncate_cascade_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_cascade_resp.body, "catalog-owned truncate cascade expansion and generation barrier");
+    try std.testing.expectEqual(@as(u16, 200), truncate_cascade_resp.status);
+    var parsed_truncate_cascade = try std.json.parseFromSlice(std.json.Value, alloc, truncate_cascade_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncate_cascade.deinit();
+    try std.testing.expectEqualStrings("ddl", parsed_truncate_cascade.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("truncate", parsed_truncate_cascade.value.object.get("statement_kind").?.string);
+    try std.testing.expectEqual(@as(usize, 2), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 3), source.table_emptying_jobs.items[1].table_id);
+    try std.testing.expectEqual(@as(u64, 13), source.table_emptying_jobs.items[1].group_id);
+    for (source.table_emptying_jobs.items[0..2]) |job| {
+        try std.testing.expect(!job.restart_identity);
+        try std.testing.expect(job.cascade);
+        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
+        try std.testing.expectEqual(@as(u64, 1), job.affected_table_ids[0]);
+        try std.testing.expectEqual(@as(u64, 3), job.affected_table_ids[1]);
+    }
 
     var truncate_restart_identity_resp = try server.handle(.{
         .method = .POST,
@@ -30797,9 +31300,18 @@ test "api http server executes SQL point writes through typed row batch ingress"
         .body = "{\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
     });
     defer truncate_restart_identity_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), truncate_restart_identity_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, truncate_restart_identity_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_restart_identity_resp.body, "catalog-owned identity allocator reset for truncate");
+    try std.testing.expectEqual(@as(u16, 200), truncate_restart_identity_resp.status);
+    var parsed_truncate_restart_identity = try std.json.parseFromSlice(std.json.Value, alloc, truncate_restart_identity_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncate_restart_identity.deinit();
+    try std.testing.expectEqualStrings("ddl", parsed_truncate_restart_identity.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("truncate", parsed_truncate_restart_identity.value.object.get("statement_kind").?.string);
+    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[2].group_id);
+    try std.testing.expect(source.table_emptying_jobs.items[2].restart_identity);
+    try std.testing.expect(!source.table_emptying_jobs.items[2].cascade);
+    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[2].affected_table_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].affected_table_ids[0]);
 
     var truncate_multi_table_resp = try server.handle(.{
         .method = .POST,
@@ -30808,9 +31320,23 @@ test "api http server executes SQL point writes through typed row batch ingress"
         .body = "{\"sql\":\"TRUNCATE usage_records, usage_archive;\"}",
     });
     defer truncate_multi_table_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), truncate_multi_table_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, truncate_multi_table_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, truncate_multi_table_resp.body, "catalog-owned multi-table truncate generation barrier");
+    try std.testing.expectEqual(@as(u16, 200), truncate_multi_table_resp.status);
+    var parsed_truncate_multi_table = try std.json.parseFromSlice(std.json.Value, alloc, truncate_multi_table_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncate_multi_table.deinit();
+    try std.testing.expectEqualStrings("ddl", parsed_truncate_multi_table.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("truncate", parsed_truncate_multi_table.value.object.get("statement_kind").?.string);
+    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[3].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[3].group_id);
+    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[4].table_id);
+    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[4].group_id);
+    for (source.table_emptying_jobs.items[3..5]) |job| {
+        try std.testing.expect(!job.restart_identity);
+        try std.testing.expect(!job.cascade);
+        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
+        try std.testing.expectEqual(@as(u64, 1), job.affected_table_ids[0]);
+        try std.testing.expectEqual(@as(u64, 2), job.affected_table_ids[1]);
+    }
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {

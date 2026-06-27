@@ -833,6 +833,7 @@ const ProjectedCoreSnapshot = struct {
     unique_constraint_ranges: []metadata_table_manager.UniqueConstraintRangeRecord = &.{},
     secondary_index_rebuild_ranges: []metadata_table_manager.SecondaryIndexRebuildRangeRecord = &.{},
     schema_rewrite_jobs: []metadata_table_manager.SchemaRewriteJobRecord = &.{},
+    table_emptying_jobs: []metadata_table_manager.TableEmptyingJobRecord = &.{},
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
@@ -861,6 +862,8 @@ const ProjectedCoreSnapshot = struct {
         if (self.secondary_index_rebuild_ranges.len > 0) alloc.free(self.secondary_index_rebuild_ranges);
         for (self.schema_rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
         if (self.schema_rewrite_jobs.len > 0) alloc.free(self.schema_rewrite_jobs);
+        for (self.table_emptying_jobs) |record| metadata_table_manager.freeTableEmptyingJob(alloc, record);
+        if (self.table_emptying_jobs.len > 0) alloc.free(self.table_emptying_jobs);
         for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
@@ -1260,6 +1263,23 @@ fn cloneProjectedSchemaRewriteJobsOwned(
     return out;
 }
 
+fn cloneProjectedTableEmptyingJobsOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.TableEmptyingJobRecord,
+) ![]metadata_table_manager.TableEmptyingJobRecord {
+    const out = try alloc.alloc(metadata_table_manager.TableEmptyingJobRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeTableEmptyingJob(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneTableEmptyingJob(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
 fn cloneProjectedStoresOwned(
     alloc: std.mem.Allocator,
     records: []const metadata_table_manager.StoreRecord,
@@ -1639,7 +1659,7 @@ pub const MetadataService = struct {
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .schema_rewrite_job, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .schema_rewrite_job, .table_emptying_job, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
@@ -1977,6 +1997,26 @@ pub const MetadataService = struct {
 
     pub fn invalidateSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
+    }
+
+    pub fn upsertTableEmptyingJob(self: *MetadataService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
+    }
+
+    pub fn removeTableEmptyingJob(self: *MetadataService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_table_emptying_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_table_emptying_job = request });
+    }
+
+    pub fn finishTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_table_emptying_job = request });
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
@@ -2442,6 +2482,16 @@ pub const MetadataService = struct {
     pub fn freeProjectedSchemaRewriteJobs(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeSchemaRewriteJobs(alloc, records);
+    }
+
+    pub fn listProjectedTableEmptyingJobs(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableEmptyingJobRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listTableEmptyingJobs(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedTableEmptyingJobs(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeTableEmptyingJobs(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -3200,7 +3250,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .secondary_index_rebuild_range, .schema_rewrite_job, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .secondary_index_rebuild_range, .schema_rewrite_job, .table_emptying_job, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
@@ -3601,6 +3651,26 @@ pub const MetadataHttpService = struct {
 
     pub fn invalidateSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
         try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
+    }
+
+    pub fn upsertTableEmptyingJob(self: *MetadataHttpService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
+    }
+
+    pub fn removeTableEmptyingJob(self: *MetadataHttpService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_table_emptying_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_table_emptying_job = request });
+    }
+
+    pub fn finishTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_table_emptying_job = request });
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
@@ -4103,6 +4173,7 @@ pub const MetadataHttpService = struct {
         snapshot.unique_constraint_ranges = try cloneProjectedUniqueConstraintRangesOwned(self.alloc, core.unique_constraint_ranges);
         snapshot.secondary_index_rebuild_ranges = try cloneProjectedSecondaryIndexRebuildRangesOwned(self.alloc, core.secondary_index_rebuild_ranges);
         snapshot.schema_rewrite_jobs = try cloneProjectedSchemaRewriteJobsOwned(self.alloc, core.schema_rewrite_jobs);
+        snapshot.table_emptying_jobs = try cloneProjectedTableEmptyingJobsOwned(self.alloc, core.table_emptying_jobs);
         snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
         snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
         snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
@@ -4184,6 +4255,7 @@ pub const MetadataHttpService = struct {
         snapshot.unique_constraint_ranges = try store.listUniqueConstraintRanges(self.alloc, self.metadata_group_id);
         snapshot.secondary_index_rebuild_ranges = try store.listSecondaryIndexRebuildRanges(self.alloc, self.metadata_group_id);
         snapshot.schema_rewrite_jobs = try store.listSchemaRewriteJobs(self.alloc, self.metadata_group_id);
+        snapshot.table_emptying_jobs = try store.listTableEmptyingJobs(self.alloc, self.metadata_group_id);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -4450,6 +4522,18 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedSchemaRewriteJobs(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeSchemaRewriteJobs(alloc, records);
+    }
+
+    pub fn listProjectedTableEmptyingJobs(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableEmptyingJobRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedTableEmptyingJobsOwned(alloc, snapshot.table_emptying_jobs);
+    }
+
+    pub fn freeProjectedTableEmptyingJobs(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeTableEmptyingJobs(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -7823,6 +7907,13 @@ pub fn snapshotStatusWithOptions(
     defer if (@hasDecl(SourceDeclType, "freeProjectedSchemaRewriteJobs") and projected_schema_rewrite_jobs.len > 0) {
         service.freeProjectedSchemaRewriteJobs(alloc, projected_schema_rewrite_jobs);
     };
+    const projected_table_emptying_jobs = if (@hasDecl(SourceDeclType, "listProjectedTableEmptyingJobs"))
+        try service.listProjectedTableEmptyingJobs(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedTableEmptyingJobs") and projected_table_emptying_jobs.len > 0) {
+        service.freeProjectedTableEmptyingJobs(alloc, projected_table_emptying_jobs);
+    };
     const projected_stores = try service.listProjectedStores(alloc);
     defer service.freeProjectedStores(alloc, projected_stores);
     const projected_placement_intents = try service.listProjectedPlacementIntents(alloc);
@@ -8132,6 +8223,7 @@ pub fn snapshotStatusWithOptions(
         .projected_unique_constraint_ranges = projected_unique_constraint_ranges.len,
         .projected_secondary_index_rebuild_ranges = projected_secondary_index_rebuild_ranges.len,
         .projected_schema_rewrite_jobs = projected_schema_rewrite_jobs.len,
+        .projected_table_emptying_jobs = projected_table_emptying_jobs.len,
         .projected_stores = projected_stores.len,
         .projected_placement_intents = projected_placement_intents.len,
         .projected_snapshot_bootstrap_intents = projected_snapshot_bootstrap_intents,

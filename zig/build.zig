@@ -1724,16 +1724,19 @@ pub fn build(b: *std.Build) void {
     docstore_test_mod.addImport("bloom", bloom_mod);
     docstore_test_mod.addImport("antfly_vellum", vellum_mod);
     docstore_test_mod.addImport("antfly_regex", regex_mod);
+    docstore_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     shard_test_mod.addImport("antfly_vellum", vellum_mod);
     shard_test_mod.addImport("antfly_regex", regex_mod);
+    shard_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("antfly_vellum", vellum_mod);
     wal_test_mod.addImport("antfly_regex", regex_mod);
+    wal_test_mod.addImport("antfly_reranking", reranking_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
@@ -1742,6 +1745,7 @@ pub fn build(b: *std.Build) void {
     wal_soak_test_mod.addImport("bloom", bloom_mod);
     wal_soak_test_mod.addImport("antfly_vellum", vellum_mod);
     wal_soak_test_mod.addImport("antfly_regex", regex_mod);
+    wal_soak_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
@@ -1800,6 +1804,7 @@ pub fn build(b: *std.Build) void {
     sparse_test_mod.addImport("bloom", bloom_mod);
     sparse_test_mod.addImport("antfly_vellum", vellum_mod);
     sparse_test_mod.addImport("antfly_regex", regex_mod);
+    sparse_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     derived_log_test_mod.addImport("bloom", bloom_mod);

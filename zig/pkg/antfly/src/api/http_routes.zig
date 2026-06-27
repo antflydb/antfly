@@ -111,6 +111,7 @@ pub const Routes = struct {
     pub const unique_integrity_suffix = "/unique-integrity";
     pub const secondary_index_rebuild_suffix = "/secondary-index-rebuild";
     pub const schema_rewrite_suffix = "/schema-rewrite";
+    pub const table_emptying_suffix = "/table-emptying";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
     pub const foreign_key_action_job_suffix = "/foreign-key-action-job";
     pub const foreign_key_action_job_progress_suffix = "/foreign-key-action-job-progress";
@@ -470,6 +471,11 @@ pub const Routes = struct {
     };
 
     pub const GroupSchemaRewrite = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupTableEmptying = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -1360,6 +1366,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupTableEmptying(path: []const u8) ?GroupTableEmptying {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, table_emptying_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - table_emptying_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupDocumentArtifact(path: []const u8) ?GroupDocumentArtifact {
         return matchGroupDocumentArtifactWithReprocess(path, false);
     }
@@ -1866,6 +1882,9 @@ test "public api routes compile" {
     const group_unique_integrity = Routes.matchGroupUniqueIntegrity("/internal/v1/groups/7/tables/docs/unique-integrity").?;
     try std.testing.expectEqual(@as(u64, 7), group_unique_integrity.group_id);
     try std.testing.expectEqualStrings("docs", group_unique_integrity.table_name);
+    const group_table_emptying = Routes.matchGroupTableEmptying("/internal/v1/groups/7/tables/docs/table-emptying").?;
+    try std.testing.expectEqual(@as(u64, 7), group_table_emptying.group_id);
+    try std.testing.expectEqualStrings("docs", group_table_emptying.table_name);
     const group_fk_ref_children = Routes.matchGroupForeignKeyRefChildren("/internal/v1/groups/7/tables/docs/foreign-key-ref-children").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_ref_children.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_ref_children.table_name);

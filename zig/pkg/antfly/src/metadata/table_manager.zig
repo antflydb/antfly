@@ -252,6 +252,8 @@ pub const TableEmptyingJobRecord = struct {
     table_id: u64,
     group_id: u64,
     schema_generation: u64,
+    start_row_key: []const u8 = "",
+    end_row_key: ?[]const u8 = null,
     affected_table_ids: []const u64 = &.{},
     restart_identity: bool = false,
     cascade: bool = false,
@@ -262,6 +264,26 @@ pub const TableEmptyingJobRecord = struct {
     completed_row_count: u64 = 0,
     progress_row_key: []const u8 = "",
     last_error: []const u8 = "",
+};
+
+pub const TableEmptyingJobBeginRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const TableEmptyingJobFinishRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const TableEmptyingJobInvalidateRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    last_error: []const u8,
 };
 
 pub const ForeignKeyReferenceRangeSelector = struct {
@@ -395,6 +417,33 @@ pub fn tableEmptyingJobStateValid(state: []const u8) bool {
 
 pub fn tableEmptyingJobComplete(record: TableEmptyingJobRecord) bool {
     return std.mem.eql(u8, record.state, table_emptying_ready);
+}
+
+fn hashTableEmptyingJobU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, value, .little);
+    hasher.update(&raw);
+}
+
+fn hashTableEmptyingJobBool(hasher: *std.hash.Wyhash, value: bool) void {
+    hasher.update(if (value) "\x01" else "\x00");
+}
+
+pub fn stableTableEmptyingJobId(record: TableEmptyingJobRecord) u64 {
+    var hasher = std.hash.Wyhash.init(0x5445_4d50_5459_2026);
+    hashTableEmptyingJobU64(&hasher, record.table_id);
+    hashTableEmptyingJobU64(&hasher, record.group_id);
+    hashTableEmptyingJobU64(&hasher, record.schema_generation);
+    hasher.update(record.start_row_key);
+    hasher.update(&[_]u8{0});
+    if (record.end_row_key) |end_row_key| hasher.update(end_row_key);
+    hasher.update(&[_]u8{0});
+    hashTableEmptyingJobU64(&hasher, @intCast(record.affected_table_ids.len));
+    for (record.affected_table_ids) |table_id| hashTableEmptyingJobU64(&hasher, table_id);
+    hashTableEmptyingJobBool(&hasher, record.restart_identity);
+    hashTableEmptyingJobBool(&hasher, record.cascade);
+    const id = hasher.final();
+    return if (id == 0) 1 else id;
 }
 
 pub fn schemaRewriteGenerationForSchemaJson(schema_json: []const u8) u64 {
@@ -912,6 +961,37 @@ pub const TableManager = struct {
         try self.schema_rewrite_jobs.append(self.alloc, owned);
     }
 
+    pub fn upsertTableEmptyingJob(self: *TableManager, record: TableEmptyingJobRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.job_id == 0) return error.InvalidTableEmptyingJob;
+        if (record.schema_generation == 0) return error.InvalidTableEmptyingGeneration;
+        if (!tableEmptyingJobStateValid(record.state)) return error.InvalidTableEmptyingJobState;
+        if (record.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidTableEmptyingJob;
+        }
+        var includes_primary = false;
+        for (record.affected_table_ids, 0..) |table_id, i| {
+            if (!self.tables.contains(table_id)) return error.UnknownTable;
+            if (table_id == record.table_id) includes_primary = true;
+            for (record.affected_table_ids[0..i]) |prior| {
+                if (prior == table_id) return error.InvalidTableEmptyingJob;
+            }
+        }
+        if (!includes_primary) return error.InvalidTableEmptyingJob;
+
+        const owned = try cloneTableEmptyingJob(self.alloc, record);
+        errdefer freeTableEmptyingJob(self.alloc, owned);
+        for (self.table_emptying_jobs.items) |*existing| {
+            if (existing.job_id != record.job_id) continue;
+            freeTableEmptyingJob(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.table_emptying_jobs.append(self.alloc, owned);
+    }
+
     pub fn clearTopology(self: *TableManager) void {
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -1096,6 +1176,7 @@ pub const TableManager = struct {
             _ = self.removeUniqueConstraintRangesForTable(table_id);
             _ = self.removeSecondaryIndexRebuildRangesForTable(table_id);
             _ = self.removeSchemaRewriteJobsForTable(table_id);
+            _ = self.removeTableEmptyingJobsForTable(table_id);
             return true;
         }
         return false;
@@ -1288,6 +1369,32 @@ pub const TableManager = struct {
         return false;
     }
 
+    pub fn removeTableEmptyingJobsForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.table_emptying_jobs.items.len) {
+            const record = self.table_emptying_jobs.items[i];
+            if (record.table_id != table_id and !u64SliceContains(record.affected_table_ids, table_id)) {
+                i += 1;
+                continue;
+            }
+            freeTableEmptyingJob(self.alloc, record);
+            _ = self.table_emptying_jobs.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeTableEmptyingJob(self: *TableManager, job_id: u64) bool {
+        for (self.table_emptying_jobs.items, 0..) |record, i| {
+            if (record.job_id != job_id) continue;
+            freeTableEmptyingJob(self.alloc, record);
+            _ = self.table_emptying_jobs.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
     pub fn beginSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobBeginRequest) !void {
         if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidSchemaRewriteJobLease;
         const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
@@ -1329,6 +1436,49 @@ pub const TableManager = struct {
         updated.lease_expires_at_ms = 0;
         updated.last_error = request.last_error;
         try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn beginTableEmptyingJob(self: *TableManager, request: TableEmptyingJobBeginRequest) !void {
+        if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidTableEmptyingJobLease;
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        const claimable = std.mem.eql(u8, record.state, table_emptying_declared) or
+            (std.mem.eql(u8, record.state, table_emptying_running) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobClaimBusy;
+            return error.TableEmptyingJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = table_emptying_running;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn finishTableEmptyingJob(self: *TableManager, request: TableEmptyingJobFinishRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.TableEmptyingJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = table_emptying_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *TableManager, request: TableEmptyingJobInvalidateRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.TableEmptyingJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = table_emptying_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        try self.upsertTableEmptyingJob(updated);
     }
 
     pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
@@ -1697,6 +1847,13 @@ pub const TableManager = struct {
         return null;
     }
 
+    fn findTableEmptyingJob(self: *TableManager, job_id: u64) ?*TableEmptyingJobRecord {
+        for (self.table_emptying_jobs.items) |*record| {
+            if (record.job_id == job_id) return record;
+        }
+        return null;
+    }
+
     pub fn listTables(self: *TableManager, alloc: std.mem.Allocator) ![]TableRecord {
         var out = std.ArrayListUnmanaged(TableRecord).empty;
         errdefer {
@@ -1834,6 +1991,21 @@ pub const TableManager = struct {
 
     pub fn freeSchemaRewriteJobs(_: *TableManager, alloc: std.mem.Allocator, records: []SchemaRewriteJobRecord) void {
         for (records) |record| freeSchemaRewriteJob(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listTableEmptyingJobs(self: *TableManager, alloc: std.mem.Allocator) ![]TableEmptyingJobRecord {
+        var out = std.ArrayListUnmanaged(TableEmptyingJobRecord).empty;
+        errdefer {
+            for (out.items) |record| freeTableEmptyingJob(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.table_emptying_jobs.items) |record| try out.append(alloc, try cloneTableEmptyingJob(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeTableEmptyingJobs(_: *TableManager, alloc: std.mem.Allocator, records: []TableEmptyingJobRecord) void {
+        for (records) |record| freeTableEmptyingJob(alloc, record);
         alloc.free(records);
     }
 
@@ -2026,6 +2198,13 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
         if (std.mem.order(u8, key, end) != .lt) return false;
     }
     return true;
+}
+
+fn u64SliceContains(values: []const u64, needle: u64) bool {
+    for (values) |value| {
+        if (value == needle) return true;
+    }
+    return false;
 }
 
 fn rangesAdjacent(a: RangeRecord, b: RangeRecord) bool {
@@ -2483,6 +2662,51 @@ pub fn freeSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRe
     alloc.free(record.rewrite_renames);
     for (record.rewrite_drops) |drop| alloc.free(drop);
     alloc.free(record.rewrite_drops);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
+}
+
+pub fn cloneTableEmptyingJob(alloc: std.mem.Allocator, record: TableEmptyingJobRecord) !TableEmptyingJobRecord {
+    const affected_table_ids = try alloc.dupe(u64, record.affected_table_ids);
+    errdefer alloc.free(affected_table_ids);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = if (record.end_row_key) |end_row_key| try alloc.dupe(u8, end_row_key) else null;
+    errdefer if (end_row_key) |owned| alloc.free(owned);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .job_id = record.job_id,
+        .table_id = record.table_id,
+        .group_id = record.group_id,
+        .schema_generation = record.schema_generation,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
+        .affected_table_ids = affected_table_ids,
+        .restart_identity = record.restart_identity,
+        .cascade = record.cascade,
+        .state = state,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeTableEmptyingJob(alloc: std.mem.Allocator, record: TableEmptyingJobRecord) void {
+    alloc.free(record.start_row_key);
+    if (record.end_row_key) |end_row_key| alloc.free(end_row_key);
+    alloc.free(record.affected_table_ids);
+    alloc.free(record.state);
     alloc.free(record.lease_owner);
     alloc.free(record.progress_row_key);
     alloc.free(record.last_error);
@@ -3907,6 +4131,329 @@ test "table manager applies schema rewrite job lifecycle operations" {
     }
 
     try std.testing.expectError(error.UnknownSchemaRewriteJob, manager.finishSchemaRewriteJob(.{
+        .job_id = 9999,
+        .lease_owner = "worker-c",
+        .completed_row_count = 1,
+        .progress_row_key = "order:a",
+    }));
+}
+
+test "table manager owns table emptying jobs" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items" });
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9202,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .cascade = true,
+        .state = table_emptying_ready,
+        .completed_row_count = 12,
+        .progress_row_key = "order:z",
+    });
+
+    try std.testing.expectError(error.UnknownTable, manager.upsertTableEmptyingJob(.{
+        .job_id = 9299,
+        .table_id = 99,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{99},
+    }));
+    try std.testing.expectError(error.UnknownTable, manager.upsertTableEmptyingJob(.{
+        .job_id = 9299,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 99 },
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 0,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingGeneration, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 0,
+        .affected_table_ids = &.{7},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJobState, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{8},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 7 },
+    }));
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 43,
+        .affected_table_ids = &.{7},
+        .state = table_emptying_invalid,
+        .last_error = "schema generation moved",
+    });
+
+    const listed = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+
+    var saw_replaced = false;
+    var saw_ready = false;
+    for (listed) |record| {
+        if (record.job_id == 9201) {
+            try std.testing.expectEqual(@as(u64, 43), record.schema_generation);
+            try std.testing.expectEqualStrings(table_emptying_invalid, record.state);
+            try std.testing.expectEqualStrings("schema generation moved", record.last_error);
+            try std.testing.expectEqual(@as(usize, 1), record.affected_table_ids.len);
+            try std.testing.expectEqual(@as(u64, 7), record.affected_table_ids[0]);
+            saw_replaced = true;
+        } else if (record.job_id == 9202) {
+            try std.testing.expect(tableEmptyingJobComplete(record));
+            try std.testing.expect(record.cascade);
+            try std.testing.expectEqual(@as(usize, 2), record.affected_table_ids.len);
+            try std.testing.expectEqual(@as(u64, 12), record.completed_row_count);
+            try std.testing.expectEqualStrings("order:z", record.progress_row_key);
+            saw_ready = true;
+        }
+    }
+    try std.testing.expect(saw_replaced and saw_ready);
+
+    try std.testing.expect(manager.removeTableEmptyingJob(9201));
+    try std.testing.expect(!manager.removeTableEmptyingJob(9201));
+    try std.testing.expectEqual(@as(usize, 1), manager.removeTableEmptyingJobsForTable(8));
+    const remaining = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table emptying stable job id captures durable intent" {
+    const base = TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+    };
+    const same = TableEmptyingJobRecord{
+        .job_id = 1234,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+        .state = table_emptying_invalid,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 123,
+        .attempts = 2,
+        .completed_row_count = 9,
+        .progress_row_key = "row:z",
+        .last_error = "boom",
+    };
+    try std.testing.expect(stableTableEmptyingJobId(base) != 0);
+    try std.testing.expectEqual(stableTableEmptyingJobId(base), stableTableEmptyingJobId(same));
+
+    var changed_generation = base;
+    changed_generation.schema_generation = 43;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_generation));
+
+    var changed_group = base;
+    changed_group.group_id = 9002;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_group));
+
+    var changed_affected = base;
+    changed_affected.affected_table_ids = &.{7};
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_affected));
+
+    var changed_restart_identity = base;
+    changed_restart_identity.restart_identity = false;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_restart_identity));
+
+    var changed_cascade = base;
+    changed_cascade.cascade = false;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_cascade));
+}
+
+test "table manager applies table emptying job lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    try std.testing.expectError(error.InvalidTableEmptyingJobLease, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJobLease, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1000,
+    }));
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings(table_emptying_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobClaimBusy, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .now_ms = 1200,
+        .lease_expires_at_ms = 2000,
+    }));
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .now_ms = 1234,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-b", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobLeaseMismatch, manager.finishTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    }));
+    try manager.finishTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_ready, jobs[0].state);
+        try std.testing.expect(tableEmptyingJobComplete(jobs[0]));
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), jobs[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", jobs[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobNotDeclared, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    }));
+    try std.testing.expectError(error.TableEmptyingJobNotRunning, manager.invalidateTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9202,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+    });
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    });
+    try std.testing.expectError(error.TableEmptyingJobLeaseMismatch, manager.invalidateTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.invalidateTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-c",
+        .last_error = "schema generation moved",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        var saw_invalid = false;
+        for (jobs) |job| {
+            if (job.job_id != 9202) continue;
+            try std.testing.expectEqualStrings(table_emptying_invalid, job.state);
+            try std.testing.expectEqualStrings("", job.lease_owner);
+            try std.testing.expectEqual(@as(u64, 0), job.lease_expires_at_ms);
+            try std.testing.expectEqualStrings("schema generation moved", job.last_error);
+            saw_invalid = true;
+        }
+        try std.testing.expect(saw_invalid);
+    }
+
+    try std.testing.expectError(error.UnknownTableEmptyingJob, manager.finishTableEmptyingJob(.{
         .job_id = 9999,
         .lease_owner = "worker-c",
         .completed_row_count = 1,

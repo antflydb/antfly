@@ -19,6 +19,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const metadata_mod = @import("../metadata/mod.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_mod = @import("../raft/mod.zig");
@@ -420,6 +421,32 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.InvalidSchemaRewriteJob, error.InvalidSchemaRewriteJobRange, error.InvalidSchemaRewriteExpression => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid schema rewrite request"),
             error.SchemaRewriteJobClaimBusy => return try http_route_helpers.textResponse(ctx.alloc, 409, "schema rewrite claim busy"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
+    if (routes.Routes.matchGroupTableEmptying(path)) |emptying_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(table_writes.TableEmptyingGroupRequest, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid table emptying request");
+        defer parsed.deinit();
+        if (parsed.value.worker_id.len == 0 or parsed.value.lease_ms == 0 or parsed.value.record.group_id != emptying_route.group_id) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid table emptying request");
+        }
+        const result = (writes.tableEmptyingGroupLocal(
+            ctx.alloc,
+            emptying_route.group_id,
+            emptying_route.table_name,
+            parsed.value.record,
+            parsed.value.worker_id,
+            parsed.value.lease_ms,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.InvalidTableEmptyingJob, error.InvalidTableEmptyingJobLease => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid table emptying request"),
+            error.TableEmptyingJobClaimBusy => return try http_route_helpers.textResponse(ctx.alloc, 409, "table emptying claim busy"),
             error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -1136,6 +1163,36 @@ test "internal group write routes expose unique integrity" {
     try std.testing.expectEqual(@as(u64, 7), parsed.value.groups[0].group_id);
 }
 
+test "internal group write routes expose table emptying" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/table-emptying",
+        .body = "{\"record\":{\"job_id\":99,\"table_id\":11,\"group_id\":7,\"schema_generation\":3,\"affected_table_ids\":[11],\"restart_identity\":true,\"cascade\":false,\"state\":\"declared\"},\"worker_id\":\"worker:empty\",\"lease_ms\":1000}",
+    }, "/internal/v1/groups/7/tables/docs/table-emptying")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(table_writes.TableEmptyingWorkerResult, alloc, resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.group_id);
+    try std.testing.expectEqual(@as(u64, 11), parsed.value.table_id);
+    try std.testing.expectEqual(@as(u64, 99), parsed.value.job_id);
+    try std.testing.expect(parsed.value.claimed);
+    try std.testing.expect(parsed.value.completed);
+    try std.testing.expectEqual(@as(u64, 4), parsed.value.result.matched);
+    try std.testing.expectEqual(@as(u64, 4), parsed.value.result.staged);
+}
+
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
 
@@ -1303,6 +1360,7 @@ const TestWriteSource = struct {
                 .foreign_key_action_job_group_local_schedule = foreignKeyActionJobGroupLocalSchedule,
                 .foreign_key_action_job_group_local_requeue = foreignKeyActionJobGroupLocalRequeue,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
+                .table_emptying_group_local = tableEmptyingGroupLocal,
             },
         };
     }
@@ -1557,6 +1615,30 @@ const TestWriteSource = struct {
             .complete = true,
             .report = .{},
             .groups = groups,
+        };
+    }
+
+    fn tableEmptyingGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?table_writes.TableEmptyingWorkerResult {
+        if (worker_id.len == 0 or lease_ms == 0) return error.InvalidTableEmptyingJobLease;
+        if (record.group_id != group_id) return error.InvalidTableEmptyingJob;
+        return .{
+            .group_id = group_id,
+            .table_id = record.table_id,
+            .job_id = record.job_id,
+            .claimed = true,
+            .completed = true,
+            .result = .{
+                .matched = 4,
+                .staged = 4,
+            },
         };
     }
 };

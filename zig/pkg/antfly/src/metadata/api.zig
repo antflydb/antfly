@@ -256,6 +256,7 @@ pub const MetadataStatus = struct {
     projected_unique_constraint_ranges: usize = 0,
     projected_secondary_index_rebuild_ranges: usize = 0,
     projected_schema_rewrite_jobs: usize = 0,
+    projected_table_emptying_jobs: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
     projected_snapshot_bootstrap_intents: usize = 0,
@@ -306,6 +307,7 @@ pub const AdminSnapshot = struct {
     unique_constraint_ranges: []table_manager.UniqueConstraintRangeRecord = &.{},
     secondary_index_rebuild_ranges: []table_manager.SecondaryIndexRebuildRangeRecord = &.{},
     schema_rewrite_jobs: []table_manager.SchemaRewriteJobRecord = &.{},
+    table_emptying_jobs: []table_manager.TableEmptyingJobRecord = &.{},
     nodes: []table_manager.NodeRecord = &.{},
     stores: []table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -363,6 +365,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedSchemaRewriteJobs")) {
         snapshot.schema_rewrite_jobs = try source.listProjectedSchemaRewriteJobs(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedTableEmptyingJobs")) {
+        snapshot.table_emptying_jobs = try source.listProjectedTableEmptyingJobs(alloc);
     }
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {
         snapshot.nodes = try source.listProjectedNodes(alloc);
@@ -449,6 +454,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedSchemaRewriteJobs") and snapshot.schema_rewrite_jobs.len > 0) {
         source.freeProjectedSchemaRewriteJobs(alloc, snapshot.schema_rewrite_jobs);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedTableEmptyingJobs") and snapshot.table_emptying_jobs.len > 0) {
+        source.freeProjectedTableEmptyingJobs(alloc, snapshot.table_emptying_jobs);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedNodes") and snapshot.nodes.len > 0) {
         source.freeProjectedNodes(alloc, snapshot.nodes);

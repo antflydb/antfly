@@ -2222,6 +2222,9 @@ fn registerInternalGroupRoutes(server: anytype) !void {
         table_prefix ++ routes.join_partition_suffix,
         table_prefix ++ routes.query_suffix,
         table_prefix ++ routes.batch_suffix,
+        table_prefix ++ routes.secondary_index_rebuild_suffix,
+        table_prefix ++ routes.schema_rewrite_suffix,
+        table_prefix ++ routes.table_emptying_suffix,
         table_prefix ++ routes.txn_begin_suffix,
         table_prefix ++ routes.txn_prepare_suffix,
         table_prefix ++ routes.txn_resolve_suffix,
@@ -3404,6 +3407,9 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_partition_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.query_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.batch_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.secondary_index_rebuild_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.schema_rewrite_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.table_emptying_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_begin_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_prepare_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_resolve_suffix));

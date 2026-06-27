@@ -158,7 +158,9 @@ pub const MetadataState = struct {
         defer self.projected.freeSecondaryIndexRebuildRanges(self.alloc, secondary_index_rebuild_ranges);
         const schema_rewrite_jobs = try self.projected.listSchemaRewriteJobs(self.alloc);
         defer self.projected.freeSchemaRewriteJobs(self.alloc, schema_rewrite_jobs);
-        try self.desired.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, schema_rewrite_jobs);
+        const table_emptying_jobs = try self.projected.listTableEmptyingJobs(self.alloc);
+        defer self.projected.freeTableEmptyingJobs(self.alloc, table_emptying_jobs);
+        try self.desired.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, schema_rewrite_jobs, table_emptying_jobs);
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -174,6 +176,8 @@ pub const MetadataState = struct {
         defer freeProjectedSecondaryIndexRebuildRanges(self, service, projected_secondary_index_rebuild_ranges);
         const projected_schema_rewrite_jobs = try listProjectedSchemaRewriteJobs(self, service);
         defer freeProjectedSchemaRewriteJobs(self, service, projected_schema_rewrite_jobs);
+        const projected_table_emptying_jobs = try listProjectedTableEmptyingJobs(self, service);
+        defer freeProjectedTableEmptyingJobs(self, service, projected_table_emptying_jobs);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -183,7 +187,7 @@ pub const MetadataState = struct {
         const merge_records = try service.listProjectedMergeTransitions(self.alloc);
         defer service.freeProjectedMergeTransitions(self.alloc, merge_records);
 
-        _ = try self.projected.replaceProjectedTopologyWithDerivedWork(projected_tables, projected_ranges, projected_foreign_key_ref_ranges, projected_unique_constraint_ranges, projected_secondary_index_rebuild_ranges, projected_schema_rewrite_jobs);
+        _ = try self.projected.replaceProjectedTopologyWithDerivedWork(projected_tables, projected_ranges, projected_foreign_key_ref_ranges, projected_unique_constraint_ranges, projected_secondary_index_rebuild_ranges, projected_schema_rewrite_jobs, projected_table_emptying_jobs);
         self.clearCommitted();
         self.clearCommittedNodes();
         self.clearCommittedStores();
@@ -522,6 +526,31 @@ fn freeProjectedSchemaRewriteJobs(self: *MetadataState, service: anytype, record
     };
     if (@hasDecl(ServiceDeclType, "freeProjectedSchemaRewriteJobs")) {
         service.freeProjectedSchemaRewriteJobs(self.alloc, records);
+        return;
+    }
+    self.alloc.free(records);
+}
+
+fn listProjectedTableEmptyingJobs(self: *MetadataState, service: anytype) ![]metadata_table_manager.TableEmptyingJobRecord {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "listProjectedTableEmptyingJobs")) {
+        return try service.listProjectedTableEmptyingJobs(self.alloc);
+    }
+    return try self.alloc.alloc(metadata_table_manager.TableEmptyingJobRecord, 0);
+}
+
+fn freeProjectedTableEmptyingJobs(self: *MetadataState, service: anytype, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "freeProjectedTableEmptyingJobs")) {
+        service.freeProjectedTableEmptyingJobs(self.alloc, records);
         return;
     }
     self.alloc.free(records);

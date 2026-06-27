@@ -160,12 +160,17 @@ const runSecondaryIndexRebuildRangeGroupLocal = table_write_schema_jobs.runSecon
 const runSecondaryIndexRebuildWorkerPassForCatalog = table_write_schema_jobs.runSecondaryIndexRebuildWorkerPassForCatalog;
 const runSchemaRewriteJobGroupLocal = table_write_schema_jobs.runSchemaRewriteJobGroupLocal;
 const runSchemaRewriteWorkerPassForCatalog = table_write_schema_jobs.runSchemaRewriteWorkerPassForCatalog;
+const runTableEmptyingJobGroupLocal = table_write_schema_jobs.runTableEmptyingJobGroupLocal;
+const runTableEmptyingWorkerPassForCatalog = table_write_schema_jobs.runTableEmptyingWorkerPassForCatalog;
 const SecondaryIndexRebuildWorkerResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerResult;
 const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerPassResult;
 const SecondaryIndexRebuildGroupRequest = table_write_schema_jobs.SecondaryIndexRebuildGroupRequest;
 const SchemaRewriteWorkerResult = table_write_schema_jobs.SchemaRewriteWorkerResult;
 const SchemaRewriteWorkerPassResult = table_write_schema_jobs.SchemaRewriteWorkerPassResult;
 const SchemaRewriteGroupRequest = table_write_schema_jobs.SchemaRewriteGroupRequest;
+const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerResult;
+const TableEmptyingWorkerPassResult = table_write_schema_jobs.TableEmptyingWorkerPassResult;
+const TableEmptyingGroupRequest = table_write_schema_jobs.TableEmptyingGroupRequest;
 const ForeignKeyIntegrityAction = table_write_integrity_types.ForeignKeyIntegrityAction;
 const ForeignKeyIntegrityRequest = table_write_integrity_types.ForeignKeyIntegrityRequest;
 const UniqueConstraintIntegrityRequest = table_write_integrity_types.UniqueConstraintIntegrityRequest;
@@ -222,6 +227,17 @@ const foreignKeyIntegrityNowNs = table_write_integrity.foreignKeyIntegrityNowNs;
 
 fn tableEmptyingRequiresCatalogBarrier(req: TableEmptyingRequest) bool {
     return req.additional_table_names.len != 0 or req.restart_identity or req.cascade;
+}
+
+fn tableEmptyingWorkerTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !metadata_table_manager.TableRecord {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    return try metadata_table_manager.cloneTable(alloc, table.*);
 }
 const foreignKeyIntegrityWorkStatusClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusClaimable;
 const foreignKeyIntegrityWorkStatusesHaveClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusesHaveClaimable;
@@ -3037,6 +3053,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
                 .schema_rewrite_worker_pass = ProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = ProvisionedTableWriteSource.schemaRewriteGroupLocal,
+                .table_emptying_worker_pass = ProvisionedTableWriteSource.tableEmptyingWorkerPass,
+                .table_emptying_group_local = ProvisionedTableWriteSource.tableEmptyingGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = ProvisionedTableWriteSource.foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -4530,6 +4548,31 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?SchemaRewriteWorkerResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runProvisionedSchemaRewriteGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    fn tableEmptyingWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runTableEmptyingWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn tableEmptyingGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?TableEmptyingWorkerResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runProvisionedTableEmptyingGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn uniqueConstraintIntegrity(
@@ -6182,6 +6225,54 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn runProvisionedTableEmptyingGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?TableEmptyingWorkerResult {
+        if (record.group_id != group_id) return error.InvalidTableEmptyingJob;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+        const table = try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
+        defer metadata_table_manager.freeTable(alloc, table);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            var result = try runTableEmptyingJobGroupLocal(alloc, cached.db, self.catalog, table, record, worker_id, now_ms, lease_ms);
+            errdefer result.deinit(alloc);
+            if (result.claimed) {
+                try drainManagedDbBeforeClose(cached.db);
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.invalidateReadCache(table_name);
+                self.local_db_mutex.unlock();
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
+            return result;
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        var result = try runTableEmptyingJobGroupLocal(alloc, &db, self.catalog, table, record, worker_id, now_ms, lease_ms);
+        errdefer result.deinit(alloc);
+        if (result.claimed) {
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            self.notifyLocalChange(table_name, .data);
+        }
+        return result;
+    }
+
     fn collectRuntimeStatusLeasesFromWriteCacheLocked(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -7089,6 +7180,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
                 .schema_rewrite_worker_pass = HostedProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = HostedProvisionedTableWriteSource.schemaRewriteGroupLocal,
+                .table_emptying_worker_pass = HostedProvisionedTableWriteSource.tableEmptyingWorkerPass,
+                .table_emptying_group_local = HostedProvisionedTableWriteSource.tableEmptyingGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -7210,6 +7303,63 @@ pub const HostedProvisionedTableWriteSource = struct {
             else => return err,
         };
         return try runHostedSchemaRewriteGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    fn tableEmptyingWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runTableEmptyingWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn tableEmptyingGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?TableEmptyingWorkerResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (record.group_id != group_id) return error.InvalidTableEmptyingJob;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try runHostedTableEmptyingGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms),
+                .remote => |remote| {
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    const body = try std.json.Stringify.valueAlloc(alloc, TableEmptyingGroupRequest{
+                        .record = record,
+                        .worker_id = worker_id,
+                        .lease_ms = lease_ms,
+                    }, .{});
+                    defer alloc.free(body);
+                    var response = try client.fetchGroupTableEmptying(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    var parsed = try std.json.parseFromSlice(TableEmptyingWorkerResult, alloc, response.body, .{
+                        .ignore_unknown_fields = true,
+                    });
+                    defer parsed.deinit();
+                    return parsed.value;
+                },
+            }
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try runHostedTableEmptyingGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn foreignKeyIntegrityWorkerPass(
@@ -9846,6 +9996,30 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
         const result = try runSchemaRewriteJobGroupLocal(alloc, cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
+        if (result.claimed) try drainManagedDbBeforeClose(cached.db);
+        return result;
+    }
+
+    fn runHostedTableEmptyingGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?TableEmptyingWorkerResult {
+        if (record.group_id != group_id) return error.InvalidTableEmptyingJob;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const table = try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
+        defer metadata_table_manager.freeTable(alloc, table);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+        var result = try runTableEmptyingJobGroupLocal(alloc, cached.db, self.catalog, table, record, worker_id, now_ms, lease_ms);
+        errdefer result.deinit(alloc);
         if (result.claimed) try drainManagedDbBeforeClose(cached.db);
         return result;
     }

@@ -57,6 +57,26 @@ pub const CatalogSource = struct {
             ptr: *anyopaque,
             request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
         ) anyerror!void = null,
+        upsert_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            record: metadata_table_manager.TableEmptyingJobRecord,
+        ) anyerror!void = null,
+        remove_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            job_id: u64,
+        ) anyerror!void = null,
+        begin_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobBeginRequest,
+        ) anyerror!void = null,
+        finish_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobFinishRequest,
+        ) anyerror!void = null,
+        invalidate_table_emptying_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+        ) anyerror!void = null,
         promote_secondary_index_ready: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -126,6 +146,46 @@ pub const CatalogSource = struct {
         return try fn_ptr(self.ptr, request);
     }
 
+    pub fn upsertTableEmptyingJob(
+        self: CatalogSource,
+        record: metadata_table_manager.TableEmptyingJobRecord,
+    ) !void {
+        const fn_ptr = self.vtable.upsert_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, record);
+    }
+
+    pub fn removeTableEmptyingJob(
+        self: CatalogSource,
+        job_id: u64,
+    ) !void {
+        const fn_ptr = self.vtable.remove_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, job_id);
+    }
+
+    pub fn beginTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobBeginRequest,
+    ) !void {
+        const fn_ptr = self.vtable.begin_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn finishTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobFinishRequest,
+    ) !void {
+        const fn_ptr = self.vtable.finish_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn invalidateTableEmptyingJob(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+    ) !void {
+        const fn_ptr = self.vtable.invalidate_table_emptying_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
     pub fn promoteSecondaryIndexReady(
         self: CatalogSource,
         alloc: std.mem.Allocator,
@@ -157,6 +217,11 @@ pub const CatalogSource = struct {
                 .begin_schema_rewrite_job = metadataServiceBeginSchemaRewriteJob,
                 .finish_schema_rewrite_job = metadataServiceFinishSchemaRewriteJob,
                 .invalidate_schema_rewrite_job = metadataServiceInvalidateSchemaRewriteJob,
+                .upsert_table_emptying_job = metadataServiceUpsertTableEmptyingJob,
+                .remove_table_emptying_job = metadataServiceRemoveTableEmptyingJob,
+                .begin_table_emptying_job = metadataServiceBeginTableEmptyingJob,
+                .finish_table_emptying_job = metadataServiceFinishTableEmptyingJob,
+                .invalidate_table_emptying_job = metadataServiceInvalidateTableEmptyingJob,
                 .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
             },
@@ -175,6 +240,11 @@ pub const CatalogSource = struct {
                 .begin_schema_rewrite_job = metadataHttpServiceBeginSchemaRewriteJob,
                 .finish_schema_rewrite_job = metadataHttpServiceFinishSchemaRewriteJob,
                 .invalidate_schema_rewrite_job = metadataHttpServiceInvalidateSchemaRewriteJob,
+                .upsert_table_emptying_job = metadataHttpServiceUpsertTableEmptyingJob,
+                .remove_table_emptying_job = metadataHttpServiceRemoveTableEmptyingJob,
+                .begin_table_emptying_job = metadataHttpServiceBeginTableEmptyingJob,
+                .finish_table_emptying_job = metadataHttpServiceFinishTableEmptyingJob,
+                .invalidate_table_emptying_job = metadataHttpServiceInvalidateTableEmptyingJob,
                 .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
             },
@@ -711,6 +781,46 @@ fn metadataServiceInvalidateSchemaRewriteJob(
     return try svc.invalidateSchemaRewriteJob(request);
 }
 
+fn metadataServiceUpsertTableEmptyingJob(
+    ptr: *anyopaque,
+    record: metadata_table_manager.TableEmptyingJobRecord,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.upsertTableEmptyingJob(record);
+}
+
+fn metadataServiceRemoveTableEmptyingJob(
+    ptr: *anyopaque,
+    job_id: u64,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.removeTableEmptyingJob(job_id);
+}
+
+fn metadataServiceBeginTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.beginTableEmptyingJob(request);
+}
+
+fn metadataServiceFinishTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.finishTableEmptyingJob(request);
+}
+
+fn metadataServiceInvalidateTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateTableEmptyingJob(request);
+}
+
 fn metadataServiceCompareAndSwapTableSchema(
     ptr: *anyopaque,
     request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
@@ -852,6 +962,46 @@ fn metadataHttpServiceInvalidateSchemaRewriteJob(
 ) !void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.invalidateSchemaRewriteJob(request);
+}
+
+fn metadataHttpServiceUpsertTableEmptyingJob(
+    ptr: *anyopaque,
+    record: metadata_table_manager.TableEmptyingJobRecord,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.upsertTableEmptyingJob(record);
+}
+
+fn metadataHttpServiceRemoveTableEmptyingJob(
+    ptr: *anyopaque,
+    job_id: u64,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.removeTableEmptyingJob(job_id);
+}
+
+fn metadataHttpServiceBeginTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.beginTableEmptyingJob(request);
+}
+
+fn metadataHttpServiceFinishTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.finishTableEmptyingJob(request);
+}
+
+fn metadataHttpServiceInvalidateTableEmptyingJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateTableEmptyingJob(request);
 }
 
 fn metadataHttpServiceCompareAndSwapTableSchema(

@@ -150,6 +150,70 @@ pub fn appliedDdlHasSchemaRewriteWork(applied: tables_api.AppliedRelationalSqlDd
     return false;
 }
 
+pub fn tableEmptyingJobForRange(
+    table: metadata_table_manager.TableRecord,
+    range: metadata_table_manager.RangeRecord,
+    affected_table_ids: []const u64,
+    restart_identity: bool,
+    cascade: bool,
+) metadata_table_manager.TableEmptyingJobRecord {
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+    var record = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = table.table_id,
+        .group_id = range.group_id,
+        .schema_generation = schema_generation,
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
+        .affected_table_ids = affected_table_ids,
+        .restart_identity = restart_identity,
+        .cascade = cascade,
+    };
+    record.job_id = metadata_table_manager.stableTableEmptyingJobId(record);
+    return record;
+}
+
+pub fn scheduleTableEmptyingJobsForTableOnService(
+    svc: anytype,
+    table: metadata_table_manager.TableRecord,
+    affected_table_ids: []const u64,
+    restart_identity: bool,
+    cascade: bool,
+) !usize {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "adminSnapshot") or
+        !@hasDecl(ServiceDeclType, "freeAdminSnapshot") or
+        !@hasDecl(ServiceDeclType, "upsertTableEmptyingJob"))
+    {
+        return error.UnsupportedOperation;
+    }
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    return try scheduleTableEmptyingJobsForTableSnapshot(svc, snapshot.ranges, table, affected_table_ids, restart_identity, cascade);
+}
+
+pub fn scheduleTableEmptyingJobsForTableSnapshot(
+    scheduler: anytype,
+    ranges: []const metadata_table_manager.RangeRecord,
+    table: metadata_table_manager.TableRecord,
+    affected_table_ids: []const u64,
+    restart_identity: bool,
+    cascade: bool,
+) !usize {
+    var scheduled: usize = 0;
+    for (ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        const job = tableEmptyingJobForRange(table, range, affected_table_ids, restart_identity, cascade);
+        try scheduler.upsertTableEmptyingJob(job);
+        scheduled += 1;
+    }
+    return scheduled;
+}
+
 fn schemaRewriteRenamesForAppliedRowRewritePlan(plan: sql_adapter.AppliedDdlRowRewritePlan) []const metadata_table_manager.SchemaRewriteRename {
     if (plan.renames.len == 0) return &.{};
     const ptr: [*]const metadata_table_manager.SchemaRewriteRename = @ptrCast(@alignCast(plan.renames.ptr));
@@ -585,6 +649,82 @@ test "catalog jobs detects schema rewrite wakeable applied DDL work" {
     try std.testing.expect(appliedDdlHasSchemaRewriteWork(applied));
     applied.dropped_table = true;
     try std.testing.expect(!appliedDdlHasSchemaRewriteWork(applied));
+}
+
+test "catalog jobs builds deterministic table emptying jobs for ranges" {
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+    };
+    const range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const affected = [_]u64{ 77, 88 };
+    const first = tableEmptyingJobForRange(table, range, affected[0..], true, true);
+    const second = tableEmptyingJobForRange(table, range, affected[0..], true, true);
+    try std.testing.expect(first.job_id != 0);
+    try std.testing.expectEqual(first.job_id, second.job_id);
+    try std.testing.expectEqual(@as(u64, 77), first.table_id);
+    try std.testing.expectEqual(@as(u64, 9001), first.group_id);
+    try std.testing.expectEqual(metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json), first.schema_generation);
+    try std.testing.expect(first.restart_identity);
+    try std.testing.expect(first.cascade);
+
+    var next_range = range;
+    next_range.group_id = 9002;
+    const different_group = tableEmptyingJobForRange(table, next_range, affected[0..], true, true);
+    try std.testing.expect(first.job_id != different_group.job_id);
+
+    const different_flags = tableEmptyingJobForRange(table, range, affected[0..], false, true);
+    try std.testing.expect(first.job_id != different_flags.job_id);
+}
+
+test "catalog jobs schedules table emptying jobs from snapshot ranges" {
+    const Scheduler = struct {
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.TableEmptyingJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.jobs.items) |record| metadata_table_manager.freeTableEmptyingJob(allocator, record);
+            self.jobs.deinit(allocator);
+        }
+
+        fn upsertTableEmptyingJob(self: *@This(), record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            const owned = try metadata_table_manager.cloneTableEmptyingJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, owned);
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+    };
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 91,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 8101, .range_id = 8102, .table_id = 91, .start_key = "", .end_key = "m" },
+        .{ .group_id = 8103, .range_id = 8104, .table_id = 91, .start_key = "m", .end_key = null },
+        .{ .group_id = 9999, .range_id = 9998, .table_id = 92, .start_key = "", .end_key = null },
+    };
+    const affected = [_]u64{ 91, 92 };
+    var scheduler = Scheduler{};
+    defer scheduler.deinit(std.testing.allocator);
+
+    const scheduled = try scheduleTableEmptyingJobsForTableSnapshot(&scheduler, ranges[0..], table, affected[0..], true, true);
+
+    try std.testing.expectEqual(@as(usize, 2), scheduled);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 8101), scheduler.jobs.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 8103), scheduler.jobs.items[1].group_id);
+    for (scheduler.jobs.items) |job| {
+        try std.testing.expectEqual(@as(u64, 91), job.table_id);
+        try std.testing.expect(job.restart_identity);
+        try std.testing.expect(job.cascade);
+        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
+    }
 }
 
 test "catalog jobs snapshot scheduler does not require HTTP service surface" {
