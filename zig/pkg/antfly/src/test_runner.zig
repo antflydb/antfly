@@ -106,10 +106,13 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
         }
 
+        std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
         testing.io_instance.deinit();
+        std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
         if (testing.allocator_instance.deinit() == .leak) {
             leak_count += 1;
         }
+        std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
     }
 
     std.debug.print(

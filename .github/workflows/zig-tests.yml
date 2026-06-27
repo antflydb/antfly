@@ -177,7 +177,90 @@ jobs:
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
-        run: make zig-unit-test
+        run: |
+          set -euo pipefail
+
+          collect_descendants() {
+            local roots="$*"
+            local all=" ${roots} "
+            local changed=1
+            while [ "$changed" -eq 1 ]; do
+              changed=0
+              while read -r pid ppid; do
+                if [[ " $all " == *" $ppid "* && " $all " != *" $pid "* ]]; then
+                  all="${all}${pid} "
+                  changed=1
+                fi
+              done < <(ps -eo pid=,ppid=)
+            done
+            echo "$all"
+          }
+
+          dump_stacks() {
+            local root_pid="$1"
+            echo "::group::antfly unit watchdog process tree"
+            ps -eo pid,ppid,stat,etime,cmd | grep -E "PID|zig build|zig-local|/test|make zig-unit-test|make -C ./zig unit-test" || true
+            echo "::endgroup::"
+
+            local pids
+            pids="$(collect_descendants "$root_pid")"
+            for pid in $pids; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                continue
+              fi
+              local cmdline
+              cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+              case "$cmdline" in
+                *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                  echo "::group::gdb thread dump pid=$pid cmd=$cmdline"
+                  timeout 45s gdb -batch -p "$pid" \
+                    -ex "set pagination off" \
+                    -ex "thread apply all bt" \
+                    -ex "detach" || \
+                    timeout 45s sudo gdb -batch -p "$pid" \
+                      -ex "set pagination off" \
+                      -ex "thread apply all bt" \
+                      -ex "detach" || true
+                  echo "::endgroup::"
+                  ;;
+              esac
+            done
+          }
+
+          terminate_tree() {
+            local root_pid="$1"
+            local pids
+            pids="$(collect_descendants "$root_pid")"
+            for pid in $pids; do
+              if [ "$pid" != "$$" ]; then
+                kill -TERM "$pid" 2>/dev/null || true
+              fi
+            done
+            sleep 5
+            for pid in $pids; do
+              if [ "$pid" != "$$" ]; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+
+          make zig-unit-test &
+          unit_pid="$!"
+          (
+            sleep "${ANTFLY_UNIT_WATCHDOG_SECS:-1200}"
+            if kill -0 "$unit_pid" 2>/dev/null; then
+              echo "::error::zig-unit-test watchdog fired; dumping stacks before terminating live test processes"
+              dump_stacks "$unit_pid"
+              terminate_tree "$unit_pid"
+            fi
+          ) &
+          watchdog_pid="$!"
+
+          status=0
+          wait "$unit_pid" || status="$?"
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
+          exit "$status"
 
   tla-verify:
     needs: changes
