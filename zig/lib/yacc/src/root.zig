@@ -282,7 +282,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             try grammar.rules.append(allocator, .{ .name = try dupToken(allocator, name) });
             active_rule = grammar.rules.items.len - 1;
             const rest = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
-            if (rest.len != 0) try appendAlternative(allocator, &grammar.rules.items[active_rule.?], rest);
+            if (rest.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
             if (ends_rule) active_rule = null;
             continue;
         }
@@ -292,7 +292,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 std.mem.trim(u8, line[1..], " \t\r")
             else
                 line;
-            try appendAlternative(allocator, &grammar.rules.items[rule_idx], alt);
+            try appendAlternatives(allocator, &grammar.rules.items[rule_idx], alt);
             if (ends_rule) active_rule = null;
             continue;
         }
@@ -399,6 +399,31 @@ fn appendAlternative(allocator: std.mem.Allocator, rule: *Rule, text: []const u8
         try symbols.append(allocator, try dupToken(allocator, symbol));
     }
     try rule.alternatives.append(allocator, .{ .symbols = try symbols.toOwnedSlice(allocator), .precedence_symbol = precedence_symbol });
+}
+
+fn appendAlternatives(allocator: std.mem.Allocator, rule: *Rule, text: []const u8) !void {
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        switch (text[index]) {
+            '\'' => {
+                try skipQuotedFragment(text, &index, '\'');
+                index += 1;
+            },
+            '"' => {
+                try skipQuotedFragment(text, &index, '"');
+                index += 1;
+            },
+            '{' => try skipActionBlock(text, &index),
+            '|' => {
+                try appendAlternative(allocator, rule, text[start..index]);
+                index += 1;
+                start = index;
+            },
+            else => index += 1,
+        }
+    }
+    try appendAlternative(allocator, rule, text[start..]);
 }
 
 fn nextGrammarSymbol(text: []const u8, index: *usize) !?[]const u8 {
@@ -1655,6 +1680,32 @@ test "parseGrammar accepts bison typed declarations and strips semantic actions"
     try std.testing.expectEqualStrings("'+'", grammar.rules.items[1].alternatives.items[0].precedence_symbol.?);
     try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[1].alternatives.items[1].symbols.len);
     try validateGrammar(grammar);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
+}
+
+test "parseGrammar splits same-line alternatives outside literals and actions" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start stmt
+        \\%token IDENT STRING BAR '|'
+        \\stmt:
+        \\    IDENT { note("|"); } | STRING | BAR '|'
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items.len);
+    try std.testing.expectEqual(@as(usize, 3), grammar.rules.items[0].alternatives.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items[0].alternatives.items[0].symbols.len);
+    try std.testing.expectEqualStrings("IDENT", grammar.rules.items[0].alternatives.items[0].symbols[0]);
+    try std.testing.expectEqualStrings("STRING", grammar.rules.items[0].alternatives.items[1].symbols[0]);
+    try std.testing.expectEqual(@as(usize, 2), grammar.rules.items[0].alternatives.items[2].symbols.len);
+    try std.testing.expectEqualStrings("BAR", grammar.rules.items[0].alternatives.items[2].symbols[0]);
+    try std.testing.expectEqualStrings("'|'", grammar.rules.items[0].alternatives.items[2].symbols[1]);
 
     const tables = try buildSlrTables(arena, grammar);
     try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);

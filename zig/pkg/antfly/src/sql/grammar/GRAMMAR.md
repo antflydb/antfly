@@ -53,7 +53,9 @@ tags such as `%token <str> IDENT`, ignored `%type` metadata, `%precedence`,
 aliases, and C/Bison semantic action blocks in rule alternatives. These source
 compatibility features are stripped before table construction so Antfly still
 owns the generated runtime AST and parser facade instead of importing
-PostgreSQL semantic actions. The
+PostgreSQL semantic actions. Rule parsing also handles same-line alternatives
+such as `rule: a | b ;`, splitting only grammar-level `|` separators while
+preserving quoted literal pipes and ignoring action-block contents. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records both
