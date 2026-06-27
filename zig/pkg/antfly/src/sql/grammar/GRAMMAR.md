@@ -419,7 +419,12 @@ alias metadata fails closed. The generated AST distinguishes direct
 updates, source-tail updates, joined `DELETE ... USING`/semijoin deletes,
 source-tail deletes, `TRUNCATE`, and `MERGE` write families; point-vs-source
 update/delete selector decisions remain in typed lowering where schema and
-unique-selector metadata are available. Deeper DML cutover still requires
+unique-selector metadata are available. Generated DML child-read bodies now
+also retain source table and alias/name token ranges for simple `INSERT ...
+SELECT` sources, recursive DML CTE body reads, and `UPDATE`/`DELETE`/`MERGE`
+relation-source wrappers; parsed-statement classification and generated DML
+lowering validate those spans so corrupted child-read source alias metadata
+fails closed before typed command-body lowering continues. Deeper DML cutover still requires
 replacing token-based recursive DML command-body lowering with complete
 generated AST-driven lowering beyond validated generated CTE child-read bodies,
 broader unsupported-shape diagnostics, and a later full statement-head

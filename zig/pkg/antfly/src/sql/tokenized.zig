@@ -2677,6 +2677,10 @@ fn generatedDmlReadBodyIsValid(
     if (!std.meta.eql(read_body.statement_span, generatedDmlSourceSpanForTokenRange(tokens, range))) return false;
     if (!std.meta.eql(read_body.command_span, tokens[range.start].sourceSpan())) return false;
     if (!generatedDmlReadBodyKindIsValid(read_body, shape)) return false;
+    if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.source_table_tokens)) return false;
+    if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.source_alias_tokens)) return false;
+    if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.source_alias_name_tokens)) return false;
+    if (!generatedDmlReadBodySingleSourceAliasPayloadIsValid(tokens, end, read_body)) return false;
 
     switch (shape) {
         .select_body => {
@@ -2698,6 +2702,82 @@ fn generatedDmlReadBodyIsValid(
         },
     }
     return true;
+}
+
+fn generatedDmlReadBodySingleSourceAliasPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    read_body: generated_parser.GeneratedSqlDmlReadBodyAst,
+) bool {
+    const source_table = read_body.source_table_tokens orelse {
+        if (read_body.source_alias_tokens != null or read_body.source_alias_name_tokens != null) return false;
+        if (read_body.source_tokens == null) return true;
+        return !generatedDmlReadBodySourceLooksLikeSingleTableSource(tokens, end, read_body.source_tokens.?);
+    };
+    const source = read_body.source_tokens orelse return false;
+    if (source.start >= source.end or source.end > end) return false;
+    var expected_table_start = source.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (source_table.start != expected_table_start or source_table.end != expected_table_start + 1 or source_table.end > source.end) return false;
+    if (tokens[source_table.start].kind != .identifier) return false;
+    const alias_end = generatedDmlReadBodySingleSourceAliasEnd(tokens, end, source_table, read_body.source_alias_tokens, read_body.source_alias_name_tokens) orelse return false;
+    return alias_end == source.end;
+}
+
+fn generatedDmlReadBodySingleSourceAliasEnd(
+    tokens: []const Token,
+    end: usize,
+    source_table: generated_parser.GeneratedSqlTokenRange,
+    source_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    source_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    if (source_table.start >= source_table.end or source_table.end > end or end > tokens.len) return null;
+    const alias = source_alias_tokens orelse {
+        if (source_alias_name_tokens != null) return null;
+        return source_table.end;
+    };
+    const alias_name = source_alias_name_tokens orelse return null;
+    if (alias.start != source_table.end or alias.start >= alias.end or alias.end > end) return null;
+    const expected_name = if (alias.end == source_table.end + 2 and
+        tokens[source_table.end].matchesKeywordTag(.as) and
+        tokens[source_table.end + 1].kind == .identifier)
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = source_table.end + 1, .end = source_table.end + 2 };
+    } else if (alias.end == source_table.end + 1 and
+        tokens[source_table.end].kind == .identifier and
+        !generatedReadSourceTailKeyword(tokens, source_table.end))
+    blk: {
+        break :blk alias;
+    } else return null;
+    if (alias_name.start != expected_name.start or alias_name.end != expected_name.end) return null;
+    return alias.end;
+}
+
+fn generatedDmlReadBodySourceLooksLikeSingleTableSource(
+    tokens: []const Token,
+    end: usize,
+    source: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (source.start >= source.end or source.end > end or end > tokens.len) return false;
+    var table_start = source.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    if (table_start >= source.end or tokens[table_start].kind != .identifier) return false;
+
+    const table_end = table_start + 1;
+    if (table_end == source.end) return true;
+    if (table_end + 2 == source.end and
+        tokens[table_end].matchesKeywordTag(.as) and
+        tokens[table_end + 1].kind == .identifier)
+    {
+        return true;
+    }
+    if (table_end + 1 == source.end and
+        tokens[table_end].kind == .identifier and
+        !generatedReadSourceTailKeyword(tokens, table_end))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn generatedDmlReadBodyKindIsValid(
@@ -7482,6 +7562,29 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
     try std.testing.expect(generated_insert_select.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
 
+    var generated_aliased_insert_select = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT s.id FROM ONLY incoming_usage AS s WHERE s.status = 'open'");
+    defer generated_aliased_insert_select.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_aliased_insert_select.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_aliased_insert_select.writeStatementKind().?);
+
+    var malformed_insert_source_alias = generated_aliased_insert_select.generated_statement.?;
+    switch (malformed_insert_source_alias.ast.?) {
+        .dml => |*dml_ast| {
+            if (dml_ast.source_read.?.source_table_tokens == null or
+                dml_ast.source_read.?.source_alias_tokens == null or
+                dml_ast.source_read.?.source_alias_name_tokens == null)
+            {
+                return error.TestUnexpectedResult;
+            }
+            dml_ast.source_read.?.source_alias_tokens = null;
+            dml_ast.source_read.?.source_alias_name_tokens = null;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    generated_aliased_insert_select.statement = parseStatement(generated_aliased_insert_select.raw_statement, malformed_insert_source_alias, &generated_aliased_insert_select.tokenized_sql);
+    try std.testing.expect(generated_aliased_insert_select.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_aliased_insert_select.statement));
+
     var generated_insert_select_no_from = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, amount) SELECT 1, 2");
     defer generated_insert_select_no_from.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_select_no_from.generatedStatementKind().?);
@@ -7529,6 +7632,29 @@ test "sql adapter parsed sql write statement kind is generated-owned for covered
     generated_update_from.statement = parseStatement(generated_update_from.raw_statement, malformed_relation_source_kind, &generated_update_from.tokenized_sql);
     try std.testing.expect(generated_update_from.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_update_from.statement));
+
+    var generated_aliased_update_from = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = s.status FROM source_rows AS s WHERE usage_records.id = s.id");
+    defer generated_aliased_update_from.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_aliased_update_from.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update_joined_source, generated_aliased_update_from.writeStatementKind().?);
+
+    var malformed_relation_source_alias = generated_aliased_update_from.generated_statement.?;
+    switch (malformed_relation_source_alias.ast.?) {
+        .dml => |*dml_ast| {
+            if (dml_ast.source_read.?.source_table_tokens == null or
+                dml_ast.source_read.?.source_alias_tokens == null or
+                dml_ast.source_read.?.source_alias_name_tokens == null)
+            {
+                return error.TestUnexpectedResult;
+            }
+            dml_ast.source_read.?.source_alias_tokens = null;
+            dml_ast.source_read.?.source_alias_name_tokens = null;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    generated_aliased_update_from.statement = parseStatement(generated_aliased_update_from.raw_statement, malformed_relation_source_alias, &generated_aliased_update_from.tokenized_sql);
+    try std.testing.expect(generated_aliased_update_from.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_aliased_update_from.statement));
 
     var generated_insert_conflict = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'open') ON CONFLICT (id) DO NOTHING RETURNING id");
     defer generated_insert_conflict.deinit(alloc);

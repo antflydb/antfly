@@ -12967,6 +12967,9 @@ fn validateGeneratedDmlReadBodyLayout(
     if (body_read.source_tokens) |source_range| {
         if (source_range.start <= projection_range.end or source_range.end > body_range.end or source_range.start >= source_range.end) return error.UnsupportedSqlShape;
         if (source_range.start == 0 or !tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+        try validateGeneratedDmlReadBodySingleSourceAlias(tokens, body_read);
+    } else if (body_read.source_table_tokens != null or body_read.source_alias_tokens != null or body_read.source_alias_name_tokens != null) {
+        return error.UnsupportedSqlShape;
     }
     if (body_read.where_tokens) |where_range| {
         if (where_range.start <= body_range.start or where_range.end > body_range.end or where_range.start >= where_range.end) return error.UnsupportedSqlShape;
@@ -12996,6 +12999,88 @@ fn validateGeneratedDmlReadBodySpans(
     const last = tokens[body_range.end - 1];
     if (body_read.statement_span.start != first.source_start or body_read.statement_span.end != last.source_end) return error.UnsupportedSqlShape;
     if (body_read.command_span.start != first.source_start or body_read.command_span.end != first.source_end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDmlReadBodySingleSourceAlias(
+    tokens: []const Token,
+    body_read: generated_parser.GeneratedSqlDmlReadBodyAst,
+) !void {
+    const source = body_read.source_tokens orelse {
+        if (body_read.source_table_tokens != null or body_read.source_alias_tokens != null or body_read.source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        return;
+    };
+    if (source.start >= source.end or source.end > tokens.len) return error.UnsupportedSqlShape;
+    const source_table = body_read.source_table_tokens orelse {
+        if (body_read.source_alias_tokens != null or body_read.source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        if (!generatedDmlReadBodySourceLooksLikeSingleTableSource(tokens, source)) return;
+        return error.UnsupportedSqlShape;
+    };
+
+    var expected_table_start = source.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (source_table.start != expected_table_start or source_table.end != expected_table_start + 1 or source_table.end > source.end) return error.UnsupportedSqlShape;
+    if (tokens[source_table.start].kind != .identifier) return error.UnsupportedSqlShape;
+    const alias_end = try generatedDmlReadBodySingleSourceAliasEnd(
+        tokens,
+        source_table,
+        body_read.source_alias_tokens,
+        body_read.source_alias_name_tokens,
+    );
+    if (alias_end != source.end) return error.UnsupportedSqlShape;
+}
+
+fn generatedDmlReadBodySingleSourceAliasEnd(
+    tokens: []const Token,
+    source_table: generated_parser.GeneratedSqlTokenRange,
+    source_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    source_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !usize {
+    if (source_table.start >= source_table.end or source_table.end > tokens.len) return error.UnsupportedSqlShape;
+    const alias = source_alias_tokens orelse {
+        if (source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        return source_table.end;
+    };
+    const alias_name = source_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.start != source_table.end or alias.start >= alias.end or alias.end > tokens.len) return error.UnsupportedSqlShape;
+    const expected_name = if (alias.end == source_table.end + 2 and
+        tokens[source_table.end].matchesKeywordTag(.as) and
+        tokens[source_table.end + 1].kind == .identifier)
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = source_table.end + 1, .end = source_table.end + 2 };
+    } else if (alias.end == source_table.end + 1 and
+        tokens[source_table.end].kind == .identifier and
+        !plan_mod.nextIsJoinClauseKeyword(tokens, source_table.end))
+    blk: {
+        break :blk alias;
+    } else return error.UnsupportedSqlShape;
+    if (alias_name.start != expected_name.start or alias_name.end != expected_name.end) return error.UnsupportedSqlShape;
+    return alias.end;
+}
+
+fn generatedDmlReadBodySourceLooksLikeSingleTableSource(
+    tokens: []const Token,
+    source: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (source.start >= source.end or source.end > tokens.len) return false;
+    var table_start = source.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    if (table_start >= source.end or tokens[table_start].kind != .identifier) return false;
+
+    const table_end = table_start + 1;
+    if (table_end == source.end) return true;
+    if (table_end + 2 == source.end and
+        tokens[table_end].matchesKeywordTag(.as) and
+        tokens[table_end + 1].kind == .identifier)
+    {
+        return true;
+    }
+    if (table_end + 1 == source.end and
+        tokens[table_end].kind == .identifier and
+        !plan_mod.nextIsJoinClauseKeyword(tokens, table_end))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !void {
@@ -13577,6 +13662,7 @@ fn validateGeneratedDmlRelationSourceBodyAst(
     try validateGeneratedDmlReadBodySpans(tokens, source_range, source_read);
     const read_source_range = source_read.source_tokens orelse return error.UnsupportedSqlShape;
     if (read_source_range.start != source_range.start or read_source_range.end != source_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReadBodySingleSourceAlias(tokens, source_read);
     if (source_read.projection_tokens != null or source_read.where_tokens != null or source_read.set_operation_tokens != null) return error.UnsupportedSqlShape;
     if (source_read.kind != .query and source_read.kind != .join and source_read.kind != .lateral) return error.UnsupportedSqlShape;
 }
@@ -14540,6 +14626,36 @@ test "sql adapter lower dml validates generated child read payloads" {
         .dml => |dml| try validateGeneratedDmlReadSourceBodyAlloc(alloc, &insert_source, dml),
         else => return error.TestUnexpectedResult,
     }
+    var insert_source_alias = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id) SELECT s.id FROM incoming_usage AS s WHERE s.status = 'ready'",
+    );
+    defer insert_source_alias.deinit(alloc);
+    switch (insert_source_alias.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedDmlReadSourceBodyAlloc(alloc, &insert_source_alias, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    if (insert_source_alias.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.source_read.?.source_table_tokens == null or
+                        dml.source_read.?.source_alias_tokens == null or
+                        dml.source_read.?.source_alias_name_tokens == null)
+                    {
+                        return error.TestUnexpectedResult;
+                    }
+                    dml.source_read.?.source_alias_tokens = null;
+                    dml.source_read.?.source_alias_name_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (insert_source_alias.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAlloc(alloc, &insert_source_alias, dml)),
+        else => return error.TestUnexpectedResult,
+    }
     if (insert_source.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
@@ -14610,6 +14726,36 @@ test "sql adapter lower dml validates generated child read payloads" {
     defer relation_source.deinit(alloc);
     switch (relation_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try validateGeneratedDmlRelationSourceBody(&relation_source, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    var relation_source_alias = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE usage_records.id = source.id",
+    );
+    defer relation_source_alias.deinit(alloc);
+    switch (relation_source_alias.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedDmlRelationSourceBody(&relation_source_alias, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    if (relation_source_alias.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.source_read.?.source_table_tokens == null or
+                        dml.source_read.?.source_alias_tokens == null or
+                        dml.source_read.?.source_alias_name_tokens == null)
+                    {
+                        return error.TestUnexpectedResult;
+                    }
+                    dml.source_read.?.source_alias_tokens = null;
+                    dml.source_read.?.source_alias_name_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (relation_source_alias.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlRelationSourceBody(&relation_source_alias, dml)),
         else => return error.TestUnexpectedResult,
     }
     if (relation_source.generated_statement) |*generated_statement| {

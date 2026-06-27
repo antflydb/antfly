@@ -1747,6 +1747,9 @@ pub const GeneratedSqlDmlReadBodyAst = struct {
     command_span: token_mod.SourceSpan,
     projection_tokens: ?GeneratedSqlTokenRange = null,
     source_tokens: ?GeneratedSqlTokenRange = null,
+    source_table_tokens: ?GeneratedSqlTokenRange = null,
+    source_alias_tokens: ?GeneratedSqlTokenRange = null,
+    source_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
     wrapper_projection_star: bool = false,
@@ -4795,6 +4798,7 @@ fn buildDmlReadBodyMetadata(
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
         if (idx + 1 < where_end) read_body.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
+    buildDmlReadBodySingleSourceAst(tokens, &read_body);
     return read_body;
 }
 
@@ -4804,7 +4808,7 @@ fn buildDmlRelationSourceReadAst(
     source_tokens: GeneratedSqlTokenRange,
 ) void {
     const statement_span = sourceSpanForTokenRange(tokens, source_tokens) orelse return;
-    ast.source_read = .{
+    var source_read = GeneratedSqlDmlReadBodyAst{
         .tokens = source_tokens,
         .kind = classifyReadKindInRange(tokens, source_tokens),
         .statement_span = statement_span,
@@ -4812,6 +4816,31 @@ fn buildDmlRelationSourceReadAst(
         .source_tokens = source_tokens,
         .wrapper_projection_star = true,
     };
+    buildDmlReadBodySingleSourceAst(tokens, &source_read);
+    ast.source_read = source_read;
+}
+
+fn buildDmlReadBodySingleSourceAst(
+    tokens: []const token_mod.Token,
+    read_body: *GeneratedSqlDmlReadBodyAst,
+) void {
+    const source_tokens = read_body.source_tokens orelse return;
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    var table_start = source_tokens.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    const table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, table_start, source_tokens.end) orelse return;
+    var alias_end = table_tokens.end;
+    if (generatedReadSourceAlias(tokens, table_tokens.end, source_tokens.end)) |alias| {
+        read_body.source_alias_tokens = alias.alias_tokens;
+        read_body.source_alias_name_tokens = alias.alias_name_tokens;
+        alias_end = alias.end;
+    }
+    if (alias_end != source_tokens.end) {
+        read_body.source_alias_tokens = null;
+        read_body.source_alias_name_tokens = null;
+        return;
+    }
+    read_body.source_table_tokens = table_tokens;
 }
 
 fn buildReadAstInPlace(
@@ -9257,6 +9286,9 @@ test "generated SQL parser facade builds control AST spans" {
             const source_read = dml.source_read orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, source_read.tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 10 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, source_read.source_alias_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
             try std.testing.expect(source_read.wrapper_projection_star);
         },
@@ -9272,6 +9304,9 @@ test "generated SQL parser facade builds control AST spans" {
             const source_read = dml.source_read orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, source_read.source_alias_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
             try std.testing.expect(source_read.wrapper_projection_star);
         },
@@ -9300,6 +9335,9 @@ test "generated SQL parser facade builds control AST spans" {
             const source_read = dml.source_read orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, source_read.source_alias_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
             try std.testing.expect(source_read.wrapper_projection_star);
         },
@@ -9315,6 +9353,11 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, dml.target_alias_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, dml.target_alias_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, dml.source_tokens.?);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 9 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, source_read.source_alias_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9328,6 +9371,27 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 6 }, dml.target_alias_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, dml.target_alias_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, dml.source_tokens.?);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 11 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, source_read.source_alias_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aliased_insert_select_sql = "INSERT INTO usage_records (id) SELECT s.id FROM ONLY incoming_usage AS s WHERE s.status = 'open'";
+    const aliased_insert_select_result = try parseSqlAlloc(alloc, aliased_insert_select_sql);
+    switch (aliased_insert_select_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_select, dml.kind);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 17 }, source_read.tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 13 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, source_read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 13 }, source_read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, source_read.source_alias_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 17 }, source_read.where_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
