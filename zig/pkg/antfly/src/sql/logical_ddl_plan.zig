@@ -15,8 +15,10 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
 const ddl_plan = @import("ddl.zig");
 const lower_expr = @import("lower_expr.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const tokenized = @import("tokenized.zig");
 
 pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
@@ -32,11 +34,29 @@ pub fn planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
     bound: *binder.BoundSqlStatement,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !binder.LogicalSqlPlan {
-    if (bound.takeDdlLogicalPlan()) |logical_plan| return logical_plan else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-    }
-    return try planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, try bound.parsedSql(), function_bindings);
+    _ = alloc;
+    _ = function_bindings;
+    return try bound.takeDdlLogicalPlan();
 }
 
 pub const parseLogicalDdlPlanAlloc = ddl_plan.parseLogicalDdlPlanAlloc;
 pub const planGeneratedLogicalDdlAstAlloc = ddl_plan.planGeneratedLogicalDdlAstAlloc;
+
+test "bound ddl planner consumes binder-owned logical plan without parsed fallback" {
+    const alloc = std.testing.allocator;
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
+    defer parsed.deinit(alloc);
+
+    var bound = try binder.bindDdlStatementWithCatalogSessionAlloc(
+        alloc,
+        &parsed,
+        table_catalog.unavailableCatalogSource(),
+        catalog_resources.SqlCatalogSession.default(),
+    );
+    defer bound.deinit(alloc);
+
+    var logical = try planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{});
+    defer logical.deinit(alloc);
+    try std.testing.expectEqualStrings("table_ddl", logical.statementKindName());
+    try std.testing.expectError(error.UnsupportedSqlShape, planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, &bound, .{}));
+}

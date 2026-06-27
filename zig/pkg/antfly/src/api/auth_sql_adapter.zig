@@ -157,25 +157,15 @@ pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindin
     var catalog_source = try SqlAuthCatalogSource.initAlloc(alloc, catalog);
     defer catalog_source.deinit(alloc);
 
-    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
-        .catalog = catalog_source.iface(),
-        .session = catalog.session(),
-        .function_bindings = function_bindings,
-    });
-    defer logical_plan.deinit(alloc);
-    return try executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(manager, alloc, &logical_plan, catalog);
-}
-
-pub fn executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(
-    manager: *usermgr.UserManager,
-    alloc: std.mem.Allocator,
-    logical_plan: *sql_adapter.LogicalSqlPlan,
-    catalog: SqlAuthCatalog,
-) !?tables_api.AppliedRelationalSqlDdlRecord {
-    return switch (logical_plan.*) {
-        .auth => |auth_plan| try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, auth_plan, catalog),
-        else => null,
-    };
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        parsed_sql,
+        catalog_source.iface(),
+        catalog.session(),
+        function_bindings,
+    );
+    defer durable_plan.deinit(alloc);
+    return try executeRelationalSqlDurablePlanOnUserManagerWithCatalog(manager, alloc, &durable_plan, catalog);
 }
 
 pub fn executeRelationalSqlDurablePlanOnUserManagerWithCatalog(

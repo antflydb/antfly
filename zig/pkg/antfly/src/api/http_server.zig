@@ -1654,9 +1654,12 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         fn tableDdlPlanAlloc(allocator: std.mem.Allocator, sql: []const u8) !sql_adapter.TableDdlLogicalPlan {
             var parsed_sql = try sql_adapter.ParsedSql.initAlloc(allocator, sql);
             defer parsed_sql.deinit(allocator);
-            var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(allocator, &parsed_sql, .{});
-            errdefer logical_plan.deinit(allocator);
-            return try sql_adapter.takeTableDdlPlanFromLogical(&logical_plan);
+            var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(allocator, &parsed_sql, .{});
+            errdefer durable_plan.deinit(allocator);
+            return switch (durable_plan) {
+                .table_ddl => |table_plan| table_plan,
+                else => error.UnsupportedSqlShape,
+            };
         }
     };
 

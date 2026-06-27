@@ -1611,22 +1611,24 @@ pub fn applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindings
 ) !AppliedRelationalSqlDdlRecord {
     var catalog_source = try SingleTableCatalogSource.initAlloc(alloc, table);
     defer catalog_source.deinit(alloc);
-    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
-        .catalog = catalog_source.iface(),
-        .session = session,
-        .function_bindings = function_bindings,
-    });
-    defer logical_plan.deinit(alloc);
-    return try applyRelationalSqlDdlLogicalPlanToTableRecordWithSessionAlloc(alloc, table, &logical_plan, session);
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        parsed_sql,
+        catalog_source.iface(),
+        session,
+        function_bindings,
+    );
+    defer durable_plan.deinit(alloc);
+    return try applyRelationalSqlDdlDurablePlanToTableRecordWithSessionAlloc(alloc, table, &durable_plan, session);
 }
 
-pub fn applyRelationalSqlDdlLogicalPlanToTableRecordWithSessionAlloc(
+pub fn applyRelationalSqlDdlDurablePlanToTableRecordWithSessionAlloc(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
-    logical_plan: *sql_adapter.LogicalSqlPlan,
+    durable_plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !AppliedRelationalSqlDdlRecord {
-    return switch (logical_plan.*) {
+    return switch (durable_plan.*) {
         .table_ddl => |*table_plan| try applyTableDdlPlanToTableRecordWithSessionAlloc(alloc, table, table_plan, session),
         else => error.UnsupportedSqlShape,
     };
@@ -2000,15 +2002,18 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 ) !RelationalSqlDdlTarget {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
-        .catalog = table_catalog.emptyCatalogSource(),
-        .session = session,
-        .function_bindings = function_bindings,
-    });
-    defer logical_plan.deinit(alloc);
-    var table_plan = try sql_adapter.takeTableDdlPlanFromLogical(&logical_plan);
-    defer table_plan.deinit(alloc);
-    return try relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, table_plan, session);
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        &parsed_sql,
+        table_catalog.emptyCatalogSource(),
+        session,
+        function_bindings,
+    );
+    defer durable_plan.deinit(alloc);
+    return switch (durable_plan) {
+        .table_ddl => |table_plan| try relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, table_plan, session),
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 pub fn relationalSqlDdlTargetForTablePlanWithSessionAlloc(
@@ -4110,15 +4115,21 @@ pub fn applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindings
     }
 
     var catalog_source = BorrowedAdminSnapshotCatalogSource{ .snapshot = snapshot };
-    var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
-        .catalog = catalog_source.iface(),
-        .session = session,
-        .function_bindings = function_bindings,
-    });
-    defer logical_plan.deinit(alloc);
-    var catalog_plan = sql_adapter.takeCatalogDdlPlanFromLogical(&logical_plan) catch return null;
-    defer catalog_plan.deinit(alloc);
-    return try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, snapshot, catalog_plan, session);
+    var durable_plan = sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
+        alloc,
+        parsed_sql,
+        catalog_source.iface(),
+        session,
+        function_bindings,
+    ) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        else => return err,
+    };
+    defer durable_plan.deinit(alloc);
+    return switch (durable_plan) {
+        .catalog_ddl => |catalog_plan| try applyCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, snapshot, catalog_plan, session),
+        else => null,
+    };
 }
 
 pub fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
