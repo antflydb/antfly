@@ -4483,103 +4483,37 @@ pub const ApiHttpServer = struct {
     }
 
     fn parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
-        const tokens = parsed_sql.items();
-        const raw = parsed_sql.statement.raw();
-        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return false;
-        const first = tokens[raw.token_start];
-        const next = raw.token_start + 1;
-        if (first.matchesKeywordTag(.commit)) {
-            return next >= raw.token_end or !tokens[next].matchesKeywordTag(.prepared);
-        }
-        if (first.matchesKeywordTag(.rollback)) {
-            return next >= raw.token_end or
-                (!tokens[next].matchesKeywordTag(.prepared) and
-                    !tokens[next].matchesKeywordTag(.to) and
-                    !tokens[next].matchesKeywordTag(.savepoint));
-        }
-        return false;
+        return sql_sessions.parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql);
     }
 
     fn parsedSqlTransactionBoundaryStartsSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
-        const tokens = parsed_sql.items();
-        const raw = parsed_sql.statement.raw();
-        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return false;
-        const first = tokens[raw.token_start];
-        if (first.matchesKeywordTag(.begin)) return true;
-        if (first.matchesKeyword("start")) {
-            const next = raw.token_start + 1;
-            return next < raw.token_end and tokens[next].matchesKeyword("transaction");
-        }
-        return false;
+        return sql_sessions.parsedSqlTransactionBoundaryStartsSession(parsed_sql);
     }
 
     fn publicSqlTransactionStatus(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) PublicSqlTransactionStatus {
         if (session.sql_transaction_failed) return .failed_transaction;
-        if (session.in_sql_transaction or session.transaction_local_search_path or session.transaction_local_settings) return .in_transaction;
+        if (sql_sessions.transactionIsActive(session)) return .in_transaction;
         return .idle;
     }
 
     fn markPublicSqlTransactionFailedIfActive(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession) void {
-        if (session.in_sql_transaction or session.transaction_local_search_path or session.transaction_local_settings) {
-            session.in_sql_transaction = true;
-            session.sql_transaction_failed = true;
-        }
+        sql_sessions.markTransactionFailedIfActive(session);
     }
 
     fn publicSqlReadOnlyActive(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) !bool {
-        return session.request_read_only or try sql_adapter.sqlEffectiveTransactionReadOnlyFromSession(session.session());
+        return try sql_sessions.readOnlyActive(session);
     }
 
     fn sessionCatalogPlanAllowedInReadOnly(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.SessionCatalogPlan) !bool {
-        return switch (plan) {
-            .set_search_path,
-            .reset_search_path,
-            .show_search_path,
-            => true,
-            .discard_all => false,
-            .set_setting => |set| blk: {
-                if (std.ascii.eqlIgnoreCase(set.name, "transaction_read_only") or
-                    std.ascii.eqlIgnoreCase(set.name, "default_transaction_read_only"))
-                {
-                    break :blk try sql_adapter.parseSqlBoolSetting(set.value);
-                }
-                break :blk true;
-            },
-            .reset_setting => |reset| blk: {
-                if (std.ascii.eqlIgnoreCase(reset.name, "default_transaction_read_only")) break :blk false;
-                if (std.ascii.eqlIgnoreCase(reset.name, "transaction_read_only")) {
-                    break :blk try sql_adapter.sqlDefaultTransactionReadOnlyFromSession(session.session());
-                }
-                break :blk true;
-            },
-        };
+        return try sql_sessions.sessionCatalogPlanAllowedInReadOnly(session, plan);
     }
 
     fn transactionControlPlanAllowedInReadOnly(_: *ApiHttpServer, plan: sql_adapter.TransactionControlPlan) !bool {
-        return switch (plan) {
-            .transaction_mode => |mode| switch (mode.access_mode orelse .read_only) {
-                .read_only => true,
-                .read_write => false,
-            },
-            .constraint_mode,
-            .advisory_lock,
-            => true,
-            .table_lock => false,
-        };
+        return try sql_sessions.transactionControlPlanAllowedInReadOnly(plan);
     }
 
     fn applyTransactionModePlanToSession(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.TransactionModePlan) !bool {
-        if (plan.starter == .begin or plan.starter == .start_transaction) {
-            session.in_sql_transaction = true;
-            session.sql_transaction_failed = false;
-        }
-        const access_mode = plan.access_mode orelse return false;
-        const value = switch (access_mode) {
-            .read_only => "on",
-            .read_write => "off",
-        };
-        try session.setTransactionLocalSettingAlloc(self.alloc, "transaction_read_only", value);
-        return true;
+        return try sql_sessions.applyTransactionModePlanToSession(self.alloc, session, plan);
     }
 
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -9603,7 +9537,7 @@ pub const ApiHttpServer = struct {
                         .catalog_read => try self.handlePublicSqlRead(logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                         .prepared_statement => |*prepared_plan| try self.executePublicSqlPreparedStatementLogicalPlanWithSession(prepared_plan, parsed_sql, session, request.authenticated_identity),
                         .cursor => |*cursor_plan| try self.executePublicSqlCursorLogicalPlanWithSession(cursor_plan, parsed_sql, session, request.params, request.authenticated_identity),
-                        .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                        .read, .write => .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
                         else => ddl_blk: {
                             const statement_kind = publicSqlStatementKindForLogicalPlan(logical_plan.*);
                             var applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {

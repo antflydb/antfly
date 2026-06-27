@@ -129,7 +129,10 @@ statement shapes the generated grammar still does not accept use a local
 first-token family mapper before entering the legacy DDL planner boundary.
 Generated read variants now come from the retained generated read AST kind
 directly, and `SELECT`/`WITH` heads must be accepted by the generated parser
-before they can publish a parsed statement. The
+before they can publish a parsed statement. The old handwritten classifier
+implementation and its token-probing tests have been removed; `classifier.zig`
+now only carries the shared statement-kind enums used by typed plan boundaries.
+The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
