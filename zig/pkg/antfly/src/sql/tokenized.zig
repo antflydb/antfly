@@ -334,7 +334,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
     if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement) and !isExtensionIndexGeneratedFallbackAllowed(tokens, raw_statement)) return true;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return true;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
@@ -349,7 +349,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
-    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement) and !isExtensionIndexGeneratedFallbackAllowed(tokens, raw_statement)) return false;
+    if (isGeneratedTableOrIndexDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedRoleDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedTypeSystemDdlHead(tokens, raw_statement)) return false;
@@ -475,42 +475,6 @@ fn isGeneratedTableOrIndexDdlHead(tokens: []const Token, raw_statement: RawSqlSt
     }
     if (tokenMatchesKeyword(first, .drop)) {
         return tokenMatchesKeyword(second, .table) or tokenMatchesKeyword(second, .index);
-    }
-    return false;
-}
-
-fn isExtensionIndexGeneratedFallbackAllowed(tokens: []const Token, raw_statement: RawSqlStatement) bool {
-    const start = raw_statement.token_start;
-    const end = raw_statement.token_end;
-    if (start + 1 >= end or end > tokens.len) return false;
-    if (!tokenMatchesKeyword(tokens[start], .create)) return false;
-
-    var object_index = start + 1;
-    consumeRelationLifetime(tokens, &object_index, end);
-    if (object_index >= end) return false;
-    if (tokenMatchesKeyword(tokens[object_index], .unique)) object_index += 1;
-    if (object_index >= end or !tokenMatchesKeyword(tokens[object_index], .index)) return false;
-
-    var depth: usize = 0;
-    var index = object_index + 1;
-    while (index < end) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth != 0 or !tokenMatchesText(tokens[index], "using")) continue;
-        if (index + 1 >= end) return false;
-        const method = tokens[index + 1];
-        return tokenMatchesText(method, "hnsw") or
-            tokenMatchesText(method, "antfly_full_text") or
-            tokenMatchesText(method, "antfly_aknn") or
-            tokenMatchesText(method, "antfly_graph") or
-            tokenMatchesText(method, "antfly_graph_metric") or
-            tokenMatchesText(method, "antfly_hybrid") or
-            tokenMatchesText(method, "antfly_algebraic");
     }
     return false;
 }
@@ -3290,6 +3254,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ROLLBACK LATER"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text ("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
@@ -4752,6 +4719,26 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (extension_index.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var antfly_extension_index = try ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard')");
+    defer antfly_extension_index.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, antfly_extension_index.generatedStatementKind().?);
+    switch (antfly_extension_index.generated_statement.?.ast.?) {
+        .extension_index => |extension_index_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_index, extension_index_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, extension_index_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, extension_index_ast.index_table_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, extension_index_ast.index_method_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, extension_index_ast.index_elements_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 15 }, extension_index_ast.index_options_tokens.?);
+            try std.testing.expect(!extension_index_ast.unique);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (antfly_extension_index.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

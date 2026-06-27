@@ -5062,6 +5062,37 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn publicSqlStatementKindForDurablePlan(plan: sql_adapter.DurableSqlPlan) []const u8 {
+        return switch (plan) {
+            .table_ddl, .catalog_ddl => "ddl",
+            .extension => "extension",
+            .auth => "auth",
+            .routine => "routine",
+            .maintenance => "maintenance",
+            .bulk_io => "bulk_io",
+        };
+    }
+
+    fn publicSqlLogicalPlanUsesDurableExecution(plan: sql_adapter.LogicalSqlPlan) bool {
+        return switch (plan) {
+            .table_ddl, .catalog_ddl, .extension, .auth, .maintenance, .bulk_io => true,
+            .routine => |routine| switch (routine) {
+                .function_catalog, .trigger_catalog => true,
+                .procedure_call => false,
+            },
+            else => false,
+        };
+    }
+
+    fn takePublicSqlPlannedExecutionPlanFromLogical(logical_plan: *sql_adapter.LogicalSqlPlan) !PublicSqlPlannedExecutionPlan {
+        if (publicSqlLogicalPlanUsesDurableExecution(logical_plan.*)) {
+            return .{ .durable = try sql_adapter.takeDurableSqlPlanFromLogical(logical_plan) };
+        }
+        const plan = logical_plan.*;
+        logical_plan.* = .{ .other_ddl = .{ .moved = {} } };
+        return .{ .logical = plan };
+    }
+
     fn publicSqlCreateDdlCommandTag(tokens: []const sql_adapter.Token) []const u8 {
         var index: usize = 0;
         while (index < tokens.len and publicSqlCreateDdlModifier(tokens[index])) : (index += 1) {}
@@ -7964,12 +7995,32 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity = null,
     };
 
+    const PublicSqlPlannedExecutionPlan = union(enum) {
+        logical: sql_adapter.LogicalSqlPlan,
+        durable: sql_adapter.DurableSqlPlan,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .logical => |*plan| plan.deinit(alloc),
+                .durable => |*plan| plan.deinit(alloc),
+            }
+            self.* = undefined;
+        }
+
+        fn statementKindName(self: *const @This()) []const u8 {
+            return switch (self.*) {
+                .logical => |plan| publicSqlStatementKindForLogicalPlan(plan),
+                .durable => |plan| publicSqlStatementKindForDurablePlan(plan),
+            };
+        }
+    };
+
     const PublicSqlPlannedExecution = struct {
-        logical_plan: sql_adapter.LogicalSqlPlan,
+        plan: PublicSqlPlannedExecutionPlan,
         row_claim_owner_id: ?[]const u8 = null,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            self.logical_plan.deinit(alloc);
+            self.plan.deinit(alloc);
             if (self.row_claim_owner_id) |owner_id| alloc.free(@constCast(owner_id));
             self.* = undefined;
         }
@@ -8208,12 +8259,44 @@ pub const ApiHttpServer = struct {
         errdefer logical_plan.deinit(self.alloc);
         self.enforcePublicSqlLogicalPlanAuthorization(&logical_plan, session.session(), authenticated_identity) catch
             return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
+        var execution_plan = try takePublicSqlPlannedExecutionPlanFromLogical(&logical_plan);
+        errdefer execution_plan.deinit(self.alloc);
         const owner_id = row_claim_owner_id;
         row_claim_owner_id = null;
         return .{ .planned = .{
-            .logical_plan = logical_plan,
+            .plan = execution_plan,
             .row_claim_owner_id = owner_id,
         } };
+    }
+
+    fn executePublicSqlDurablePlannedExecution(
+        self: *ApiHttpServer,
+        durable_plan: *sql_adapter.DurableSqlPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
+        switch (durable_plan.*) {
+            .bulk_io => return try ApiHttpServer.executePublicBulkSqlDurablePlanWithSession(self, durable_plan, session, authenticated_identity),
+            else => {
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                const context = RelationalDdlPlanExecutionContext{ .parsed_sql = parsed_sql };
+                const timing = try self.sqlStatementExecutionTimingForContext(session, context);
+                const statement_kind = publicSqlStatementKindForDurablePlan(durable_plan.*);
+                var applied = try self.applyDurableSqlPlanWithSession(durable_plan, session, context, timing);
+                errdefer applied.deinit(self.alloc);
+                const session_id = self.ensureSqlProtocolSessionId(session);
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = statement_kind,
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = publicSqlDdlCommandTag(parsed_sql),
+                    } },
+                } };
+            },
+        }
     }
 
     pub fn executePublicParsedSqlRequestResult(self: *ApiHttpServer, request: PublicParsedSqlExecutionRequest) !PublicSqlResultOrResponse {
@@ -8277,88 +8360,96 @@ pub const ApiHttpServer = struct {
                 return .{ .response = out };
             },
             .planned => |*planned| {
-                var outcome: PublicSqlResultOrResponse = switch (planned.logical_plan) {
-                    .catalog_write => try self.handlePublicSqlWrite(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
-                    .catalog_read => try self.handlePublicSqlRead(&planned.logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
-                    .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
-                    .bulk_io => bulk_blk: {
-                        var durable_plan = sql_adapter.takeDurableSqlPlanFromLogical(&planned.logical_plan) catch |err| switch (err) {
-                            error.UnsupportedSqlShape => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
-                            },
-                        };
-                        defer durable_plan.deinit(self.alloc);
-                        break :bulk_blk ApiHttpServer.executePublicBulkSqlDurablePlanWithSession(self, &durable_plan, session, request.authenticated_identity) catch |err| switch (err) {
-                            error.SqlReadOnlyTransaction => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
-                            },
-                            error.PermissionDenied, error.Unauthorized => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
-                            },
-                            error.TableNotFound, error.InvalidSqlCatalog => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .invalid_sql_catalog)) };
-                            },
-                            error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
-                            },
-                            error.UnsupportedSqlShape, error.UnsupportedOperation => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
-                            },
-                            error.StatementTimeout => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
-                            },
-                            else => return err,
-                        };
+                var outcome: PublicSqlResultOrResponse = switch (planned.plan) {
+                    .logical => |*logical_plan| switch (logical_plan.*) {
+                        .catalog_write => try self.handlePublicSqlWrite(logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
+                        .catalog_read => try self.handlePublicSqlRead(logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
+                        .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                        else => ddl_blk: {
+                            const statement_kind = publicSqlStatementKindForLogicalPlan(logical_plan.*);
+                            var applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
+                                error.DocumentSqlViewMappingUnsupported => {
+                                    self.markPublicSqlTransactionFailedIfActive(session);
+                                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
+                                },
+                                error.SqlReadOnlyTransaction => {
+                                    self.markPublicSqlTransactionFailedIfActive(session);
+                                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
+                                },
+                                error.UnsupportedSqlShape => {
+                                    self.markPublicSqlTransactionFailedIfActive(session);
+                                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                                },
+                                error.StatementTimeout => {
+                                    self.markPublicSqlTransactionFailedIfActive(session);
+                                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
+                                },
+                                error.InvalidSqlSession,
+                                error.PreparedStatementAlreadyExists,
+                                error.PreparedStatementNotFound,
+                                error.PreparedStatementArgumentMismatch,
+                                error.InvalidSqlCatalog,
+                                error.InvalidRoleSetting,
+                                error.RoleSettingNotFound,
+                                => {
+                                    self.markPublicSqlTransactionFailedIfActive(session);
+                                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
+                                },
+                                else => return err,
+                            };
+                            errdefer applied.deinit(self.alloc);
+                            const session_id = self.ensureSqlProtocolSessionId(session);
+                            break :ddl_blk .{ .result = .{
+                                .session_id = session_id,
+                                .statement_kind = statement_kind,
+                                .transaction_status = self.publicSqlTransactionStatus(session),
+                                .result = .{ .ddl = .{
+                                    .applied = applied,
+                                    .command_tag = publicSqlDdlCommandTag(parsed_sql),
+                                } },
+                            } };
+                        },
                     },
-                    else => ddl_blk: {
-                        const statement_kind = publicSqlStatementKindForLogicalPlan(planned.logical_plan);
-                        const applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, &planned.logical_plan, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
-                            error.DocumentSqlViewMappingUnsupported => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
-                            },
-                            error.SqlReadOnlyTransaction => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
-                            },
-                            error.UnsupportedSqlShape => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
-                            },
-                            error.StatementTimeout => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
-                            },
-                            error.InvalidSqlSession,
-                            error.PreparedStatementAlreadyExists,
-                            error.PreparedStatementNotFound,
-                            error.PreparedStatementArgumentMismatch,
-                            error.InvalidSqlCatalog,
-                            error.InvalidRoleSetting,
-                            error.RoleSettingNotFound,
-                            => {
-                                self.markPublicSqlTransactionFailedIfActive(session);
-                                return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
-                            },
-                            else => return err,
-                        };
-                        const session_id = self.ensureSqlProtocolSessionId(session);
-                        break :ddl_blk .{ .result = .{
-                            .session_id = session_id,
-                            .statement_kind = statement_kind,
-                            .transaction_status = self.publicSqlTransactionStatus(session),
-                            .result = .{ .ddl = .{
-                                .applied = applied,
-                                .command_tag = publicSqlDdlCommandTag(parsed_sql),
-                            } },
-                        } };
+                    .durable => |*durable_plan| self.executePublicSqlDurablePlannedExecution(durable_plan, parsed_sql, session, request.authenticated_identity) catch |err| switch (err) {
+                        error.DocumentSqlViewMappingUnsupported => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
+                        },
+                        error.SqlReadOnlyTransaction => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
+                        },
+                        error.PermissionDenied, error.Unauthorized => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
+                        },
+                        error.TableNotFound, error.InvalidSqlCatalog => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .invalid_sql_catalog)) };
+                        },
+                        error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
+                        },
+                        error.UnsupportedSqlShape, error.UnsupportedOperation => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                        },
+                        error.StatementTimeout => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
+                        },
+                        error.InvalidSqlSession,
+                        error.PreparedStatementAlreadyExists,
+                        error.PreparedStatementNotFound,
+                        error.PreparedStatementArgumentMismatch,
+                        error.InvalidRoleSetting,
+                        error.RoleSettingNotFound,
+                        => {
+                            self.markPublicSqlTransactionFailedIfActive(session);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
+                        },
+                        else => return err,
                     },
                 };
                 errdefer outcome.deinit(self.alloc);
@@ -8418,7 +8509,7 @@ pub const ApiHttpServer = struct {
                         planned_or_response_owned = false;
                         return .{ .response = out };
                     },
-                    .planned => |planned| break :blk publicSqlStatementKindForLogicalPlan(planned.logical_plan),
+                    .planned => |planned| break :blk planned.plan.statementKindName(),
                 }
             },
         };

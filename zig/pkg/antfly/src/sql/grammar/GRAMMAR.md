@@ -202,6 +202,11 @@ Generated
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
 partial-index `WHERE ...` token ranges and generated-first create-index
 planning validates those ranges before lowering through the typed DDL planner.
+Antfly-derived index methods exposed through PostgreSQL-style `CREATE INDEX
+... USING antfly_full_text`/`antfly_aknn`/`antfly_graph`/
+`antfly_graph_metric`/`antfly_hybrid`/`antfly_algebraic` now use the same
+strict generated parser ingress as ordinary table/index DDL instead of a
+derived-index-specific fallback exception.
 PostgreSQL-style relation population heads, including `SELECT ... INTO` and
 `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE ... AS SELECT ... [WITH [NO] DATA]`,
 now parse and classify through the generated DDL family with retained target
