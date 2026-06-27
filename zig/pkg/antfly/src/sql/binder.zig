@@ -2286,12 +2286,37 @@ fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
     switch (plan) {
         .vacuum => |vacuum| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, vacuum.table_name, session, false),
         .analyze => |analyze| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, analyze.table_name, session, false),
-        .cluster => |cluster| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, cluster.table_name, session, false),
+        .cluster => |cluster| {
+            try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, cluster.table_name, session, false);
+            try validateMaintenanceClusterIndexAlloc(alloc, catalog, cluster, session);
+        },
         .reindex => |reindex| switch (reindex.target) {
             .table => try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, reindex.name, session, false),
             .index => try appendBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, .target, catalog, reindex.name, session),
             .schema, .database, .system => {},
         },
+    }
+}
+
+fn validateMaintenanceClusterIndexAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    cluster: ddl_plan.ClusterMaintenancePlan,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    const index_name = cluster.index_name orelse return;
+    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, cluster.table_name, session);
+    defer deinitCatalogTableRef(alloc, target);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    const index_table = try catalogTableForIndexNameAlloc(alloc, &snapshot, index_name, session);
+    if (table.table_id != index_table.table_id or
+        !std.mem.eql(u8, table.database_name, index_table.database_name) or
+        !std.mem.eql(u8, table.namespace_name, index_table.namespace_name) or
+        !std.mem.eql(u8, table.name, index_table.name))
+    {
+        return error.InvalidSqlCatalog;
     }
 }
 
@@ -3234,6 +3259,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const incoming_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(incoming_schema_json);
     var catalog = MultiTableTestCatalog.init("usage_records", usage_schema_json, "incoming_usage", incoming_schema_json);
     catalog.tables[0].indexes_json = "{\"usage_status_idx\":{}}";
+    catalog.tables[1].indexes_json = "{\"incoming_status_idx\":{}}";
 
     var parsed_read = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -3439,6 +3465,20 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     );
     defer parsed_missing_reindex_index.deinit(alloc);
     try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_reindex_index, catalog.iface()));
+
+    var parsed_missing_cluster_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CLUSTER usage_records USING missing_usage_status_idx",
+    );
+    defer parsed_missing_cluster_index.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_cluster_index, catalog.iface()));
+
+    var parsed_wrong_table_cluster_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CLUSTER usage_records USING incoming_status_idx",
+    );
+    defer parsed_wrong_table_cluster_index.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_wrong_table_cluster_index, catalog.iface()));
 
     var parsed_create_table = try tokenized.ParsedSql.initAlloc(
         alloc,

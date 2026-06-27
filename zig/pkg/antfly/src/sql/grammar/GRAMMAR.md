@@ -531,7 +531,8 @@ Generated maintenance DDL that already lowers to typed plans also participates
 in catalog binding: table-targeting `VACUUM`, `ANALYZE`, `CLUSTER`, and
 `REINDEX TABLE` plans resolve their target table, `REINDEX INDEX` resolves the
 owning table for the named index, and both fail closed on missing catalog
-objects before execution, while schema/database/system `REINDEX` targets remain
+objects before execution. `CLUSTER ... USING index` also verifies that the
+named index exists and belongs to the target table, while schema/database/system `REINDEX` targets remain
 catalog-independent at this binding boundary.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points that Antfly does not type yet, including
