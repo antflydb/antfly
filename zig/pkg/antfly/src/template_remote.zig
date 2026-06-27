@@ -742,11 +742,39 @@ test "template remote preserves http status from shared scraping fetches" {
 test "template remote validated text rejects oversized remote media directive" {
     const alloc = std.testing.allocator;
 
-    const json_doc =
-        \\{"photo":"data:image/png;base64,aGVsbG8="}
-    ;
+    const ListenerApp = struct {
+        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+            return .{
+                .status = 200,
+                .content_type = try req_alloc.dupe(u8, "image/png"),
+                .body = try req_alloc.dupe(u8, "0123456789abcdef"),
+            };
+        }
+    };
+
+    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const photo_url = try std.fmt.allocPrint(alloc, "{s}/photo.png", .{base_uri});
+    defer alloc.free(photo_url);
+
+    const json_doc = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo_url, .{})});
+    defer alloc.free(json_doc);
     var remote_content = scraping.RemoteContentConfig{
-        .security = .{ .max_download_size_bytes = 4 },
+        .security = .{ .block_private_ips = false, .max_download_size_bytes = 4 },
     };
     defer remote_content.deinit(alloc);
 

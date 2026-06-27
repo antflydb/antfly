@@ -142,7 +142,10 @@ pub fn renderJsonToPartsWithConfig(
     if (requiresRemoteHelpers(template_source)) {
         const renderer = host_renderer orelse return error.UnsupportedPlatform;
         if (renderer.render_json_to_parts) |render_fn| {
-            return try render_fn(renderer.ctx, alloc, template_source, json_doc, config);
+            const parts = try render_fn(renderer.ctx, alloc, template_source, json_doc, config);
+            errdefer template_mod.freeContentParts(alloc, parts);
+            try validateRenderedParts(alloc, parts);
+            return parts;
         }
         const rendered = try callHostRenderJsonToText(alloc, template_source, json_doc, config);
         defer alloc.free(@constCast(rendered));
@@ -162,6 +165,15 @@ fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     if (directives.len == 0) return;
     if (directives[0].isPermanent()) return RenderError.PermanentPromptFailure;
     return RenderError.TransientPromptFailure;
+}
+
+fn validateRenderedParts(alloc: Allocator, parts: []const template_mod.ContentPart) !void {
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| try validateRenderedTemplate(alloc, text),
+            else => {},
+        }
+    }
 }
 
 pub fn downloadRemoteContentOutcomeAllocWithConfig(
@@ -254,4 +266,34 @@ test "template remote stub can use host text renderer for remote helpers" {
     defer alloc.free(@constCast(rendered));
 
     try std.testing.expectEqualStrings("remote text", rendered);
+}
+
+fn testHostRenderJsonToPartsErrorDirective(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+    _: []const u8,
+    _: RenderConfig,
+) ![]template_mod.ContentPart {
+    const parts = try alloc.alloc(template_mod.ContentPart, 1);
+    errdefer alloc.free(parts);
+    parts[0] = .{ .text = try alloc.dupe(u8, "<<<error:status=413 message=StreamTooLong>>> fallback text") };
+    return parts;
+}
+
+test "template remote stub validates host-rendered parts for error directives" {
+    const alloc = std.testing.allocator;
+    setHostRenderer(.{
+        .render_json_to_parts = testHostRenderJsonToPartsErrorDirective,
+    });
+    defer setHostRenderer(null);
+
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToParts(
+            alloc,
+            "{{remoteMedia url=this}}",
+            "\"https://example.com/photo.png\"",
+        ),
+    );
 }
