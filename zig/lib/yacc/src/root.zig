@@ -136,6 +136,16 @@ pub const ConflictExpectation = struct {
     }
 };
 
+const PendingDeclaration = union(enum) {
+    token,
+    precedence: PendingPrecedenceDeclaration,
+};
+
+const PendingPrecedenceDeclaration = struct {
+    associativity: PrecedenceAssociativity,
+    level: u16,
+};
+
 pub fn generateZigMetadata(
     allocator: std.mem.Allocator,
     input_path: []const u8,
@@ -213,6 +223,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     var skip_percent_prologue = false;
     var skip_brace_block_depth: usize = 0;
     var skip_block_comment = false;
+    var pending_declaration: ?PendingDeclaration = null;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
@@ -237,55 +248,62 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
         if (std.mem.startsWith(u8, line, "%reference ")) {
             try parseReference(&grammar, line);
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%expect ")) {
             const value = std.mem.trim(u8, line["%expect ".len..], " \t\r");
             grammar.expected_conflicts = try std.fmt.parseUnsigned(usize, value, 10);
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%start ")) {
             grammar.start_symbol = try dupToken(allocator, line["%start ".len..]);
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%left ")) {
-            try parsePrecedenceDeclaration(allocator, &grammar, .left, line["%left ".len..]);
+            pending_declaration = try parsePrecedenceDeclaration(allocator, &grammar, .left, line["%left ".len..]);
             active_rule = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%right ")) {
-            try parsePrecedenceDeclaration(allocator, &grammar, .right, line["%right ".len..]);
+            pending_declaration = try parsePrecedenceDeclaration(allocator, &grammar, .right, line["%right ".len..]);
             active_rule = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%nonassoc ")) {
-            try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%nonassoc ".len..]);
+            pending_declaration = try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%nonassoc ".len..]);
             active_rule = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%precedence ")) {
-            try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%precedence ".len..]);
+            pending_declaration = try parsePrecedenceDeclaration(allocator, &grammar, .nonassoc, line["%precedence ".len..]);
             active_rule = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%token ")) {
             try parseTokens(allocator, &grammar, line["%token ".len..]);
+            pending_declaration = .token;
             active_rule = null;
             continue;
         }
         if (std.mem.startsWith(u8, line, "%type ") or std.mem.startsWith(u8, line, "%nterm ")) {
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
         if (isIgnoredBisonDirective(line)) {
             skip_brace_block_depth = try braceDepthAfterLine(line, 0);
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
         if (std.mem.eql(u8, line, "%%")) {
             active_rule = null;
+            pending_declaration = null;
             continue;
         }
 
@@ -301,6 +319,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
 
         if (active_rule == null) {
             if (indexOfRuleColon(line)) |colon| {
+                pending_declaration = null;
                 const name = std.mem.trim(u8, line[0..colon], " \t\r");
                 if (name.len == 0) return error.InvalidRuleName;
                 try grammar.rules.append(allocator, .{ .name = try dupToken(allocator, name) });
@@ -316,6 +335,13 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                     }
                 }
                 if (ends_rule) active_rule = null;
+                continue;
+            }
+            if (pending_declaration) |pending| {
+                switch (pending) {
+                    .token => try parseTokens(allocator, &grammar, line),
+                    .precedence => |precedence| try parsePrecedenceItems(allocator, &grammar, precedence.associativity, precedence.level, line),
+                }
                 continue;
             }
         }
@@ -544,9 +570,20 @@ fn parsePrecedenceDeclaration(
     grammar: *Grammar,
     associativity: PrecedenceAssociativity,
     text: []const u8,
-) !void {
+) !PendingDeclaration {
     grammar.precedence_level_count += 1;
     const level = grammar.precedence_level_count;
+    try parsePrecedenceItems(allocator, grammar, associativity, level, text);
+    return .{ .precedence = .{ .associativity = associativity, .level = level } };
+}
+
+fn parsePrecedenceItems(
+    allocator: std.mem.Allocator,
+    grammar: *Grammar,
+    associativity: PrecedenceAssociativity,
+    level: u16,
+    text: []const u8,
+) !void {
     const parts = try declarationPartsAlloc(allocator, text);
     var previous_token: ?[]const u8 = null;
     var previous_can_alias = false;
@@ -1979,6 +2016,37 @@ test "parseGrammar creates stable terminals for unaliased bison literals" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_2B,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    LIT_28,") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    '+',") == null);
+}
+
+test "parseGrammar supports wrapped token and precedence declarations" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%expect 0
+        \\%start expr
+        \\%token ID
+        \\       NUMBER "number"
+        \\%left '+'
+        \\      '-'
+        \\%%
+        \\expr:
+        \\    expr '+' expr
+        \\  | expr '-' expr
+        \\  | ID
+        \\  | "number"
+        \\  ;
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 4), grammar.tokens.items.len);
+    try std.testing.expectEqualStrings("NUMBER", resolveTerminalName(grammar, "\"number\"").?);
+    try std.testing.expectEqualStrings("LIT_2B", resolveTerminalName(grammar, "'+'").?);
+    try std.testing.expectEqualStrings("LIT_2D", resolveTerminalName(grammar, "'-'").?);
+    try std.testing.expectEqual(@as(usize, 2), grammar.token_precedences.items.len);
+    try std.testing.expectEqual(grammar.token_precedences.items[0].precedence.level, grammar.token_precedences.items[1].precedence.level);
+
+    const tables = try buildSlrTables(arena, grammar);
+    try std.testing.expectEqual(@as(usize, 0), tables.conflicts.len);
 }
 
 test "parseGrammar treats non-pipe rule lines as alternative continuations" {

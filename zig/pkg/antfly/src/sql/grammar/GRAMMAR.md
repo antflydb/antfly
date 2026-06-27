@@ -60,7 +60,9 @@ display aliases such as `%token <str> IDENT 258 "identifier"`, and C/Bison
 semantic action blocks in rule alternatives. Production-local GLR metadata
 such as `%dprec` and `%merge` is accepted and stripped from the structural RHS
 because Antfly's current generator records unresolved conflicts explicitly
-rather than importing Bison merge actions. It also skips multi-line Bison
+rather than importing Bison merge actions. Wrapped token and precedence
+declarations are treated as continuations before the grammar section, with
+wrapped precedence items sharing the original precedence level. It also skips multi-line Bison
 prologue blocks, ignored directive blocks such as `%union`/`%destructor`, and
 multi-line semantic action blocks that follow a production alternative,
 including actions that start after production symbols on the same line. Bison
