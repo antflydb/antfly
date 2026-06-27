@@ -591,6 +591,7 @@ test "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
 
     const same_expression_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, same_expression_job);
     const alternate_expression = try runtime_schema_mod.cloneRelationalRowsExpressionAlloc(alloc, .{
         .kind = .upper,
         .operands = &.{.{ .kind = .field, .field = "status" }},
@@ -606,6 +607,7 @@ test "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work
         },
     };
     const alternate_expression_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, alternate_expression_job);
     try std.testing.expect(same_expression_job.job_id != alternate_expression_job.job_id);
 
     applied.deinit(alloc);
@@ -767,6 +769,7 @@ test "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL w
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
 
     const same_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, same_row_plan_job);
     const alternate_item: sql_adapter.AppliedDdlWorkItem = .{
         .action = .rewrite,
         .subject = .table,
@@ -774,6 +777,7 @@ test "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL w
         .row_rewrite_plan = .{ .drops = &.{"legacy_status"} },
     };
     const alternate_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, alternate_row_plan_job);
     try std.testing.expect(same_row_plan_job.job_id != alternate_row_plan_job.job_id);
 
     applied.deinit(alloc);
@@ -846,6 +850,7 @@ test "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL w
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
 
     const same_full_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, same_full_job);
     const alternate_item: sql_adapter.AppliedDdlWorkItem = .{
         .action = .rewrite,
         .subject = .table,
@@ -853,6 +858,7 @@ test "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL w
         .row_rewrite_plan = .{ .drops = &.{"legacy_status"} },
     };
     const alternate_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    defer metadata_table_manager.freeSchemaRewriteJob(alloc, alternate_row_plan_job);
     try std.testing.expect(same_full_job.job_id != alternate_row_plan_job.job_id);
 
     applied.deinit(alloc);

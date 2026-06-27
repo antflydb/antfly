@@ -499,7 +499,8 @@ fn appParityBindingCoverageCatalogForEntryParsedSqlAlloc(
     entry: AppParityCorpusEntry,
     parsed_sql: *const tokenized.ParsedSql,
 ) !?AppParitySourceSchemaCatalog {
-    const table_names = try appParityBindingCoverageTableNamesAlloc(alloc, entry, parsed_sql) orelse return null;
+    var table_names = try appParityBindingCoverageTableNamesAlloc(alloc, entry, parsed_sql) orelse return null;
+    defer table_names.deinit(alloc);
     var catalog_tables = std.ArrayListUnmanaged(AppParityCatalogTable).empty;
     defer catalog_tables.deinit(alloc);
     try appendAppParityBindingCoverageCatalogTable(alloc, &catalog_tables, entry, table_names.target);
