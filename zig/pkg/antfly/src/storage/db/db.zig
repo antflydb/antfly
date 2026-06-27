@@ -13881,6 +13881,14 @@ fn renderSourceTemplateText(
     template_source: []const u8,
     doc_value: []const u8,
 ) ![]const u8 {
+    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
+        return try template_remote.renderJsonToValidatedTextWithConfig(
+            alloc,
+            template_source,
+            doc_value,
+            remoteRenderConfig(secret_store, remote_content),
+        );
+    }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
@@ -13985,7 +13993,10 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -16174,7 +16185,10 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
         return @constCast(rendered);
@@ -16787,7 +16801,7 @@ fn computeDenseRequestImpl(
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(alloc, db, doc_value, request) catch null;
+        const source_parts = try renderSourceParts(alloc, db, doc_value, request);
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -16811,7 +16825,10 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -16889,7 +16906,10 @@ fn computeSparseRequestDerived(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -17073,7 +17093,10 @@ fn renderSourceParts(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+        else => return null,
+    };
     if (parts.len == 0) {
         template_mod.freeContentParts(alloc, parts);
         return null;
