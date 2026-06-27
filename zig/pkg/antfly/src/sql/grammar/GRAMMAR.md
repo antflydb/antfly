@@ -481,7 +481,8 @@ such as `antfly.full_text_search`, `antfly.semantic_search`,
 read sources with named `=`/`=>` arguments, retained source/name/argument token
 ranges, owned named-argument item/name/operator/value ranges, list-based
 Antfly function kind metadata across joined sources, graph function subset
-metadata, graph-specific semantic argument payloads for table/index selectors,
+metadata, exact named-argument operator validation for `=` and `=>`,
+graph-specific semantic argument payloads for table/index selectors,
 start/target selectors, pattern returns, metric names, and query text, and
 fail-closed semantic/range validation in the generated read lowering boundary.
 The generated parser now also treats graph DDL as a distinct graph
@@ -1199,7 +1200,9 @@ kind before typed join planning consumes the metadata. Parsed-statement
 classification now also validates retained generated join-item arrays,
 left-associative tree root/depth/child links, first-join compatibility fields,
 and top-level/CTE-body `ON`/`USING` payload consistency before publishing a
-generated read family. It also validates top-level and CTE-body generated
+generated read family. Read CTE classification now also validates CTE item
+layout, comma adjacency, optional column-list payloads, and materialization
+keyword metadata before publishing a generated read family. It also validates top-level and CTE-body generated
 projection, `DISTINCT ON`, grouping, and ordering list payloads, including
 first/last expression summaries, alias spans, direction/`USING` operator
 ordering, `NULLS` ordering, and delimiter adjacency before publishing a
