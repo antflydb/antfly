@@ -5610,7 +5610,22 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .role_session_control_not_planned_by_generated_parser,
         },
         .{
+            .sql = "SET SESSION AUTHORIZATION app_user",
+            .kind = .role_session_control,
+            .reason = .role_session_control_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "SET SESSION AUTHORIZATION DEFAULT",
+            .kind = .role_session_control,
+            .reason = .role_session_control_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "RESET ROLE",
+            .kind = .role_session_control,
+            .reason = .role_session_control_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "RESET SESSION AUTHORIZATION",
             .kind = .role_session_control,
             .reason = .role_session_control_not_planned_by_generated_parser,
         },

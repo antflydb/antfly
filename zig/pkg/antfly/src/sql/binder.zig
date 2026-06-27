@@ -1043,6 +1043,35 @@ fn appendBoundCatalogObjectForCatalogTableAlloc(
     try objects.append(alloc, object);
 }
 
+fn appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    schema_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    const target = try session.namespaceTargetFromSchemaName(schema_name);
+    var snapshot = catalog.adminSnapshot() catch |err| switch (err) {
+        error.UnsupportedOperation => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    var matched: usize = 0;
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, target.database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, target.namespace_name)) continue;
+        var object = try boundCatalogObjectForTableRecordAlloc(alloc, role, table);
+        var object_transferred = false;
+        errdefer if (!object_transferred) object.deinit(alloc);
+        try objects.append(alloc, object);
+        object_transferred = true;
+        matched += 1;
+    }
+    if (matched == 0) return error.TableNotFound;
+}
+
 fn appendBoundCatalogObjectForCatalogIndexAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
@@ -1054,6 +1083,22 @@ fn appendBoundCatalogObjectForCatalogIndexAlloc(
     var object = try boundCatalogObjectForCatalogIndexAlloc(alloc, role, catalog, index_name, session);
     errdefer object.deinit(alloc);
     try objects.append(alloc, object);
+}
+
+fn appendOptionalBoundCatalogObjectForCatalogIndexAlloc(
+    alloc: std.mem.Allocator,
+    objects: *std.ArrayListUnmanaged(BoundCatalogObject),
+    role: BoundCatalogObjectRole,
+    catalog: table_catalog.CatalogSource,
+    index_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    missing_ok: bool,
+) !void {
+    appendBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, role, catalog, index_name, session) catch |err| switch (err) {
+        error.InvalidSqlCatalog, error.TableNotFound => if (missing_ok) return else return err,
+        error.UnsupportedOperation => return,
+        else => return err,
+    };
 }
 
 fn sourceBindingForCatalogTableWithSessionAlloc(
@@ -2225,7 +2270,7 @@ fn collectTableDdlBoundCatalogObjectsAlloc(
         .create_index => |create| if (create.table_name.len != 0) {
             try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, create.table_name, session, false);
         },
-        .drop_index => {},
+        .drop_index => |drop| try appendOptionalBoundCatalogObjectForCatalogIndexAlloc(alloc, objects, .target, catalog, drop.index_name, session, drop.if_exists),
         .drop_table => |drop| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, drop.table_name, session, drop.if_exists),
         .alter_table => |alter| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, alter.table_name, session, alter.if_exists),
         .create_update_policy => |policy| try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, policy.table_name, session, false),
@@ -2244,11 +2289,15 @@ fn collectAuthDdlBoundCatalogObjectsAlloc(
             .grant_privilege => |grant| {
                 if (std.ascii.eqlIgnoreCase(grant.object_kind, "table")) {
                     try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, grant.object_name, session, false);
+                } else if (std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema")) {
+                    try appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(alloc, objects, .target, catalog, grant.object_name, session);
                 }
             },
             .revoke_privilege => |revoke| {
                 if (std.ascii.eqlIgnoreCase(revoke.object_kind, "table")) {
                     try appendOptionalBoundCatalogObjectForCatalogTableAlloc(alloc, objects, .target, catalog, revoke.object_name, session, false);
+                } else if (std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema")) {
+                    try appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(alloc, objects, .target, catalog, revoke.object_name, session);
                 }
             },
             else => {},
@@ -3444,6 +3493,36 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqual(@as(u64, 1), create_index_ddl.bound_objects[0].table_id);
     try std.testing.expectEqual(usage_schema_generation, create_index_ddl.bound_objects[0].schema_generation);
 
+    var parsed_drop_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP INDEX usage_status_idx",
+    );
+    defer parsed_drop_index.deinit(alloc);
+    var bound_drop_index = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_drop_index, catalog.iface());
+    defer bound_drop_index.deinit(alloc);
+    const drop_index_ddl = try bound_drop_index.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), drop_index_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, drop_index_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", drop_index_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), drop_index_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, drop_index_ddl.bound_objects[0].schema_generation);
+
+    var parsed_missing_drop_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP INDEX missing_usage_status_idx",
+    );
+    defer parsed_missing_drop_index.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_drop_index, catalog.iface()));
+
+    var parsed_missing_drop_index_if_exists = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP INDEX IF EXISTS missing_usage_status_idx",
+    );
+    defer parsed_missing_drop_index_if_exists.deinit(alloc);
+    var bound_missing_drop_index_if_exists = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_drop_index_if_exists, catalog.iface());
+    defer bound_missing_drop_index_if_exists.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), (try bound_missing_drop_index_if_exists.ddlCatalog()).bound_objects.len);
+
     const maintenance_cases = [_][]const u8{
         "VACUUM usage_records",
         "ANALYZE usage_records",
@@ -3545,6 +3624,47 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqualStrings("tenant_ops", tenant_ddl.bound_objects[0].target.database_name);
     try std.testing.expectEqualStrings("analytics", tenant_ddl.bound_objects[0].target.namespace_name);
     try std.testing.expectEqualStrings("usage_records", tenant_ddl.bound_objects[0].target.table_name);
+
+    var parsed_grant_schema = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer",
+    );
+    defer parsed_grant_schema.deinit(alloc);
+    var bound_grant_schema = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_grant_schema, catalog.iface());
+    defer bound_grant_schema.deinit(alloc);
+    const grant_schema_ddl = try bound_grant_schema.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), grant_schema_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, grant_schema_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("usage_records", grant_schema_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqual(@as(u64, 1), grant_schema_ddl.bound_objects[0].table_id);
+    try std.testing.expectEqual(usage_schema_generation, grant_schema_ddl.bound_objects[0].schema_generation);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, grant_schema_ddl.bound_objects[1].role);
+    try std.testing.expectEqualStrings("incoming_usage", grant_schema_ddl.bound_objects[1].target.table_name);
+    try std.testing.expectEqual(@as(u64, 2), grant_schema_ddl.bound_objects[1].table_id);
+    try std.testing.expectEqual(incoming_schema_generation, grant_schema_ddl.bound_objects[1].schema_generation);
+
+    var parsed_revoke_tenant_schema = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA analytics FROM app_writer",
+    );
+    defer parsed_revoke_tenant_schema.deinit(alloc);
+    var bound_revoke_tenant_schema = try bindDdlStatementWithCatalogSessionAlloc(alloc, &parsed_revoke_tenant_schema, tenant_catalog.iface(), tenant_session);
+    defer bound_revoke_tenant_schema.deinit(alloc);
+    const revoke_tenant_schema_ddl = try bound_revoke_tenant_schema.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 2), revoke_tenant_schema_ddl.bound_objects.len);
+    try std.testing.expectEqualStrings("tenant_ops", revoke_tenant_schema_ddl.bound_objects[0].target.database_name);
+    try std.testing.expectEqualStrings("analytics", revoke_tenant_schema_ddl.bound_objects[0].target.namespace_name);
+    try std.testing.expectEqualStrings("usage_records", revoke_tenant_schema_ddl.bound_objects[0].target.table_name);
+    try std.testing.expectEqualStrings("tenant_ops", revoke_tenant_schema_ddl.bound_objects[1].target.database_name);
+    try std.testing.expectEqualStrings("analytics", revoke_tenant_schema_ddl.bound_objects[1].target.namespace_name);
+    try std.testing.expectEqualStrings("incoming_usage", revoke_tenant_schema_ddl.bound_objects[1].target.table_name);
+
+    var parsed_missing_grant_schema = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA missing_schema TO app_writer",
+    );
+    defer parsed_missing_grant_schema.deinit(alloc);
+    try std.testing.expectError(error.TableNotFound, bindDdlStatementWithCatalogAlloc(alloc, &parsed_missing_grant_schema, catalog.iface()));
 
     const read_auth_grants = [_]BoundSqlAuthorizationGrant{
         .{ .resource_kind = .table, .resource = "usage_records", .permission = .read },

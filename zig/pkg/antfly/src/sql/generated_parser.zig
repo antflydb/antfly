@@ -2257,7 +2257,10 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SET ROLE app_user", .kind = .unsupported },
     .{ .sql = "SET ROLE DEFAULT", .kind = .unsupported },
+    .{ .sql = "SET SESSION AUTHORIZATION app_user", .kind = .unsupported },
+    .{ .sql = "SET SESSION AUTHORIZATION DEFAULT", .kind = .unsupported },
     .{ .sql = "RESET ROLE", .kind = .unsupported },
+    .{ .sql = "RESET SESSION AUTHORIZATION", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
@@ -2564,6 +2567,10 @@ fn appendTokenIds(
 
 fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
     _ = prev;
+    if (generatedSessionAuthorizationKeywordContext(tokens, index)) {
+        if (tok.matchesKeyword("authorization")) return generated.tokenId(.AUTHORIZATION);
+        if (tok.matchesKeyword("session")) return generated.tokenId(.SESSION);
+    }
     if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.tokenId(.ROUTINE);
     if (generatedSessionKeywordContext(tokens, index) and tok.matchesKeyword("local")) return generated.tokenId(.LOCAL);
     if (!generatedTransactionControlContext(tokens, index)) return null;
@@ -2591,6 +2598,15 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
 fn generatedSessionKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
     if (index >= tokens.len or index != 1 or tokens.len == 0) return false;
     return tokens[0].matchesKeywordTag(.set);
+}
+
+fn generatedSessionAuthorizationKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or tokens.len < 3) return false;
+    const first = tokens[0];
+    if (!first.matchesKeywordTag(.set) and !first.matchesKeywordTag(.reset)) return false;
+    if (!tokens[1].matchesKeyword("session")) return false;
+    if (!tokens[2].matchesKeyword("authorization")) return false;
+    return index == 1 or index == 2;
 }
 
 fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -2683,8 +2699,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.rollback) and tokens.len > 1 and tokens[1].matchesKeyword("prepared")) return .{ .prepared_transaction = .rollback };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .transaction = .set_transaction };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
+    if (first.matchesKeywordTag(.set) and tokens.len > 2 and tokens[1].matchesKeyword("session") and tokens[2].matchesKeyword("authorization")) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
     if (first.matchesKeywordTag(.reset) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
+    if (first.matchesKeywordTag(.reset) and tokens.len > 2 and tokens[1].matchesKeyword("session") and tokens[2].matchesKeyword("authorization")) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.reset)) return .{ .session = .reset };
     if (first.matchesKeywordTag(.show)) return .{ .session = .show };
     if (first.matchesKeywordTag(.discard)) {

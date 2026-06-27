@@ -82,7 +82,8 @@ PostgreSQL-compatible non-`ALL` `DISCARD` forms such as `DISCARD TEMP`,
 `DISCARD TEMPORARY`, `DISCARD PLANS`, and `DISCARD SEQUENCES` are represented
 as explicit generated unsupported diagnostics instead of syntax errors or
 session-parser probes.
-PostgreSQL role session controls such as `SET ROLE` and `RESET ROLE` are also
+PostgreSQL role session controls such as `SET ROLE`, `RESET ROLE`,
+`SET SESSION AUTHORIZATION`, and `RESET SESSION AUTHORIZATION` are also
 classified as explicit generated unsupported diagnostics instead of generic
 session setting tails.
 Session command heads now require generated parser success at SQL ingress, so

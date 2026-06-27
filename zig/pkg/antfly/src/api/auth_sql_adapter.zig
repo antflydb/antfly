@@ -1076,13 +1076,13 @@ test "sql auth catalog builder shares live catalog tables for table-aware auth p
             .database_name = "tenant_ops",
             .namespace_name = "analytics",
             .table_name = "events",
-            .schema_json = "{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"string\"}}}",
+            .schema_json = auth_test_usage_schema_json,
         },
         .{
             .database_name = "tenant_ops",
             .namespace_name = "analytics",
             .table_name = "rollups",
-            .schema_json = "{\"type\":\"object\",\"properties\":{\"bucket\":{\"type\":\"string\"}}}",
+            .schema_json = auth_test_usage_schema_json,
         },
     };
     var source = try SqlAuthCatalogSource.initAlloc(alloc, .{
@@ -1179,12 +1179,11 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expect(found_role);
 
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;"));
-    const public_tables = [_][]const u8{ "usage_records", "docs" };
     var schema_granted = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
         &manager,
         alloc,
         "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;",
-        .{ .public_table_names = public_tables[0..] },
+        authTestCatalog(),
     )).?;
     defer schema_granted.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_writer");
@@ -1196,7 +1195,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
         &manager,
         alloc,
         "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer;",
-        .{ .public_table_names = public_tables[0..] },
+        authTestCatalog(),
     )).?;
     defer schema_revoked.deinit(alloc);
     try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.docs", .read)));
@@ -1204,10 +1203,10 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA private TO app_writer;"));
 
     const catalog_tables = [_]SqlAuthTableRef{
-        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "events" },
-        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "rollups" },
-        .{ .database_name = "default", .namespace_name = "public", .table_name = "events" },
-        .{ .database_name = "tenant_ops", .namespace_name = "analytics", .table_name = "events" },
+        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "events", .schema_json = auth_test_usage_schema_json },
+        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "rollups", .schema_json = auth_test_usage_schema_json },
+        .{ .database_name = "default", .namespace_name = "public", .table_name = "events", .schema_json = auth_test_usage_schema_json },
+        .{ .database_name = "tenant_ops", .namespace_name = "analytics", .table_name = "events", .schema_json = auth_test_usage_schema_json },
     };
     var analytics_granted = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
         &manager,
