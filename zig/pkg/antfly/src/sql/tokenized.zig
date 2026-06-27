@@ -338,6 +338,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return true;
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
+    if (isGeneratedReadStatementHead(tokens, raw_statement)) return true;
     if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
@@ -1106,6 +1107,13 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     return false;
 }
 
+fn isGeneratedReadStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    if (start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
+    const first = tokens[start];
+    return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
+}
+
 fn isIncompleteGeneratedReadWindowClauseTail(tokens: []const Token, start: usize, end: usize) bool {
     if (end <= start + 1 or end > tokens.len) return false;
     const last = tokens[end - 1];
@@ -1442,15 +1450,6 @@ fn parseStatement(
             },
             .other => {},
         }
-    }
-    if (classifier.classifyReadStatement(tokenized_sql.items())) |kind| {
-        return .{ .read = .{ .kind = kind, .raw = raw_statement } };
-    }
-    if (classifier.classifyWriteStatement(tokenized_sql.items())) |kind| {
-        return .{ .write = .{ .kind = kind, .raw = raw_statement } };
-    }
-    if (classifier.classifyRecursiveWriteStatement(tokenized_sql.items())) |kind| {
-        return .{ .write = .{ .kind = kind, .raw = raw_statement, .recursive = true } };
     }
     return switch (raw_statement.family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
@@ -4675,7 +4674,7 @@ fn rawStatementFamily(
     if (generated_statement) |generated_raw| {
         if (rawStatementFamilyFromGenerated(tokens, raw_statement, generated_raw)) |family| return family;
     }
-    return classifier.classifyStatementFamily(tokens);
+    return rawStatementFamilyFromHead(tokens);
 }
 
 fn rawStatementFamilyFromGenerated(
@@ -4710,6 +4709,28 @@ fn generatedDmlFamilyFromHead(first: Token) ?classifier.SqlStatementFamily {
     if (tokenMatchesKeyword(first, .truncate)) return .truncate;
     if (tokenMatchesKeyword(first, .merge)) return .merge;
     return null;
+}
+
+fn rawStatementFamilyFromHead(tokens: []const Token) ?classifier.SqlStatementFamily {
+    const first = firstStatementToken(tokens) orelse return null;
+    if (first.keyword) |keyword| {
+        return switch (keyword) {
+            .select => .select,
+            .insert => .insert,
+            .update => .update,
+            .delete => .delete,
+            .truncate => .truncate,
+            .merge => .merge,
+            .with => .with,
+            else => .ddl,
+        };
+    }
+    return if (first.kind == .identifier) .ddl else null;
+}
+
+fn firstStatementToken(tokens: []const Token) ?Token {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    return tokens[0];
 }
 
 fn rawStatementTokenEnd(tokens: []const Token) !usize {
@@ -4786,7 +4807,7 @@ test "sql adapter parsed sql exposes raw statement source spans" {
     try std.testing.expectEqualStrings("SELECT ';' AS separator", nested_semicolon.statementSql());
 }
 
-test "sql adapter parsed sql does not require generated grammar parity" {
+test "sql adapter parsed sql keeps DDL fallback outside generated grammar parity" {
     const alloc = std.testing.allocator;
 
     var ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
@@ -4795,6 +4816,7 @@ test "sql adapter parsed sql does not require generated grammar parity" {
 
     var select = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
     defer select.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, select.generatedStatementKind().?);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, select.readStatementKind().?);
 }
 
@@ -4815,6 +4837,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT NOW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COMMIT WORK NOW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ROLLBACK LATER"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM docs) SELECT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM docs) UPDATE docs SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text"));

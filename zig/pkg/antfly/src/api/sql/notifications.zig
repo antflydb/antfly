@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("../sql/mod.zig");
+const sql_adapter = @import("../../sql/mod.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -101,6 +101,12 @@ pub const Runtime = struct {
         };
     }
 
+    pub fn clearSession(self: *@This(), session_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        clearSessionLocked(self, session_id);
+    }
+
     pub fn subscriptionCountForTest(self: *@This(), session_id: u64, channel_name: []const u8) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -183,15 +189,7 @@ pub const Runtime = struct {
         plan: sql_adapter.UnlistenNotificationPlan,
     ) !ApplyResult {
         if (plan.all) {
-            var i: usize = 0;
-            while (i < self.subscriptions.items.len) {
-                if (self.subscriptions.items[i].session_id == session_id) {
-                    var removed = self.subscriptions.orderedRemove(i);
-                    removed.deinit(self.alloc);
-                    continue;
-                }
-                i += 1;
-            }
+            clearSessionLocked(self, session_id);
             return .{};
         }
         const channel_name = plan.channel_name orelse return error.UnsupportedSqlShape;
@@ -208,6 +206,18 @@ pub const Runtime = struct {
             i += 1;
         }
         return .{};
+    }
+
+    fn clearSessionLocked(self: *@This(), session_id: u64) void {
+        var i: usize = 0;
+        while (i < self.subscriptions.items.len) {
+            if (self.subscriptions.items[i].session_id == session_id) {
+                var removed = self.subscriptions.orderedRemove(i);
+                removed.deinit(self.alloc);
+                continue;
+            }
+            i += 1;
+        }
     }
 };
 

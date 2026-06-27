@@ -1045,6 +1045,53 @@ test "graph metric runtime boundary tick preserves worker pool operation" {
     try std.testing.expectEqual(@as(usize, 2), result.pages_completed);
 }
 
+fn waitForGraphMetricFresh(
+    alloc: Allocator,
+    db: anytype,
+    index_name: []const u8,
+    metric_name: []const u8,
+    target_generation: u64,
+    max_attempts: usize,
+) !bool {
+    for (0..max_attempts) |attempt| {
+        yieldToBackground();
+        if (attempt % 8 != 0 and attempt + 1 != max_attempts) continue;
+        const graph_entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus(metric_name);
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) return true;
+    }
+    return false;
+}
+
+fn waitForGraphMetricPairFresh(
+    alloc: Allocator,
+    db: anytype,
+    index_name: []const u8,
+    first_metric_name: []const u8,
+    second_metric_name: []const u8,
+    target_generation: u64,
+    max_attempts: usize,
+) !bool {
+    for (0..max_attempts) |attempt| {
+        yieldToBackground();
+        if (attempt % 8 != 0 and attempt + 1 != max_attempts) continue;
+        const graph_entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var first_status = try graph_entry.index.graphMetricStatus(first_metric_name);
+        defer first_status.deinit(alloc);
+        var second_status = try graph_entry.index.graphMetricStatus(second_metric_name);
+        defer second_status.deinit(alloc);
+        if (first_status.state == .fresh and
+            second_status.state == .fresh and
+            first_status.published_generation == target_generation and
+            second_status.published_generation == target_generation)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn workerMain(runtime: *GraphMetricRuntime) void {
     while (true) {
         if (isShutdown(runtime)) return;
@@ -3590,18 +3637,7 @@ test "db graph metric runtime background coordinator and worker loops publish de
     coordinator_runtime.notify();
     worker_runtime.notify();
 
-    var fresh = false;
-    for (0..300) |_| {
-        yieldToBackground();
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        var status = try graph_entry.index.graphMetricStatus("degree");
-        defer status.deinit(alloc);
-        if (status.state == .fresh and status.published_generation == target_generation) {
-            fresh = true;
-            break;
-        }
-    }
-    try std.testing.expect(fresh);
+    try std.testing.expect(try waitForGraphMetricFresh(alloc, &db, "graph_idx", "degree", target_generation, 300));
 
     {
         const coordinator_stats = coordinator_runtime.stats();
@@ -3758,18 +3794,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     coordinator_runtime.notify();
     worker_pool_runtime.notify();
 
-    var fresh = false;
-    for (0..500) |_| {
-        yieldToBackground();
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        var status = try graph_entry.index.graphMetricStatus("degree");
-        defer status.deinit(alloc);
-        if (status.state == .fresh and status.published_generation == target_generation) {
-            fresh = true;
-            break;
-        }
-    }
-    try std.testing.expect(fresh);
+    try std.testing.expect(try waitForGraphMetricFresh(alloc, &db, "graph_idx", "degree", target_generation, 500));
 
     {
         const coordinator_stats = coordinator_runtime.stats();
@@ -3918,18 +3943,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     coordinator_runtime.notify();
     worker_pool_runtime.notify();
 
-    var fresh = false;
-    for (0..700) |_| {
-        yieldToBackground();
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        var status = try graph_entry.index.graphMetricStatus("pagerank");
-        defer status.deinit(alloc);
-        if (status.state == .fresh and status.published_generation == target_generation) {
-            fresh = true;
-            break;
-        }
-    }
-    try std.testing.expect(fresh);
+    try std.testing.expect(try waitForGraphMetricFresh(alloc, &db, "graph_idx", "pagerank", target_generation, 700));
 
     {
         const coordinator_stats = coordinator_runtime.stats();
@@ -4077,18 +4091,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     coordinator_runtime.notify();
     worker_pool_runtime.notify();
 
-    var fresh = false;
-    for (0..700) |_| {
-        yieldToBackground();
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        var status = try graph_entry.index.graphMetricStatus("eigenvector");
-        defer status.deinit(alloc);
-        if (status.state == .fresh and status.published_generation == target_generation) {
-            fresh = true;
-            break;
-        }
-    }
-    try std.testing.expect(fresh);
+    try std.testing.expect(try waitForGraphMetricFresh(alloc, &db, "graph_idx", "eigenvector", target_generation, 700));
 
     {
         const coordinator_stats = coordinator_runtime.stats();
@@ -4235,24 +4238,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     coordinator_runtime.notify();
     worker_pool_runtime.notify();
 
-    var fresh = false;
-    for (0..700) |_| {
-        yieldToBackground();
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
-        defer authority_status.deinit(alloc);
-        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
-        defer hub_status.deinit(alloc);
-        if (authority_status.state == .fresh and
-            hub_status.state == .fresh and
-            authority_status.published_generation == target_generation and
-            hub_status.published_generation == target_generation)
-        {
-            fresh = true;
-            break;
-        }
-    }
-    try std.testing.expect(fresh);
+    try std.testing.expect(try waitForGraphMetricPairFresh(alloc, &db, "graph_idx", "hits_authority", "hits_hub", target_generation, 700));
 
     {
         const coordinator_stats = coordinator_runtime.stats();

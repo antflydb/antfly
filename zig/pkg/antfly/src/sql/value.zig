@@ -52,6 +52,25 @@ pub const SqlValue = union(enum) {
     }
 };
 
+pub fn deinitSqlValue(alloc: std.mem.Allocator, value: SqlValue) void {
+    switch (value) {
+        .string => |text| alloc.free(@constCast(text)),
+        .json => |json| alloc.free(@constCast(json)),
+        .null, .bool, .integer, .float => {},
+    }
+}
+
+pub fn cloneSqlValueAlloc(alloc: std.mem.Allocator, value: SqlValue) !SqlValue {
+    return switch (value) {
+        .null => .null,
+        .bool => |flag| .{ .bool = flag },
+        .integer => |number| .{ .integer = number },
+        .float => |number| .{ .float = number },
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .json => |json| .{ .json = try alloc.dupe(u8, json) },
+    };
+}
+
 pub fn boundSqlValue(token: Token, params: []const SqlValue) !SqlValue {
     if (token.text.len < 2 or token.text[0] != '$') return error.UnsupportedSqlShape;
     var end: usize = 1;
@@ -1055,6 +1074,39 @@ pub fn parseSqlUntypedValueJsonAlloc(
         return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
     }
     return error.UnsupportedSqlShape;
+}
+
+pub fn parseSqlUntypedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !SqlValue {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeywordTag(.true)) return .{ .bool = true };
+    if (cursor.matchKeywordTag(.false)) return .{ .bool = false };
+    if (cursor.matchKeywordTag(.null)) return .null;
+    if (cursor.matchToken(.string)) |token| return .{ .string = try alloc.dupe(u8, token.text) };
+    if (cursor.matchToken(.number)) |token| return try parseSqlNumberValue(token.text);
+    if (cursor.matchToken(.minus) != null) {
+        const token = parser.matchToken(tokens, pos, .number) orelse return error.UnsupportedSqlShape;
+        return try parseSqlNegativeNumberValue(token.text);
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseSqlNumberValue(text: []const u8) !SqlValue {
+    if (std.mem.indexOfAny(u8, text, ".eE") == null) {
+        if (std.fmt.parseInt(i64, text, 10)) |integer| return .{ .integer = integer } else |_| {}
+    }
+    return .{ .float = try std.fmt.parseFloat(f64, text) };
+}
+
+fn parseSqlNegativeNumberValue(text: []const u8) !SqlValue {
+    if (std.mem.indexOfAny(u8, text, ".eE") == null) {
+        if (std.fmt.parseInt(i64, text, 10)) |integer| return .{ .integer = -integer } else |_| {}
+    }
+    const positive = try std.fmt.parseFloat(f64, text);
+    return .{ .float = -positive };
 }
 
 pub fn parseSqlNegativeNumberJsonAfterMinusAlloc(

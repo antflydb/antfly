@@ -4532,6 +4532,42 @@ test "db write path document artifact child range applies batch without source r
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
 }
 
+test "debug preserved document artifact manifest" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const path = if (std.c.getenv("ANTFLY_DEBUG_DB_PATH")) |value_z| std.mem.span(value_z) else return error.SkipZigTest;
+    const doc = if (std.c.getenv("ANTFLY_DEBUG_DOC")) |value_z| std.mem.span(value_z) else return error.SkipZigTest;
+    const artifact = if (std.c.getenv("ANTFLY_DEBUG_ARTIFACT")) |value_z| std.mem.span(value_z) else return error.SkipZigTest;
+
+    var db = try DB.open(alloc, path, .{
+        .open_mode = .status_only,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .transaction_recovery = .{ .enabled = false },
+        .text_merge = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var lookup = (try db.lookup(alloc, doc, .{})) orelse {
+        std.debug.print("debug source lookup missing doc={s}\n", .{doc});
+        return error.TestUnexpectedResult;
+    };
+    defer lookup.deinit(alloc);
+    std.debug.print("debug source lookup json={s}\n", .{lookup.json});
+
+    if (try db.getDocumentArtifactManifest(alloc, doc, artifact)) |manifest_value| {
+        var manifest = manifest_value;
+        defer manifest.deinit(alloc);
+        std.debug.print("debug manifest found doc={s} artifact={s} units={d} status={s}\n", .{ manifest.document_id, manifest.artifact_name, manifest.unit_count, manifest.merge_status });
+    } else {
+        std.debug.print("debug manifest missing doc={s} artifact={s}\n", .{ doc, artifact });
+    }
+
+    var list = try db.listDocumentArtifactManifests(alloc, doc);
+    defer list.deinit(alloc);
+    std.debug.print("debug manifest list len={d}\n", .{list.artifacts.len});
+}
+
 test "db write path document artifact child range dispatches generated artifacts to remote owner" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;

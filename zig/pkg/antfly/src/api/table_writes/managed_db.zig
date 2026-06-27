@@ -19,6 +19,7 @@ const common_secrets = @import("../../common/secrets.zig");
 const metadata_mod = @import("../../metadata/mod.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const asset_producer_mod = @import("../../storage/db/enrichment/asset_producer.zig");
+const document_extraction_mod = @import("../../storage/db/enrichment/document_extraction.zig");
 const asset_producer_runtime = @import("../../asset_producer_runtime.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const db_mod = @import("../../storage/db/mod.zig");
@@ -339,8 +340,9 @@ pub fn replayManagedIndexForTableIfNeeded(
 
 pub fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
     // Provisioned writes open a managed DB per request, so queued enrichment
-    // must drain before the DB is closed or semantic indexes can stay empty.
+    // and primary-store writes must be flushed before query DBs reopen.
     try db.runUntilIdle();
+    try db.forceFlushPrimaryStoreForVisibility();
     try db.core.index_manager.syncAll(false);
 }
 
@@ -1041,7 +1043,7 @@ pub fn openManagedDbWithIndexesJsonAndCache(
         hbc_cache,
         lsm_root_generation,
         resource_manager,
-        .default,
+        .default_async,
     );
 }
 
@@ -1636,7 +1638,15 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy;
+    return switch (producer_cfg.type) {
+        .copy => false,
+        .document_extraction => blk: {
+            var config = document_extraction_mod.parseConfig(alloc, producer_cfg.config_json) catch return false;
+            defer config.deinit(alloc);
+            break :blk config.ocr_enabled or config.transcription_enabled;
+        },
+        .generator, .reader, .transcriber, .extractor => true,
+    };
 }
 
 test "provisioning detects model backed graph shorthand assets inside config_json strings" {
@@ -1666,6 +1676,63 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
         \\}]
     ));
+}
+
+test "managed db full_index materializes graph shorthand document extraction assets" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-graph-document-artifact/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+
+    const indexes_json =
+        \\{
+        \\  "document_units_graph":{
+        \\    "type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.edges[*]","format":"extraction_relation"},
+        \\    "artifact":{
+        \\      "name":"document_units_v1",
+        \\      "kind":"asset",
+        \\      "field":"url",
+        \\      "content_type":"application/json",
+        \\      "producer_json":{"type":"document_extraction","config":{"source":{"filename_field":"filename","content_type_field":"mime_type","version_field":"version"}}}
+        \\    },
+        \\    "edge_types":[{"name":"mentions"}]
+        \\  }
+        \\}
+    ;
+    var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntime(
+        alloc,
+        path,
+        indexes_json,
+        null,
+        null,
+        0,
+        null,
+        .default,
+        backend_runtime.ptr(),
+    );
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a/with/slash",
+            .value = "{\"filename\":\"alpha.txt\",\"mime_type\":\"text/plain\",\"version\":\"1\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var manifest = (try db.getDocumentArtifactManifest(alloc, "doc:a/with/slash", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a/with/slash", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqual(@as(u32, 1), manifest.unit_count);
+    try std.testing.expectEqualStrings("converged", manifest.merge_status);
 }
 
 test "managed startup catch-up open disables optional runtimes and workers" {

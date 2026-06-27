@@ -57,6 +57,7 @@ const serverless_query = @import("../../serverless/query/mod.zig");
 const schema_api = @import("../../schema/mod.zig");
 const distributed_graph = @import("../distributed_graph.zig");
 const runtime_status = @import("../runtime_status.zig");
+const http_client = @import("../http_client.zig");
 const http_common = @import("../../raft/transport/http_common.zig");
 const platform_time = @import("../../platform/time.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
@@ -981,6 +982,8 @@ pub const ProvisionedTableReadSource = struct {
                 .document_algebraic_aggregate = ProvisionedTableReadSource.documentAlgebraicAggregate,
                 .document_algebraic_aggregate_catalog = ProvisionedTableReadSource.documentAlgebraicAggregateCatalog,
                 .document_algebraic_aggregate_group_local = ProvisionedTableReadSource.documentAlgebraicAggregateGroupLocal,
+                .document_artifact_manifest = ProvisionedTableReadSource.documentArtifactManifest,
+                .document_artifact_manifests = ProvisionedTableReadSource.documentArtifactManifests,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -1082,7 +1085,11 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse {
+            std.log.err("debug provisioned document artifact group resolution miss table={s} doc={s}", .{ table_name, doc_key });
+            return null;
+        };
+        std.log.err("debug provisioned document artifact group={d} table={s} doc={s}", .{ group_id, table_name, doc_key });
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
@@ -1902,6 +1909,8 @@ pub const HostedProvisionedTableReadSource = struct {
                 .document_algebraic_aggregate = documentAlgebraicAggregate,
                 .document_algebraic_aggregate_catalog = documentAlgebraicAggregateCatalog,
                 .document_algebraic_aggregate_group_local = documentAlgebraicAggregateGroupLocal,
+                .document_artifact_manifest = HostedProvisionedTableReadSource.documentArtifactManifest,
+                .document_artifact_manifests = HostedProvisionedTableReadSource.documentArtifactManifests,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -1972,6 +1981,76 @@ pub const HostedProvisionedTableReadSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try lookup(ptr, alloc, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse {
+            std.log.err("debug hosted document artifact group resolution miss table={s} doc={s}", .{ table_name, doc_key });
+            return null;
+        };
+        std.log.err("debug hosted document artifact group={d} table={s} doc={s}", .{ group_id, table_name, doc_key });
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => try documentArtifactManifestProvisionedHostedLocal(
+                null,
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                doc_key,
+                artifact_name,
+                consistency,
+            ),
+            .remote => |remote| documentArtifactManifestRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn documentArtifactManifests(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => try documentArtifactManifestsProvisionedHostedLocal(
+                null,
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                doc_key,
+                consistency,
+            ),
+            .remote => |remote| documentArtifactManifestsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
     }
 
     fn queryCatalogNative(
@@ -4359,6 +4438,7 @@ fn documentArtifactManifestProvisionedLocal(
 ) !?db_mod.types.DocumentArtifactManifest {
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
+    std.log.err("debug document artifact manifest read path={s} group={d} table={s} doc={s} artifact={s} root_generation={d}", .{ path, group_id, table_name, doc_key, artifact_name, lsm_root_generation });
     if (cache) |cached| {
         var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
         defer db_lease.release();
@@ -4366,7 +4446,15 @@ fn documentArtifactManifestProvisionedLocal(
         return try reads.documentArtifactManifestWithConsistency(alloc, db_lease.db, doc_key, artifact_name, consistency);
     }
 
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    var db = try openProvisionedLookupDbForTable(
+        alloc,
+        path,
+        null,
+        lsm_root_generation,
+        null,
+        backend_runtime,
+        try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
+    );
     defer db.close();
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     return try reads.documentArtifactManifestWithConsistency(alloc, &db, doc_key, artifact_name, consistency);
@@ -4414,7 +4502,15 @@ fn documentArtifactManifestsProvisionedLocal(
         return try reads.documentArtifactManifestsWithConsistency(alloc, db_lease.db, doc_key, consistency);
     }
 
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    var db = try openProvisionedLookupDbForTable(
+        alloc,
+        path,
+        null,
+        lsm_root_generation,
+        null,
+        backend_runtime,
+        try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
+    );
     defer db.close();
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     return try reads.documentArtifactManifestsWithConsistency(alloc, &db, doc_key, consistency);
@@ -6065,6 +6161,47 @@ fn queryRemote(
         req,
         vector_worker_body,
     );
+}
+
+fn documentArtifactManifestRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !?db_mod.types.DocumentArtifactManifest {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var response = client.fetchGroupDocumentArtifactManifest(base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer response.deinit(alloc);
+    return try std.json.parseFromSliceLeaky(db_mod.types.DocumentArtifactManifest, alloc, response.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+}
+
+fn documentArtifactManifestsRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    doc_key: []const u8,
+) !?db_mod.types.DocumentArtifactManifestList {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var response = client.fetchGroupDocumentArtifactManifests(base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer response.deinit(alloc);
+    return try std.json.parseFromSliceLeaky(db_mod.types.DocumentArtifactManifestList, alloc, response.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {

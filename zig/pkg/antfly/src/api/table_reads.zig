@@ -54,6 +54,7 @@ pub const searchRequestFromVectorWorkerEnvelope = table_read_remote_wire.searchR
 
 pub const LoweredSqlReadPlanResult = table_read_relational_rows.LoweredSqlReadPlanResult;
 pub const LoweredRelationPopulationRowsResult = table_read_relational_rows.LoweredRelationPopulationRowsResult;
+pub const takeLoweredSqlReadRows = table_read_relational_rows.takeLoweredSqlReadRows;
 pub const executeLoweredSqlReadPlanAlloc = table_read_relational_rows.executeLoweredSqlReadPlanAlloc;
 pub const executeLoweredSqlReadPlanWithSessionAlloc = table_read_relational_rows.executeLoweredSqlReadPlanWithSessionAlloc;
 pub const executeLoweredRelationPopulationPlanAlloc = table_read_relational_rows.executeLoweredRelationPopulationPlanAlloc;

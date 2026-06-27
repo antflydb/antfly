@@ -589,6 +589,15 @@ pub const SingleTableEmptyingJobCatalogService = struct {
     }
 };
 
+fn tableEmptyingJobMatchesTableGeneration(
+    table: metadata_table_manager.TableRecord,
+    record: metadata_table_manager.TableEmptyingJobRecord,
+) bool {
+    return record.table_id == table.table_id and
+        record.schema_generation == metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json) and
+        record.data_generation == table.data_generation;
+}
+
 pub fn runTableEmptyingJobGroupLocal(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -619,6 +628,15 @@ pub fn runTableEmptyingJobGroupLocal(
     };
     result.claimed = true;
 
+    if (!tableEmptyingJobMatchesTableGeneration(table, record)) {
+        catalog.invalidateTableEmptyingJob(.{
+            .job_id = record.job_id,
+            .lease_owner = worker_id,
+            .last_error = @errorName(error.InvalidTableEmptyingJob),
+        }) catch {};
+        result.invalidated = true;
+        return error.InvalidTableEmptyingJob;
+    }
     if (table.schema_json.len == 0) {
         catalog.invalidateTableEmptyingJob(.{
             .job_id = record.job_id,
@@ -670,6 +688,13 @@ pub fn runTableEmptyingJobGroupLocal(
     return result;
 }
 
+fn findTableRecordById(snapshot: *const metadata_api.AdminSnapshot, table_id: u64) ?metadata_table_manager.TableRecord {
+    for (snapshot.tables) |table| {
+        if (table.table_id == table_id) return table;
+    }
+    return null;
+}
+
 pub fn runTableEmptyingWorkerPassForCatalog(
     alloc: std.mem.Allocator,
     source: anytype,
@@ -683,7 +708,36 @@ pub fn runTableEmptyingWorkerPassForCatalog(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
+    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table.*, worker_id, lease_ms, max_work_units);
+}
 
+pub fn runTableEmptyingWorkerPassForCatalogTableId(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    catalog: table_catalog.CatalogSource,
+    table_id: u64,
+    table_name: []const u8,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !TableEmptyingWorkerPassResult {
+    _ = table_name;
+    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidTableEmptyingJobLease;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordById(&snapshot, table_id) orelse return .{};
+    return try runTableEmptyingWorkerPassForSnapshotTable(alloc, source, snapshot.table_emptying_jobs, table, worker_id, lease_ms, max_work_units);
+}
+
+fn runTableEmptyingWorkerPassForSnapshotTable(
+    alloc: std.mem.Allocator,
+    source: anytype,
+    table_emptying_jobs: []const metadata_table_manager.TableEmptyingJobRecord,
+    table: metadata_table_manager.TableRecord,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !TableEmptyingWorkerPassResult {
     var groups = std.ArrayListUnmanaged(TableEmptyingWorkerResult).empty;
     errdefer {
         for (groups.items) |*group| group.deinit(alloc);
@@ -691,7 +745,7 @@ pub fn runTableEmptyingWorkerPassForCatalog(
     }
 
     var result: TableEmptyingWorkerPassResult = .{};
-    for (snapshot.table_emptying_jobs) |record| {
+    for (table_emptying_jobs) |record| {
         if (record.table_id != table.table_id) continue;
         if (!tableEmptyingRecordPending(record)) continue;
         result.jobs_scanned += 1;
@@ -703,7 +757,7 @@ pub fn runTableEmptyingWorkerPassForCatalog(
         var one = (try source.tableEmptyingGroupLocal(
             alloc,
             record.group_id,
-            table_name,
+            table.name,
             record,
             worker_id,
             lease_ms,
@@ -916,6 +970,114 @@ test "table emptying worker helper claims deletes rows and finishes job" {
     try std.testing.expectEqual(@as(u64, 2), final_jobs[0].completed_row_count);
 }
 
+test "table emptying worker completes restart identity range delete before catalog reset" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-restart-identity-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    try manager.upsertTable(table);
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .start_row_key = "",
+        .end_row_key = null,
+        .affected_table_ids = &.{77},
+        .restart_identity = true,
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    const records = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    var catalog = Catalog{ .manager = &manager };
+    var result = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, records[0], "worker-a", 1000, 500);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.claimed);
+    try std.testing.expect(result.completed);
+    try std.testing.expect(!result.invalidated);
+    try std.testing.expectEqual(@as(u32, 1), result.result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.result.staged);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:a"));
+
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, final_jobs[0].state);
+    try std.testing.expectEqual(@as(u64, 1), final_jobs[0].completed_row_count);
+}
+
 test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {
     const alloc = std.testing.allocator;
 
@@ -1029,6 +1191,109 @@ test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {
     try std.testing.expectEqual(@as(usize, 2), pass.groups.len);
     try std.testing.expect(pass.groups[0].completed);
     try std.testing.expect(pass.groups[1].invalidated);
+}
+
+test "table emptying worker pass can select same-name table by table id" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+
+    const Catalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 91, .name = "events", .namespace_name = "public", .schema_json = schema_json, .data_generation = 4 },
+            .{ .table_id = 92, .name = "events", .namespace_name = "tenant", .schema_json = schema_json, .data_generation = 7 },
+        },
+        jobs: [2]metadata_table_manager.TableEmptyingJobRecord = undefined,
+
+        fn seed(self: *@This(), generation: u64) void {
+            self.jobs = .{
+                .{ .job_id = 9101, .table_id = 91, .group_id = 8101, .schema_generation = generation, .data_generation = 4, .affected_table_ids = &.{91} },
+                .{ .job_id = 9201, .table_id = 92, .group_id = 8201, .schema_generation = generation, .data_generation = 7, .affected_table_ids = &.{92} },
+            };
+        }
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .table_emptying_jobs = self.jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Source = struct {
+        calls: usize = 0,
+        last_group_id: u64 = 0,
+        last_table_id: u64 = 0,
+
+        fn tableEmptyingGroupLocal(
+            self: *@This(),
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            record: metadata_table_manager.TableEmptyingJobRecord,
+            _: []const u8,
+            _: u64,
+        ) !?TableEmptyingWorkerResult {
+            if (!std.mem.eql(u8, table_name, "events")) return error.TestUnexpectedResult;
+            self.calls += 1;
+            self.last_group_id = group_id;
+            self.last_table_id = record.table_id;
+            return .{
+                .group_id = group_id,
+                .table_id = record.table_id,
+                .job_id = record.job_id,
+                .claimed = true,
+                .completed = true,
+                .result = .{ .matched = 3, .staged = 3 },
+            };
+        }
+    };
+
+    var catalog = Catalog{};
+    catalog.seed(schema_generation);
+    var source = Source{};
+    var pass = try runTableEmptyingWorkerPassForCatalogTableId(
+        alloc,
+        &source,
+        catalog.iface(),
+        92,
+        "events",
+        "worker-a",
+        500,
+        4,
+    );
+    defer pass.deinit(alloc);
+
+    try std.testing.expect(pass.complete);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(u64, 8201), source.last_group_id);
+    try std.testing.expectEqual(@as(u64, 92), source.last_table_id);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_scanned);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_completed);
+    try std.testing.expectEqual(@as(u64, 3), pass.rows_matched);
+    try std.testing.expectEqual(@as(u64, 3), pass.rows_staged);
 }
 
 test "secondary index promotion ignores stale ready rebuild generation" {

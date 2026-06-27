@@ -453,6 +453,12 @@ pub fn Impl(comptime DB: type) type {
             try self.core.index_manager.syncAll(force);
         }
 
+        pub fn forceFlushPrimaryStoreForVisibility(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.primary_store_owner.forceFlushLsmMutable();
+        }
+
         pub fn lsmMaintenanceScore(self: *DB) u64 {
             self.core.lockApplyShared();
             defer self.core.unlockApplyShared();

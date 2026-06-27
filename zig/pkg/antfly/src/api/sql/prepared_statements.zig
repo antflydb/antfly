@@ -1,0 +1,177 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the Elastic License 2.0 is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+// the Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+const sql_adapter = @import("../../sql/mod.zig");
+
+pub const Runtime = struct {
+    alloc: std.mem.Allocator,
+    sessions: std.AutoHashMapUnmanaged(u64, Session) = .empty,
+
+    const Session = struct {
+        statements: std.StringHashMapUnmanaged(Record) = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var it = self.statements.iterator();
+            while (it.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(alloc);
+            }
+            self.statements.deinit(alloc);
+            self.* = undefined;
+        }
+
+        fn clear(self: *@This(), alloc: std.mem.Allocator) void {
+            var it = self.statements.iterator();
+            while (it.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(alloc);
+            }
+            self.statements.clearRetainingCapacity();
+        }
+    };
+
+    const Record = struct {
+        parameter_count: usize,
+        statement_kind: sql_adapter.PreparedStatementSubjectKind,
+        statement_family: sql_adapter.PreparedStatementStatementKind,
+        subject_sql: []const u8,
+        subject_parsed_sql: sql_adapter.ParsedSql,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.subject_parsed_sql.deinit(alloc);
+            alloc.free(@constCast(self.subject_sql));
+            self.* = undefined;
+        }
+    };
+
+    pub const ExecutableStatement = struct {
+        statement_kind: sql_adapter.PreparedStatementSubjectKind,
+        statement_family: sql_adapter.PreparedStatementStatementKind,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    };
+
+    pub fn init(alloc: std.mem.Allocator) Runtime {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+        self.sessions.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn apply(self: *@This(), plan: sql_adapter.PreparedStatementPlan, session_id: u64) !void {
+        if (session_id == 0) return error.InvalidSqlSession;
+        switch (plan) {
+            .prepare => |prepare_plan| try self.prepare(session_id, prepare_plan),
+            .execute => |execute_plan| try self.execute(session_id, execute_plan),
+            .deallocate => |deallocate_plan| try self.deallocate(session_id, deallocate_plan),
+        }
+    }
+
+    pub fn statementKindForExecute(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.ExecutePreparedStatementPlan,
+    ) !sql_adapter.PreparedStatementSubjectKind {
+        return (try self.executeRecord(session_id, plan)).statement_kind;
+    }
+
+    pub fn executableForExecute(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.ExecutePreparedStatementPlan,
+    ) !ExecutableStatement {
+        const record = try self.executeRecord(session_id, plan);
+        return .{
+            .statement_kind = record.statement_kind,
+            .statement_family = record.statement_family,
+            .parsed_sql = &record.subject_parsed_sql,
+        };
+    }
+
+    pub fn statementCountForTest(self: *@This(), session_id: u64) usize {
+        const session = self.sessions.getPtr(session_id) orelse return 0;
+        return session.statements.count();
+    }
+
+    fn prepare(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.PrepareStatementPlan,
+    ) !void {
+        const result = try self.sessions.getOrPut(self.alloc, session_id);
+        if (!result.found_existing) result.value_ptr.* = .{};
+        const session = result.value_ptr;
+        if (session.statements.contains(plan.statement_name)) return error.PreparedStatementAlreadyExists;
+        const subject_sql = plan.subject_sql orelse return error.UnsupportedSqlShape;
+        const key = try self.alloc.dupe(u8, plan.statement_name);
+        errdefer self.alloc.free(key);
+        const owned_subject_sql = try self.alloc.dupe(u8, subject_sql);
+        errdefer self.alloc.free(owned_subject_sql);
+        var subject_parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, owned_subject_sql);
+        errdefer subject_parsed_sql.deinit(self.alloc);
+        try session.statements.put(self.alloc, key, .{
+            .parameter_count = plan.parameter_count,
+            .statement_kind = plan.statement_kind,
+            .statement_family = plan.statement_family,
+            .subject_sql = owned_subject_sql,
+            .subject_parsed_sql = subject_parsed_sql,
+        });
+    }
+
+    fn execute(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.ExecutePreparedStatementPlan,
+    ) !void {
+        _ = try self.executeRecord(session_id, plan);
+    }
+
+    fn executeRecord(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.ExecutePreparedStatementPlan,
+    ) !*const Record {
+        const session = self.sessions.getPtr(session_id) orelse return error.PreparedStatementNotFound;
+        const record = session.statements.getPtr(plan.statement_name) orelse return error.PreparedStatementNotFound;
+        if (record.parameter_count != plan.arguments.len or record.parameter_count != plan.argument_count) return error.PreparedStatementArgumentMismatch;
+        return record;
+    }
+
+    fn deallocate(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.DeallocatePreparedStatementPlan,
+    ) !void {
+        const session = self.sessions.getPtr(session_id) orelse {
+            if (plan.all) return;
+            return error.PreparedStatementNotFound;
+        };
+        if (plan.all) {
+            session.clear(self.alloc);
+            return;
+        }
+        const name = plan.statement_name orelse return error.UnsupportedSqlShape;
+        if (session.statements.fetchRemove(name)) |removed| {
+            self.alloc.free(removed.key);
+            var value = removed.value;
+            value.deinit(self.alloc);
+            return;
+        }
+        return error.PreparedStatementNotFound;
+    }
+};

@@ -197,6 +197,13 @@ pub const PrimaryStoreOwner = union(enum) {
         }
     }
 
+    pub fn forceFlushLsmMutable(self: *PrimaryStoreOwner) !void {
+        switch (self.*) {
+            .none, .mem => {},
+            .lsm => |owner| try owner.handle.backend.forceFlushMutable(),
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.NativeStorageStats {
         return switch (self.*) {
             .none, .mem => null,

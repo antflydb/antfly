@@ -96,6 +96,10 @@ validate_one() {
     else
         echo "FAIL ${trace}"
         echo "  TLC output: ${state_dir}/tlc.log"
+        echo "  TLC tail:"
+        tail -n 80 "${state_dir}/tlc.log" | sed 's/^/    /'
+        echo "  Trace head:"
+        sed -n '1,40p' "${trace}" | sed 's/^/    /'
         rm -f "${preprocessed}"
         return 1
     fi

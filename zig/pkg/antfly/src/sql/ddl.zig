@@ -1964,8 +1964,12 @@ pub const PrepareStatementPlan = struct {
     parameter_count: usize = 0,
     statement_kind: PreparedStatementSubjectKind,
     statement_family: PreparedStatementStatementKind,
+    subject_sql: ?[]const u8 = null,
+    subject_parsed_sql: ?tokenized.ParsedSql = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.subject_parsed_sql) |*parsed| parsed.deinit(alloc);
+        if (self.subject_sql) |subject_sql| alloc.free(@constCast(subject_sql));
         alloc.free(self.statement_name);
         self.* = undefined;
     }
@@ -1991,8 +1995,11 @@ pub const PreparedStatementStatementKind = enum {
 pub const ExecutePreparedStatementPlan = struct {
     statement_name: []const u8,
     argument_count: usize = 0,
+    arguments: []const value_mod.SqlValue = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.arguments) |argument| value_mod.deinitSqlValue(alloc, argument);
+        if (self.arguments.len > 0) alloc.free(self.arguments);
         alloc.free(self.statement_name);
         self.* = undefined;
     }
@@ -2031,8 +2038,12 @@ pub const DeclareCursorPortalPlan = struct {
     binary: bool = false,
     hold: bool = false,
     statement_kind: PreparedStatementSubjectKind,
+    subject_sql: ?[]const u8 = null,
+    subject_parsed_sql: ?tokenized.ParsedSql = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.subject_parsed_sql) |*parsed| parsed.deinit(alloc);
+        if (self.subject_sql) |subject_sql| alloc.free(@constCast(subject_sql));
         alloc.free(self.portal_name);
         self.* = undefined;
     }
@@ -3380,12 +3391,22 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
         try countGeneratedParenthesizedList(tokens, parameter_tokens)
     else
         0;
-    return .{
+    var plan = PrepareStatementPlan{
         .statement_name = try alloc.dupe(u8, statement_name),
         .parameter_count = parameter_count,
         .statement_kind = preparedStatementSubjectKindFromStatementKind(statement_family),
         .statement_family = statement_family,
     };
+    errdefer plan.deinit(alloc);
+    plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[inner.start..inner.end]);
+    errdefer {
+        if (plan.subject_sql) |subject_sql| {
+            alloc.free(@constCast(subject_sql));
+            plan.subject_sql = null;
+        }
+    }
+    plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+    return plan;
 }
 
 fn generatedPreparedStatementFamilyAlloc(
@@ -3430,6 +3451,32 @@ fn preparedStatementSubjectKindFromStatementKind(kind: PreparedStatementStatemen
     };
 }
 
+fn parseExecutePreparedStatementArgumentsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+) ![]const value_mod.SqlValue {
+    if (tokens.len == 0) return &.{};
+    var pos: usize = 0;
+    if (parser.matchToken(tokens, &pos, .lparen) == null) return error.UnsupportedSqlShape;
+    if (parser.matchToken(tokens, &pos, .rparen) != null) {
+        if (pos != tokens.len) return error.UnsupportedSqlShape;
+        return &.{};
+    }
+    var values = std.ArrayListUnmanaged(value_mod.SqlValue).empty;
+    errdefer {
+        for (values.items) |value| value_mod.deinitSqlValue(alloc, value);
+        values.deinit(alloc);
+    }
+    while (true) {
+        try values.append(alloc, try value_mod.parseSqlUntypedValueAlloc(alloc, tokens, &pos));
+        if (parser.matchToken(tokens, &pos, .comma) != null) continue;
+        break;
+    }
+    _ = parser.matchToken(tokens, &pos, .rparen) orelse return error.UnsupportedSqlShape;
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    return try values.toOwnedSlice(alloc);
+}
+
 pub fn executePreparedStatementPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -3440,10 +3487,15 @@ pub fn executePreparedStatementPlanFromGeneratedAstAlloc(
         try countGeneratedParenthesizedList(tokens, argument_tokens)
     else
         0;
-    return .{
+    var plan = ExecutePreparedStatementPlan{
         .statement_name = try alloc.dupe(u8, statement_name),
         .argument_count = argument_count,
     };
+    errdefer plan.deinit(alloc);
+    if (ast.argument_tokens) |argument_tokens| {
+        plan.arguments = try parseExecutePreparedStatementArgumentsAlloc(alloc, tokens[argument_tokens.start..argument_tokens.end]);
+    }
+    return plan;
 }
 
 pub fn deallocatePreparedStatementPlanFromGeneratedAstAlloc(
@@ -7281,7 +7333,21 @@ pub fn parsePrepareStatementPlanTailAlloc(
     pos: *usize,
 ) !PrepareStatementPlan {
     const syntax = try grammar.parsePrepareStatementTailAlloc(alloc, tokens, pos);
-    return try prepareStatementPlanFromSyntaxAlloc(alloc, syntax);
+    var plan = try prepareStatementPlanFromSyntaxAlloc(alloc, syntax);
+    errdefer plan.deinit(alloc);
+    if (syntax.subject_token_start) |subject_start| {
+        const subject_end = syntax.subject_token_end orelse return error.UnsupportedSqlShape;
+        if (subject_start >= subject_end or subject_end > tokens.len) return error.UnsupportedSqlShape;
+        plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
+        errdefer {
+            if (plan.subject_sql) |subject_sql| {
+                alloc.free(@constCast(subject_sql));
+                plan.subject_sql = null;
+            }
+        }
+        plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+    }
+    return plan;
 }
 
 pub fn parseExecutePreparedStatementPlanTailAlloc(
@@ -7290,7 +7356,14 @@ pub fn parseExecutePreparedStatementPlanTailAlloc(
     pos: *usize,
 ) !ExecutePreparedStatementPlan {
     const syntax = try grammar.parseExecutePreparedStatementTail(tokens, pos);
-    return try executePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
+    var plan = try executePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
+    errdefer plan.deinit(alloc);
+    if (syntax.argument_token_start) |argument_start| {
+        const argument_end = syntax.argument_token_end orelse return error.UnsupportedSqlShape;
+        if (argument_start >= argument_end or argument_end > tokens.len) return error.UnsupportedSqlShape;
+        plan.arguments = try parseExecutePreparedStatementArgumentsAlloc(alloc, tokens[argument_start..argument_end]);
+    }
+    return plan;
 }
 
 pub fn parseDeallocatePreparedStatementPlanTailAlloc(
@@ -7308,7 +7381,21 @@ pub fn parseDeclareCursorPortalPlanTailAlloc(
     pos: *usize,
 ) !DeclareCursorPortalPlan {
     const syntax = try grammar.parseDeclareCursorPortalTailAlloc(alloc, tokens, pos);
-    return try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+    var plan = try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+    errdefer plan.deinit(alloc);
+    if (syntax.subject_token_start) |subject_start| {
+        const subject_end = syntax.subject_token_end orelse return error.UnsupportedSqlShape;
+        if (subject_start >= subject_end or subject_end > tokens.len) return error.UnsupportedSqlShape;
+        plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
+        errdefer {
+            if (plan.subject_sql) |subject_sql| {
+                alloc.free(@constCast(subject_sql));
+                plan.subject_sql = null;
+            }
+        }
+        plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+    }
+    return plan;
 }
 
 pub fn parseFetchCursorPortalPlanTailAlloc(
@@ -7327,6 +7414,37 @@ pub fn parseCloseCursorPortalPlanTailAlloc(
 ) !CloseCursorPortalPlan {
     const syntax = try grammar.parseCloseCursorPortalTail(tokens, pos);
     return try closeCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+fn sqlTextFromTokenRangeAlloc(alloc: std.mem.Allocator, tokens: []const grammar.Token) ![]const u8 {
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    var contiguous = true;
+    const start_addr = @intFromPtr(tokens[0].text.ptr);
+    var prev_end = start_addr + tokens[0].text.len;
+    for (tokens[1..]) |token| {
+        const token_start = @intFromPtr(token.text.ptr);
+        if (token_start < prev_end) {
+            contiguous = false;
+            break;
+        }
+        prev_end = token_start + token.text.len;
+    }
+    if (contiguous) {
+        const end_token = tokens[tokens.len - 1];
+        const end_addr = @intFromPtr(end_token.text.ptr) + end_token.text.len;
+        if (end_addr >= start_addr) {
+            const source = tokens[0].text.ptr[0 .. end_addr - start_addr];
+            return try alloc.dupe(u8, source);
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (tokens, 0..) |token, index| {
+        if (index != 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(token.text);
+    }
+    return try out.toOwnedSlice();
 }
 
 pub fn parseSavepointTransactionPlanTailAlloc(
@@ -18477,6 +18595,8 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
                 try std.testing.expectEqual(@as(usize, 1), prepare.parameter_count);
                 try std.testing.expectEqual(PreparedStatementSubjectKind.read, prepare.statement_kind);
                 try std.testing.expectEqual(PreparedStatementStatementKind.read, prepare.statement_family);
+                try std.testing.expect(prepare.subject_parsed_sql != null);
+                try std.testing.expect(std.mem.indexOf(u8, prepare.subject_sql orelse return error.TestUnexpectedResult, "SELECT id FROM usage_records") != null);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -18513,6 +18633,8 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
             .execute => |execute| {
                 try std.testing.expectEqualStrings("usage_plan", execute.statement_name);
                 try std.testing.expectEqual(@as(usize, 1), execute.argument_count);
+                try std.testing.expectEqual(@as(usize, 1), execute.arguments.len);
+                try std.testing.expectEqualStrings("open", execute.arguments[0].string);
             },
             else => return error.TestUnexpectedResult,
         },

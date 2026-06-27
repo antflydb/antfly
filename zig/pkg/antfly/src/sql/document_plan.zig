@@ -2911,9 +2911,7 @@ test "document SQL rejects unsupported tail keywords as source aliases" {
     defer window_tail.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlWindowUnsupported, lowerDocumentReadPlanParsedSqlAlloc(alloc, &window_tail, schema));
 
-    var aggregate_keyword_alias_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs offset");
-    defer aggregate_keyword_alias_tail.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlPaginationUnsupported, lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &aggregate_keyword_alias_tail, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnexpectedToken, tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs offset"));
 
     var aggregate_having_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs HAVING count(*) > 0");
     defer aggregate_having_tail.deinit(alloc);

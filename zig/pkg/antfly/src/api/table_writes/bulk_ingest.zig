@@ -49,13 +49,12 @@ pub fn shouldDrainManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
     // explicit catch-up, or bulk-session finish.
     return switch (sync_level) {
         .propose, .write, .enrichments => false,
-        .full_text, .aknn, .full_index => false,
+        .full_text, .aknn, .full_index => true,
     };
 }
 
 pub fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
-    _ = sync_level;
-    return false;
+    return shouldDrainManagedDbAfterBatch(sync_level);
 }
 
 pub fn autoBulkIngestBatchOps(req: db_mod.types.BatchRequest) usize {
@@ -332,6 +331,11 @@ pub fn freeWriteCoalesceGroupBatch(alloc: std.mem.Allocator, group: *GroupBatch)
 test "weak sync levels do not drain managed db after batch" {
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.propose));
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.write));
+    try std.testing.expect(!shouldDrainManagedDbAfterBatch(.enrichments));
+    try std.testing.expect(shouldDrainManagedDbAfterBatch(.full_text));
+    try std.testing.expect(shouldDrainManagedDbAfterBatch(.aknn));
+    try std.testing.expect(shouldDrainManagedDbAfterBatch(.full_index));
+    try std.testing.expect(shouldDrainCachedManagedDbAfterBatch(.full_index));
 }
 
 test "write coalesce queue helpers reuse and prune idle queues" {

@@ -124,9 +124,12 @@ the legacy statement-family classifier. When the generated parser accepts a
 statement, `ParsedSql` stamps the raw statement family from the generated
 statement kind and head token, then uses generated AST payloads for the first
 migrated concrete variants. The legacy classifier is no longer re-exported
-through the SQL facade and remains only as an internal compatibility fallback
-for statement shapes the generated grammar still does not accept. Generated
-read variants now come from the retained generated read AST kind directly. The
+through the SQL facade and is no longer called by the parsed SQL path; DDL-like
+statement shapes the generated grammar still does not accept use a local
+first-token family mapper before entering the legacy DDL planner boundary.
+Generated read variants now come from the retained generated read AST kind
+directly, and `SELECT`/`WITH` heads must be accepted by the generated parser
+before they can publish a parsed statement. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
@@ -1396,8 +1399,7 @@ including body-local table-function items, join-tree payloads, named windows,
 pagination with `OFFSET ... ROWS`, row-lock tails, and body set-operation
 metadata, so direct generated read lowering no longer depends on later
 body-clone validation to catch corrupted retained CTE payloads.
-   Removing the remaining compatibility classifier fallback and requiring
-   generated parsing for all reads still requires
+   Completing the generated-parser-only read path still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join

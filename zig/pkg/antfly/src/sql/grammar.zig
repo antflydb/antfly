@@ -134,11 +134,15 @@ pub const PrepareStatementSyntax = struct {
     parameter_count: usize = 0,
     statement_kind: PreparedStatementSubjectSyntax,
     statement_family: PreparedStatementStatementSyntax,
+    subject_token_start: ?usize = null,
+    subject_token_end: ?usize = null,
 };
 
 pub const ExecutePreparedStatementSyntax = struct {
     statement_name: []const u8,
     argument_count: usize = 0,
+    argument_token_start: ?usize = null,
+    argument_token_end: ?usize = null,
 };
 
 pub const TableLockModeSyntax = enum {
@@ -1309,6 +1313,8 @@ pub const DeclareCursorPortalSyntax = struct {
     binary: bool = false,
     hold: bool = false,
     statement_kind: ?PreparedStatementSubjectSyntax = null,
+    subject_token_start: ?usize = null,
+    subject_token_end: ?usize = null,
 };
 
 pub const CursorFetchDirectionSyntax = enum {
@@ -2105,25 +2111,33 @@ pub fn parsePrepareStatementTailAlloc(alloc: std.mem.Allocator, tokens: []const 
     const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     const parameter_count = if (cursor.peekKind(.lparen)) try countParenthesizedTypeList(cursor) else 0;
     try cursor.expectKeyword("as");
+    const subject_token_start = cursor.checkpoint();
     const statement_family = try generatedPreparedStatementStatementKindAlloc(alloc, tokens[cursor.checkpoint()..]);
     const statement_kind = preparedStatementSubjectKindFromStatementKind(statement_family);
     try consumePreparedStatementSubjectTail(cursor);
+    const subject_token_end = cursor.checkpoint();
     return .{
         .statement_name = statement_token.text,
         .parameter_count = parameter_count,
         .statement_kind = statement_kind,
         .statement_family = statement_family,
+        .subject_token_start = subject_token_start,
+        .subject_token_end = subject_token_end,
     };
 }
 
 pub fn parseExecutePreparedStatementTail(tokens: []const Token, pos: *usize) !ExecutePreparedStatementSyntax {
     var cursor = parser.Cursor.init(tokens, pos);
     const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const argument_token_start = if (cursor.peekKind(.lparen)) cursor.checkpoint() else null;
     const argument_count = try countParenthesizedUntypedValues(cursor);
+    const argument_token_end = if (argument_token_start != null) cursor.checkpoint() else null;
     try adapterNoopStatementEnd(cursor);
     return .{
         .statement_name = statement_token.text,
         .argument_count = argument_count,
+        .argument_token_start = argument_token_start,
+        .argument_token_end = argument_token_end,
     };
 }
 
@@ -2165,8 +2179,10 @@ pub fn parseDeclareCursorPortalPrefix(tokens: []const Token, pos: *usize) !Decla
 pub fn parseDeclareCursorPortalTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !DeclareCursorPortalSyntax {
     var syntax = try parseDeclareCursorPortalPrefix(tokens, pos);
     const cursor = parser.Cursor.init(tokens, pos);
+    syntax.subject_token_start = cursor.checkpoint();
     syntax.statement_kind = try generatedPreparedStatementSubjectKindAlloc(alloc, tokens[cursor.checkpoint()..]);
     try consumePreparedStatementSubjectTail(cursor);
+    syntax.subject_token_end = pos.*;
     return syntax;
 }
 

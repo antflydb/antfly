@@ -162,6 +162,7 @@ const runSchemaRewriteJobGroupLocal = table_write_schema_jobs.runSchemaRewriteJo
 const runSchemaRewriteWorkerPassForCatalog = table_write_schema_jobs.runSchemaRewriteWorkerPassForCatalog;
 const runTableEmptyingJobGroupLocal = table_write_schema_jobs.runTableEmptyingJobGroupLocal;
 const runTableEmptyingWorkerPassForCatalog = table_write_schema_jobs.runTableEmptyingWorkerPassForCatalog;
+const runTableEmptyingWorkerPassForCatalogTableId = table_write_schema_jobs.runTableEmptyingWorkerPassForCatalogTableId;
 const SecondaryIndexRebuildWorkerResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerResult;
 const SecondaryIndexRebuildWorkerPassResult = table_write_schema_jobs.SecondaryIndexRebuildWorkerPassResult;
 const SecondaryIndexRebuildGroupRequest = table_write_schema_jobs.SecondaryIndexRebuildGroupRequest;
@@ -238,6 +239,19 @@ fn tableEmptyingWorkerTableRecordAlloc(
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     return try metadata_table_manager.cloneTable(alloc, table.*);
+}
+
+fn tableEmptyingWorkerTableRecordByIdAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_id: u64,
+) !metadata_table_manager.TableRecord {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    for (snapshot.tables) |table| {
+        if (table.table_id == table_id) return try metadata_table_manager.cloneTable(alloc, table);
+    }
+    return error.TableNotFound;
 }
 const foreignKeyIntegrityWorkStatusClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusClaimable;
 const foreignKeyIntegrityWorkStatusesHaveClaimable = table_write_integrity.foreignKeyIntegrityWorkStatusesHaveClaimable;
@@ -3054,6 +3068,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .schema_rewrite_worker_pass = ProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = ProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .table_emptying_worker_pass = ProvisionedTableWriteSource.tableEmptyingWorkerPass,
+                .table_emptying_worker_pass_for_table_id = ProvisionedTableWriteSource.tableEmptyingWorkerPassForTableId,
                 .table_emptying_group_local = ProvisionedTableWriteSource.tableEmptyingGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = ProvisionedTableWriteSource.foreignKeyIntegrityWorkUnitGroupLocal,
@@ -4066,13 +4081,23 @@ pub const ProvisionedTableWriteSource = struct {
                 null,
             );
             defer cached.deinit(alloc);
-            try cached.db.waitForCurrentSyncLevel(sync_level);
+            if (cached.db.core.hasGeneratedEnrichmentTargets()) {
+                _ = try cached.db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                try drainManagedDbBeforeClose(cached.db);
+            } else {
+                try cached.db.waitForCurrentSyncLevel(sync_level);
+            }
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try db.waitForCurrentSyncLevel(sync_level);
+            if (db.core.hasGeneratedEnrichmentTargets()) {
+                _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                try drainManagedDbBeforeClose(&db);
+            } else {
+                try db.waitForCurrentSyncLevel(sync_level);
+            }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
         self.notifyLocalChange(table_name, .data);
@@ -4560,6 +4585,19 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?TableEmptyingWorkerPassResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runTableEmptyingWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn tableEmptyingWorkerPassForTableId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_id: u64,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runTableEmptyingWorkerPassForCatalogTableId(alloc, self.source(), self.catalog, table_id, table_name, worker_id, lease_ms, max_work_units);
     }
 
     fn tableEmptyingGroupLocal(
@@ -6238,7 +6276,10 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
-        const table = try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
+        const table = if (record.table_id != 0)
+            try tableEmptyingWorkerTableRecordByIdAlloc(alloc, self.catalog, record.table_id)
+        else
+            try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
         defer metadata_table_manager.freeTable(alloc, table);
 
         self.beginGroupOperation(table_name, group_id);
@@ -7181,6 +7222,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .schema_rewrite_worker_pass = HostedProvisionedTableWriteSource.schemaRewriteWorkerPass,
                 .schema_rewrite_group_local = HostedProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .table_emptying_worker_pass = HostedProvisionedTableWriteSource.tableEmptyingWorkerPass,
+                .table_emptying_worker_pass_for_table_id = HostedProvisionedTableWriteSource.tableEmptyingWorkerPassForTableId,
                 .table_emptying_group_local = HostedProvisionedTableWriteSource.tableEmptyingGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
@@ -7315,6 +7357,19 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?TableEmptyingWorkerPassResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runTableEmptyingWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn tableEmptyingWorkerPassForTableId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_id: u64,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runTableEmptyingWorkerPassForCatalogTableId(alloc, self.source(), self.catalog, table_id, table_name, worker_id, lease_ms, max_work_units);
     }
 
     fn tableEmptyingGroupLocal(
@@ -7535,6 +7590,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             try group.transforms.append(alloc, transform);
         }
 
+        var invalidate_after_local_sync = false;
         for (grouped.items) |group| {
             var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group.group_id, .prefer_leader);
             if (resolved_route) |*route| {
@@ -7559,7 +7615,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
                         });
-                        if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+                        if (self.shouldDrainAfterBatch(req.sync_level)) {
+                            try drainManagedDbBeforeClose(cached.db);
+                            invalidate_after_local_sync = true;
+                        }
                     },
                     .remote => |remote| {
                         if (group.relational_identity_rewrites.items.len != 0) return error.UnsupportedOperation;
@@ -7603,9 +7662,13 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .timestamp_ns = req.timestamp_ns,
                     .sync_level = req.sync_level,
                 });
-                if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+                if (self.shouldDrainAfterBatch(req.sync_level)) {
+                    try drainManagedDbBeforeClose(cached.db);
+                    invalidate_after_local_sync = true;
+                }
             }
         }
+        if (invalidate_after_local_sync) self.invalidateManagedCache(table_name);
     }
 
     fn batchCatalogNative(
@@ -10012,7 +10075,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (record.group_id != group_id) return error.InvalidTableEmptyingJob;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const table = try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
+        const table = if (record.table_id != 0)
+            try tableEmptyingWorkerTableRecordByIdAlloc(alloc, self.catalog, record.table_id)
+        else
+            try tableEmptyingWorkerTableRecordAlloc(alloc, self.catalog, table_name);
         defer metadata_table_manager.freeTable(alloc, table);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
@@ -12737,6 +12803,112 @@ test "provisioned table write source persists chunk artifacts when chunker enabl
     try std.testing.expect(chunk_count >= 2);
 }
 
+test "provisioned table write source full_index materializes graph shorthand document extraction assets" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-document-artifact-full-index");
+    defer alloc.free(path);
+
+    const indexes_json =
+        \\{
+        \\  "document_units_graph":{
+        \\    "type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.edges[*]","format":"extraction_relation"},
+        \\    "artifact":{
+        \\      "name":"document_units_v1",
+        \\      "kind":"asset",
+        \\      "field":"url",
+        \\      "content_type":"application/json",
+        \\      "producer_json":{"type":"document_extraction","config":{"source":{"filename_field":"filename","content_type_field":"mime_type","version_field":"version"}}}
+        \\    },
+        \\    "edge_types":[{"name":"mentions"}]
+        \\  }
+        \\}
+    ;
+    const schema_json = "{\"version\":0,\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}";
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .database_name = tables_api.default_database_name,
+                    .namespace_name = tables_api.default_namespace_name,
+                    .schema_json = schema_json,
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .range_id = 7001,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    defer alloc.free(owned_indexes_json);
+    _ = try source.source().createTable(alloc, "docs", .{
+        .indexes_json = owned_indexes_json,
+    });
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{
+            .{
+                .key = "doc:a/with/slash",
+                .value = "{\"filename\":\"alpha.txt\",\"mime_type\":\"text/plain\",\"version\":\"1\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+            },
+            .{
+                .key = "doc:b",
+                .value = "{\"filename\":\"delta.txt\",\"mime_type\":\"text/plain\",\"version\":\"1\",\"url\":\"data:text/plain;base64,ZGVsdGEgZXBzaWxvbg==\"}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var db = try openManagedDbForTableGroupWithCacheAndRuntime(alloc, db_path, Catalog.iface(), "docs", 7001, null, null, backend_current_root_generation, null, null);
+    defer db.close();
+
+    var manifest = (try db.getDocumentArtifactManifest(alloc, "doc:a/with/slash", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a/with/slash", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqual(@as(u32, 1), manifest.unit_count);
+    try std.testing.expectEqualStrings("converged", manifest.merge_status);
+}
+
 test "api.table_writes.query_visibility read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
@@ -13567,6 +13739,91 @@ test "provisioned replicated sync marks local runtime status dirty" {
 
     try std.testing.expect(hook.calls > 0);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
+}
+
+test "provisioned replicated full_index materializes graph shorthand document extraction assets" {
+    const alloc = std.testing.allocator;
+    const indexes_json =
+        \\{
+        \\  "document_units_graph":{
+        \\    "type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.edges[*]","format":"extraction_relation"},
+        \\    "artifact":{
+        \\      "name":"document_units_v1",
+        \\      "kind":"asset",
+        \\      "field":"url",
+        \\      "content_type":"application/json",
+        \\      "producer_json":{"type":"document_extraction","config":{"source":{"filename_field":"filename","content_type_field":"mime_type","version_field":"version"}}}
+        \\    },
+        \\    "edge_types":[{"name":"mentions"}]
+        \\  }
+        \\}
+    ;
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicated-document-artifact-full-index", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.backend_runtime = backend_runtime.ptr();
+
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{
+            .key = "doc:a/with/slash",
+            .value = "{\"filename\":\"alpha.txt\",\"mime_type\":\"text/plain\",\"version\":\"1\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    var manifest = (try write_cache.entries.items[0].db.getDocumentArtifactManifest(alloc, "doc:a/with/slash", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a/with/slash", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqual(@as(u32, 1), manifest.unit_count);
+    try std.testing.expectEqualStrings("converged", manifest.merge_status);
 }
 
 test "api.table_writes.docid provisioned table write source consistent visibility hook does not block on busy apply lock" {
@@ -16195,6 +16452,175 @@ test "hosted write cache opens current visible root generation" {
     cached_second.deinit(hosted_cache.write_cache.alloc);
     try std.testing.expectEqual(@as(usize, 1), hosted_cache.write_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 2), hosted_cache.write_cache.entries.items[0].lsm_root_generation);
+}
+
+test "hosted provisioned table write source full_index materializes graph shorthand document extraction assets" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-document-artifact-full-index", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const indexes_json =
+        \\{
+        \\  "document_units_graph":{
+        \\    "type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.edges[*]","format":"extraction_relation"},
+        \\    "artifact":{
+        \\      "name":"document_units_v1",
+        \\      "kind":"asset",
+        \\      "field":"url",
+        \\      "content_type":"application/json",
+        \\      "producer_json":{"type":"document_extraction","config":{"source":{"filename_field":"filename","content_type_field":"mime_type","version_field":"version"}}}
+        \\    },
+        \\    "edge_types":[{"name":"mentions"}]
+        \\  }
+        \\}
+    ;
+    const schema_json = "{\"version\":0,\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}";
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .range_id = 7001,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    _ = source.withBackendRuntime(backend_runtime.ptr());
+    defer source.invalidateManagedCache("docs");
+
+    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    defer alloc.free(owned_indexes_json);
+    const owned_schema_json = try alloc.dupe(u8, schema_json);
+    defer alloc.free(owned_schema_json);
+    _ = try source.source().createTable(alloc, "docs", .{
+        .indexes_json = owned_indexes_json,
+        .schema_json = owned_schema_json,
+    });
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{
+            .key = "doc:a/with/slash",
+            .value = "{\"filename\":\"alpha.txt\",\"mime_type\":\"text/plain\",\"version\":\"1\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
+    var cached = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
+    defer cached.deinit(hosted_cache.write_cache.alloc);
+
+    var manifest = (try cached.db.getDocumentArtifactManifest(alloc, "doc:a/with/slash", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a/with/slash", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqual(@as(u32, 1), manifest.unit_count);
+    try std.testing.expectEqualStrings("converged", manifest.merge_status);
+
+    source.invalidateManagedCache("docs");
+
+    var read_source = table_read_sources.HostedProvisionedTableReadSource.init(
+        replica_root_dir,
+        Catalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        Router.iface(),
+        Executor.iface(),
+    );
+    _ = read_source.withBackendRuntime(backend_runtime.ptr());
+
+    var read_manifest = (try read_source.source().documentArtifactManifest(alloc, "docs", "doc:a/with/slash", "document_units_v1", .read_index)) orelse return error.TestUnexpectedResult;
+    defer read_manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a/with/slash", read_manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", read_manifest.artifact_name);
+    try std.testing.expectEqual(@as(u32, 1), read_manifest.unit_count);
+    try std.testing.expectEqualStrings("converged", read_manifest.merge_status);
 }
 
 test "write cache adopts just-created db across reconcile generation bump" {

@@ -450,6 +450,10 @@ coverage green after each slice.
 
 ## Current Execution Priorities
 
+Release blockers and transient CI bugs are not tracked in this document. With
+main and this PR assumed green, the remaining serverless work is product and
+architecture convergence.
+
 The bootstrap/objectstore/control-plane seam is in decent shape. The next
 priority is no longer basic end-to-end publication scaffolding. The next
 priority is making the published read path and runtime model look like a real

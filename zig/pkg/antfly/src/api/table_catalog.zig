@@ -89,6 +89,11 @@ pub const CatalogSource = struct {
             ptr: *anyopaque,
             request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
         ) anyerror!void = null,
+        reset_identity_allocators_for_table_emptying_barrier: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+        ) anyerror!void = null,
+        supports_identity_allocator_reset_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque) bool = null,
         promote_secondary_index_ready: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -222,6 +227,19 @@ pub const CatalogSource = struct {
         return try fn_ptr(self.ptr, request);
     }
 
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(
+        self: CatalogSource,
+        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+    ) !void {
+        const fn_ptr = self.vtable.reset_identity_allocators_for_table_emptying_barrier orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn supportsIdentityAllocatorResetForTableEmptyingBarrier(self: CatalogSource) bool {
+        if (self.vtable.supports_identity_allocator_reset_for_table_emptying_barrier) |fn_ptr| return fn_ptr(self.ptr);
+        return self.vtable.reset_identity_allocators_for_table_emptying_barrier != null;
+    }
+
     pub fn promoteSecondaryIndexReady(
         self: CatalogSource,
         alloc: std.mem.Allocator,
@@ -261,6 +279,8 @@ pub const CatalogSource = struct {
                 .finish_table_emptying_job = metadataServiceFinishTableEmptyingJob,
                 .invalidate_table_emptying_job = metadataServiceInvalidateTableEmptyingJob,
                 .promote_table_emptying_barrier = metadataServicePromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = metadataServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
                 .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
             },
@@ -287,6 +307,8 @@ pub const CatalogSource = struct {
                 .finish_table_emptying_job = metadataHttpServiceFinishTableEmptyingJob,
                 .invalidate_table_emptying_job = metadataHttpServiceInvalidateTableEmptyingJob,
                 .promote_table_emptying_barrier = metadataHttpServicePromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataHttpService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataHttpServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = metadataHttpServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
                 .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
             },
@@ -887,6 +909,21 @@ fn metadataServicePromoteTableEmptyingBarrier(
     return try svc.promoteTableEmptyingBarrier(request);
 }
 
+fn metadataServiceResetIdentityAllocatorsForTableEmptyingBarrier(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    if (comptime @hasDecl(metadata_service.MetadataService, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
+        return try svc.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+    }
+    return error.UnsupportedOperation;
+}
+
+fn metadataServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+    return comptime @hasDecl(metadata_service.MetadataService, "resetIdentityAllocatorsForTableEmptyingBarrier");
+}
+
 fn metadataServiceCompareAndSwapTableSchema(
     ptr: *anyopaque,
     request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
@@ -1092,6 +1129,21 @@ fn metadataHttpServicePromoteTableEmptyingBarrier(
 ) !void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.promoteTableEmptyingBarrier(request);
+}
+
+fn metadataHttpServiceResetIdentityAllocatorsForTableEmptyingBarrier(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (comptime @hasDecl(metadata_service.MetadataHttpService, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
+        return try svc.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+    }
+    return error.UnsupportedOperation;
+}
+
+fn metadataHttpServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+    return comptime @hasDecl(metadata_service.MetadataHttpService, "resetIdentityAllocatorsForTableEmptyingBarrier");
 }
 
 fn metadataHttpServiceCompareAndSwapTableSchema(

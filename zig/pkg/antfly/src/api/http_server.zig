@@ -31,8 +31,11 @@ const relational_sql_ddl = @import("relational_sql_ddl.zig");
 const sql_adapter_runtime = @import("../sql/runtime.zig");
 const catalog_jobs = @import("catalog_jobs.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const sql_notifications = @import("sql_notifications.zig");
-const sql_routines = @import("sql_routines.zig");
+const sql_cursors = @import("sql/cursors.zig");
+const sql_notifications = @import("sql/notifications.zig");
+const sql_prepared_statements = @import("sql/prepared_statements.zig");
+const sql_routines = @import("sql/routines.zig");
+const sql_savepoints = @import("sql/savepoints.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -612,6 +615,8 @@ pub const StatusSource = struct {
         upsert_table: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableRecord) anyerror!void = null,
         apply_table_catalog_update_with_schema_rewrite_jobs: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) anyerror!void = null,
         promote_table_emptying_barrier: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) anyerror!void = null,
+        reset_identity_allocators_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) anyerror!void = null,
+        supports_identity_allocator_reset_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque) bool = null,
         apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_tablespace_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.TablespaceCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
@@ -755,6 +760,19 @@ pub const StatusSource = struct {
     ) !void {
         const fn_ptr = self.vtable.promote_table_emptying_barrier orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(
+        self: StatusSource,
+        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+    ) !void {
+        const fn_ptr = self.vtable.reset_identity_allocators_for_table_emptying_barrier orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn supportsIdentityAllocatorResetForTableEmptyingBarrier(self: StatusSource) bool {
+        if (self.vtable.supports_identity_allocator_reset_for_table_emptying_barrier) |fn_ptr| return fn_ptr(self.ptr);
+        return self.vtable.reset_identity_allocators_for_table_emptying_barrier != null;
     }
 
     pub fn applyPreparedTransactionPlan(
@@ -1018,6 +1036,18 @@ pub const StatusSource = struct {
                 return error.UnsupportedOperation;
             }
 
+            fn resetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
+                    return try svc.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn supportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+                return comptime @hasDecl(T, "resetIdentityAllocatorsForTableEmptyingBarrier");
+            }
+
             fn applyPreparedTransactionPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult {
                 const svc = cast(ptr);
                 if (comptime @hasDecl(T, "applyPreparedTransactionPlan")) {
@@ -1157,6 +1187,8 @@ pub const StatusSource = struct {
             .upsert_table = Gen.upsertTable,
             .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
             .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
+            .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(T, "resetIdentityAllocatorsForTableEmptyingBarrier")) Gen.resetIdentityAllocatorsForTableEmptyingBarrier else null,
+            .supports_identity_allocator_reset_for_table_emptying_barrier = Gen.supportsIdentityAllocatorResetForTableEmptyingBarrier,
             .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .apply_tablespace_catalog_plan = Gen.applyTablespaceCatalogPlan,
@@ -1645,13 +1677,23 @@ const TableEmptyingWakeJob = struct {
         var pass_count: usize = 0;
         var made_progress = false;
         while (pass_count < self.max_passes) : (pass_count += 1) {
-            var pass = (try self.source.tableEmptyingWorkerPass(
-                alloc,
-                self.table_name,
-                self.worker_id,
-                self.lease_ms,
-                self.max_work_units_per_pass,
-            )) orelse return;
+            var pass = (if (self.table_id != 0)
+                try self.source.tableEmptyingWorkerPassForTableId(
+                    alloc,
+                    self.table_id,
+                    self.table_name,
+                    self.worker_id,
+                    self.lease_ms,
+                    self.max_work_units_per_pass,
+                )
+            else
+                try self.source.tableEmptyingWorkerPass(
+                    alloc,
+                    self.table_name,
+                    self.worker_id,
+                    self.lease_ms,
+                    self.max_work_units_per_pass,
+                )) orelse return;
             defer pass.deinit(alloc);
 
             if (pass.complete) {
@@ -1682,7 +1724,7 @@ const TableEmptyingWakeJob = struct {
 
     fn promoteCompletedTableEmptyingBarrier(self: *TableEmptyingWakeJob) !void {
         const catalog = self.catalog orelse return;
-        _ = catalog_jobs.promoteCompletedTableEmptyingBarriersForTableAlloc(std.heap.page_allocator, catalog, self.table_name) catch |err| switch (err) {
+        _ = catalog_jobs.promoteCompletedTableEmptyingBarriersForTableIdAlloc(std.heap.page_allocator, catalog, self.table_id) catch |err| switch (err) {
             error.UnsupportedOperation => return,
             else => return err,
         };
@@ -3519,8 +3561,10 @@ pub const ApiHttpServer = struct {
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     sql_notification_runtime: sql_notifications.Runtime = .{ .alloc = undefined },
     sql_catalog_session_runtime: SqlCatalogSessionRuntime = .{ .alloc = undefined },
-    sql_prepared_statement_runtime: SqlPreparedStatementRuntime = .{ .alloc = undefined },
+    sql_prepared_statement_runtime: sql_prepared_statements.Runtime = .{ .alloc = undefined },
+    sql_cursor_runtime: sql_cursors.Runtime = .{ .alloc = undefined },
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
+    sql_savepoint_runtime: sql_savepoints.Runtime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
     schema_rewrite_wake_registry: SchemaRewriteWakeRegistry = .{},
     table_emptying_wake_owner_id: u64 = 0,
@@ -3547,125 +3591,6 @@ pub const ApiHttpServer = struct {
                 .export_file => {},
             }
             self.* = undefined;
-        }
-    };
-
-    const SqlPreparedStatementRuntime = struct {
-        alloc: std.mem.Allocator,
-        sessions: std.AutoHashMapUnmanaged(u64, Session) = .empty,
-
-        const Session = struct {
-            statements: std.StringHashMapUnmanaged(Record) = .empty,
-
-            fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-                var it = self.statements.iterator();
-                while (it.next()) |entry| alloc.free(entry.key_ptr.*);
-                self.statements.deinit(alloc);
-                self.* = undefined;
-            }
-
-            fn clear(self: *@This(), alloc: std.mem.Allocator) void {
-                var it = self.statements.iterator();
-                while (it.next()) |entry| alloc.free(entry.key_ptr.*);
-                self.statements.clearRetainingCapacity();
-            }
-        };
-
-        const Record = struct {
-            parameter_count: usize,
-            statement_kind: sql_adapter.PreparedStatementSubjectKind,
-            statement_family: sql_adapter.PreparedStatementStatementKind,
-        };
-
-        fn init(alloc: std.mem.Allocator) SqlPreparedStatementRuntime {
-            return .{ .alloc = alloc };
-        }
-
-        fn deinit(self: *@This()) void {
-            var it = self.sessions.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
-            self.sessions.deinit(self.alloc);
-            self.* = undefined;
-        }
-
-        fn apply(self: *@This(), plan: sql_adapter.PreparedStatementPlan, session_id: u64) !void {
-            if (session_id == 0) return error.InvalidSqlSession;
-            switch (plan) {
-                .prepare => |prepare_plan| try self.prepare(session_id, prepare_plan),
-                .execute => |execute_plan| try self.execute(session_id, execute_plan),
-                .deallocate => |deallocate_plan| try self.deallocate(session_id, deallocate_plan),
-            }
-        }
-
-        fn prepare(
-            self: *@This(),
-            session_id: u64,
-            plan: sql_adapter.PrepareStatementPlan,
-        ) !void {
-            const result = try self.sessions.getOrPut(self.alloc, session_id);
-            if (!result.found_existing) result.value_ptr.* = .{};
-            const session = result.value_ptr;
-            if (session.statements.contains(plan.statement_name)) return error.PreparedStatementAlreadyExists;
-            const key = try self.alloc.dupe(u8, plan.statement_name);
-            errdefer self.alloc.free(key);
-            try session.statements.put(self.alloc, key, .{
-                .parameter_count = plan.parameter_count,
-                .statement_kind = plan.statement_kind,
-                .statement_family = plan.statement_family,
-            });
-        }
-
-        fn execute(
-            self: *@This(),
-            session_id: u64,
-            plan: sql_adapter.ExecutePreparedStatementPlan,
-        ) !void {
-            _ = try self.executeRecord(session_id, plan);
-        }
-
-        fn executeRecord(
-            self: *@This(),
-            session_id: u64,
-            plan: sql_adapter.ExecutePreparedStatementPlan,
-        ) !Record {
-            const session = self.sessions.getPtr(session_id) orelse return error.PreparedStatementNotFound;
-            const record = session.statements.get(plan.statement_name) orelse return error.PreparedStatementNotFound;
-            if (record.parameter_count != plan.argument_count) return error.PreparedStatementArgumentMismatch;
-            return record;
-        }
-
-        fn statementKindForExecute(
-            self: *@This(),
-            session_id: u64,
-            plan: sql_adapter.ExecutePreparedStatementPlan,
-        ) !sql_adapter.PreparedStatementSubjectKind {
-            return (try self.executeRecord(session_id, plan)).statement_kind;
-        }
-
-        fn deallocate(
-            self: *@This(),
-            session_id: u64,
-            plan: sql_adapter.DeallocatePreparedStatementPlan,
-        ) !void {
-            const session = self.sessions.getPtr(session_id) orelse {
-                if (plan.all) return;
-                return error.PreparedStatementNotFound;
-            };
-            if (plan.all) {
-                session.clear(self.alloc);
-                return;
-            }
-            const name = plan.statement_name orelse return error.UnsupportedSqlShape;
-            if (session.statements.fetchRemove(name)) |removed| {
-                self.alloc.free(removed.key);
-                return;
-            }
-            return error.PreparedStatementNotFound;
-        }
-
-        fn statementCountForTest(self: *@This(), session_id: u64) usize {
-            const session = self.sessions.getPtr(session_id) orelse return 0;
-            return session.statements.count();
         }
     };
 
@@ -3769,8 +3694,10 @@ pub const ApiHttpServer = struct {
             }),
             .sql_notification_runtime = sql_notifications.Runtime.init(alloc),
             .sql_catalog_session_runtime = SqlCatalogSessionRuntime.init(alloc),
-            .sql_prepared_statement_runtime = SqlPreparedStatementRuntime.init(alloc),
+            .sql_prepared_statement_runtime = sql_prepared_statements.Runtime.init(alloc),
+            .sql_cursor_runtime = sql_cursors.Runtime.init(alloc),
             .sql_routine_runtime = sql_routines.Runtime.init(alloc),
+            .sql_savepoint_runtime = sql_savepoints.Runtime.init(alloc),
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -3918,7 +3845,9 @@ pub const ApiHttpServer = struct {
         self.sql_notification_runtime.deinit();
         self.sql_catalog_session_runtime.deinit();
         self.sql_prepared_statement_runtime.deinit();
+        self.sql_cursor_runtime.deinit();
         self.sql_routine_runtime.deinit();
+        self.sql_savepoint_runtime.deinit();
         self.join_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
@@ -4496,6 +4425,8 @@ pub const ApiHttpServer = struct {
                 .upsert_table = apiHttpServerCatalogUpsertTable,
                 .apply_table_catalog_update_with_schema_rewrite_jobs = apiHttpServerCatalogApplyTableCatalogUpdateWithSchemaRewriteJobs,
                 .promote_table_emptying_barrier = apiHttpServerCatalogPromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = apiHttpServerCatalogResetIdentityAllocatorsForTableEmptyingBarrier,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = apiHttpServerCatalogSupportsIdentityAllocatorResetForTableEmptyingBarrier,
             },
         };
     }
@@ -4847,6 +4778,10 @@ pub const ApiHttpServer = struct {
                 .transaction_control => {
                     if (context.parsed_sql) |parsed_sql| {
                         if (parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
+                            if (session.notification_session_id != 0) {
+                                try self.sql_cursor_runtime.closeTransactionPortals(session.notification_session_id);
+                                self.sql_savepoint_runtime.clear(session.notification_session_id);
+                            }
                             try session.clearTransactionLocalState(self.alloc);
                             var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
                             applied.noop = true;
@@ -4892,6 +4827,9 @@ pub const ApiHttpServer = struct {
         updated.request_read_only = session.request_read_only;
         if (clear_prepared_statements and notification_session_id != 0) {
             try self.sql_prepared_statement_runtime.apply(.{ .deallocate = .{ .all = true } }, notification_session_id);
+            try self.sql_cursor_runtime.close(notification_session_id, .{ .all = true });
+            self.sql_notification_runtime.clearSession(notification_session_id);
+            self.sql_savepoint_runtime.clear(notification_session_id);
         }
         session.deinit(self.alloc);
         session.* = updated;
@@ -4928,11 +4866,23 @@ pub const ApiHttpServer = struct {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
                 _ = try self.applyPreparedTransactionPlan(prepared, sqlDdlTimestampNs());
                 if (prepared.action == .prepare) {
+                    if (session.notification_session_id != 0) {
+                        try self.sql_cursor_runtime.closeTransactionPortals(session.notification_session_id);
+                        self.sql_savepoint_runtime.clear(session.notification_session_id);
+                    }
                     try session.clearTransactionLocalState(self.alloc);
                 }
                 return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
             },
-            .savepoint => return error.UnsupportedSqlShape,
+            .savepoint => |savepoint| {
+                if (!session.in_sql_transaction) return error.InvalidSqlSession;
+                const session_id = self.ensureSqlProtocolSessionId(session);
+                try self.sql_savepoint_runtime.apply(session_id, savepoint, session);
+                session.in_sql_transaction = true;
+                var applied = try self.emptyAppliedSqlDdlRecordWithTiming(timing);
+                applied.noop = true;
+                return applied;
+            },
         }
     }
 
@@ -5069,10 +5019,34 @@ pub const ApiHttpServer = struct {
         session: *sql_adapter.OwnedSqlCatalogSession,
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
-        _ = plan;
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-        return error.UnsupportedSqlShape;
+        switch (plan) {
+            .fetch => return error.UnsupportedSqlShape,
+            .declare, .move, .close => {},
+        }
+        const parsed_sql = context.parsed_sql orelse return error.UnsupportedSqlShape;
+        var plan_copy = plan;
+        var outcome = try self.executePublicSqlCursorLogicalPlanWithSession(&plan_copy, parsed_sql, session, &.{}, null);
+        switch (outcome) {
+            .response => |*response| {
+                response.deinit(self.alloc);
+                return error.UnsupportedSqlShape;
+            },
+            .result => |*result| switch (result.result) {
+                .ddl => |*ddl| {
+                    const applied = ddl.applied;
+                    ddl.* = undefined;
+                    outcome = undefined;
+                    try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                    return applied;
+                },
+                else => {
+                    result.deinit(self.alloc);
+                    return error.UnsupportedSqlShape;
+                },
+            },
+        }
     }
 
     fn applyDurableSqlPlanWithSession(
@@ -5184,6 +5158,7 @@ pub const ApiHttpServer = struct {
         namespace: ?[]const u8 = null,
         read_only: ?bool = null,
         params: []const sql_adapter.SqlValue = &.{},
+        stdin_payload: ?[]const u8 = null,
     };
 
     const PublicSqlJsonRequest = struct {
@@ -5193,6 +5168,7 @@ pub const ApiHttpServer = struct {
         namespace: ?[]const u8 = null,
         read_only: ?bool = null,
         params: ?[]const std.json.Value = null,
+        stdin_payload: ?[]const u8 = null,
     };
 
     pub const OwnedPublicSqlParams = struct {
@@ -6755,6 +6731,7 @@ pub const ApiHttpServer = struct {
                 return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
             error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_write_unsupported)) },
+            error.MissingSqlParameter => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.plan, .unique_owner_unavailable)) },
@@ -7071,6 +7048,7 @@ pub const ApiHttpServer = struct {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.plan, .invalid_sql_request).withMessage(message).withMissingNativeModel("document SQL read shape")) };
             switch (err) {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+                error.MissingSqlParameter => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
                     if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
@@ -7144,6 +7122,307 @@ pub const ApiHttpServer = struct {
                 .columns = result_columns,
             } },
         } };
+    }
+
+    fn executePublicSqlCursorLogicalPlanWithSession(
+        self: *ApiHttpServer,
+        cursor_plan: *sql_adapter.CursorPortalPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        params: []const sql_adapter.SqlValue,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        const session_id = self.ensureSqlProtocolSessionId(session);
+
+        switch (cursor_plan.*) {
+            .declare => |*declare_plan| {
+                if (declare_plan.binary) {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                }
+                if (try self.publicSqlReadOnlyActive(session)) {
+                    if (declare_plan.statement_kind != .read) {
+                        return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
+                    }
+                }
+                if (declare_plan.statement_kind != .read) {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                }
+                const subject = &(declare_plan.subject_parsed_sql orelse {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                });
+
+                if (try self.handlePublicSqlPostgresCompatibilityRead(subject, session, params)) |read_outcome_value| {
+                    var read_outcome = read_outcome_value;
+                    errdefer read_outcome.deinit(self.alloc);
+                    if (try self.declarePublicSqlReadCursorFromOutcome(session_id, declare_plan.*, parsed_sql, &read_outcome)) |outcome| return outcome;
+                } else {
+                    var planned_or_response = self.planPublicParsedSqlExecutionAlloc(subject, session, authenticated_identity) catch |err| switch (err) {
+                        error.SqlReadOnlyTransaction => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) },
+                        error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) },
+                        error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
+                        error.UnsupportedSqlShape => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                        else => return err,
+                    };
+                    var planned_owned = true;
+                    defer if (planned_owned) planned_or_response.deinit(self.alloc);
+                    switch (planned_or_response) {
+                        .response => |*response| {
+                            const out = response.*;
+                            planned_owned = false;
+                            return .{ .response = out };
+                        },
+                        .planned => |*planned| {
+                            var read_outcome = switch (planned.plan) {
+                                .logical => |*logical_plan| switch (logical_plan.*) {
+                                    .catalog_read => try self.handlePublicSqlRead(logical_plan, subject, params, session, authenticated_identity),
+                                    else => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                                },
+                                .durable => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
+                            };
+                            errdefer read_outcome.deinit(self.alloc);
+                            if (try self.declarePublicSqlReadCursorFromOutcome(session_id, declare_plan.*, parsed_sql, &read_outcome)) |outcome| return outcome;
+                        },
+                    }
+                }
+
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                applied.noop = true;
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = "cursor",
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = "DECLARE CURSOR",
+                    } },
+                } };
+            },
+            .fetch => |fetch_plan| {
+                var cursor_read = self.sql_cursor_runtime.fetch(session_id, fetch_plan) catch |err| switch (err) {
+                    error.CursorPortalNotFound, error.InvalidSqlSession => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) },
+                    else => return err,
+                };
+                errdefer cursor_read.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = "cursor",
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .read = .{
+                        .result = cursor_read.result,
+                        .columns = cursor_read.columns,
+                    } },
+                } };
+            },
+            .move => |move_plan| {
+                _ = self.sql_cursor_runtime.move(session_id, move_plan) catch |err| switch (err) {
+                    error.CursorPortalNotFound, error.InvalidSqlSession => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) },
+                    else => return err,
+                };
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                applied.noop = true;
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = "cursor",
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = "MOVE",
+                    } },
+                } };
+            },
+            .close => |close_plan| {
+                self.sql_cursor_runtime.close(session_id, close_plan) catch |err| switch (err) {
+                    error.CursorPortalNotFound, error.InvalidSqlSession => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) },
+                    else => return err,
+                };
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                applied.noop = true;
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return .{ .result = .{
+                    .session_id = session_id,
+                    .statement_kind = "cursor",
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = "CLOSE CURSOR",
+                    } },
+                } };
+            },
+        }
+    }
+
+    fn executePublicSqlPreparedStatementLogicalPlanWithSession(
+        self: *ApiHttpServer,
+        prepared_plan: *sql_adapter.PreparedStatementPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlResultOrResponse {
+        switch (prepared_plan.*) {
+            .execute => |execute_plan| {
+                const session_id = session.notification_session_id;
+                if (session_id == 0) {
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .prepared_statement_not_found)) };
+                }
+                const executable = self.sql_prepared_statement_runtime.executableForExecute(session_id, execute_plan) catch |err| switch (err) {
+                    error.PreparedStatementNotFound,
+                    error.PreparedStatementArgumentMismatch,
+                    => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                };
+                if (try self.publicSqlReadOnlyActive(session)) {
+                    if (executable.statement_kind != .read) {
+                        return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
+                    }
+                }
+                const subject = executable.parsed_sql;
+                if (try self.handlePublicSqlPostgresCompatibilityRead(subject, session, execute_plan.arguments)) |outcome_value| {
+                    var outcome = outcome_value;
+                    errdefer outcome.deinit(self.alloc);
+                    switch (outcome) {
+                        .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
+                        .response => {},
+                    }
+                    return outcome;
+                }
+
+                var planned_or_response = self.planPublicParsedSqlExecutionAlloc(subject, session, authenticated_identity) catch |err| switch (err) {
+                    error.DocumentSqlViewMappingUnsupported => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject, .init(.plan, .document_sql_view_mapping_unsupported)) },
+                    error.SqlReadOnlyTransaction => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) },
+                    error.UnsupportedSqlShape => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject, .init(.plan, .unsupported_sql_statement)) },
+                    error.StatementTimeout => return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) },
+                    error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, subject, .init(.bind, .permission_denied)) },
+                    error.InvalidSqlSession,
+                    error.PreparedStatementAlreadyExists,
+                    error.PreparedStatementNotFound,
+                    error.PreparedStatementArgumentMismatch,
+                    error.InvalidSqlCatalog,
+                    error.SavepointNotFound,
+                    error.InvalidRoleSetting,
+                    error.RoleSettingNotFound,
+                    => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                    else => return err,
+                };
+                var planned_owned = true;
+                defer if (planned_owned) planned_or_response.deinit(self.alloc);
+
+                switch (planned_or_response) {
+                    .response => |*response| {
+                        const out = response.*;
+                        planned_owned = false;
+                        return .{ .response = out };
+                    },
+                    .planned => |*planned| {
+                        return switch (planned.plan) {
+                            .logical => |*logical_plan| switch (logical_plan.*) {
+                                .catalog_write => try self.handlePublicSqlWrite(logical_plan, subject, execute_plan.arguments, session, authenticated_identity),
+                                .catalog_read => try self.handlePublicSqlRead(logical_plan, subject, execute_plan.arguments, session, authenticated_identity),
+                                .read, .write => .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject, .init(.plan, .unsupported_sql_statement)) },
+                                else => ddl_blk: {
+                                    const statement_kind = publicSqlStatementKindForLogicalPlan(logical_plan.*);
+                                    var applied = ApiHttpServer.applyLogicalSqlPlanWithSession(self, logical_plan, session, .{ .parsed_sql = subject }) catch |err| switch (err) {
+                                        error.SqlReadOnlyTransaction => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) },
+                                        error.UnsupportedSqlShape => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject, .init(.plan, .unsupported_sql_statement)) },
+                                        error.StatementTimeout => return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) },
+                                        error.InvalidSqlSession,
+                                        error.PreparedStatementAlreadyExists,
+                                        error.PreparedStatementNotFound,
+                                        error.PreparedStatementArgumentMismatch,
+                                        error.InvalidSqlCatalog,
+                                        error.SavepointNotFound,
+                                        error.InvalidRoleSetting,
+                                        error.RoleSettingNotFound,
+                                        => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                                        else => return err,
+                                    };
+                                    errdefer applied.deinit(self.alloc);
+                                    break :ddl_blk .{ .result = .{
+                                        .session_id = self.ensureSqlProtocolSessionId(session),
+                                        .statement_kind = statement_kind,
+                                        .transaction_status = self.publicSqlTransactionStatus(session),
+                                        .result = .{ .ddl = .{
+                                            .applied = applied,
+                                            .command_tag = publicSqlDdlCommandTag(subject),
+                                        } },
+                                    } };
+                                },
+                            },
+                            .durable => |*durable_plan| try self.executePublicSqlDurablePlannedExecutionOrDiagnostic(
+                                durable_plan,
+                                subject,
+                                parsed_sql,
+                                session,
+                                authenticated_identity,
+                                null,
+                            ),
+                        };
+                    },
+                }
+            },
+            .prepare, .deallocate => {
+                const statement_kind = publicSqlStatementKindForLogicalPlan(.{ .prepared_statement = prepared_plan.* });
+                var applied = ApiHttpServer.applyPreparedStatementLogicalPlanWithSession(self, prepared_plan.*, session, .{ .parsed_sql = parsed_sql }) catch |err| switch (err) {
+                    error.SqlReadOnlyTransaction => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) },
+                    error.PreparedStatementAlreadyExists,
+                    error.PreparedStatementNotFound,
+                    error.PreparedStatementArgumentMismatch,
+                    error.InvalidSqlSession,
+                    => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                    else => return err,
+                };
+                errdefer applied.deinit(self.alloc);
+                return .{ .result = .{
+                    .session_id = self.ensureSqlProtocolSessionId(session),
+                    .statement_kind = statement_kind,
+                    .transaction_status = self.publicSqlTransactionStatus(session),
+                    .result = .{ .ddl = .{
+                        .applied = applied,
+                        .command_tag = publicSqlDdlCommandTag(parsed_sql),
+                    } },
+                } };
+            },
+        }
+    }
+
+    fn declarePublicSqlReadCursorFromOutcome(
+        self: *ApiHttpServer,
+        session_id: u64,
+        declare_plan: sql_adapter.DeclareCursorPortalPlan,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        read_outcome: *PublicSqlResultOrResponse,
+    ) !?PublicSqlResultOrResponse {
+        switch (read_outcome.*) {
+            .response => |*response| {
+                const out = response.*;
+                read_outcome.* = undefined;
+                return .{ .response = out };
+            },
+            .result => |*result| switch (result.result) {
+                .read => |*read| {
+                    self.sql_cursor_runtime.declareReadPortal(session_id, declare_plan, &read.result, &read.columns) catch |err| switch (err) {
+                        error.CursorPortalAlreadyExists, error.InvalidSqlSession => {
+                            read_outcome.deinit(self.alloc);
+                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) };
+                        },
+                        else => return err,
+                    };
+                    read_outcome.deinit(self.alloc);
+                    return null;
+                },
+                else => {
+                    read_outcome.deinit(self.alloc);
+                    return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+                },
+            },
+        }
     }
 
     fn clonePublicSqlRuntimeSchemaAlloc(alloc: std.mem.Allocator, schema: runtime_schema_mod.TableSchema) !runtime_schema_mod.TableSchema {
@@ -7830,6 +8109,7 @@ pub const ApiHttpServer = struct {
             .namespace = parsed.value.namespace,
             .read_only = parsed.value.read_only,
             .params = params.values,
+            .stdin_payload = parsed.value.stdin_payload,
         }, authenticated_identity);
     }
 
@@ -7953,8 +8233,13 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
+        params: []const sql_adapter.SqlValue,
     ) !?PublicSqlResultOrResponse {
-        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session())) |scalar_value| {
+        const maybe_scalar = self.postgresCompatibilityScalarAlloc(parsed_sql, session.session(), params) catch |err| switch (err) {
+            error.MissingSqlParameter => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) },
+            else => return err,
+        };
+        if (maybe_scalar) |scalar_value| {
             var scalar = scalar_value;
             defer scalar.deinit(self.alloc);
             return .{ .result = .{
@@ -7990,7 +8275,7 @@ pub const ApiHttpServer = struct {
         parsed_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
     ) !?PublicSqlDescribeResult {
-        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session())) |scalar_value| {
+        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session(), &.{})) |scalar_value| {
             var scalar = scalar_value;
             defer scalar.deinit(self.alloc);
             return .{
@@ -8305,6 +8590,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
         session: catalog_resources.SqlCatalogSession,
+        params: []const sql_adapter.SqlValue,
     ) !?PostgresCompatibilityScalar {
         if (self.postgresCompatibilitySelectFunction(parsed_sql, "version")) {
             return .{
@@ -8330,7 +8616,7 @@ pub const ApiHttpServer = struct {
                 .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
             };
         }
-        if (try self.postgresCompatibilitySelectLiteralAlloc(parsed_sql)) |literal| {
+        if (try self.postgresCompatibilitySelectLiteralAlloc(parsed_sql, params)) |literal| {
             return literal;
         }
         if (self.postgresCompatibilityShowSettingName(parsed_sql)) |setting_name| {
@@ -8345,6 +8631,7 @@ pub const ApiHttpServer = struct {
     fn postgresCompatibilitySelectLiteralAlloc(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
     ) !?PostgresCompatibilityScalar {
         const raw = parsed_sql.statement.raw();
         const all_tokens = parsed_sql.items();
@@ -8357,11 +8644,13 @@ pub const ApiHttpServer = struct {
             .number,
             .string,
             => value_token.text,
+            .placeholder => try self.postgresCompatibilitySqlValueTextAlloc(try sql_adapter.boundSqlValue(value_token, params)),
             else => if (value_token.matchesKeywordTag(.true) or value_token.matchesKeywordTag(.false) or value_token.matchesKeywordTag(.null))
                 value_token.text
             else
                 return null,
         };
+        defer if (value_token.kind == .placeholder) self.alloc.free(@constCast(value));
 
         const column_name: []const u8 = if (tokens.len == 2)
             "?column?"
@@ -8375,6 +8664,17 @@ pub const ApiHttpServer = struct {
         return .{
             .column_name = column_name,
             .value = try self.alloc.dupe(u8, value),
+        };
+    }
+
+    fn postgresCompatibilitySqlValueTextAlloc(self: *ApiHttpServer, value: sql_adapter.SqlValue) ![]const u8 {
+        return switch (value) {
+            .null => try self.alloc.dupe(u8, "null"),
+            .bool => |raw| try self.alloc.dupe(u8, if (raw) "true" else "false"),
+            .integer => |raw| try std.fmt.allocPrint(self.alloc, "{d}", .{raw}),
+            .float => |raw| try std.fmt.allocPrint(self.alloc, "{d}", .{raw}),
+            .string => |raw| try self.alloc.dupe(u8, raw),
+            .json => |raw| try self.alloc.dupe(u8, raw),
         };
     }
 
@@ -8913,6 +9213,7 @@ pub const ApiHttpServer = struct {
             .params = request.params,
             .session = &session,
             .authenticated_identity = authenticated_identity,
+            .stdin_payload = request.stdin_payload,
         });
         errdefer outcome.deinit(self.alloc);
         try self.savePublicSqlSession(session);
@@ -8924,6 +9225,7 @@ pub const ApiHttpServer = struct {
         params: []const sql_adapter.SqlValue = &.{},
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity = null,
+        stdin_payload: ?[]const u8 = null,
     };
 
     const PublicSqlPlannedExecutionPlan = union(enum) {
@@ -9232,9 +9534,10 @@ pub const ApiHttpServer = struct {
         parsed_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
+        stdin_payload: ?[]const u8,
     ) !PublicSqlResultOrResponse {
         switch (durable_plan.*) {
-            .bulk_io => return try ApiHttpServer.executePublicBulkSqlDurablePlanWithSession(self, durable_plan, session, authenticated_identity),
+            .bulk_io => return try ApiHttpServer.executePublicBulkSqlDurablePlanWithSession(self, durable_plan, session, authenticated_identity, stdin_payload),
             else => {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
                 const context = RelationalDdlPlanExecutionContext{ .parsed_sql = parsed_sql };
@@ -9256,6 +9559,35 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicSqlDurablePlannedExecutionOrDiagnostic(
+        self: *ApiHttpServer,
+        durable_plan: *sql_adapter.DurableSqlPlan,
+        subject_sql: *const sql_adapter.ParsedSql,
+        execute_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+        stdin_payload: ?[]const u8,
+    ) !PublicSqlResultOrResponse {
+        return self.executePublicSqlDurablePlannedExecution(durable_plan, subject_sql, session, authenticated_identity, stdin_payload) catch |err| switch (err) {
+            error.DocumentSqlViewMappingUnsupported => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, .init(.plan, .document_sql_view_mapping_unsupported)) },
+            error.SqlReadOnlyTransaction => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, execute_sql, .init(.execute, .read_only_transaction)) },
+            error.PermissionDenied, error.Unauthorized => .{ .response = try self.publicSqlParsedDiagnosticResponse(403, subject_sql, .init(.bind, .permission_denied)) },
+            error.TableNotFound, error.InvalidSqlCatalog => .{ .response = try self.publicSqlParsedDiagnosticResponse(404, subject_sql, .init(.bind, .invalid_sql_catalog)) },
+            error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, .init(.bind, .invalid_sql_request)) },
+            error.UnsupportedSqlShape, error.UnsupportedOperation => .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject_sql, .init(.plan, .unsupported_sql_statement)) },
+            error.StatementTimeout => .{ .response = try self.publicSqlParsedDiagnosticResponse(408, execute_sql, .init(.execute, .statement_timeout)) },
+            error.InvalidSqlSession,
+            error.PreparedStatementAlreadyExists,
+            error.PreparedStatementNotFound,
+            error.PreparedStatementArgumentMismatch,
+            error.SavepointNotFound,
+            error.InvalidRoleSetting,
+            error.RoleSettingNotFound,
+            => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+            else => return err,
+        };
+    }
+
     pub fn executePublicParsedSqlRequestResult(self: *ApiHttpServer, request: PublicParsedSqlExecutionRequest) !PublicSqlResultOrResponse {
         const parsed_sql = request.parsed_sql;
         const session = request.session;
@@ -9263,12 +9595,12 @@ pub const ApiHttpServer = struct {
         if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
             return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .current_transaction_aborted)) };
         }
-        if (try self.handlePublicSqlPostgresCompatibilityRead(parsed_sql, session)) |outcome_value| {
+        if (try self.handlePublicSqlPostgresCompatibilityRead(parsed_sql, session, request.params)) |outcome_value| {
             var outcome = outcome_value;
             errdefer outcome.deinit(self.alloc);
             switch (outcome) {
                 .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
-                .response => {},
+                .response => self.markPublicSqlTransactionFailedIfActive(session),
             }
             return outcome;
         }
@@ -9278,7 +9610,7 @@ pub const ApiHttpServer = struct {
                 errdefer outcome.deinit(self.alloc);
                 switch (outcome) {
                     .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
-                    .response => {},
+                    .response => self.markPublicSqlTransactionFailedIfActive(session),
                 }
                 return outcome;
             }
@@ -9309,6 +9641,7 @@ pub const ApiHttpServer = struct {
             error.PreparedStatementNotFound,
             error.PreparedStatementArgumentMismatch,
             error.InvalidSqlCatalog,
+            error.SavepointNotFound,
             error.InvalidRoleSetting,
             error.RoleSettingNotFound,
             => {
@@ -9332,6 +9665,8 @@ pub const ApiHttpServer = struct {
                     .logical => |*logical_plan| switch (logical_plan.*) {
                         .catalog_write => try self.handlePublicSqlWrite(logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
                         .catalog_read => try self.handlePublicSqlRead(logical_plan, parsed_sql, request.params, session, request.authenticated_identity),
+                        .prepared_statement => |*prepared_plan| try self.executePublicSqlPreparedStatementLogicalPlanWithSession(prepared_plan, parsed_sql, session, request.authenticated_identity),
+                        .cursor => |*cursor_plan| try self.executePublicSqlCursorLogicalPlanWithSession(cursor_plan, parsed_sql, session, request.params, request.authenticated_identity),
                         .read, .write => return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) },
                         else => ddl_blk: {
                             const statement_kind = publicSqlStatementKindForLogicalPlan(logical_plan.*);
@@ -9357,6 +9692,7 @@ pub const ApiHttpServer = struct {
                                 error.PreparedStatementNotFound,
                                 error.PreparedStatementArgumentMismatch,
                                 error.InvalidSqlCatalog,
+                                error.SavepointNotFound,
                                 error.InvalidRoleSetting,
                                 error.RoleSettingNotFound,
                                 => {
@@ -9378,47 +9714,14 @@ pub const ApiHttpServer = struct {
                             } };
                         },
                     },
-                    .durable => |*durable_plan| self.executePublicSqlDurablePlannedExecution(durable_plan, parsed_sql, session, request.authenticated_identity) catch |err| switch (err) {
-                        error.DocumentSqlViewMappingUnsupported => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) };
-                        },
-                        error.SqlReadOnlyTransaction => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) };
-                        },
-                        error.PermissionDenied, error.Unauthorized => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) };
-                        },
-                        error.TableNotFound, error.InvalidSqlCatalog => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .invalid_sql_catalog)) };
-                        },
-                        error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) };
-                        },
-                        error.UnsupportedSqlShape, error.UnsupportedOperation => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
-                        },
-                        error.StatementTimeout => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(408, parsed_sql, .init(.execute, .statement_timeout)) };
-                        },
-                        error.InvalidSqlSession,
-                        error.PreparedStatementAlreadyExists,
-                        error.PreparedStatementNotFound,
-                        error.PreparedStatementArgumentMismatch,
-                        error.InvalidRoleSetting,
-                        error.RoleSettingNotFound,
-                        => {
-                            self.markPublicSqlTransactionFailedIfActive(session);
-                            return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) };
-                        },
-                        else => return err,
-                    },
+                    .durable => |*durable_plan| try self.executePublicSqlDurablePlannedExecutionOrDiagnostic(
+                        durable_plan,
+                        parsed_sql,
+                        parsed_sql,
+                        session,
+                        request.authenticated_identity,
+                        request.stdin_payload,
+                    ),
                 };
                 errdefer outcome.deinit(self.alloc);
                 switch (outcome) {
@@ -9842,6 +10145,7 @@ pub const ApiHttpServer = struct {
         durable_plan: *sql_adapter.DurableSqlPlan,
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
+        stdin_payload: ?[]const u8,
     ) !PublicSqlResultOrResponse {
         const bulk_plan = switch (durable_plan.*) {
             .bulk_io => |plan| plan,
@@ -9858,8 +10162,12 @@ pub const ApiHttpServer = struct {
         switch (execution_plan.operation) {
             .import_rows => {
                 if (execution_plan.native_route != .rows_batch) return error.UnsupportedSqlShape;
+                if (execution_plan.stream != .stdin and stdin_payload != null) return error.InvalidRowsRequest;
                 const rows = switch (execution_plan.stream) {
-                    .stdin => return error.InvalidRowsRequest,
+                    .stdin => blk: {
+                        const payload = stdin_payload orelse return error.InvalidRowsRequest;
+                        break :blk try self.executeBulkSqlImportPlanFromStdin(execution_plan, payload, session_value, identity_ptr);
+                    },
                     .file => try self.executeBulkSqlImportPlanFromFile(execution_plan, session_value, identity_ptr),
                     .program => try self.executeBulkSqlImportPlanFromProgram(execution_plan, session_value, identity_ptr),
                     .stdout => return error.UnsupportedSqlShape,
@@ -9872,6 +10180,7 @@ pub const ApiHttpServer = struct {
                 } };
             },
             .export_rows => {
+                if (stdin_payload != null) return error.InvalidRowsRequest;
                 if (execution_plan.native_route != .rows_query) return error.UnsupportedSqlShape;
                 switch (execution_plan.stream) {
                     .stdout => {
@@ -13732,6 +14041,27 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactManifests(table_name, artifact_route.key, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactManifest(table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
             if (matchPublicTableDocumentLookup(uri_parts.path)) |document| {
                 return try self.handlePublicTableDocumentLookup(document.table_name, document.key, uri_parts.query, authenticated_identity);
             }
@@ -13774,27 +14104,6 @@ pub const ApiHttpServer = struct {
                         .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
                     },
                 });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifests(table_name, artifact_route.key, uri_parts.query, authenticated_identity);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifest(table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
@@ -14888,6 +15197,19 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogPromoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.source.promoteTableEmptyingBarrier(request);
+    }
+
+    fn apiHttpServerCatalogResetIdentityAllocatorsForTableEmptyingBarrier(
+        ptr: *anyopaque,
+        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+    ) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+    }
+
+    fn apiHttpServerCatalogSupportsIdentityAllocatorResetForTableEmptyingBarrier(ptr: *anyopaque) bool {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.supportsIdentityAllocatorResetForTableEmptyingBarrier();
     }
 
     fn waitForTableMetadata(
@@ -28879,6 +29201,176 @@ test "api http server persists prepared transaction SQL DDL through durable sess
     }
 }
 
+test "api http server applies public SQL savepoints to session state" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const Request = struct {
+        fn post(server: *ApiHttpServer, allocator: std.mem.Allocator, session_id: ?u64, sql: []const u8) !http_common.HttpResponse {
+            const body = if (session_id) |id|
+                try std.fmt.allocPrint(allocator, "{{\"session_id\":{d},\"sql\":\"{s}\"}}", .{ id, sql })
+            else
+                try std.fmt.allocPrint(allocator, "{{\"sql\":\"{s}\"}}", .{sql});
+            defer allocator.free(body);
+            return try server.handle(.{
+                .method = .POST,
+                .uri = "/db/v1/sql",
+                .content_type = "application/json",
+                .body = body,
+            });
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var begin_resp = try Request.post(&server, alloc, null, "BEGIN;");
+    defer begin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), begin_resp.status);
+    var parsed_begin = try std.json.parseFromSlice(std.json.Value, alloc, begin_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_begin.deinit();
+    const session_id = @as(u64, @intCast(parsed_begin.value.object.get("session_id").?.integer));
+    try std.testing.expect(session_id != 0);
+
+    var set_path_resp = try Request.post(&server, alloc, session_id, "SET search_path TO analytics, public;");
+    defer set_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_path_resp.status);
+    const stored_after_set = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), stored_after_set.search_path.len);
+    try std.testing.expectEqualStrings("analytics", stored_after_set.search_path[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_set.search_path[1]);
+
+    var savepoint_resp = try Request.post(&server, alloc, session_id, "SAVEPOINT before_local;");
+    defer savepoint_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), savepoint_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_savepoint_runtime.savepointCountForTest(session_id));
+
+    var set_local_resp = try Request.post(&server, alloc, session_id, "SET LOCAL search_path TO reports;");
+    defer set_local_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_local_resp.status);
+    const stored_after_local = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), stored_after_local.search_path.len);
+    try std.testing.expectEqualStrings("reports", stored_after_local.search_path[0]);
+    try std.testing.expect(stored_after_local.transaction_local_search_path);
+
+    var rollback_to_resp = try Request.post(&server, alloc, session_id, "ROLLBACK TO SAVEPOINT before_local;");
+    defer rollback_to_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), rollback_to_resp.status);
+    var parsed_rollback_to = try std.json.parseFromSlice(std.json.Value, alloc, rollback_to_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_rollback_to.deinit();
+    try std.testing.expectEqualStrings("in_transaction", parsed_rollback_to.value.object.get("transaction_status").?.string);
+    const stored_after_rollback = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), stored_after_rollback.search_path.len);
+    try std.testing.expectEqualStrings("analytics", stored_after_rollback.search_path[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_rollback.search_path[1]);
+    try std.testing.expect(!stored_after_rollback.transaction_local_search_path);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_savepoint_runtime.savepointCountForTest(session_id));
+
+    var savepoint_release_resp = try Request.post(&server, alloc, session_id, "SAVEPOINT before_release;");
+    defer savepoint_release_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), savepoint_release_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), server.sql_savepoint_runtime.savepointCountForTest(session_id));
+
+    var release_resp = try Request.post(&server, alloc, session_id, "RELEASE SAVEPOINT before_release;");
+    defer release_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), release_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_savepoint_runtime.savepointCountForTest(session_id));
+
+    var missing_resp = try Request.post(&server, alloc, session_id, "ROLLBACK TO SAVEPOINT missing_savepoint;");
+    defer missing_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, missing_resp.body, "execute", "invalid_sql_request", "invalid sql request", null, null);
+
+    var commit_resp = try Request.post(&server, alloc, session_id, "COMMIT;");
+    defer commit_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), commit_resp.status);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_savepoint_runtime.savepointCountForTest(session_id));
+}
+
+test "api http server applies cursor SQL plans through DDL session helper" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var declared = try server.applyRelationalSqlDdlWithSession("DECLARE usage_cursor CURSOR FOR SELECT 1;", &session);
+    defer declared.deinit(alloc);
+    try std.testing.expect(declared.noop);
+    try std.testing.expect(session.notification_session_id != 0);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_cursor_runtime.portalCountForTest(session.notification_session_id));
+
+    var moved = try server.applyRelationalSqlDdlWithSession("MOVE NEXT FROM usage_cursor;", &session);
+    defer moved.deinit(alloc);
+    try std.testing.expect(moved.noop);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        server.applyRelationalSqlDdlWithSession("FETCH NEXT FROM usage_cursor;", &session),
+    );
+
+    var closed = try server.applyRelationalSqlDdlWithSession("CLOSE usage_cursor;", &session);
+    defer closed.deinit(alloc);
+    try std.testing.expect(closed.noop);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_cursor_runtime.portalCountForTest(session.notification_session_id));
+
+    var begin = try server.applyRelationalSqlDdlWithSession("BEGIN;", &session);
+    defer begin.deinit(alloc);
+    try std.testing.expect(begin.noop);
+
+    var transaction_cursor = try server.applyRelationalSqlDdlWithSession("DECLARE transaction_cursor CURSOR FOR SELECT 1;", &session);
+    defer transaction_cursor.deinit(alloc);
+    try std.testing.expect(transaction_cursor.noop);
+    var hold_cursor = try server.applyRelationalSqlDdlWithSession("DECLARE held_cursor CURSOR WITH HOLD FOR SELECT 1;", &session);
+    defer hold_cursor.deinit(alloc);
+    try std.testing.expect(hold_cursor.noop);
+    try std.testing.expectEqual(@as(usize, 2), server.sql_cursor_runtime.portalCountForTest(session.notification_session_id));
+
+    var committed = try server.applyRelationalSqlDdlWithSession("COMMIT;", &session);
+    defer committed.deinit(alloc);
+    try std.testing.expect(committed.noop);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_cursor_runtime.portalCountForTest(session.notification_session_id));
+
+    var closed_held = try server.applyRelationalSqlDdlWithSession("CLOSE held_cursor;", &session);
+    defer closed_held.deinit(alloc);
+    try std.testing.expect(closed_held.noop);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_cursor_runtime.portalCountForTest(session.notification_session_id));
+}
+
 test "api http server applies prepared statement SQL plans to session runtime" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -29174,7 +29666,7 @@ test "api http server exposes psql-style SQL session endpoint" {
         .method = .POST,
         .uri = "/db/v1/sql",
         .content_type = "application/json",
-        .body = "{\"read_only\":null,\"sql\":\"PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;\"}",
+        .body = "{\"read_only\":null,\"sql\":\"PREPARE usage_plan(text) AS SELECT $1 AS status;\"}",
     });
     defer prepare_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), prepare_resp.status);
@@ -29192,7 +29684,7 @@ test "api http server exposes psql-style SQL session endpoint" {
 
     var describe_prepare = try server.handlePublicSqlDescribeRequestResult(.{
         .session_id = session_id,
-        .sql = "PREPARE describe_only(text) AS SELECT id FROM usage_records WHERE status = $1;",
+        .sql = "PREPARE describe_only AS SELECT 1;",
     }, null);
     defer describe_prepare.deinit(alloc);
     switch (describe_prepare) {
@@ -29243,6 +29735,11 @@ test "api http server exposes psql-style SQL session endpoint" {
     var parsed_execute = try std.json.parseFromSlice(std.json.Value, alloc, execute_resp.body, .{ .allocate = .alloc_always });
     defer parsed_execute.deinit();
     try std.testing.expectEqual(@as(i64, @intCast(session_id)), parsed_execute.value.object.get("session_id").?.integer);
+    try std.testing.expectEqualStrings("read", parsed_execute.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_execute.value.object.get("statement_kind").?.string);
+    const prepared_execute_rows = parsed_execute.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), prepared_execute_rows.len);
+    try std.testing.expectEqualStrings("open", prepared_execute_rows[0].object.get("status").?.string);
 
     const readonly_execute_read_body = try std.fmt.allocPrint(
         alloc,
@@ -29323,7 +29820,7 @@ test "api http server exposes psql-style SQL session endpoint" {
 
     const transaction_cleared_write_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('allowed');\"}}",
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE usage_plan('open');\"}}",
         .{session_id},
     );
     defer alloc.free(transaction_cleared_write_body);
@@ -29335,6 +29832,72 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer transaction_cleared_write_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), transaction_cleared_write_resp.status);
+
+    const begin_missing_param_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"BEGIN;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(begin_missing_param_body);
+    var begin_missing_param_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = begin_missing_param_body,
+    });
+    defer begin_missing_param_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), begin_missing_param_resp.status);
+
+    const missing_param_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SELECT $1 AS status;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(missing_param_body);
+    var missing_param_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = missing_param_body,
+    });
+    defer missing_param_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_param_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, missing_param_resp.body, "bind", "invalid_sql_request", "invalid sql request", null, null);
+    const stored_after_missing_param = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stored_after_missing_param.sql_transaction_failed);
+
+    const aborted_after_missing_param_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SELECT 1;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(aborted_after_missing_param_body);
+    var aborted_after_missing_param_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = aborted_after_missing_param_body,
+    });
+    defer aborted_after_missing_param_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), aborted_after_missing_param_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, aborted_after_missing_param_resp.body, "execute", "current_transaction_aborted", "current transaction is aborted", null, null);
+
+    const rollback_missing_param_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"ROLLBACK;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(rollback_missing_param_body);
+    var rollback_missing_param_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = rollback_missing_param_body,
+    });
+    defer rollback_missing_param_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), rollback_missing_param_resp.status);
+    const stored_after_missing_param_rollback = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!stored_after_missing_param_rollback.sql_transaction_failed);
 
     const request_readonly_set_readwrite_body = try std.fmt.allocPrint(
         alloc,
@@ -29354,7 +29917,7 @@ test "api http server exposes psql-style SQL session endpoint" {
 
     const request_readonly_not_persisted_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('allowed');\"}}",
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE usage_plan('open');\"}}",
         .{session_id},
     );
     defer alloc.free(request_readonly_not_persisted_body);
@@ -29638,15 +30201,74 @@ test "api http server exposes psql-style SQL session endpoint" {
     try std.testing.expectEqual(@as(u16, 400), readonly_maintenance_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, readonly_maintenance_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 
+    const readonly_cursor_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"read_only\":true,\"session_id\":{d},\"sql\":\"DECLARE usage_cursor CURSOR FOR SELECT $1 AS status;\",\"params\":[\"open\"]}}",
+        .{session_id},
+    );
+    defer alloc.free(readonly_cursor_body);
     var readonly_cursor_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
         .content_type = "application/json",
-        .body = "{\"read_only\":true,\"sql\":\"DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records;\"}",
+        .body = readonly_cursor_body,
     });
     defer readonly_cursor_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), readonly_cursor_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, readonly_cursor_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try std.testing.expectEqual(@as(u16, 200), readonly_cursor_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_cursor_runtime.portalCountForTest(session_id));
+
+    const fetch_cursor_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"FETCH NEXT FROM usage_cursor;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(fetch_cursor_body);
+    var fetch_cursor_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = fetch_cursor_body,
+    });
+    defer fetch_cursor_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), fetch_cursor_resp.status);
+    var parsed_fetch_cursor = try std.json.parseFromSlice(std.json.Value, alloc, fetch_cursor_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_fetch_cursor.deinit();
+    try std.testing.expectEqualStrings("read", parsed_fetch_cursor.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("cursor", parsed_fetch_cursor.value.object.get("statement_kind").?.string);
+    const cursor_rows = parsed_fetch_cursor.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), cursor_rows.len);
+    try std.testing.expectEqualStrings("open", cursor_rows[0].object.get("status").?.string);
+
+    const move_cursor_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"MOVE NEXT FROM usage_cursor;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(move_cursor_body);
+    var move_cursor_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = move_cursor_body,
+    });
+    defer move_cursor_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), move_cursor_resp.status);
+
+    const close_cursor_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"CLOSE usage_cursor;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(close_cursor_body);
+    var close_cursor_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = close_cursor_body,
+    });
+    defer close_cursor_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), close_cursor_resp.status);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_cursor_runtime.portalCountForTest(session_id));
 
     var trigger_function_resp = try server.handle(.{
         .method = .POST,
@@ -31677,18 +32299,8 @@ test "api http server executes SQL point writes through typed row batch ingress"
         .body = "{\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
     });
     defer truncate_restart_identity_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_restart_identity_resp.status);
-    var parsed_truncate_restart_identity = try std.json.parseFromSlice(std.json.Value, alloc, truncate_restart_identity_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncate_restart_identity.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_truncate_restart_identity.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_truncate_restart_identity.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[2].group_id);
-    try std.testing.expect(source.table_emptying_jobs.items[2].restart_identity);
-    try std.testing.expect(!source.table_emptying_jobs.items[2].cascade);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[2].affected_table_ids.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].affected_table_ids[0]);
+    try std.testing.expectEqual(@as(u16, 501), truncate_restart_identity_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), source.table_emptying_jobs.items.len);
 
     var truncate_multi_table_resp = try server.handle(.{
         .method = .POST,
@@ -31702,12 +32314,12 @@ test "api http server executes SQL point writes through typed row batch ingress"
     defer parsed_truncate_multi_table.deinit();
     try std.testing.expectEqualStrings("ddl", parsed_truncate_multi_table.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate_multi_table.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[3].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[3].group_id);
-    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[4].table_id);
-    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[4].group_id);
-    for (source.table_emptying_jobs.items[3..5]) |job| {
+    try std.testing.expectEqual(@as(usize, 4), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[2].group_id);
+    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[3].table_id);
+    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[3].group_id);
+    for (source.table_emptying_jobs.items[2..4]) |job| {
         try std.testing.expect(!job.restart_identity);
         try std.testing.expect(!job.cascade);
         try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
@@ -31722,17 +32334,8 @@ test "api http server executes SQL point writes through typed row batch ingress"
         .body = "{\"namespace\":\"tenant\",\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
     });
     defer tenant_truncate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), tenant_truncate_resp.status);
-    var parsed_tenant_truncate = try std.json.parseFromSlice(std.json.Value, alloc, tenant_truncate_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_tenant_truncate.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_tenant_truncate.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_tenant_truncate.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 6), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 4), source.table_emptying_jobs.items[5].table_id);
-    try std.testing.expectEqual(@as(u64, 14), source.table_emptying_jobs.items[5].group_id);
-    try std.testing.expect(source.table_emptying_jobs.items[5].restart_identity);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[5].affected_table_ids.len);
-    try std.testing.expectEqual(@as(u64, 4), source.table_emptying_jobs.items[5].affected_table_ids[0]);
+    try std.testing.expectEqual(@as(u16, 501), tenant_truncate_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), source.table_emptying_jobs.items.len);
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {
@@ -31963,6 +32566,20 @@ test "api http server executes SQL notification channel plans through native run
 
     var unlisten_b = try server.applyRelationalSqlDdlWithSession("UNLISTEN usage_events;", &session_b);
     defer unlisten_b.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
+    );
+
+    var listen_b_again = try server.applyRelationalSqlDdlWithSession("LISTEN usage_events;", &session_b);
+    defer listen_b_again.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
+    );
+    var discard_b = try server.applyRelationalSqlDdlWithSession("DISCARD ALL;", &session_b);
+    defer discard_b.deinit(alloc);
+    try std.testing.expect(discard_b.noop);
     try std.testing.expectEqual(
         @as(usize, 0),
         server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
@@ -33648,6 +34265,155 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqualStrings("write_only_bulk", audit.events[14].authenticated_subject orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("PermissionDenied", audit.events[14].error_name orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(@as(usize, 0), audit.events[14].row_count);
+}
+
+test "api http server executes public SQL COPY FROM STDIN payload" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 91,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 91, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 17,
+                    .name = "events",
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .schema_json = schema_json,
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const FakeWrites = struct {
+        calls: usize = 0,
+        first_row_json: []u8 = &.{},
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
+        }
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch_catalog = batchCatalog,
+                },
+            };
+        }
+
+        fn batchCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.BatchRequest) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("events", target.table_name);
+            try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
+            self.first_row_json = try allocator.dupe(u8, req.writes[0].value);
+            self.calls += 1;
+            return {};
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    defer writes.deinit(alloc);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body =
+        \\{"database":"tenant_ops","namespace":"analytics","sql":"COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);","stdin_payload":"id,status\nu_public,Ready\n"}
+        ,
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+
+    var parsed_body = try std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{ .allocate = .alloc_always });
+    defer parsed_body.deinit();
+    try std.testing.expectEqualStrings("write", parsed_body.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("bulk_io", parsed_body.value.object.get("statement_kind").?.string);
+
+    var first_row = try std.json.parseFromSlice(std.json.Value, alloc, writes.first_row_json, .{});
+    defer first_row.deinit();
+    try std.testing.expectEqualStrings("u_public", first_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("Ready", first_row.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
+
+    var missing_payload_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body =
+        \\{"database":"tenant_ops","namespace":"analytics","sql":"COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);"}
+        ,
+    });
+    defer missing_payload_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_payload_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, missing_payload_resp.body, "bind", "invalid_sql_request", "invalid sql request", null, null);
+
+    var prepare_copy_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body =
+        \\{"database":"tenant_ops","namespace":"analytics","sql":"PREPARE copy_plan AS COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);"}
+        ,
+    });
+    defer prepare_copy_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), prepare_copy_resp.status);
+    var parsed_prepare_copy = try std.json.parseFromSlice(std.json.Value, alloc, prepare_copy_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_prepare_copy.deinit();
+    const copy_session_id = parsed_prepare_copy.value.object.get("session_id").?.integer;
+
+    const execute_copy_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"database\":\"tenant_ops\",\"namespace\":\"analytics\",\"session_id\":{d},\"sql\":\"EXECUTE copy_plan;\"}}",
+        .{copy_session_id},
+    );
+    defer alloc.free(execute_copy_body);
+    var execute_copy_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = execute_copy_body,
+    });
+    defer execute_copy_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), execute_copy_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, execute_copy_resp.body, "bind", "invalid_sql_request", "invalid sql request", null, null);
 }
 
 test "api http server serves api key and row filter routes" {

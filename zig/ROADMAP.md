@@ -212,21 +212,22 @@ Near-term goals:
 
 ## Immediate Project Order
 
-1. Keep CI and generated-contract checks green as guardrails, with focused
-   reruns when route or trace behavior changes.
-2. Tighten generated/OpenAPI checks around Go and Zig surface changes so route
+CI is assumed green on main and on this PR. Treat release-blocking failures as
+bugs to fix in-place, not as roadmap work.
+
+1. Tighten generated/OpenAPI checks around Go and Zig surface changes so route
    additions fail close to the source of drift.
-3. Keep the CI lanes stable enough to decide which E2E and TLA checks should be
+2. Keep the CI lanes stable enough to decide which E2E and TLA checks should be
    required for normal PRs.
-4. Continue serverless table/publication convergence:
+3. Continue serverless table/publication convergence:
    - canonical table metadata
    - index/schema publication execution
    - per-family artifact reuse
    - explicit freshness/read semantics
-5. Deepen public query/search/retrieval parity only with matching coverage.
-6. Continue stateful metadata/runtime hardening around split, merge, recovery,
+4. Deepen public query/search/retrieval parity only with matching coverage.
+5. Continue stateful metadata/runtime hardening around split, merge, recovery,
    backup/restore, and remote status propagation.
-7. Keep shared library docs under `lib/` and inference docs under
+6. Keep shared library docs under `lib/` and inference docs under
    `pkg/inference/` as those modules become stable user-facing design surfaces.
 
 ## Planning Rules

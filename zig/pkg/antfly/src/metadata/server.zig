@@ -147,6 +147,7 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_read_source.withBackendRuntime(try svc.ensureBackendRuntime());
             owned_public_read_source = public_read_source;
 
             const public_write_source = try alloc.create(api_table_writes.HostedProvisionedTableWriteSource);
@@ -156,6 +157,7 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_write_source.withBackendRuntime(try svc.ensureBackendRuntime());
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;

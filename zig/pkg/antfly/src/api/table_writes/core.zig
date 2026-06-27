@@ -704,6 +704,15 @@ pub const TableWriteSource = struct {
             lease_ms: u64,
             max_work_units: usize,
         ) anyerror!?TableEmptyingWorkerPassResult = null,
+        table_emptying_worker_pass_for_table_id: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_id: u64,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?TableEmptyingWorkerPassResult = null,
         table_emptying_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -826,6 +835,19 @@ pub const TableWriteSource = struct {
     ) !?TableEmptyingWorkerPassResult {
         const fn_ptr = self.vtable.table_emptying_worker_pass orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn tableEmptyingWorkerPassForTableId(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_id: u64,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?TableEmptyingWorkerPassResult {
+        const fn_ptr = self.vtable.table_emptying_worker_pass_for_table_id orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_id, table_name, worker_id, lease_ms, max_work_units);
     }
 
     pub fn tableEmptyingGroupLocal(

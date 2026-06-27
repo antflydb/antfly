@@ -489,6 +489,11 @@ pub const DB = struct {
         return try lifecycle_impl.runLsmMaintenanceUntilIdle(self);
     }
 
+    pub fn forceFlushPrimaryStoreForVisibility(self: *DB) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try lifecycle_impl.forceFlushPrimaryStoreForVisibility(self);
+    }
+
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.retryQuarantinedIndexLoads(self, force);

@@ -304,6 +304,13 @@ pub const TableEmptyingBarrierPromotionRequest = struct {
     promotions: []const TableEmptyingBarrierPromotion = &.{},
 };
 
+pub const TableEmptyingIdentityAllocatorResetRequest = struct {
+    barrier_id: u64,
+    affected_table_ids: []const u64,
+    job_ids: []const u64,
+    cascade: bool = false,
+};
+
 pub const ForeignKeyReferenceRangeSelector = struct {
     child_table_id: u64,
     constraint_name: []const u8,
@@ -1532,6 +1539,10 @@ pub const TableManager = struct {
     pub fn promoteTableEmptyingBarrier(self: *TableManager, request: TableEmptyingBarrierPromotionRequest) !void {
         if (request.job_ids.len == 0 or request.promotions.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
 
+        const first_record = self.findTableEmptyingJob(request.job_ids[0]) orelse return error.UnknownTableEmptyingJob;
+        if (first_record.barrier_id == 0 or first_record.affected_table_ids.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+        if (request.promotions.len != first_record.affected_table_ids.len) return error.InvalidTableEmptyingBarrierPromotion;
+
         for (request.job_ids, 0..) |job_id, i| {
             if (job_id == 0) return error.InvalidTableEmptyingBarrierPromotion;
             for (request.job_ids[0..i]) |previous| {
@@ -1539,16 +1550,28 @@ pub const TableManager = struct {
             }
             const record = self.findTableEmptyingJob(job_id) orelse return error.UnknownTableEmptyingJob;
             if (!std.mem.eql(u8, record.state, table_emptying_ready)) return error.TableEmptyingJobNotReady;
+            if (record.barrier_id != first_record.barrier_id or
+                record.restart_identity != first_record.restart_identity or
+                record.cascade != first_record.cascade or
+                !u64SlicesEqual(record.affected_table_ids, first_record.affected_table_ids) or
+                !u64SliceContains(first_record.affected_table_ids, record.table_id))
+            {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
         }
 
         for (request.promotions, 0..) |promotion, i| {
             if (promotion.table_id == 0 or promotion.target_generation == 0) return error.InvalidTableEmptyingBarrierPromotion;
-            _ = self.tables.getPtr(promotion.table_id) orelse return error.UnknownTable;
+            const table = self.tables.getPtr(promotion.table_id) orelse return error.UnknownTable;
+            if (!u64SliceContains(first_record.affected_table_ids, promotion.table_id)) return error.InvalidTableEmptyingBarrierPromotion;
+            if (promotion.target_generation != table.data_generation +| 1) return error.InvalidTableEmptyingBarrierPromotion;
             for (request.promotions[0..i]) |previous| {
-                if (previous.table_id == promotion.table_id and previous.target_generation != promotion.target_generation) {
-                    return error.InvalidTableEmptyingBarrierPromotion;
-                }
+                if (previous.table_id == promotion.table_id) return error.InvalidTableEmptyingBarrierPromotion;
             }
+        }
+        for (first_record.affected_table_ids) |table_id| {
+            if (!promotionListContainsTable(request.promotions, table_id)) return error.InvalidTableEmptyingBarrierPromotion;
+            try self.validateCompleteTableEmptyingBarrierTable(first_record.*, request.job_ids, table_id);
         }
 
         for (request.promotions) |promotion| {
@@ -1561,6 +1584,51 @@ pub const TableManager = struct {
         for (request.job_ids) |job_id| {
             if (!self.removeTableEmptyingJob(job_id)) return error.UnknownTableEmptyingJob;
         }
+    }
+
+    fn validateCompleteTableEmptyingBarrierTable(
+        self: *TableManager,
+        barrier: TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table_id: u64,
+    ) !void {
+        const table = self.tables.get(table_id) orelse return error.UnknownTable;
+        var range_count: usize = 0;
+        var range_it = self.ranges.valueIterator();
+        while (range_it.next()) |range| {
+            if (range.table_id != table_id) continue;
+            range_count += 1;
+            if (!self.tableEmptyingPromotionHasReadyRangeJob(barrier, job_ids, table, range.*)) {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
+        }
+        if (range_count == 0) return error.InvalidTableEmptyingBarrierPromotion;
+    }
+
+    fn tableEmptyingPromotionHasReadyRangeJob(
+        self: *TableManager,
+        barrier: TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table: TableRecord,
+        range: RangeRecord,
+    ) bool {
+        const schema_generation = schemaRewriteGenerationForSchemaJson(table.schema_json);
+        for (job_ids) |job_id| {
+            const record = self.findTableEmptyingJob(job_id) orelse continue;
+            if (!std.mem.eql(u8, record.state, table_emptying_ready)) continue;
+            if (record.barrier_id != barrier.barrier_id) continue;
+            if (record.table_id != table.table_id) continue;
+            if (record.group_id != range.group_id) continue;
+            if (record.schema_generation != schema_generation) continue;
+            if (record.data_generation != table.data_generation) continue;
+            if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
+            if (!optionalStringSlicesEqual(record.end_row_key, range.end_key)) continue;
+            if (!u64SlicesEqual(record.affected_table_ids, barrier.affected_table_ids)) continue;
+            if (record.restart_identity != barrier.restart_identity) continue;
+            if (record.cascade != barrier.cascade) continue;
+            return true;
+        }
+        return false;
     }
 
     pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
@@ -2285,6 +2353,27 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
 fn u64SliceContains(values: []const u64, needle: u64) bool {
     for (values) |value| {
         if (value == needle) return true;
+    }
+    return false;
+}
+
+fn u64SlicesEqual(a: []const u64, b: []const u64) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left != right) return false;
+    }
+    return true;
+}
+
+fn optionalStringSlicesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn promotionListContainsTable(promotions: []const TableEmptyingBarrierPromotion, table_id: u64) bool {
+    for (promotions) |promotion| {
+        if (promotion.table_id == table_id) return true;
     }
     return false;
 }
@@ -4672,13 +4761,17 @@ test "table manager promotes table-emptying barriers atomically" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
-    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .data_generation = 4 });
-    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .data_generation = 9 });
+    const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = schema_json, .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .schema_json = schema_json, .data_generation = 9 });
+    try manager.upsertRange(.{ .group_id = 9001, .range_id = 9101, .table_id = 7, .start_key = "", .end_key = null });
+    try manager.upsertRange(.{ .group_id = 9002, .range_id = 9102, .table_id = 8, .start_key = "", .end_key = null });
     try manager.upsertTableEmptyingJob(.{
         .job_id = 7101,
         .table_id = 7,
         .group_id = 9001,
-        .schema_generation = 1,
+        .schema_generation = schema_generation,
         .data_generation = 4,
         .barrier_id = 77,
         .state = table_emptying_ready,
@@ -4688,7 +4781,7 @@ test "table manager promotes table-emptying barriers atomically" {
         .job_id = 8101,
         .table_id = 8,
         .group_id = 9002,
-        .schema_generation = 1,
+        .schema_generation = schema_generation,
         .data_generation = 9,
         .barrier_id = 77,
         .state = table_emptying_declared,
@@ -4719,7 +4812,7 @@ test "table manager promotes table-emptying barriers atomically" {
         .job_id = 8101,
         .table_id = 8,
         .group_id = 9002,
-        .schema_generation = 1,
+        .schema_generation = schema_generation,
         .data_generation = 9,
         .barrier_id = 77,
         .state = table_emptying_ready,
@@ -4743,6 +4836,56 @@ test "table manager promotes table-emptying barriers atomically" {
         defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
         try std.testing.expectEqual(@as(usize, 0), jobs.len);
     }
+}
+
+test "table manager rejects mixed table-emptying barrier promotion" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = schema_json, .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .schema_json = schema_json, .data_generation = 9 });
+    try manager.upsertRange(.{ .group_id = 9001, .range_id = 9101, .table_id = 7, .start_key = "", .end_key = null });
+    try manager.upsertRange(.{ .group_id = 9002, .range_id = 9102, .table_id = 8, .start_key = "", .end_key = null });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 78,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+
+    try std.testing.expectError(error.InvalidTableEmptyingBarrierPromotion, manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    }));
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    for (tables) |table| {
+        if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 4), table.data_generation);
+        if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 9), table.data_generation);
+    }
+    const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
 }
 
 test "table manager parses placement classes and checks compatibility" {

@@ -156,6 +156,7 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         error.PreparedStatementArgumentMismatch => .prepared_statement_argument_mismatch,
         error.PreparedStatementNotFound => .prepared_statement_not_found,
         error.RoleSettingNotFound => .role_setting_not_found,
+        error.SavepointNotFound => .invalid_sql_request,
         error.SqlReadOnlyTransaction => .read_only_transaction,
         error.StatementTimeout => .statement_timeout,
         error.TableNotFound => .table_not_found,
