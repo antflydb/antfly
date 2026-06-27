@@ -489,6 +489,25 @@ pub fn lowerAntflyQueryFunctionReadParsedSqlAlloc(
     };
 }
 
+pub fn antflyQueryFunctionReadTableNameAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) ![]const u8 {
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
+    var projection_columns = std.ArrayListUnmanaged([]const u8).empty;
+    defer projection_columns.deinit(alloc);
+    var pos: usize = 0;
+    _ = try parseAntflyQueryFunctionReadCall(alloc, parsed_sql.items(), &pos, &args, &projection_columns);
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    if (table_name.len == 0) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, table_name);
+}
+
 fn ownAntflyQueryFunctionProjectionColumnsAlloc(
     alloc: std.mem.Allocator,
     columns: []const []const u8,

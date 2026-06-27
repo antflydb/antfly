@@ -556,7 +556,8 @@ validation now also fail-closes right-hand `DISTINCT`/`DISTINCT ON`, projection,
 source, and `WHERE` metadata so right-arm generated clause ranges cannot drift
 independently of the retained set-operation AST. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
-final set-operation reads, instead of re-entering the legacy read classifier;
+final set-operation reads and final no-`FROM` projection reads, instead of
+re-entering the legacy read classifier;
 direct CTE query-plan lowering also preserves generated final set-operation
 metadata for same-source CTE set-operation arms and fails closed when retained
 set-operation payloads are malformed. CTE body set-operation AST construction

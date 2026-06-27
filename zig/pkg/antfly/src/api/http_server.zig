@@ -6178,6 +6178,38 @@ pub const ApiHttpServer = struct {
         return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
     }
 
+    fn publicSqlGeneratedReadRowClaimMissingNativeModel(
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) ?[]const u8 {
+        const generated_statement = parsed_sql.generated_statement orelse return null;
+        const generated_ast = generated_statement.ast orelse return null;
+        const read = switch (generated_ast) {
+            .read => |read| read,
+            else => return null,
+        };
+        for (read.cte_items) |cte| {
+            if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
+        }
+        if (read.row_lock_tokens == null) return null;
+        return switch (parsed_sql.readStatementKind() orelse return "lockable base-row source for derived row claim") {
+            .query => null,
+            .aggregate => "lockable base-row source for aggregate row claim",
+            .join => "lockable base-row source for join row claim",
+            .lateral => "lockable base-row source for lateral row claim",
+            .window => "lockable base-row source for window row claim",
+            .set_operation => "lockable base-row source for set-operation row claim",
+            .recursive_cte => "lockable base-row source for recursive CTE row claim",
+        };
+    }
+
+    fn publicSqlGeneratedReadRowClaimDiagnostic(
+        parsed_sql: *const sql_adapter.ParsedSql,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
+    ) ?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        const missing_native_model = publicSqlGeneratedReadRowClaimMissingNativeModel(parsed_sql) orelse return null;
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
+    }
+
     fn publicSqlGeneratedExpressionUnsupportedSubqueryPredicateMissingNativeModel(
         expression: sql_adapter.generated_parser.GeneratedSqlExpressionAst,
     ) ?[]const u8 {
@@ -7036,6 +7068,9 @@ pub const ApiHttpServer = struct {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+                    }
                     if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
                         return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
                     }
@@ -7176,6 +7211,9 @@ pub const ApiHttpServer = struct {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+                    }
                     if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
                         return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
                     }
@@ -7410,6 +7448,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         statement_kind: sql_adapter.SqlReadStatementKind,
     ) !?PublicSqlResultOrResponse {
+        const query_table_name = sql_adapter.antflyQueryFunctionReadTableNameAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return null,
+            else => return err,
+        };
+        defer self.alloc.free(query_table_name);
+        const target = session.session().tableTargetFromObjectName(query_table_name) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+        };
+        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, target, .read) catch |err| switch (err) {
+            error.PermissionDenied => return .{ .response = try self.publicSqlDiagnosticResponse(403, .init(.bind, .permission_denied)) },
+            else => return err,
+        };
+
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
             .antfly_provider = self.antfly_provider,
@@ -7425,13 +7476,6 @@ pub const ApiHttpServer = struct {
         defer lowered.deinit(self.alloc);
 
         const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
-        const target = session.session().tableTargetFromObjectName(lowered.table_name) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
-        };
-        self.enforceAuthenticatedIdentitySqlTablePermission(authenticated_identity, target, .read) catch |err| switch (err) {
-            error.PermissionDenied => return .{ .response = try self.publicSqlDiagnosticResponse(403, .init(.bind, .permission_denied)) },
-            else => return err,
-        };
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
         const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, target.database_name, resource_name);

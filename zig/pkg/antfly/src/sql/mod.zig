@@ -194,6 +194,7 @@ pub const antflyQueryFunctionArg = query_function.antflyQueryFunctionArg;
 pub const antflyQueryFunctionBoolArg = query_function.antflyQueryFunctionBoolArg;
 pub const antflyQueryFunctionFromSqlName = query_function.antflyQueryFunctionFromSqlName;
 pub const antflyQueryFunctionNumberArg = query_function.antflyQueryFunctionNumberArg;
+pub const antflyQueryFunctionReadTableNameAlloc = query_function.antflyQueryFunctionReadTableNameAlloc;
 pub const antflyQueryFunctionStringArg = query_function.antflyQueryFunctionStringArg;
 pub const lowerAntflyQueryFunctionParsedSqlAlloc = query_function.lowerAntflyQueryFunctionParsedSqlAlloc;
 pub const lowerAntflyQueryFunctionReadParsedSqlAlloc = query_function.lowerAntflyQueryFunctionReadParsedSqlAlloc;

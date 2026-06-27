@@ -3176,14 +3176,14 @@ fn generatedReadJoinItemIsValid(
         if (!std.meta.eql(item.left_tokens, join_items[index - 1].tokens)) return false;
     }
     if (item.tokens.start != source_tokens.start) return false;
-    if (item.left_tokens.end != item.operator_tokens.start) return false;
+    if (!generatedReadJoinRelationGapIsOptionalAlias(tokens, item.left_tokens.end, item.operator_tokens.start)) return false;
     if (item.operator_tokens.end != item.right_tokens.start) return false;
     if (item.right_tokens.end > item.tokens.end) return false;
     if (!generatedReadJoinKindMatchesOperator(tokens, item.operator_tokens, item.kind)) return false;
 
     return switch (item.condition_kind) {
-        .none => item.condition_tokens.start == item.right_tokens.end and
-            item.condition_tokens.end == item.right_tokens.end and
+        .none => generatedReadJoinRelationGapIsOptionalAlias(tokens, item.right_tokens.end, item.condition_tokens.start) and
+            item.condition_tokens.end == item.condition_tokens.start and
             (item.kind == .cross or item.kind == .natural) and
             item.predicate_tokens == null and
             item.predicate_expression.tokens == null and
@@ -3192,7 +3192,7 @@ fn generatedReadJoinItemIsValid(
             item.using_columns.count == 0,
         .on => blk: {
             if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.condition_tokens)) break :blk false;
-            if (item.condition_tokens.start != item.right_tokens.end or item.condition_tokens.end != item.tokens.end) break :blk false;
+            if (!generatedReadJoinRelationGapIsOptionalAlias(tokens, item.right_tokens.end, item.condition_tokens.start) or item.condition_tokens.end != item.tokens.end) break :blk false;
             if (item.condition_tokens.start >= tokens.len or !tokens[item.condition_tokens.start].matchesKeywordTag(.on)) break :blk false;
             const predicate_tokens = item.predicate_tokens orelse break :blk false;
             if (!generatedReadNestedRangeIsValid(tokens, end, item.condition_tokens, predicate_tokens)) break :blk false;
@@ -3203,7 +3203,7 @@ fn generatedReadJoinItemIsValid(
         },
         .using => blk: {
             if (!generatedReadNestedRangeIsValid(tokens, end, item.tokens, item.condition_tokens)) break :blk false;
-            if (item.condition_tokens.start != item.right_tokens.end or item.condition_tokens.end != item.tokens.end) break :blk false;
+            if (!generatedReadJoinRelationGapIsOptionalAlias(tokens, item.right_tokens.end, item.condition_tokens.start) or item.condition_tokens.end != item.tokens.end) break :blk false;
             if (item.condition_tokens.start >= tokens.len or !tokens[item.condition_tokens.start].matchesKeywordTag(.using)) break :blk false;
             if (!std.meta.eql(item.using_tokens orelse break :blk false, item.condition_tokens)) break :blk false;
             const column_tokens = item.using_column_tokens orelse break :blk false;
@@ -3213,6 +3213,18 @@ fn generatedReadJoinItemIsValid(
             break :blk true;
         },
     };
+}
+
+fn generatedReadJoinRelationGapIsOptionalAlias(tokens: []const Token, relation_end: usize, next_start: usize) bool {
+    if (relation_end == next_start) return true;
+    if (relation_end >= next_start or next_start > tokens.len) return false;
+    if (relation_end + 1 == next_start) {
+        return tokens[relation_end].kind == .identifier;
+    }
+    if (relation_end + 2 == next_start) {
+        return tokens[relation_end].matchesKeywordTag(.as) and tokens[relation_end + 1].kind == .identifier;
+    }
+    return false;
 }
 
 fn generatedReadJoinUsingColumnListIsValid(
@@ -4181,7 +4193,7 @@ fn generatedCteReadStatementKind(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) ?classifier.SqlReadStatementKind {
-    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return null;
+    if (read_ast.projection_tokens == null) return null;
     if (read_ast.cte_recursive) return .recursive_cte;
     return generatedReadStatementKindFromStructuredClauses(tokens, read_ast);
 }
@@ -8328,6 +8340,18 @@ test "sql adapter parsed sql read statement kind can come from generated AST" {
     generated_cte_aggregate.tokenized_sql.read_statement_kind = null;
     generated_cte_aggregate.statement = parseStatement(generated_cte_aggregate.raw_statement, generated_cte_aggregate.generated_statement, &generated_cte_aggregate.tokenized_sql);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, generated_cte_aggregate.readStatementKind().?);
+
+    var generated_cte_without_final_source = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT 1");
+    defer generated_cte_without_final_source.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_without_final_source.generatedStatementKind().?);
+
+    generated_cte_without_final_source.tokenized_sql.read_statement_kind = null;
+    generated_cte_without_final_source.statement = parseStatement(
+        generated_cte_without_final_source.raw_statement,
+        generated_cte_without_final_source.generated_statement,
+        &generated_cte_without_final_source.tokenized_sql,
+    );
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_cte_without_final_source.readStatementKind().?);
 }
 
 test "sql adapter parsed sql read statement kind is generated-owned for covered reads" {

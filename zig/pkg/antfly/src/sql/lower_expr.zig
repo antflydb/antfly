@@ -10007,10 +10007,12 @@ pub fn parseArithmeticExpressionProjectionFromFieldAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
+    expression_start: usize,
     lhs_field: []const u8,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     type_context: RowExpressionTypeContext,
     hooks: ArithmeticExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !db_mod.types.RelationalRowsExpressionProjection {
     var current: db_mod.types.RelationalRowsExpression = .{
         .kind = .field,
@@ -10023,6 +10025,7 @@ pub fn parseArithmeticExpressionProjectionFromFieldAlloc(
     current_owned = false;
     current = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, current, 0, type_context, hooks);
     current_owned = true;
+    try validateGeneratedRowExpressionIdentity(tokens, expression_start, pos.*, current, generated_expression_ast);
     try type_context.validateNumericRowExpression(current);
 
     const default_output = switch (current.kind) {
@@ -24186,6 +24189,7 @@ pub const SelectFieldItemParserOptions = struct {
     type_context: RowExpressionTypeContext,
     arithmetic_hooks: ArithmeticExpressionParserHooks,
     boolean_hooks: BooleanExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const SelectItemParserOptions = struct {
@@ -24943,6 +24947,8 @@ pub fn parseSelectItemAlloc(
         }
     }
 
+    var select_field_options = options.select_field;
+    select_field_options.generated_expression_ast = options.generated_expression_ast;
     return try parseSelectFieldItemAlloc(
         alloc,
         tokens,
@@ -24953,7 +24959,7 @@ pub fn parseSelectItemAlloc(
         returning_expression_qualifiers,
         defer_row_expression_field_validation,
         field_source,
-        options.select_field,
+        select_field_options,
     );
 }
 
@@ -24969,6 +24975,7 @@ pub fn parseSelectFieldItemAlloc(
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     options: SelectFieldItemParserOptions,
 ) !plan_mod.SelectItem {
+    const expression_start = pos.*;
     const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     defer alloc.free(parsed_field);
     const field = try binder.normalizeRowExpressionFieldAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
@@ -25034,7 +25041,7 @@ pub fn parseSelectFieldItemAlloc(
     if (peekArithmeticOperator(tokens, pos.*)) |_| {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         field_owned = false;
-        return .{ .expression = try parseArithmeticExpressionProjectionFromFieldAlloc(alloc, tokens, pos, field, field_source, options.type_context, options.arithmetic_hooks) };
+        return .{ .expression = try parseArithmeticExpressionProjectionFromFieldAlloc(alloc, tokens, pos, expression_start, field, field_source, options.type_context, options.arithmetic_hooks, options.generated_expression_ast) };
     }
     if (peekBooleanOperator(tokens, pos.*)) |_| {
         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
