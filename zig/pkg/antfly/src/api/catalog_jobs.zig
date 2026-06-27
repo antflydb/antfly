@@ -357,6 +357,21 @@ fn appendTableEmptyingAffectedRecord(
     return true;
 }
 
+fn cloneSortedTableEmptyingAffectedTableIdsAlloc(
+    alloc: std.mem.Allocator,
+    affected_table_ids: []const u64,
+) ![]u64 {
+    if (affected_table_ids.len == 0) return error.InvalidArgument;
+    const out = try alloc.dupe(u64, affected_table_ids);
+    errdefer alloc.free(out);
+    std.mem.sort(u64, out, {}, comptime std.sort.asc(u64));
+    for (out, 0..) |table_id, i| {
+        if (table_id == 0) return error.InvalidArgument;
+        if (i > 0 and out[i - 1] == table_id) return error.InvalidArgument;
+    }
+    return out;
+}
+
 fn appendTableEmptyingTargetWithSession(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -483,14 +498,17 @@ pub fn scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
         try appendTableEmptyingCascadeTargets(alloc, &snapshot, &affected_table_ids, &affected_tables);
     }
 
-    const barrier_id = try tableEmptyingBarrierIdForSnapshot(&snapshot, affected_table_ids.items, restart_identity, cascade);
+    const canonical_affected_table_ids = try cloneSortedTableEmptyingAffectedTableIdsAlloc(alloc, affected_table_ids.items);
+    defer alloc.free(canonical_affected_table_ids);
+
+    const barrier_id = try tableEmptyingBarrierIdForSnapshot(&snapshot, canonical_affected_table_ids, restart_identity, cascade);
     var scheduled_jobs: usize = 0;
     for (affected_tables.items) |table| {
         scheduled_jobs += try scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
             svc,
             snapshot.ranges,
             table.*,
-            affected_table_ids.items,
+            canonical_affected_table_ids,
             restart_identity,
             cascade,
             barrier_id,
@@ -1404,6 +1422,30 @@ test "catalog jobs admits session qualified table emptying barrier with cascade"
     }
     try std.testing.expect(saw_tenant_parent);
     try std.testing.expect(saw_tenant_child);
+
+    var ordered_service = FakeService{};
+    defer ordered_service.deinit(alloc);
+    var ordered_admission = try scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
+        alloc,
+        &ordered_service,
+        "orders",
+        &.{"customers"},
+        false,
+        false,
+        .{ .search_path = search_path[0..] },
+    );
+    defer ordered_admission.applied.deinit(alloc);
+    defer ordered_admission.deinitAffectedTables(alloc);
+
+    try std.testing.expectEqual(@as(u64, 3), ordered_admission.applied.table.table_id);
+    try std.testing.expectEqual(@as(usize, 2), ordered_admission.scheduled_jobs);
+    try std.testing.expectEqual(@as(usize, 2), ordered_service.jobs.items.len);
+    for (ordered_service.jobs.items) |job| {
+        try std.testing.expect(!job.cascade);
+        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
+        try std.testing.expectEqual(@as(u64, 2), job.affected_table_ids[0]);
+        try std.testing.expectEqual(@as(u64, 3), job.affected_table_ids[1]);
+    }
 }
 
 test "catalog jobs table emptying barrier waits for every affected table range" {

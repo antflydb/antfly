@@ -2368,11 +2368,78 @@ fn parseGeneratedDmlTargetAliasAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     target_range: generated_parser.GeneratedSqlTokenRange,
-    end: usize,
+    target_alias_end: usize,
 ) !plan_mod.TableAlias {
-    if (target_range.start >= target_range.end or target_range.end > end or end > tokens.len) return error.UnsupportedSqlShape;
+    if (target_range.start >= target_range.end or target_range.end > target_alias_end or target_alias_end > tokens.len) return error.UnsupportedSqlShape;
     var pos: usize = 0;
-    return try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens[target_range.start..end], &pos);
+    const target_tokens = tokens[target_range.start..target_alias_end];
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, target_tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (pos != target_tokens.len) return error.UnsupportedSqlShape;
+    return target_table;
+}
+
+fn generatedDmlTargetAliasRangeValid(
+    tokens: []const Token,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    target_alias_end: usize,
+) bool {
+    if (target_range.start >= target_range.end or target_range.end > target_alias_end or target_alias_end > tokens.len) return false;
+    if (target_alias_end == target_range.end) return true;
+    if (target_alias_end == target_range.end + 2 and
+        tokens[target_range.end].matchesKeywordTag(.as) and
+        tokens[target_range.end + 1].kind == .identifier)
+    {
+        return true;
+    }
+    return target_alias_end == target_range.end + 1 and
+        tokens[target_range.end].kind == .identifier and
+        !plan_mod.nextIsDmlTargetTailKeyword(tokens, target_range.end);
+}
+
+fn validateGeneratedDmlTargetAliasRange(
+    tokens: []const Token,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    target_alias_end: usize,
+) !void {
+    if (!generatedDmlTargetAliasRangeValid(tokens, target_range, target_alias_end)) return error.UnsupportedSqlShape;
+}
+
+fn generatedUpdateTargetAliasEnd(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !usize {
+    const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
+    if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+    const target_alias_end = assignments_range.start - 1;
+    try validateGeneratedDmlTargetAliasRange(tokens, target_range, target_alias_end);
+    return target_alias_end;
+}
+
+fn generatedDeleteTargetAliasEnd(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    target_range: generated_parser.GeneratedSqlTokenRange,
+    end: usize,
+) !usize {
+    const target_alias_end = if (ast.source_tokens) |source_range| blk: {
+        if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+        break :blk source_range.start - 1;
+    } else if (ast.where_tokens) |where_range| blk: {
+        if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+        break :blk where_range.start - 1;
+    } else if (ast.returning_tokens) |returning_range| blk: {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        break :blk returning_range.start - 1;
+    } else end;
+    try validateGeneratedDmlTargetAliasRange(tokens, target_range, target_alias_end);
+    return target_alias_end;
 }
 
 fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
@@ -2389,7 +2456,8 @@ fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
     const start = try generatedDmlCommandStart(tokens, ast, end);
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, end);
+    const target_alias_end = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
+    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, target_alias_end);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
     const where_range = ast.where_tokens orelse return .source;
@@ -2420,7 +2488,8 @@ fn classifyGeneratedDeleteSelectorFromDmlAstAlloc(
     const start = try generatedDmlCommandStart(tokens, ast, end);
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, end);
+    const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
+    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, target_alias_end);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
     const where_range = ast.where_tokens orelse return .source;
@@ -13567,7 +13636,8 @@ fn validateGeneratedUpdateSourceRanges(
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 3 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
-    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    _ = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
@@ -13583,7 +13653,8 @@ fn validateGeneratedDeleteSourceRanges(
     if (start + 2 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    try validateGeneratedDmlTailRanges(tokens, end, target_range.end, ast.where_tokens, ast.returning_tokens);
+    const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
+    try validateGeneratedDmlTailRanges(tokens, end, target_alias_end, ast.where_tokens, ast.returning_tokens);
 }
 
 fn validateGeneratedDmlTailRanges(
@@ -13712,7 +13783,8 @@ fn validateGeneratedUpdateJoinedRanges(
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 7 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
-    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    _ = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
@@ -13735,14 +13807,15 @@ fn validateGeneratedDeleteJoinedRanges(
     if (start + 6 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
     if (ast.source_tokens) |source_range| {
         if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
-        if (source_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
+        if (source_range.start - 1 != target_alias_end) return error.UnsupportedSqlShape;
         try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
     } else {
         const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
-        if (where_range.start == 0 or where_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
+        if (where_range.start == 0 or where_range.start - 1 != target_alias_end) return error.UnsupportedSqlShape;
         try validateGeneratedJoinedTailRanges(tokens, end, where_range.start - 1, ast.where_tokens, ast.returning_tokens);
     }
 }
@@ -13837,6 +13910,7 @@ fn updatePointFromGeneratedDmlAstAlloc(
     if (start + 5 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    _ = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
@@ -13994,6 +14068,7 @@ fn deletePointFromGeneratedDmlAstAlloc(
     if (start + 4 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
+    _ = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
@@ -15091,6 +15166,38 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
             try std.testing.expectEqual(@as(usize, 1), delete.batch.returning_rows.len);
         },
         else => return error.TestUnexpectedResult,
+    }
+
+    {
+        const update_tokens = parsed_generated_update.items();
+        const update_end = generatedDmlStatementEnd(update_tokens, generated_update_ast.statement_span) orelse return error.TestUnexpectedResult;
+        const update_start = try generatedDmlCommandStart(update_tokens, generated_update_ast, update_end);
+        const update_target_start = try generatedUpdateTargetTableStart(update_tokens, update_start, update_end);
+        const update_target_range = try requireGeneratedDmlTokenRangeAt(generated_update_ast.target_table_tokens, update_target_start, update_end);
+        const update_target_alias_end = try generatedUpdateTargetAliasEnd(update_tokens, generated_update_ast, update_target_range, update_end);
+        const update_target = try parseGeneratedDmlTargetAliasAlloc(alloc, update_tokens, update_target_range, update_target_alias_end);
+        defer plan_mod.freeTableAlias(alloc, update_target);
+        try std.testing.expectEqualStrings("usage_records", update_target.name);
+        try std.testing.expectEqualStrings("usage_records", update_target.alias);
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            parseGeneratedDmlTargetAliasAlloc(alloc, update_tokens, update_target_range, update_target_alias_end + 1),
+        );
+
+        const delete_tokens = parsed_generated_delete.items();
+        const delete_end = generatedDmlStatementEnd(delete_tokens, generated_delete_ast.statement_span) orelse return error.TestUnexpectedResult;
+        const delete_start = try generatedDmlCommandStart(delete_tokens, generated_delete_ast, delete_end);
+        const delete_target_start = try generatedDeleteTargetTableStart(delete_tokens, delete_start, delete_end);
+        const delete_target_range = try requireGeneratedDmlTokenRangeAt(generated_delete_ast.target_table_tokens, delete_target_start, delete_end);
+        const delete_target_alias_end = try generatedDeleteTargetAliasEnd(delete_tokens, generated_delete_ast, delete_target_range, delete_end);
+        const delete_target = try parseGeneratedDmlTargetAliasAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end);
+        defer plan_mod.freeTableAlias(alloc, delete_target);
+        try std.testing.expectEqualStrings("usage_records", delete_target.name);
+        try std.testing.expectEqualStrings("usage_records", delete_target.alias);
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            parseGeneratedDmlTargetAliasAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end + 1),
+        );
     }
 
     var parsed_generated_source_update = try tokenized.ParsedSql.initAlloc(

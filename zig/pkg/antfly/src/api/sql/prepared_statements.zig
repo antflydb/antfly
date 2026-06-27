@@ -90,6 +90,18 @@ pub const Runtime = struct {
         return (try self.executeRecord(session_id, plan)).statement_kind;
     }
 
+    pub fn planAllowedInReadOnly(
+        self: *@This(),
+        session_id: u64,
+        plan: sql_adapter.PreparedStatementPlan,
+    ) !bool {
+        return switch (plan) {
+            .prepare => |prepare_plan| prepare_plan.statement_kind == .read,
+            .deallocate => true,
+            .execute => |execute_plan| (try self.statementKindForExecute(session_id, execute_plan)) == .read,
+        };
+    }
+
     pub fn executableForExecute(
         self: *@This(),
         session_id: u64,
@@ -201,6 +213,7 @@ test "sql prepared statement runtime stores session scoped plans" {
         .argument_count = args.len,
         .arguments = &args,
     };
+    try std.testing.expect(try runtime.planAllowedInReadOnly(session_a, .{ .execute = execute_read }));
     const executable = try runtime.executableForExecute(session_a, execute_read);
     try std.testing.expectEqual(sql_adapter.PreparedStatementSubjectKind.read, executable.statement_kind);
     try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, executable.statement_family);
@@ -230,6 +243,12 @@ test "sql prepared statement runtime stores session scoped plans" {
         .statement_family = .insert,
         .subject_sql = "INSERT INTO usage_records(id, status) VALUES ($1, 'prepared');",
     } }, session_a);
+    const write_args = [_]sql_adapter.SqlValue{.{ .string = "open" }};
+    try std.testing.expect(!try runtime.planAllowedInReadOnly(session_a, .{ .execute = .{
+        .statement_name = "write_plan",
+        .argument_count = write_args.len,
+        .arguments = &write_args,
+    } }));
     try std.testing.expectEqual(@as(usize, 2), runtime.statementCountForTest(session_a));
     try runtime.apply(.{ .deallocate = .{ .all = true } }, session_a);
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(session_a));

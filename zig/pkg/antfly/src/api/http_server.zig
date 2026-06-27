@@ -4765,16 +4765,8 @@ pub const ApiHttpServer = struct {
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         if (try self.publicSqlReadOnlyActive(session)) {
-            const allowed = switch (plan) {
-                .prepare => |prepare| prepare.statement_kind == .read,
-                .deallocate => true,
-                .execute => |execute_plan| blk: {
-                    const session_id = session.notification_session_id;
-                    if (session_id == 0) return error.PreparedStatementNotFound;
-                    break :blk (try self.sql_prepared_statement_runtime.statementKindForExecute(session_id, execute_plan)) == .read;
-                },
-            };
-            if (!allowed) return error.SqlReadOnlyTransaction;
+            const session_id = session.notification_session_id;
+            if (!try self.sql_prepared_statement_runtime.planAllowedInReadOnly(session_id, plan)) return error.SqlReadOnlyTransaction;
         }
         const session_id = self.ensureSqlProtocolSessionId(session);
         try self.sql_prepared_statement_runtime.apply(plan, session_id);
@@ -4792,11 +4784,7 @@ pub const ApiHttpServer = struct {
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         if (try self.publicSqlReadOnlyActive(session)) {
-            const allowed = switch (plan) {
-                .listen, .unlisten => true,
-                .notify => false,
-            };
-            if (!allowed) return error.SqlReadOnlyTransaction;
+            if (!self.sql_notification_runtime.planAllowedInReadOnly(plan)) return error.SqlReadOnlyTransaction;
         }
         const session_id = self.ensureSqlNotificationSessionId(session);
         _ = try self.sql_notification_runtime.apply(plan, session_id, sqlDdlTimestampNs());

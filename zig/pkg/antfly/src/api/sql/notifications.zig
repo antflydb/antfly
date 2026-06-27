@@ -101,6 +101,13 @@ pub const Runtime = struct {
         };
     }
 
+    pub fn planAllowedInReadOnly(_: *@This(), plan: sql_adapter.NotificationChannelPlan) bool {
+        return switch (plan) {
+            .listen, .unlisten => true,
+            .notify => false,
+        };
+    }
+
     pub fn clearSession(self: *@This(), session_id: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -249,6 +256,12 @@ test "sql notification runtime records subscriptions and delivered events" {
 
     const session_a = runtime.allocateSessionId();
     const session_b = runtime.allocateSessionId();
+    try std.testing.expect(runtime.planAllowedInReadOnly(.{ .listen = .{ .channel_name = "usage_events" } }));
+    try std.testing.expect(runtime.planAllowedInReadOnly(.{ .unlisten = .{ .channel_name = "usage_events" } }));
+    try std.testing.expect(!runtime.planAllowedInReadOnly(.{ .notify = .{
+        .channel_name = "usage_events",
+        .payload_json = "\"updated\"",
+    } }));
     _ = try runtime.apply(.{ .listen = .{ .channel_name = "usage_events" } }, session_a, 10);
     _ = try runtime.apply(.{ .listen = .{ .channel_name = "usage_events" } }, session_b, 11);
     _ = try runtime.apply(.{ .listen = .{ .channel_name = "usage_events" } }, session_b, 12);

@@ -407,7 +407,12 @@ including `INSERT ... ON CONFLICT ... DO` tails and `MERGE` action bodies, now
 fail closed through the generated parser instead of falling back to the legacy
 write classifier. Generated-covered DML now also derives the parsed write
 family from the retained generated DML AST instead of re-entering the
-hand-written write classifier. The generated AST distinguishes direct
+hand-written write classifier. Generated UPDATE/DELETE target alias handling
+now validates the exact generated span between the retained target table token
+and the following generated clause boundary before typed selector or mutation
+lowering can reuse legacy target parsing, so aliases remain supported without
+letting target parsing drift into `SET`, `WHERE`, `USING`, or `RETURNING`
+tokens. The generated AST distinguishes direct
 `INSERT ... VALUES`, `INSERT ... SELECT`, joined `UPDATE ... FROM`/semijoin
 updates, source-tail updates, joined `DELETE ... USING`/semijoin deletes,
 source-tail deletes, `TRUNCATE`, and `MERGE` write families; point-vs-source
