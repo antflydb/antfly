@@ -26292,6 +26292,7 @@ fn validateGeneratedSingleOperatorPredicateExpression(
         return error.UnsupportedSqlShape;
     }
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
 }
 
@@ -26392,6 +26393,20 @@ fn validateGeneratedRegexPredicateExpression(
         else => return error.UnsupportedSqlShape,
     };
     if (tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
+    if (expression.negation_tokens != null or
+        expression.quantifier_tokens != null or
+        expression.between_modifier_tokens != null or
+        expression.between_modifier != null or
+        expression.escape_tokens != null or
+        expression.escape_expression_kind != null or
+        expression.escape_expression != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
 }
 
 fn generatedRegexPredicateKind(
@@ -33539,6 +33554,22 @@ fn clearGeneratedReadWhereQuantifierRange(parsed_sql: *tokenized.ParsedSql) !voi
     return error.TestUnexpectedResult;
 }
 
+fn clearGeneratedReadWhereRightRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.where_expression.right_tokens == null) return error.TestUnexpectedResult;
+                    read.where_expression.right_tokens = null;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn setGeneratedReadWhereExpressionKind(
     parsed_sql: *tokenized.ParsedSql,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -36696,6 +36727,51 @@ test "sql adapter lower expr lowers text pattern predicates" {
     try std.testing.expectEqual(@as(usize, 1), parameterized_escape.plan.query.text_patterns.len);
     try std.testing.expectEqualStrings("A\\%%", parameterized_escape.plan.query.text_patterns[0].pattern);
     try std.testing.expect(parameterized_escape.plan.query.text_patterns[0].case_insensitive);
+
+    var regex_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(name) ~* $1 ORDER BY id",
+        schema,
+        &.{.{ .string = "ada.*" }},
+    );
+    defer regex_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), regex_lowered.plan.query.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), regex_lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_match, regex_lowered.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 3), regex_lowered.plan.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, regex_lowered.plan.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("name", regex_lowered.plan.query.expression_predicates[0].lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"ada.*\"", regex_lowered.plan.query.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", regex_lowered.plan.query.expression_predicates[0].lhs.operands[2].value_json);
+    try std.testing.expectEqualStrings("true", regex_lowered.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var malformed_regex_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(name) ~* $1 ORDER BY id",
+    );
+    defer malformed_regex_kind.deinit(alloc);
+    try setGeneratedReadWhereExpressionKind(&malformed_regex_kind, .regex_match);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_regex_kind,
+        schema,
+        &.{.{ .string = "ada.*" }},
+        .{},
+    ));
+
+    var malformed_regex_right_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(name) ~* $1 ORDER BY id",
+    );
+    defer malformed_regex_right_range.deinit(alloc);
+    try clearGeneratedReadWhereRightRange(&malformed_regex_right_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_regex_right_range,
+        schema,
+        &.{.{ .string = "ada.*" }},
+        .{},
+    ));
 
     var pattern_any = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -40143,8 +40219,19 @@ test "sql adapter lower expr detects catalog expression references" {
     const regex_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .regex_not_imatch,
         .operator_tokens = .{ .start = 0, .end = 1 },
+        .right_tokens = .{ .start = 1, .end = 2 },
     };
-    try validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, true, true);
+    const regex_expression_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .regex_not_imatch, .text = "!~*" },
+        .{ .kind = .string, .text = "closed.*" },
+    };
+    const ranged_regex_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .regex_not_imatch,
+        .operator_tokens = .{ .start = 1, .end = 2 },
+        .right_tokens = .{ .start = 2, .end = 3 },
+    };
+    try validateGeneratedRegexPredicateExpression(&ranged_regex_expression, &regex_expression_tokens, 1, true, true);
     const stale_regex_tokens = [_]Token{.{ .kind = .regex_match, .text = "~" }};
     try std.testing.expectError(
         error.UnsupportedSqlShape,
@@ -40153,6 +40240,14 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, false, false),
+    );
+    const regex_expression_without_right = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .regex_not_imatch,
+        .operator_tokens = .{ .start = 0, .end = 1 },
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedRegexPredicateExpression(&regex_expression_without_right, &regex_tokens, 0, true, true),
     );
     const in_tokens = [_]Token{
         .{ .kind = .identifier, .text = "status" },

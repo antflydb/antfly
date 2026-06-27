@@ -5543,9 +5543,10 @@ pub const ApiHttpServer = struct {
 
     fn publicSqlReadUnsupportedRowClaimDiagnostic(
         lowered: *const sql_adapter.LoweredReadPlan,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
     ) ?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
         const missing_native_model = publicSqlReadPlanRowClaimMissingNativeModel(lowered) orelse return null;
-        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .unsupported_sql_statement).withMissingNativeModel(missing_native_model);
     }
 
     fn applyLoweredPublicSqlMutationSource(
@@ -6265,6 +6266,9 @@ pub const ApiHttpServer = struct {
             }
         };
         defer lowered.deinit(self.alloc);
+        if (publicSqlReadUnsupportedRowClaimDiagnostic(&lowered, .plan)) |diagnostic| {
+            return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+        }
         self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
@@ -6298,7 +6302,7 @@ pub const ApiHttpServer = struct {
             switch (err) {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.UnsupportedQueryRequest => {
-                    if (publicSqlReadUnsupportedRowClaimDiagnostic(&lowered)) |diagnostic| {
+                    if (publicSqlReadUnsupportedRowClaimDiagnostic(&lowered, .execute)) |diagnostic| {
                         return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
                     }
                     return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) };
@@ -29403,7 +29407,7 @@ test "api http server executes SQL reads through typed row plan ingress" {
     });
     defer aggregate_claim_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), aggregate_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, aggregate_claim_resp.body, "execute", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticBody(alloc, aggregate_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, aggregate_claim_resp.body, "lockable base-row source for aggregate row claim");
 
     var join_claim_resp = try server.handle(.{
@@ -29414,8 +29418,30 @@ test "api http server executes SQL reads through typed row plan ingress" {
     });
     defer join_claim_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), join_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, join_claim_resp.body, "execute", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticBody(alloc, join_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, join_claim_resp.body, "lockable base-row source for join row claim");
+
+    var window_claim_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, row_number() OVER (ORDER BY amount) AS rn FROM usage_records FOR UPDATE;\"}",
+    });
+    defer window_claim_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), window_claim_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, window_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, window_claim_resp.body, "lockable base-row source for window row claim");
+
+    var cte_claim_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"WITH locked_usage AS (SELECT id FROM usage_records FOR UPDATE) SELECT id FROM locked_usage;\"}",
+    });
+    defer cte_claim_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), cte_claim_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, cte_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
+    try expectPublicSqlDiagnosticMissingNativeModel(alloc, cte_claim_resp.body, "lockable base-row source for materialized CTE row claim");
 }
 
 test "api http server executes document SQL reads through typed document plan ingress" {
