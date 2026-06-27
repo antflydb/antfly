@@ -2222,8 +2222,7 @@ fn appendExistingCreateTargetIfPresentAlloc(
 }
 
 fn foreignKeyReferencesSelf(child_table_name: []const u8, foreign_key: runtime_schema.ForeignKey) bool {
-    return std.mem.eql(u8, foreign_key.parent_table, child_table_name) or
-        std.mem.eql(u8, foreign_key.parent_table, "row");
+    return std.mem.eql(u8, foreign_key.parent_table, child_table_name);
 }
 
 fn appendBoundCatalogObjectsForForeignKeysAlloc(
@@ -3635,6 +3634,15 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqual(@as(u64, 1), create_fk_ddl.bound_objects[0].table_id);
     try std.testing.expectEqual(usage_schema_generation, create_fk_ddl.bound_objects[0].schema_generation);
 
+    var parsed_create_self_fk_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TABLE usage_tree (id text PRIMARY KEY, parent_id text REFERENCES usage_tree(id))",
+    );
+    defer parsed_create_self_fk_table.deinit(alloc);
+    var bound_create_self_fk_table = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_create_self_fk_table, catalog.iface());
+    defer bound_create_self_fk_table.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), (try bound_create_self_fk_table.ddlCatalog()).bound_objects.len);
+
     var parsed_missing_create_fk_table = try tokenized.ParsedSql.initAlloc(
         alloc,
         "CREATE TABLE bad_usage_events (id text PRIMARY KEY, usage_id text REFERENCES missing_usage_records(id))",
@@ -3669,6 +3677,18 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqual(@as(usize, 2), alter_add_column_fk_ddl.bound_objects.len);
     try std.testing.expectEqualStrings("incoming_usage", alter_add_column_fk_ddl.bound_objects[0].target.table_name);
     try std.testing.expectEqualStrings("usage_records", alter_add_column_fk_ddl.bound_objects[1].target.table_name);
+
+    var parsed_alter_add_self_fk = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE incoming_usage ADD CONSTRAINT incoming_usage_parent_fkey FOREIGN KEY (source) REFERENCES incoming_usage(id)",
+    );
+    defer parsed_alter_add_self_fk.deinit(alloc);
+    var bound_alter_add_self_fk = try bindDdlStatementWithCatalogAlloc(alloc, &parsed_alter_add_self_fk, catalog.iface());
+    defer bound_alter_add_self_fk.deinit(alloc);
+    const alter_add_self_fk_ddl = try bound_alter_add_self_fk.ddlCatalog();
+    try std.testing.expectEqual(@as(usize, 1), alter_add_self_fk_ddl.bound_objects.len);
+    try std.testing.expectEqual(BoundCatalogObjectRole.target, alter_add_self_fk_ddl.bound_objects[0].role);
+    try std.testing.expectEqualStrings("incoming_usage", alter_add_self_fk_ddl.bound_objects[0].target.table_name);
 
     try std.testing.expectError(error.UnsupportedSqlShape, bindReadPlanCatalogStatementAlloc(alloc, &parsed_write, catalog.iface()));
     try std.testing.expectError(error.UnsupportedSqlShape, bindWritePlanCatalogStatementAlloc(alloc, &parsed_read, .{}, catalog.iface()));
