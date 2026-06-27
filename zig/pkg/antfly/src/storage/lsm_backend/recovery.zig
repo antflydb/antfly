@@ -92,6 +92,16 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     errdefer cleanup(BackendType, backend, false);
     errdefer finishOpenFailure(BackendType, backend);
 
+    if (@hasDecl(BackendType, "acquireRootLockState")) {
+        try backend.acquireRootLockState(options.create_if_missing);
+    }
+    if (@hasDecl(BackendType, "acquireRootWriterLock")) {
+        try backend.acquireRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "prepareWalOperationLockFile")) {
+        try backend.prepareWalOperationLockFile();
+    }
+
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
         defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
@@ -257,6 +267,15 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "manifest_backing")) {
         if (backend.manifest_backing) |raw| backend.allocator.free(raw);
+    }
+    if (@hasDecl(BackendType, "releaseRootWriterLock")) {
+        backend.releaseRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "closeWalOperationLockFile")) {
+        backend.closeWalOperationLockFile();
+    }
+    if (@hasDecl(BackendType, "releaseRootLockState")) {
+        backend.releaseRootLockState();
     }
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {

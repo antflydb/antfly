@@ -2922,6 +2922,7 @@ pub const DB = struct {
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                 opts.external_derived_checkpoints,
+                openModeRequiresReadOnlyBackends(opts.open_mode),
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -39439,6 +39440,49 @@ test "db query_readonly lsm primary opens physical backend read-only" {
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,
     }));
+}
+
+test "db read-only open modes can share lsm root with live writer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var writer = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try writer.sync(true);
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .query_readonly,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.TestUnexpectedResult;
+        defer result.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    }
+
+    {
+        var status = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .status_only,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer status.close();
+    }
 }
 
 test "db query_readonly lmdb primary does not create missing database" {

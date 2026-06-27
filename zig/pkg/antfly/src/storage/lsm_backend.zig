@@ -268,6 +268,85 @@ pub const BackendHandleConfig = struct {
     internal_flush_worker: bool = false,
 };
 const max_local_cached_run_blocks: usize = 64;
+const root_writer_lock_file_name = "writer.lock";
+const wal_operation_lock_file_name = "wal.lock";
+
+const RootLockState = struct {
+    key: []u8,
+    io_impl: std.Io.Threaded,
+    ref_count: usize = 1,
+    writer_open: bool = false,
+    wal_rwlock: std.Io.RwLock = .init,
+};
+
+var root_lock_registry_mutex: std.atomic.Mutex = .unlocked;
+var root_lock_registry: std.StringHashMapUnmanaged(*RootLockState) = .empty;
+
+fn retainRootLockState(root_identity: []const u8) !*RootLockState {
+    lockWorkerMutex(&root_lock_registry_mutex);
+    defer root_lock_registry_mutex.unlock();
+
+    if (root_lock_registry.get(root_identity)) |state| {
+        state.ref_count += 1;
+        return state;
+    }
+
+    const key = try std.heap.page_allocator.dupe(u8, root_identity);
+    errdefer std.heap.page_allocator.free(key);
+    const state = try std.heap.page_allocator.create(RootLockState);
+    errdefer std.heap.page_allocator.destroy(state);
+    state.* = .{
+        .key = key,
+        .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
+    };
+    errdefer state.io_impl.deinit();
+    try root_lock_registry.put(std.heap.page_allocator, state.key, state);
+    return state;
+}
+
+fn releaseProcessRootLockState(state: *RootLockState) void {
+    lockWorkerMutex(&root_lock_registry_mutex);
+    defer root_lock_registry_mutex.unlock();
+
+    std.debug.assert(state.ref_count > 0);
+    state.ref_count -= 1;
+    if (state.ref_count != 0) return;
+
+    std.debug.assert(!state.writer_open);
+    if (root_lock_registry.fetchRemove(state.key)) |entry| {
+        entry.value.io_impl.deinit();
+        std.heap.page_allocator.free(entry.key);
+        std.heap.page_allocator.destroy(entry.value);
+        if (root_lock_registry.count() == 0) {
+            root_lock_registry.deinit(std.heap.page_allocator);
+            root_lock_registry = .empty;
+        }
+    }
+}
+
+fn acquireProcessRootWriter(state: *RootLockState) !void {
+    lockWorkerMutex(&root_lock_registry_mutex);
+    defer root_lock_registry_mutex.unlock();
+
+    if (state.writer_open) return error.LsmRootWriterAlreadyOpen;
+    state.writer_open = true;
+}
+
+fn releaseProcessRootWriter(state: *RootLockState) void {
+    lockWorkerMutex(&root_lock_registry_mutex);
+    defer root_lock_registry_mutex.unlock();
+
+    std.debug.assert(state.writer_open);
+    state.writer_open = false;
+}
+
+fn rootLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
+    return try std.fs.path.join(allocator, &.{ root_dir, root_writer_lock_file_name });
+}
+
+fn walOperationLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
+    return try std.fs.path.join(allocator, &.{ root_dir, wal_operation_lock_file_name });
+}
 
 pub const Backend = struct {
     pub const OpenPhase = enum {
@@ -895,6 +974,10 @@ pub const Backend = struct {
     options: Options,
     root_generation: u64 = 0,
     root_dir: ?[]u8 = null,
+    root_lock_state: ?*RootLockState = null,
+    root_writer_registered: bool = false,
+    root_writer_lock: ?storage_io.NativePathLock = null,
+    wal_operation_lock_file: ?storage_io.NativePathLockFile = null,
     storage_owner: ?*storage_io.NativeStorage = null,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
@@ -1000,6 +1083,156 @@ pub const Backend = struct {
         recovery_mod.close(Backend, self);
     }
 
+    pub fn acquireRootLockState(self: *Backend, create_if_missing: bool) !void {
+        if (self.root_dir == null or self.root_lock_state != null) return;
+
+        const root_dir = self.root_dir.?;
+        if (create_if_missing) try self.storage.?.createDirPath(root_dir);
+        const identity = try self.storage.?.rootIdentityAlloc(self.allocator, root_dir);
+        defer self.allocator.free(identity);
+        self.root_lock_state = try retainRootLockState(identity);
+    }
+
+    pub fn releaseRootLockState(self: *Backend) void {
+        if (self.root_lock_state) |state| {
+            releaseProcessRootLockState(state);
+            self.root_lock_state = null;
+        }
+    }
+
+    pub fn acquireRootWriterLock(self: *Backend) !void {
+        if (self.options.backend.read_only or self.root_dir == null) return;
+        if (self.root_writer_registered) return;
+
+        const root_dir = self.root_dir.?;
+        const root_state = self.root_lock_state orelse return error.LsmRootWriterLockStateMissing;
+        try acquireProcessRootWriter(root_state);
+        errdefer releaseProcessRootWriter(root_state);
+
+        var native_lock: ?storage_io.NativePathLock = null;
+        errdefer if (native_lock) |*lock| lock.release();
+
+        if (self.storage.?.supportsNativePathLocks()) {
+            const lock_path = try rootLockPathAlloc(self.allocator, root_dir);
+            defer self.allocator.free(lock_path);
+            native_lock = storage_io.acquireNativePathLock(
+                self.allocator,
+                lock_path,
+                .exclusive,
+                .{ .nonblocking = true },
+            ) catch |err| switch (err) {
+                error.WouldBlock => return error.LsmRootWriterAlreadyOpen,
+                else => return err,
+            };
+        }
+
+        self.root_writer_registered = true;
+        self.root_writer_lock = native_lock;
+        native_lock = null;
+    }
+
+    pub fn releaseRootWriterLock(self: *Backend) void {
+        if (self.root_writer_lock) |*lock| {
+            lock.release();
+            self.root_writer_lock = null;
+        }
+        if (self.root_writer_registered) {
+            if (self.root_lock_state) |state| releaseProcessRootWriter(state);
+            self.root_writer_registered = false;
+        }
+    }
+
+    pub fn prepareWalOperationLockFile(self: *Backend) !void {
+        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+        if (self.wal_operation_lock_file != null) return;
+
+        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+        defer self.allocator.free(lock_path);
+        self.wal_operation_lock_file = try storage_io.openNativePathLockFile(self.allocator, lock_path, .{
+            // Read-only native opens may create this coordination file on
+            // legacy roots so WAL replay always contends with live appends.
+            .create_if_missing = true,
+        });
+    }
+
+    pub fn closeWalOperationLockFile(self: *Backend) void {
+        if (self.wal_operation_lock_file) |*lock_file| {
+            lock_file.close();
+            self.wal_operation_lock_file = null;
+        }
+    }
+
+    const WalOperationLock = struct {
+        backend: *Backend,
+        process_lock_mode: ?storage_io.NativePathLockMode = null,
+        native_locked: bool = false,
+
+        fn release(self: *WalOperationLock) void {
+            if (self.native_locked) {
+                self.backend.wal_operation_lock_file.?.unlock();
+                self.native_locked = false;
+            }
+            if (self.process_lock_mode) |mode| {
+                const state = self.backend.root_lock_state.?;
+                switch (mode) {
+                    .shared => state.wal_rwlock.unlockShared(state.io_impl.io()),
+                    .exclusive => state.wal_rwlock.unlock(state.io_impl.io()),
+                }
+                self.process_lock_mode = null;
+            }
+        }
+    };
+
+    fn acquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !WalOperationLock {
+        var guard = WalOperationLock{ .backend = self };
+        if (!self.options.wal_enabled or self.root_dir == null) return guard;
+
+        if (self.root_lock_state) |state| {
+            switch (mode) {
+                .shared => state.wal_rwlock.lockSharedUncancelable(state.io_impl.io()),
+                .exclusive => state.wal_rwlock.lockUncancelable(state.io_impl.io()),
+            }
+            guard.process_lock_mode = mode;
+        }
+        errdefer guard.release();
+
+        if (self.storage.?.supportsNativePathLocks()) {
+            if (self.wal_operation_lock_file == null) try self.prepareWalOperationLockFile();
+            if (self.wal_operation_lock_file) |*lock_file| {
+                try lock_file.lock(mode);
+                guard.native_locked = true;
+            }
+        }
+        return guard;
+    }
+
+    fn tryAcquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !?WalOperationLock {
+        var guard = WalOperationLock{ .backend = self };
+        if (!self.options.wal_enabled or self.root_dir == null) return guard;
+
+        if (self.root_lock_state) |state| {
+            const process_locked = switch (mode) {
+                .shared => state.wal_rwlock.tryLockShared(state.io_impl.io()),
+                .exclusive => state.wal_rwlock.tryLock(state.io_impl.io()),
+            };
+            if (!process_locked) return null;
+            guard.process_lock_mode = mode;
+        }
+        errdefer guard.release();
+
+        if (self.storage.?.supportsNativePathLocks()) {
+            if (self.wal_operation_lock_file == null) try self.prepareWalOperationLockFile();
+            if (self.wal_operation_lock_file) |*lock_file| {
+                if (!try lock_file.tryLock(mode)) {
+                    guard.release();
+                    return null;
+                }
+                guard.native_locked = true;
+            }
+        }
+        return guard;
+    }
+
     fn resolveBackgroundExecutor(configured: ?*const BackgroundExecutor) BackgroundExecutor {
         return if (configured) |executor| executor.* else BackgroundExecutor.initInline(0);
     }
@@ -1017,6 +1250,8 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         if (!self.options.backend.read_only and self.options.wal_enabled) {
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
             try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
             return;
         }
@@ -1773,6 +2008,8 @@ pub const Backend = struct {
         }
         const oldest_active = self.oldestActiveWalSegment() orelse return;
         if (oldest_active <= 1) return;
+        var wal_lock = try self.acquireWalOperationLock(.exclusive);
+        defer wal_lock.release();
         try wal_mod.retireCoveredSegments(self.storage.?, self.allocator, self.root_dir.?, oldest_active - 1);
         self.syncTrackedWalRetentionUsageCurrentLocked();
     }
@@ -2614,6 +2851,8 @@ pub const Backend = struct {
         defer if (self.options.resource_manager) |manager| {
             manager.observeUsage(.lsm_wal_write_working_set, &wal_write_bytes, 0);
         };
+        var wal_lock = try self.acquireWalOperationLock(.exclusive);
+        defer wal_lock.release();
         const bytes = try wal_mod.appendStateWithOptions(
             self.storage.?,
             self.allocator,
@@ -2651,18 +2890,22 @@ pub const Backend = struct {
             }
         else
             null;
-        const stats = try wal_mod.replayIntoMutableWithHooksAndOptions(
-            self.storage.?,
-            self.allocator,
-            self.root_dir.?,
-            &self.mutable,
-            replay_hooks,
-            .{
-                .resource_manager = self.options.resource_manager,
-                .tracked_working_set_bytes = &self.tracked_recovery_working_set_bytes,
-                .retained_cap_bytes = self.options.recovery_scratch_retained_cap_bytes,
-            },
-        );
+        const stats = blk: {
+            var wal_lock = try self.acquireWalOperationLock(if (self.options.backend.read_only) .shared else .exclusive);
+            defer wal_lock.release();
+            break :blk try wal_mod.replayIntoMutableWithHooksAndOptions(
+                self.storage.?,
+                self.allocator,
+                self.root_dir.?,
+                &self.mutable,
+                replay_hooks,
+                .{
+                    .resource_manager = self.options.resource_manager,
+                    .tracked_working_set_bytes = &self.tracked_recovery_working_set_bytes,
+                    .retained_cap_bytes = self.options.recovery_scratch_retained_cap_bytes,
+                },
+            );
+        };
         self.recovery_replaying_wal = false;
         if (!self.options.backend.read_only and self.write_stats.manifest_writes != before_manifest_writes) {
             try self.maybeCheckpointWalAfterManifestPublish();
@@ -2743,6 +2986,8 @@ pub const Backend = struct {
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const start_ns = self.writeStatsNowNs();
+        var wal_lock = try self.acquireWalOperationLock(.exclusive);
+        defer wal_lock.release();
         try wal_mod.reset(self.storage.?, self.allocator, self.root_dir.?);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
@@ -4288,9 +4533,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 };
 
 fn lockWorkerMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    platform.sync.lockYielding(mutex);
 }
 
 pub const InternalFlushWorkerStats = InternalFlushWorker.Stats;
@@ -4731,6 +4974,28 @@ fn sleepForTest(duration_ns: u64) void {
         .INTR => continue,
         else => return,
     };
+}
+
+fn pathExistsForTest(path: []const u8) bool {
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return false,
+    };
+    return true;
+}
+
+fn writeMarkerForTest(path: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "1" });
+}
+
+fn waitForPathForTest(path: []const u8, timeout_ns: u64) !void {
+    var waited_ns: u64 = 0;
+    const poll_ns: u64 = 5 * std.time.ns_per_ms;
+    while (waited_ns < timeout_ns) : (waited_ns += poll_ns) {
+        if (pathExistsForTest(path)) return;
+        sleepForTest(poll_ns);
+    }
+    return error.TestTimedOutWaitingForPath;
 }
 
 test "lsm backend default base level target absorbs L0 pressure output" {
@@ -7185,11 +7450,11 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             const thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
 
             while (stage.load(.acquire) == 0) {
-                std.Thread.yield() catch {};
+                platform.time.yieldBriefly();
             }
             var spin: usize = 0;
             while (spin < 128) : (spin += 1) {
-                std.Thread.yield() catch {};
+                platform.time.yieldBriefly();
             }
             const blocked_stage = stage.load(.acquire);
 
@@ -11536,6 +11801,7 @@ test "lsm backend stale instance can still read after newer instance compacts an
     var stale = try Backend.open(std.testing.allocator, std.mem.span(path), .{
         .flush_threshold = 1,
         .compact_threshold_runs = 1,
+        .backend = .{ .read_only = true },
     });
     defer stale.close();
 
@@ -11563,6 +11829,209 @@ test "lsm backend stale instance can still read after newer instance compacts an
     var stale_txn = try stale_runtime.beginRead();
     defer stale_txn.abort();
     try std.testing.expectEqualStrings("A", try stale_txn.get("doc:a"));
+}
+
+test "lsm backend rejects concurrent writable opens for one native root" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "single-writer-root");
+    defer repository_mod.cleanupTmp(path);
+
+    var writer = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+        .flush_threshold = 1,
+    });
+    defer writer.close();
+
+    {
+        var runtime = try writer.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, Backend.open(std.testing.allocator, std.mem.span(path), .{}));
+
+    const root_path = std.mem.span(path);
+    const same_root_path = try std.fs.path.join(std.testing.allocator, &.{
+        std.fs.path.dirname(root_path) orelse ".",
+        ".",
+        std.fs.path.basename(root_path),
+    });
+    defer std.testing.allocator.free(same_root_path);
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, Backend.open(std.testing.allocator, same_root_path, .{}));
+
+    var reader = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+        .backend = .{
+            .read_only = true,
+            .create_if_missing = false,
+        },
+    });
+    defer reader.close();
+
+    var runtime = try reader.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var read_txn = try runtime.beginRead();
+    defer read_txn.abort();
+    try std.testing.expectEqualStrings("A", try read_txn.get("doc:a"));
+}
+
+test "lsm backend cross-process writer lock child helper" {
+    const root_dir = platform.env.getenv("ANTFLY_LSM_WRITER_LOCK_CHILD_ROOT") orelse return error.SkipZigTest;
+    const ready_path = platform.env.getenv("ANTFLY_LSM_WRITER_LOCK_CHILD_READY") orelse return error.SkipZigTest;
+    const release_path = platform.env.getenv("ANTFLY_LSM_WRITER_LOCK_CHILD_RELEASE") orelse return error.SkipZigTest;
+
+    var writer = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1,
+    });
+    defer writer.close();
+
+    try writeMarkerForTest(ready_path);
+    try waitForPathForTest(release_path, 30 * std.time.ns_per_s);
+}
+
+test "lsm backend native writer lock rejects writable opens across processes" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "cross-process-single-writer-root");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_path = std.mem.span(path);
+    const ready_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.child-ready.marker", .{root_path});
+    defer std.testing.allocator.free(ready_path);
+    std.Io.Dir.cwd().deleteFile(std.testing.io, ready_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, ready_path) catch {};
+    const release_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.child-release.marker", .{root_path});
+    defer std.testing.allocator.free(release_path);
+    std.Io.Dir.cwd().deleteFile(std.testing.io, release_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, release_path) catch {};
+
+    const exe_path = try std.process.executablePathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(exe_path);
+
+    var env_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_ROOT", root_path);
+    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_READY", ready_path);
+    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_RELEASE", release_path);
+
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{
+            exe_path,
+            "--test-filter",
+            "lsm backend cross-process writer lock child helper",
+        },
+        .environ_map = &env_map,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    var child_waited = false;
+    defer if (!child_waited) {
+        writeMarkerForTest(release_path) catch {};
+        _ = child.wait(std.testing.io) catch {};
+    };
+
+    try waitForPathForTest(ready_path, 10 * std.time.ns_per_s);
+
+    const same_root_path = try std.fs.path.join(std.testing.allocator, &.{
+        std.fs.path.dirname(root_path) orelse ".",
+        ".",
+        std.fs.path.basename(root_path),
+    });
+    defer std.testing.allocator.free(same_root_path);
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, Backend.open(std.testing.allocator, same_root_path, .{}));
+
+    try writeMarkerForTest(release_path);
+    const term = try child.wait(std.testing.io);
+    child_waited = true;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "lsm backend wal operation lock blocks read-only replay during live append critical section" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "wal-operation-lock-blocks-replay");
+    defer repository_mod.cleanupTmp(path);
+
+    var writer = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+        .flush_threshold = 1024,
+    });
+    defer writer.close();
+
+    var reader = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+        .backend = .{
+            .read_only = true,
+            .create_if_missing = false,
+        },
+    });
+    defer reader.close();
+
+    var held = try writer.acquireWalOperationLock(.exclusive);
+    var held_active = true;
+    defer if (held_active) held.release();
+
+    const blocked = try reader.tryAcquireWalOperationLock(.shared);
+    try std.testing.expect(blocked == null);
+
+    held.release();
+    held_active = false;
+
+    var acquired = (try reader.tryAcquireWalOperationLock(.shared)) orelse return error.TestExpectedWalOperationLock;
+    defer acquired.release();
+}
+
+test "lsm backend read-only native open creates missing wal operation lock for legacy roots" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "read-only-creates-missing-wal-lock");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_path = std.mem.span(path);
+    {
+        var writer = try Backend.open(std.testing.allocator, root_path, .{
+            .flush_threshold = 1024,
+        });
+        defer writer.close();
+
+        var runtime = try writer.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    const lock_path = try walOperationLockPathAlloc(std.testing.allocator, root_path);
+    defer std.testing.allocator.free(lock_path);
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, lock_path);
+    try std.testing.expect(!pathExistsForTest(lock_path));
+
+    var reader = try Backend.open(std.testing.allocator, root_path, .{
+        .backend = .{
+            .read_only = true,
+            .create_if_missing = false,
+        },
+    });
+    defer reader.close();
+    try std.testing.expect(pathExistsForTest(lock_path));
+
+    var writer = try Backend.open(std.testing.allocator, root_path, .{
+        .flush_threshold = 1024,
+    });
+    defer writer.close();
+
+    var held = try reader.acquireWalOperationLock(.shared);
+    var held_active = true;
+    defer if (held_active) held.release();
+
+    const blocked = try writer.tryAcquireWalOperationLock(.exclusive);
+    try std.testing.expect(blocked == null);
+
+    held.release();
+    held_active = false;
+
+    var acquired = (try writer.tryAcquireWalOperationLock(.exclusive)) orelse return error.TestExpectedWalOperationLock;
+    defer acquired.release();
 }
 
 test "lsm backend active reader survives obsolete cache eviction after writer compaction" {

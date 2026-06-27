@@ -922,20 +922,25 @@ pub const WAL = struct {
 fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !StoreOwner {
     return switch (opts.resolvedBackend()) {
         .lmdb => blk: {
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+            if (!opts.read_only) {
+                var io_impl = std.Io.Threaded.init(alloc, .{});
+                defer io_impl.deinit();
+                try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+            }
 
             const backend = try alloc.create(lmdb_backend.Backend);
             errdefer alloc.destroy(backend);
             backend.* = try lmdb_backend.Backend.open(alloc, path, .{
                 .backend = .{
+                    .read_only = opts.read_only,
                     .durability = if (opts.no_sync) .none else .full,
+                    .create_if_missing = !opts.read_only,
                 },
                 .env = .{
                     .max_dbs = 1,
                     .map_size = opts.map_size,
                     .no_sync = opts.no_sync,
+                    .read_only = opts.read_only,
                     .artificial_sync_delay_ns = opts.artificial_sync_delay_ns,
                     .commit_backend = opts.commit_backend,
                 },
