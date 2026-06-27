@@ -5897,6 +5897,12 @@ fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: [
 
 fn resetSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
     var pos: usize = 0;
+    if (grammar.parseResetAllTail(tail, &pos)) {
+        return .discard_all;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos = 0,
+    }
+
     if (grammar.parseResetSearchPathTail(tail, &pos)) {
         return .reset_search_path;
     } else |err| switch (err) {
@@ -17016,6 +17022,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
         sql: []const u8,
         tag: std.meta.Tag(SessionCatalogPlan),
     }{
+        .{ .sql = "RESET ALL;", .tag = .discard_all },
         .{ .sql = "RESET search_path;", .tag = .reset_search_path },
         .{ .sql = "SHOW search_path;", .tag = .show_search_path },
         .{ .sql = "DISCARD ALL;", .tag = .discard_all },

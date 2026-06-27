@@ -1905,6 +1905,12 @@ pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !v
     try adapterNoopStatementEnd(cursor);
 }
 
+pub fn parseResetAllTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("all");
+    try adapterNoopStatementEnd(cursor);
+}
+
 pub fn parseResetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !ddl_plan.ResetSessionSettingPlan {
     var cursor = parser.Cursor.init(tokens, pos);
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;

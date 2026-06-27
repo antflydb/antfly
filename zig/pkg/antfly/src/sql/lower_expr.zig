@@ -24472,6 +24472,9 @@ pub fn parseSelectListAlloc(
         );
         var item_transferred = false;
         errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
+        if (item == .expression) {
+            try validateGeneratedRowExpressionIdentity(tokens, item_start, pos.*, item.expression.expression, generated_expression);
+        }
         switch (item) {
             .field => |field| {
                 item_transferred = true;
