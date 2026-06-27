@@ -775,7 +775,9 @@ Unsupported DDL remains on the existing parser until
    for plain and `WITH`-prefixed writes, checks retained CTE prefix
    count/first/last/body-read compatibility, target/source/assignment clause
    ranges, and required source child-read payloads before direct generated
-   lowering, and fails closed when retained generated kind metadata is missing,
+   lowering, validates retained generated child-read `SELECT` source, `WHERE`,
+   and set-operation clause boundaries for insert-source and relation-source
+   writes, and fails closed when retained generated kind metadata is missing,
    internally inconsistent, or disagrees with the legacy classifier instead of
    falling back to legacy write-family classification.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
@@ -1168,7 +1170,8 @@ contract until storage and API row plans grow those outer-join semantics.
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
    incomplete boolean and comparison operator tails, ordering,
    `DISTINCT`/`DISTINCT ON`, set operations, unambiguous pagination result
-   tails, row-locking clauses, window clauses, joins, and CTE `AS` bodies now require
+   tails, row-locking clauses, incomplete named `WINDOW` clause item tails,
+   joins, and CTE `AS` bodies now require
    generated parsing and fail closed instead of falling back to the legacy read
    classifier. Read expressions that end on generated-owned operators, open
    function/group delimiters, or quantified/pattern predicate heads such as

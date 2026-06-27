@@ -1044,6 +1044,7 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
         return true;
     }
     if (isIncompleteGeneratedReadRowLockTail(tokens, start, end)) return true;
+    if (isIncompleteGeneratedReadWindowClauseTail(tokens, start, end)) return true;
     if (tokenMatchesKeyword(last, .all) and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .@"union")) return true;
     if (tokenMatchesKeyword(last, .select) or
         tokenMatchesKeyword(last, .from) or
@@ -1094,6 +1095,31 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
             tokenMatchesKeyword(last, .not);
     }
     return false;
+}
+
+fn isIncompleteGeneratedReadWindowClauseTail(tokens: []const Token, start: usize, end: usize) bool {
+    if (end <= start + 1 or end > tokens.len) return false;
+    const last = tokens[end - 1];
+    if (last.kind != .identifier) return false;
+
+    var depth: usize = 0;
+    var index = start;
+    var window_index: ?usize = null;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0 or !tokenMatchesKeyword(tokens[index], .window)) continue;
+        if (generatedReadHasCompleteSourceBefore(tokens, start, index)) window_index = index;
+    }
+    const found_window = window_index orelse return false;
+    if (end <= found_window + 1) return false;
+    const previous = tokens[end - 2];
+    return tokenMatchesKeyword(previous, .window) or previous.kind == .comma;
 }
 
 fn isGeneratedSqlTrailingOperatorToken(token: Token) bool {
@@ -2123,6 +2149,7 @@ fn generatedDmlReadBodyIsValid(
             if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.source_tokens)) return false;
             if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.where_tokens)) return false;
             if (!generatedDmlOptionalNestedRangeIsValid(tokens, end, range, read_body.set_operation_tokens)) return false;
+            if (!generatedDmlSelectReadBodyClauseLayoutIsValid(tokens, range, read_body)) return false;
             if (read_body.wrapper_projection_star) return false;
         },
         .relation_source => {
@@ -2131,6 +2158,42 @@ fn generatedDmlReadBodyIsValid(
             if (!read_body.wrapper_projection_star) return false;
         },
     }
+    return true;
+}
+
+fn generatedDmlSelectReadBodyClauseLayoutIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    read_body: generated_parser.GeneratedSqlDmlReadBodyAst,
+) bool {
+    const projection = read_body.projection_tokens orelse return false;
+    if (projection.start <= range.start or projection.end > range.end) return false;
+
+    var previous_end = projection.end;
+    if (read_body.source_tokens) |source| {
+        if (source.start == 0 or !tokens[source.start - 1].matchesKeywordTag(.from)) return false;
+        if (source.start != projection.end + 1) return false;
+        if (source.end > range.end) return false;
+        previous_end = source.end;
+    }
+
+    if (read_body.where_tokens) |where| {
+        if (where.start == 0 or !tokens[where.start - 1].matchesKeywordTag(.where)) return false;
+        if (where.start <= previous_end) return false;
+        if (where.end > range.end) return false;
+        previous_end = where.end;
+    }
+
+    if (read_body.set_operation_tokens) |set_operation| {
+        if (set_operation.start < previous_end or set_operation.end > range.end) return false;
+        if (!tokens[set_operation.start].matchesKeywordTag(.@"union") and
+            !tokens[set_operation.start].matchesKeywordTag(.intersect) and
+            !tokens[set_operation.start].matchesKeywordTag(.except))
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -4158,6 +4221,8 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records INTERSECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records EXCEPT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT row_number() OVER usage_window FROM usage_records WINDOW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT row_number() OVER usage_window FROM usage_records WINDOW usage_window"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT row_number() OVER first_window FROM usage_records WINDOW first_window AS (ORDER BY id), second_window"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE OF"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR SHARE OF"));
@@ -6284,6 +6349,28 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     generated_insert_select.statement = parseStatement(generated_insert_select.raw_statement, malformed_source_read, &generated_insert_select.tokenized_sql);
     try std.testing.expect(generated_insert_select.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
+
+    var malformed_source_clause = generated_insert_select.generated_statement.?;
+    switch (malformed_source_clause.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.source_tokens.?.start -= 1,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert_select.statement = parseStatement(generated_insert_select.raw_statement, malformed_source_clause, &generated_insert_select.tokenized_sql);
+    try std.testing.expect(generated_insert_select.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_select.statement));
+
+    var generated_insert_set_operation = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage UNION SELECT id FROM archived_usage");
+    defer generated_insert_set_operation.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_set_operation.generatedStatementKind().?);
+
+    var malformed_source_set_operation = generated_insert_set_operation.generated_statement.?;
+    switch (malformed_source_set_operation.ast.?) {
+        .dml => |*dml_ast| dml_ast.source_read.?.set_operation_tokens.?.start = dml_ast.source_read.?.projection_tokens.?.start,
+        else => return error.TestUnexpectedResult,
+    }
+    generated_insert_set_operation.statement = parseStatement(generated_insert_set_operation.raw_statement, malformed_source_set_operation, &generated_insert_set_operation.tokenized_sql);
+    try std.testing.expect(generated_insert_set_operation.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert_set_operation.statement));
 
     var generated_recursive_insert = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
     defer generated_recursive_insert.deinit(alloc);
