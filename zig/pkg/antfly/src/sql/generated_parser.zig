@@ -2377,6 +2377,20 @@ fn parseGeneratedTokenIds(alloc: std.mem.Allocator, token_ids: []const u16) !voi
     return try generated.parse(alloc, token_ids);
 }
 
+pub fn parseStatementKindFromGrammarAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !GeneratedSqlStatementKind {
+    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
+        return try parseGeneratedTokenIdStatementKind(alloc, token_ids);
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {
+            const token_ids = try tokenIdsAlloc(alloc, tokens);
+            defer alloc.free(token_ids);
+            return try parseGeneratedTokenIdStatementKind(alloc, token_ids);
+        },
+        else => return err,
+    }
+}
+
 pub fn parseReductionTraceAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !GeneratedSqlReductionTrace {
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
@@ -2413,6 +2427,38 @@ const ReductionTraceHandler = struct {
         self.accepted_token_count = accepted.token_count;
     }
 };
+
+const StatementKindTraceHandler = struct {
+    statement_kind: ?GeneratedSqlStatementKind = null,
+
+    pub fn shift(_: *@This(), _: generated.Shift) !void {}
+
+    pub fn reduce(self: *@This(), reduction: generated.Reduction) !void {
+        const info = generated.productionInfo(reduction.production) orelse return error.UnsupportedSqlShape;
+        if (info.rule != .statement) return;
+        const rhs = generated.productionRhs(reduction.production) orelse return error.UnsupportedSqlShape;
+        if (rhs.len != 1) return error.UnsupportedSqlShape;
+        const rule = generated.symbolRule(rhs[0]) orelse return error.UnsupportedSqlShape;
+        self.statement_kind = statementKindFromGrammarRule(rule) orelse return error.UnsupportedSqlShape;
+    }
+
+    pub fn accept(_: *@This(), _: generated.Accept) !void {}
+};
+
+fn parseGeneratedTokenIdStatementKind(alloc: std.mem.Allocator, token_ids: []const u16) !GeneratedSqlStatementKind {
+    var handler = StatementKindTraceHandler{};
+
+    if (token_ids.len + 1 <= generated_parse_stack_capacity) {
+        var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
+        try generated.parseWithEvents(token_ids, &stack_buffer, &handler);
+    } else {
+        const stack_buffer = try alloc.alloc(u16, token_ids.len + 1);
+        defer alloc.free(stack_buffer);
+        try generated.parseWithEvents(token_ids, stack_buffer, &handler);
+    }
+
+    return handler.statement_kind orelse error.UnsupportedSqlShape;
+}
 
 fn parseGeneratedTokenIdReductionTraceAlloc(alloc: std.mem.Allocator, token_ids: []const u16) !GeneratedSqlReductionTrace {
     var reductions: std.ArrayListUnmanaged(GeneratedSqlReductionEvent) = .empty;
@@ -13100,6 +13146,27 @@ test "generated SQL reduction traces derive statement family" {
         var trace = try parseReductionTraceAlloc(std.testing.allocator, tokens.items);
         defer trace.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.kind, trace.statementKind().?);
+    }
+}
+
+test "generated SQL parser derives statement family without trace allocation" {
+    const cases = [_]GeneratedSqlCorpusCase{
+        .{ .sql = "SET search_path TO public", .kind = .session },
+        .{ .sql = "BEGIN READ WRITE", .kind = .transaction },
+        .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
+        .{ .sql = "PREPARE TRANSACTION 'usage_batch'", .kind = .prepared_transaction },
+        .{ .sql = "CREATE TABLE usage_records (id text)", .kind = .ddl },
+        .{ .sql = "INSERT INTO usage_records (id) VALUES ('u1')", .kind = .dml },
+        .{ .sql = "SELECT id FROM usage_records", .kind = .read },
+        .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
+        .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
+        .{ .sql = "ANALYZE", .kind = .unsupported },
+    };
+
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(std.testing.allocator, case.sql);
+        defer lexer.freeTokens(std.testing.allocator, &tokens);
+        try std.testing.expectEqual(case.kind, try parseStatementKindFromGrammarAlloc(std.testing.allocator, tokens.items));
     }
 }
 

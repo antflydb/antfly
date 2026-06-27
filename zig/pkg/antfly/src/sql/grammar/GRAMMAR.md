@@ -102,7 +102,10 @@ builders retain a compact grammar-derived proof of the production path without
 changing the normal parse result or exposing parser tables. Reduction traces
 can now derive the coarse statement family from the accepted top-level
 `statement` production, which is the next bridge toward replacing token-head
-statement classification with grammar-owned AST dispatch. The
+statement classification with grammar-owned AST dispatch. The runtime also has
+a non-allocating statement-family helper that observes the accepted LR
+reductions without retaining a full trace, giving the normal parse path a
+low-overhead migration target once each family is proven equivalent. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus
