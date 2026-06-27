@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const catalog_resources = @import("catalog_resources.zig");
+const table_catalog = @import("table_catalog.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
@@ -212,6 +213,126 @@ pub fn scheduleTableEmptyingJobsForTableSnapshot(
         scheduled += 1;
     }
     return scheduled;
+}
+
+fn findTableById(snapshot: *const metadata_api.AdminSnapshot, table_id: u64) ?metadata_table_manager.TableRecord {
+    for (snapshot.tables) |table| {
+        if (table.table_id == table_id) return table;
+    }
+    return null;
+}
+
+fn findTableEmptyingJobById(
+    snapshot: *const metadata_api.AdminSnapshot,
+    job_id: u64,
+) ?metadata_table_manager.TableEmptyingJobRecord {
+    for (snapshot.table_emptying_jobs) |record| {
+        if (record.job_id == job_id) return record;
+    }
+    return null;
+}
+
+fn tableEmptyingJobInvolvesTable(record: metadata_table_manager.TableEmptyingJobRecord, table_id: u64) bool {
+    if (record.table_id == table_id) return true;
+    for (record.affected_table_ids) |affected_table_id| {
+        if (affected_table_id == table_id) return true;
+    }
+    return false;
+}
+
+fn appendUniqueTableEmptyingJobId(alloc: std.mem.Allocator, job_ids: *std.ArrayListUnmanaged(u64), job_id: u64) !void {
+    for (job_ids.items) |existing| {
+        if (existing == job_id) return;
+    }
+    try job_ids.append(alloc, job_id);
+}
+
+fn completedTableEmptyingBarrierJobIdsForCandidateAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    candidate: metadata_table_manager.TableEmptyingJobRecord,
+) !?[]u64 {
+    if (!metadata_table_manager.tableEmptyingJobComplete(candidate)) return null;
+    if (candidate.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
+
+    var completed_job_ids = std.ArrayListUnmanaged(u64).empty;
+    errdefer completed_job_ids.deinit(alloc);
+
+    for (candidate.affected_table_ids) |affected_table_id| {
+        const table = findTableById(snapshot, affected_table_id) orelse return error.TableNotFound;
+        var range_count: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (range.table_id != affected_table_id) continue;
+            range_count += 1;
+            const expected = tableEmptyingJobForRange(
+                table,
+                range,
+                candidate.affected_table_ids,
+                candidate.restart_identity,
+                candidate.cascade,
+            );
+            const record = findTableEmptyingJobById(snapshot, expected.job_id) orelse return null;
+            if (std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_invalid)) return error.TableEmptyingJobInvalid;
+            if (!metadata_table_manager.tableEmptyingJobComplete(record)) return null;
+            try appendUniqueTableEmptyingJobId(alloc, &completed_job_ids, record.job_id);
+        }
+        if (range_count == 0) return error.InvalidTableEmptyingJob;
+    }
+
+    return try completed_job_ids.toOwnedSlice(alloc);
+}
+
+pub fn completedTableEmptyingBarrierJobIdsForTableAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_id: u64,
+) ![]u64 {
+    var completed_job_ids = std.ArrayListUnmanaged(u64).empty;
+    errdefer completed_job_ids.deinit(alloc);
+
+    for (snapshot.table_emptying_jobs) |candidate| {
+        if (!tableEmptyingJobInvolvesTable(candidate, table_id)) continue;
+        var barrier_job_ids = (try completedTableEmptyingBarrierJobIdsForCandidateAlloc(alloc, snapshot, candidate)) orelse continue;
+        defer alloc.free(barrier_job_ids);
+        for (barrier_job_ids) |job_id| try appendUniqueTableEmptyingJobId(alloc, &completed_job_ids, job_id);
+    }
+
+    return try completed_job_ids.toOwnedSlice(alloc);
+}
+
+pub fn promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    service: anytype,
+    table_name: []const u8,
+) !usize {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "adminSnapshot") or
+        !@hasDecl(ServiceDeclType, "freeAdminSnapshot") or
+        !@hasDecl(ServiceDeclType, "removeTableEmptyingJob"))
+    {
+        return error.UnsupportedOperation;
+    }
+
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const job_ids = try completedTableEmptyingBarrierJobIdsForTableAlloc(alloc, &snapshot, table.table_id);
+    defer alloc.free(job_ids);
+
+    for (job_ids) |job_id| try service.removeTableEmptyingJob(job_id);
+    return job_ids.len;
+}
+
+pub fn promoteCompletedTableEmptyingBarriersForTableAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !usize {
+    return try promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(alloc, catalog, table_name);
 }
 
 fn schemaRewriteRenamesForAppliedRowRewritePlan(plan: sql_adapter.AppliedDdlRowRewritePlan) []const metadata_table_manager.SchemaRewriteRename {
