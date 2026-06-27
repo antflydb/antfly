@@ -5597,6 +5597,57 @@ pub const ApiHttpServer = struct {
         return .{ .result = result };
     }
 
+    fn applyLoweredPublicSqlTableEmptying(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: *sql_adapter.LoweredMutationSource,
+        authenticated_identity: ?AuthenticatedIdentity,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    } {
+        const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+            error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        };
+
+        var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (filter) |*value| value.deinit(self.alloc);
+        if (filter) |active| {
+            try self.applyRowsAuthFilterToQuery(target_schema, active, &lowered.mutation.req.source);
+        }
+
+        const result = (source.tableEmptying(self.alloc, .{
+            .primary_table_name = target_table_name,
+            .additional_table_names = lowered.additional_table_names,
+            .schema = target_schema,
+            .mutation = lowered.mutation.req,
+            .sync_level = lowered.sync_level,
+            .restart_identity = lowered.restart_identity,
+            .cascade = lowered.truncate_cascade,
+        }) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedQueryRequest => return .{ .failure = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.*)) },
+            error.InvalidArgument, error.InvalidQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
+            error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
+            else => {
+                std.log.err("public sql table emptying failed table={s} err={}", .{ target_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        return .{ .result = result };
+    }
+
     fn joinedMutationTargetQuery(req: *db_mod.types.RelationalRowsJoinedMutationSourceRequest) *db_mod.types.RelationalRowsQueryRequest {
         return switch (req.target_side) {
             .left => &req.join.left,
@@ -6021,10 +6072,7 @@ pub const ApiHttpServer = struct {
         }
 
         if (lowered == .truncate_source) {
-            if (lowered.truncate_source.additional_table_names.len != 0 or lowered.truncate_source.truncate_cascade or lowered.truncate_source.restart_identity) {
-                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, publicSqlUnsupportedTruncateSourceDiagnostic(lowered.truncate_source)) };
-            }
-            const truncate_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, &lowered.truncate_source, authenticated_identity)) {
+            const truncate_result = switch (try self.applyLoweredPublicSqlTableEmptying(target_table, schema, &lowered.truncate_source, authenticated_identity, parsed_sql)) {
                 .failure => |failure| return .{ .response = failure },
                 .result => |result| result,
             };

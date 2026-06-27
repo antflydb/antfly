@@ -1297,9 +1297,9 @@ body-clone validation to catch corrupted retained CTE payloads.
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-   conditionless cartesian payload layout, remaining join-tail validation and
-   fail-closed right/full plus conditionless
-   `NATURAL JOIN` executable-contract coverage, expression AST
+   conditionless cartesian payload layout, future executable right/full outer
+   join and `NATURAL JOIN` semantics beyond the current fail-closed generated
+   contract, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,
