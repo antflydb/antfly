@@ -1904,7 +1904,35 @@ fn generatedUnsupportedAstHasValidClassificationPayload(
     if (!std.meta.eql(unsupported_ast.command_span, tokens[0].sourceSpan())) return false;
     if (!generatedUnsupportedOptionalTokenRangeIsValid(tokens, end, unsupported_ast.subject_tokens)) return false;
     if (!generatedUnsupportedOptionalTokenRangeIsValid(tokens, end, unsupported_ast.explain_options_tokens)) return false;
+    if (!generatedUnsupportedShapePayloadIsValid(tokens, end, unsupported_ast)) return false;
     return true;
+}
+
+fn generatedUnsupportedShapePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    return switch (unsupported_ast.kind) {
+        .graph_query => generatedGraphQueryUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        else => true,
+    };
+}
+
+fn generatedGraphQueryUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.reason != .graph_query_not_planned_by_generated_parser) return false;
+    if (end < 4 or !tokens[0].matchesKeywordTag(.match)) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    if (subject.start != 1 or subject.end != end) return false;
+    var index = subject.start;
+    while (index < subject.end) : (index += 1) {
+        if (tokens[index].matchesKeyword("return")) return true;
+    }
+    return false;
 }
 
 fn generatedUnsupportedStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
@@ -5442,6 +5470,32 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, mismatched_unsupported_kind, &unsupported_copy.tokenized_sql)),
+    );
+
+    var graph_query = try ParsedSql.initAlloc(alloc, "MATCH (doc) RETURN doc");
+    defer graph_query.deinit(alloc);
+    var malformed_graph_query_subject = graph_query.generated_statement.?;
+    if (malformed_graph_query_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.subject_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_query.raw_statement, malformed_graph_query_subject, &graph_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_reason = graph_query.generated_statement.?;
+    if (malformed_graph_query_reason.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.reason = .copy_not_planned_by_generated_parser,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_query.raw_statement, malformed_graph_query_reason, &graph_query.tokenized_sql)),
     );
 
     var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN (FORMAT JSON) SELECT id FROM usage_records");

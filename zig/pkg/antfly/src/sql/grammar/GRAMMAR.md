@@ -1251,8 +1251,12 @@ generated read family.
    missing or corrupted. CTE bodies now retain the same Antfly and graph
    table-function source metadata, validate it at the CTE boundary, and rebase
    it into the direct generated read AST used by child body planning. Broader
-   graph DSL cutover still requires deeper graph-query semantic planning for
-   non-table-function graph syntax and broader unsupported-shape diagnostics.
+   graph unsupported diagnostics now require generated `MATCH ... RETURN ...`
+   unsupported ASTs to retain the graph-query reason and exact subject span
+   before parsed-statement classification publishes the terminal unsupported
+   statement. Broader graph DSL cutover still requires deeper graph-query
+   semantic planning for non-table-function graph syntax and broader
+   unsupported-shape diagnostics.
 
 ## Generator Performance
 

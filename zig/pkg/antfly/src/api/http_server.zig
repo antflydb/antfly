@@ -4276,7 +4276,9 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer logical_plan.deinit(self.alloc);
-        return try self.applyLogicalSqlPlanWithSession(&logical_plan, session, .{
+        var execution_plan = try takePublicSqlPlannedExecutionPlanFromLogical(&logical_plan);
+        defer execution_plan.deinit(self.alloc);
+        return try self.applySqlDdlExecutionPlanWithSession(&execution_plan, session, .{
             .parsed_sql = parsed_sql,
             .function_bindings = function_bindings,
             .statement_timing = .{
@@ -4286,6 +4288,28 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    fn applySqlDdlExecutionPlanWithSession(
+        self: *ApiHttpServer,
+        plan: *PublicSqlPlannedExecutionPlan,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        context: RelationalDdlPlanExecutionContext,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        return switch (plan.*) {
+            .logical => |*logical_plan| try self.applyLogicalSqlPlanWithSession(logical_plan, session, context),
+            .durable => |*durable_plan| blk: {
+                const timing = try self.sqlStatementExecutionTimingForContext(session, context);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                if (try self.publicSqlReadOnlyActive(session)) {
+                    switch (durable_plan.*) {
+                        .bulk_io => |bulk| if (bulk.direction == .from) return error.SqlReadOnlyTransaction,
+                        else => return error.SqlReadOnlyTransaction,
+                    }
+                }
+                break :blk try self.applyDurableSqlPlanWithSession(durable_plan, session, context, timing);
+            },
+        };
+    }
+
     fn applyLogicalSqlPlanWithSession(
         self: *ApiHttpServer,
         logical_plan: *sql_adapter.LogicalSqlPlan,
@@ -4293,13 +4317,13 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         switch (logical_plan.*) {
-            .table_ddl, .catalog_ddl, .extension, .auth, .maintenance, .bulk_io => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, context),
+            .table_ddl, .catalog_ddl, .extension, .auth, .maintenance, .bulk_io => return error.UnsupportedSqlShape,
             .other_ddl => |plan| return try self.applyOtherDdlLogicalPlanWithSession(plan, session, context),
             .session => |plan| return try self.applySessionLogicalPlanWithSession(plan, session, context),
             .transaction => |plan| return try self.applyTransactionLogicalPlanWithSession(plan, session, context),
             .prepared_statement => |plan| return try self.applyPreparedStatementLogicalPlanWithSession(plan, session, context),
             .notification => |plan| return try self.applyNotificationLogicalPlanWithSession(plan, session, context),
-            .routine => return try self.applyRoutineLogicalPlanWithSession(logical_plan, session, context),
+            .routine => |plan| return try self.applyRoutineLogicalPlanWithSession(plan, session, context),
             .cursor => |plan| return try self.applyCursorLogicalPlanWithSession(plan, session, context),
             .read, .write, .catalog_read, .catalog_write => return error.UnsupportedSqlShape,
         }
@@ -4484,7 +4508,7 @@ pub const ApiHttpServer = struct {
 
     fn applyRoutineLogicalPlanWithSession(
         self: *ApiHttpServer,
-        logical_plan: *sql_adapter.LogicalSqlPlan,
+        plan: sql_adapter.RoutineLogicalPlan,
         session: *sql_adapter.OwnedSqlCatalogSession,
         context: RelationalDdlPlanExecutionContext,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -4492,17 +4516,11 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
 
-        switch (logical_plan.*) {
-            .routine => |plan| switch (plan) {
-                .function_catalog, .trigger_catalog => return try self.applyDurableLogicalPlanWithSession(logical_plan, session, .{
-                    .function_bindings = context.function_bindings,
-                    .statement_timing = timing,
-                }),
-                .procedure_call => |procedure_call| {
-                    try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
-                },
+        switch (plan) {
+            .function_catalog, .trigger_catalog => return error.UnsupportedSqlShape,
+            .procedure_call => |procedure_call| {
+                try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
             },
-            else => return error.UnsupportedSqlShape,
         }
         return try self.emptyAppliedSqlDdlRecordWithTiming(timing);
     }
@@ -4537,26 +4555,6 @@ pub const ApiHttpServer = struct {
         const timing = try self.sqlStatementExecutionTimingForContext(session, context);
         try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
         return error.UnsupportedSqlShape;
-    }
-
-    fn applyDurableLogicalPlanWithSession(
-        self: *ApiHttpServer,
-        logical_plan: *sql_adapter.LogicalSqlPlan,
-        session: *sql_adapter.OwnedSqlCatalogSession,
-        context: RelationalDdlPlanExecutionContext,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
-        const timing = try self.sqlStatementExecutionTimingForContext(session, context);
-        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
-
-        var durable_plan = try sql_adapter.takeDurableSqlPlanFromLogical(logical_plan);
-        defer durable_plan.deinit(self.alloc);
-        if (try self.publicSqlReadOnlyActive(session)) {
-            switch (durable_plan) {
-                .bulk_io => |plan| if (plan.direction == .from) return error.SqlReadOnlyTransaction,
-                else => return error.SqlReadOnlyTransaction,
-            }
-        }
-        return try self.applyDurableSqlPlanWithSession(&durable_plan, session, context, timing);
     }
 
     fn applyDurableSqlPlanWithSession(
