@@ -2853,7 +2853,11 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.distinct_tokens)) return false;
     if (!generatedReadDistinctPayloadIsValid(tokens, end, read_ast.distinct_tokens, read_ast.distinct_on_items)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_table_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_alias_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_alias_name_tokens)) return false;
     if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, read_ast.source_tokens, .from)) return false;
+    if (!generatedReadSingleSourceAliasPayloadIsValid(tokens, end, read_ast)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_name_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_argument_tokens)) return false;
@@ -3030,7 +3034,11 @@ fn generatedReadCtePayloadIsValid(
             .last_expression = cte.body_projection_last_expression,
         })) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_table_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_alias_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_alias_name_tokens)) return false;
         if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, cte.body_source_tokens, .from)) return false;
+        if (!generatedReadCteSingleSourceAliasPayloadIsValid(tokens, end, cte)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_operator_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_left_tokens)) return false;
@@ -3160,6 +3168,126 @@ fn generatedReadCteItemLayoutIsValid(
         body.end < list_tokens.end and
         tokens[cursor].kind == .lparen and
         tokens[body.end].kind == .rparen;
+}
+
+fn generatedReadSingleSourceAliasPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) bool {
+    const source_table = read_ast.source_table_tokens orelse {
+        if (read_ast.source_alias_tokens != null or read_ast.source_alias_name_tokens != null) return false;
+        if (read_ast.source_tokens == null) return true;
+        if (read_ast.source_antfly_function_count != 0 or read_ast.source_graph_function_count != 0 or read_ast.join_items.len != 0) return true;
+        return !generatedReadSourceLooksLikeSingleTableSource(tokens, end, read_ast.source_tokens.?);
+    };
+    const source = read_ast.source_tokens orelse return false;
+    if (source.start >= source.end or source.end > end) return false;
+    var expected_table_start = source.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (source_table.start != expected_table_start or source_table.end != expected_table_start + 1 or source_table.end > source.end) return false;
+    if (tokens[source_table.start].kind != .identifier) return false;
+    const alias_end = generatedReadSingleSourceAliasEnd(tokens, end, source_table, read_ast.source_alias_tokens, read_ast.source_alias_name_tokens) orelse return false;
+    return alias_end == source.end;
+}
+
+fn generatedReadCteSingleSourceAliasPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    cte: generated_parser.GeneratedSqlCteAst,
+) bool {
+    const source_table = cte.body_source_table_tokens orelse {
+        if (cte.body_source_alias_tokens != null or cte.body_source_alias_name_tokens != null) return false;
+        if (cte.body_source_tokens == null) return true;
+        if (cte.body_source_antfly_function_count != 0 or cte.body_source_graph_function_count != 0 or cte.body_join_items.len != 0) return true;
+        return !generatedReadSourceLooksLikeSingleTableSource(tokens, end, cte.body_source_tokens.?);
+    };
+    const source = cte.body_source_tokens orelse return false;
+    if (source.start >= source.end or source.end > end) return false;
+    var expected_table_start = source.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (source_table.start != expected_table_start or source_table.end != expected_table_start + 1 or source_table.end > source.end) return false;
+    if (tokens[source_table.start].kind != .identifier) return false;
+    const alias_end = generatedReadSingleSourceAliasEnd(tokens, end, source_table, cte.body_source_alias_tokens, cte.body_source_alias_name_tokens) orelse return false;
+    return alias_end == source.end;
+}
+
+fn generatedReadSingleSourceAliasEnd(
+    tokens: []const Token,
+    end: usize,
+    source_table: generated_parser.GeneratedSqlTokenRange,
+    source_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    source_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    if (source_table.start >= source_table.end or source_table.end > end or end > tokens.len) return null;
+    const alias = source_alias_tokens orelse {
+        if (source_alias_name_tokens != null) return null;
+        return source_table.end;
+    };
+    const alias_name = source_alias_name_tokens orelse return null;
+    if (alias.start != source_table.end or alias.start >= alias.end or alias.end > end) return null;
+    const expected_name = if (alias.end == source_table.end + 2 and
+        tokens[source_table.end].matchesKeywordTag(.as) and
+        tokens[source_table.end + 1].kind == .identifier)
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = source_table.end + 1, .end = source_table.end + 2 };
+    } else if (alias.end == source_table.end + 1 and
+        tokens[source_table.end].kind == .identifier and
+        !generatedReadSourceTailKeyword(tokens, source_table.end))
+    blk: {
+        break :blk alias;
+    } else return null;
+    if (alias_name.start != expected_name.start or alias_name.end != expected_name.end) return null;
+    return alias.end;
+}
+
+fn generatedReadSourceLooksLikeSingleTableSource(
+    tokens: []const Token,
+    end: usize,
+    source: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (source.start >= source.end or source.end > end or end > tokens.len) return false;
+    var table_start = source.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    if (table_start >= source.end or tokens[table_start].kind != .identifier) return false;
+
+    const table_end = table_start + 1;
+    if (table_end == source.end) return true;
+    if (table_end + 2 == source.end and
+        tokens[table_end].matchesKeywordTag(.as) and
+        tokens[table_end + 1].kind == .identifier)
+    {
+        return true;
+    }
+    if (table_end + 1 == source.end and
+        tokens[table_end].kind == .identifier and
+        !generatedReadSourceTailKeyword(tokens, table_end))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn generatedReadSourceTailKeyword(tokens: []const Token, index: usize) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    return token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.outer) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.on) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.having) or
+        token.matchesKeywordTag(.window) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.@"union") or
+        token.matchesKeywordTag(.intersect) or
+        token.matchesKeywordTag(.except);
 }
 
 fn generatedReadJoinPayloadIsValid(
@@ -8559,6 +8687,33 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     generated_projection_alias_query.statement = parseStatement(generated_projection_alias_query.raw_statement, malformed_projection_alias_generated, &generated_projection_alias_query.tokenized_sql);
     try std.testing.expect(generated_projection_alias_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_projection_alias_query.statement));
+
+    var generated_source_alias_query = try ParsedSql.initAlloc(alloc, "SELECT u.id FROM ONLY usage_records AS u WHERE u.status = 'open'");
+    defer generated_source_alias_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_source_alias_query.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_source_alias_query.readStatementKind().?);
+
+    var malformed_source_alias_generated = generated_source_alias_query.generated_statement.?;
+    if (malformed_source_alias_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.source_table_tokens == null or
+                    read_ast.source_alias_tokens == null or
+                    read_ast.source_alias_name_tokens == null)
+                {
+                    return error.TestUnexpectedResult;
+                }
+                read_ast.source_alias_tokens = null;
+                read_ast.source_alias_name_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_source_alias_query.statement = parseStatement(generated_source_alias_query.raw_statement, malformed_source_alias_generated, &generated_source_alias_query.tokenized_sql);
+    try std.testing.expect(generated_source_alias_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_source_alias_query.statement));
 
     var generated_distinct_on_query = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (status) status FROM usage_records");
     defer generated_distinct_on_query.deinit(alloc);

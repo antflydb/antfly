@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("../../sql/mod.zig");
+const sql_adapter = @import("mod.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,

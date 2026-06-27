@@ -967,6 +967,9 @@ pub const GeneratedSqlCteAst = struct {
     body_distinct_on_items: GeneratedSqlListAst = .{},
     body_projection_tokens: ?GeneratedSqlTokenRange = null,
     body_source_tokens: ?GeneratedSqlTokenRange = null,
+    body_source_table_tokens: ?GeneratedSqlTokenRange = null,
+    body_source_alias_tokens: ?GeneratedSqlTokenRange = null,
+    body_source_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     body_source_antfly_function_items: []GeneratedSqlAntflyTableFunctionAst = &.{},
     body_source_antfly_function_count: usize = 0,
     body_source_graph_function_items: []GeneratedSqlGraphTableFunctionAst = &.{},
@@ -1129,6 +1132,9 @@ pub const GeneratedSqlReadAst = struct {
     projection_first_expression: GeneratedSqlExpressionAst = .{},
     projection_last_expression: GeneratedSqlExpressionAst = .{},
     source_tokens: ?GeneratedSqlTokenRange = null,
+    source_table_tokens: ?GeneratedSqlTokenRange = null,
+    source_alias_tokens: ?GeneratedSqlTokenRange = null,
+    source_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_name_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_argument_tokens: ?GeneratedSqlTokenRange = null,
@@ -1681,6 +1687,9 @@ pub fn cloneCteBodyReadAstAlloc(
     cloned.projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_first_expression, body.start, body.end);
     cloned.projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_last_expression, body.start, body.end);
     cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_tokens, body.start, body.end);
+    cloned.source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_table_tokens, body.start, body.end);
+    cloned.source_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_alias_tokens, body.start, body.end);
+    cloned.source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_alias_name_tokens, body.start, body.end);
     cloned.source_antfly_function_items = try cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(alloc, cte.body_source_antfly_function_items, body.start, body.end);
     cloned.source_antfly_function_count = cte.body_source_antfly_function_count;
     cloned.source_graph_function_items = try cloneRebasedGeneratedGraphTableFunctionSliceAlloc(alloc, cte.body_source_graph_function_items, body.start, body.end);
@@ -4871,6 +4880,7 @@ fn buildReadAstInPlace(
             ast.source_tokens = source_tokens;
             try buildGeneratedReadGraphSourceAst(alloc, tokens, source_tokens, ast);
             try buildReadJoinAst(alloc, tokens, source_tokens, ast);
+            buildGeneratedSingleReadSourceAst(tokens, source_tokens, ast);
         }
     }
     if (where_index) |idx| {
@@ -5383,6 +5393,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             cte.body_source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, tokens, cte.body_source_antfly_function_items);
             cte.body_source_graph_function_count = cte.body_source_graph_function_items.len;
             cte.body_join_items = try buildGeneratedJoinItemsAst(alloc, tokens, source_tokens);
+            buildGeneratedSingleCteBodySourceAst(tokens, source_tokens, cte);
             if (cte.body_join_items.len > 0) {
                 cte.body_join_tree_root_index = cte.body_join_items.len - 1;
                 cte.body_join_tree_depth = cte.body_join_items.len;
@@ -6129,6 +6140,102 @@ fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, s
     if (first.predicate_tokens) |predicate_tokens| {
         try buildGeneratedExpressionAstInto(alloc, tokens, predicate_tokens, &ast.join_predicate_expression);
     }
+}
+
+fn buildGeneratedSingleReadSourceAst(
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+    ast: *GeneratedSqlReadAst,
+) void {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    if (ast.join_items.len != 0 or ast.source_antfly_function_items.len != 0) return;
+    var table_start = source_tokens.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    const table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, table_start, source_tokens.end) orelse return;
+    var alias_end = table_tokens.end;
+    if (generatedReadSourceAlias(tokens, table_tokens.end, source_tokens.end)) |alias| {
+        ast.source_alias_tokens = alias.alias_tokens;
+        ast.source_alias_name_tokens = alias.alias_name_tokens;
+        alias_end = alias.end;
+    }
+    if (alias_end != source_tokens.end) {
+        ast.source_alias_tokens = null;
+        ast.source_alias_name_tokens = null;
+        return;
+    }
+    ast.source_table_tokens = table_tokens;
+}
+
+fn buildGeneratedSingleCteBodySourceAst(
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+    cte: *GeneratedSqlCteAst,
+) void {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    if (cte.body_join_items.len != 0 or cte.body_source_antfly_function_items.len != 0) return;
+    var table_start = source_tokens.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    const table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, table_start, source_tokens.end) orelse return;
+    var alias_end = table_tokens.end;
+    if (generatedReadSourceAlias(tokens, table_tokens.end, source_tokens.end)) |alias| {
+        cte.body_source_alias_tokens = alias.alias_tokens;
+        cte.body_source_alias_name_tokens = alias.alias_name_tokens;
+        alias_end = alias.end;
+    }
+    if (alias_end != source_tokens.end) {
+        cte.body_source_alias_tokens = null;
+        cte.body_source_alias_name_tokens = null;
+        return;
+    }
+    cte.body_source_table_tokens = table_tokens;
+}
+
+const GeneratedReadSourceAlias = struct {
+    alias_tokens: GeneratedSqlTokenRange,
+    alias_name_tokens: GeneratedSqlTokenRange,
+    end: usize,
+};
+
+fn generatedReadSourceAlias(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedReadSourceAlias {
+    if (start >= end or end > tokens.len) return null;
+    if (start + 1 < end and tokens[start].matchesKeywordTag(.as) and tokens[start + 1].kind == .identifier) {
+        return .{
+            .alias_tokens = .{ .start = start, .end = start + 2 },
+            .alias_name_tokens = .{ .start = start + 1, .end = start + 2 },
+            .end = start + 2,
+        };
+    }
+    if (tokens[start].kind == .identifier and !generatedReadSourceTailKeyword(tokens, start)) {
+        const alias_tokens = GeneratedSqlTokenRange{ .start = start, .end = start + 1 };
+        return .{
+            .alias_tokens = alias_tokens,
+            .alias_name_tokens = alias_tokens,
+            .end = start + 1,
+        };
+    }
+    return null;
+}
+
+fn generatedReadSourceTailKeyword(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    return token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.outer) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.on) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.having) or
+        token.matchesKeywordTag(.window) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.@"union") or
+        token.matchesKeywordTag(.intersect) or
+        token.matchesKeywordTag(.except);
 }
 
 fn buildGeneratedJoinItemsAst(
@@ -11361,6 +11468,19 @@ test "generated SQL parser facade builds null logical and join AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const aliased_read_sql = "SELECT id FROM ONLY usage_records AS u WHERE u.status = 'open'";
+    const aliased_read_result = try parseSqlAlloc(alloc, aliased_read_sql);
+    switch (aliased_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.source_alias_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const joined_read_sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id";
     const joined_read_result = try parseSqlAlloc(alloc, joined_read_sql);
     switch (joined_read_result.ast.?) {
@@ -11897,7 +12017,22 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_distinct_on_items.expressions[0].tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_source_table_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.cte_items[0].body_order_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_aliased_body_read_sql = "WITH source_rows AS (SELECT id FROM ONLY usage_records AS u WHERE u.status = 'open') SELECT id FROM source_rows";
+    const cte_aliased_body_read_result = try parseSqlAlloc(alloc, cte_aliased_body_read_sql);
+    switch (cte_aliased_body_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 11 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 11 }, read.cte_items[0].body_source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_source_alias_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -11954,9 +12089,11 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_projection_items.expressions[0].kind);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_table_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_table_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -1396,7 +1396,10 @@ projection/source/predicate payloads, right-arm projection adjacency after
 requires top-level and CTE-body `WHERE`/`HAVING` generated predicate expression
 spans to match their retained clause bodies. Named `WINDOW` clauses now also validate generated window item
 boundaries, `name AS (...)` layout, partition/order list payloads, and frame
-expression spans before publishing a generated read family. Join classification
+expression spans before publishing a generated read family. Simple generated
+read sources now retain source table and alias/name token ranges, and read
+classification rejects missing simple-source table metadata unless the source is
+a generated table function or join. Join classification
 now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete
@@ -1415,7 +1418,9 @@ projection, grouping, and top-level order lowerers now also enforce that each
 parsed item ends exactly at the retained generated item boundary after aliases,
 direction, and `NULLS` modifiers are consumed, so typed lowering cannot consume
 beyond the generated AST item span and only notice clause drift after
-fallback-style token parsing.
+fallback-style token parsing. Simple, aggregate, and window read source
+lowering also validates parsed table consumption against retained simple-source
+table/alias spans before typed planning continues.
    Completing the generated-parser-only read path still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

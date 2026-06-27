@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const sql_adapter = @import("../../sql/mod.zig");
+const sql_adapter = @import("mod.zig");
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
@@ -136,6 +136,10 @@ pub const Runtime = struct {
         errdefer self.alloc.free(owned_subject_sql);
         var subject_parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, owned_subject_sql);
         errdefer subject_parsed_sql.deinit(self.alloc);
+        const subject_family = preparedStatementFamilyFromParsedSql(&subject_parsed_sql) orelse return error.UnsupportedSqlShape;
+        if (subject_family != plan.statement_family or preparedStatementSubjectKindFromFamily(subject_family) != plan.statement_kind) {
+            return error.UnsupportedSqlShape;
+        }
         try session.statements.put(self.alloc, key, .{
             .parameter_count = plan.parameter_count,
             .statement_kind = plan.statement_kind,
@@ -187,6 +191,41 @@ pub const Runtime = struct {
         return error.PreparedStatementNotFound;
     }
 };
+
+fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql) ?sql_adapter.PreparedStatementStatementKind {
+    return switch (parsed_sql.statement) {
+        .read => .read,
+        .write => |write| switch (write.kind) {
+            .insert => .insert,
+            .insert_source => .insert_source,
+            .update, .update_source, .update_joined_source => .update,
+            .delete, .delete_source, .delete_joined_source => .delete,
+            .truncate => .truncate,
+            .merge => .merge,
+        },
+        .ddl,
+        .explain,
+        .transaction,
+        .prepared,
+        .session,
+        => .ddl,
+        .unsupported, .unknown => null,
+    };
+}
+
+fn preparedStatementSubjectKindFromFamily(family: sql_adapter.PreparedStatementStatementKind) sql_adapter.PreparedStatementSubjectKind {
+    return switch (family) {
+        .read => .read,
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .truncate,
+        .merge,
+        => .write,
+        .ddl => .ddl,
+    };
+}
 
 test "sql prepared statement runtime stores session scoped plans" {
     const alloc = std.testing.allocator;
@@ -252,4 +291,26 @@ test "sql prepared statement runtime stores session scoped plans" {
     try std.testing.expectEqual(@as(usize, 2), runtime.statementCountForTest(session_a));
     try runtime.apply(.{ .deallocate = .{ .all = true } }, session_a);
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(session_a));
+}
+
+test "sql prepared statement runtime rejects mismatched subject metadata" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = .{
+        .statement_name = "mismatched_read",
+        .statement_kind = .write,
+        .statement_family = .insert,
+        .subject_sql = "SELECT id FROM usage_records;",
+    } }, 303));
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = .{
+        .statement_name = "mismatched_insert_source",
+        .statement_kind = .write,
+        .statement_family = .insert,
+        .subject_sql = "INSERT INTO usage_records(id) SELECT id FROM incoming_usage;",
+    } }, 303));
+    try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 }

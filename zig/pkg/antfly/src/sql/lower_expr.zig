@@ -1975,6 +1975,92 @@ fn generatedSourceClauseEnd(
     return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedSingleSourceAliasForParsedTable(
+    tokens: []const Token,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    source_start: usize,
+    parsed_end: usize,
+) !void {
+    const read = generated_read_ast orelse return;
+    const source = read.source_tokens orelse return;
+    if (source.start != source_start) return;
+    if (source.start >= source.end or source.end > tokens.len) return error.UnsupportedSqlShape;
+
+    const source_table = read.source_table_tokens orelse {
+        if (read.source_alias_tokens != null or read.source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        if (read.source_antfly_function_count != 0 or read.source_graph_function_count != 0 or read.join_items.len != 0) return;
+        if (!generatedReadSourceLooksLikeSingleTableSource(tokens, source)) return;
+        if (parsed_end != source.end) return;
+        return error.UnsupportedSqlShape;
+    };
+    var expected_table_start = source.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (source_table.start != expected_table_start or source_table.end != expected_table_start + 1 or source_table.end > source.end) return error.UnsupportedSqlShape;
+    if (tokens[source_table.start].kind != .identifier) return error.UnsupportedSqlShape;
+
+    const alias_end = try generatedSingleSourceAliasEnd(
+        tokens,
+        source_table,
+        read.source_alias_tokens,
+        read.source_alias_name_tokens,
+    );
+    if (alias_end != source.end or parsed_end != alias_end) return error.UnsupportedSqlShape;
+}
+
+fn generatedReadSourceLooksLikeSingleTableSource(
+    tokens: []const Token,
+    source: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (source.start >= source.end or source.end > tokens.len) return false;
+    var table_start = source.start;
+    if (tokens[table_start].matchesKeywordTag(.only)) table_start += 1;
+    if (table_start >= source.end or tokens[table_start].kind != .identifier) return false;
+
+    const table_end = table_start + 1;
+    if (table_end == source.end) return true;
+    if (table_end + 2 == source.end and
+        tokens[table_end].matchesKeywordTag(.as) and
+        tokens[table_end + 1].kind == .identifier)
+    {
+        return true;
+    }
+    if (table_end + 1 == source.end and
+        tokens[table_end].kind == .identifier and
+        !plan_mod.nextIsJoinClauseKeyword(tokens, table_end))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn generatedSingleSourceAliasEnd(
+    tokens: []const Token,
+    source_table: generated_parser.GeneratedSqlTokenRange,
+    source_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    source_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !usize {
+    if (source_table.start >= source_table.end or source_table.end > tokens.len) return error.UnsupportedSqlShape;
+    const alias = source_alias_tokens orelse {
+        if (source_alias_name_tokens != null) return error.UnsupportedSqlShape;
+        return source_table.end;
+    };
+    const alias_name = source_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.start != source_table.end or alias.start >= alias.end or alias.end > tokens.len) return error.UnsupportedSqlShape;
+    const expected_name = if (alias.end == source_table.end + 2 and
+        tokens[source_table.end].matchesKeywordTag(.as) and
+        tokens[source_table.end + 1].kind == .identifier)
+    blk: {
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = source_table.end + 1, .end = source_table.end + 2 };
+    } else if (alias.end == source_table.end + 1 and
+        tokens[source_table.end].kind == .identifier and
+        !plan_mod.nextIsJoinClauseKeyword(tokens, source_table.end))
+    blk: {
+        break :blk alias;
+    } else return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(alias_name, expected_name)) return error.UnsupportedSqlShape;
+    return alias.end;
+}
+
 fn generatedGroupClauseEnd(
     tokens: []const Token,
     keyword_index: usize,
@@ -19240,7 +19326,8 @@ pub fn parseSelectAlloc(
     }
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
+    const source_start = pos.*;
+    const generated_source_end = try generatedSourceClauseEnd(tokens, source_start, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -19254,6 +19341,7 @@ pub fn parseSelectAlloc(
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
     }
+    try validateGeneratedSingleSourceAliasForParsedTable(tokens, options.generated_read_ast, source_start, pos.*);
     if (generated_source_end) |end| {
         if (pos.* != end) return error.UnsupportedSqlShape;
     }
@@ -19603,7 +19691,8 @@ pub fn parseAggregateAlloc(
     } else if (select.aggregations.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, false);
+    const source_start = pos.*;
+    const generated_source_end = try generatedSourceClauseEnd(tokens, source_start, options.generated_read_ast, false);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -19617,6 +19706,7 @@ pub fn parseAggregateAlloc(
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
     }
+    try validateGeneratedSingleSourceAliasForParsedTable(tokens, options.generated_read_ast, source_start, pos.*);
     if (generated_source_end) |end| {
         if (pos.* != end) return error.UnsupportedSqlShape;
     }
@@ -20072,7 +20162,8 @@ pub fn parseWindowSelectAlloc(
     if (select.windows.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, false);
+    const source_start = pos.*;
+    const generated_source_end = try generatedSourceClauseEnd(tokens, source_start, options.generated_read_ast, false);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -20086,6 +20177,7 @@ pub fn parseWindowSelectAlloc(
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
     }
+    try validateGeneratedSingleSourceAliasForParsedTable(tokens, options.generated_read_ast, source_start, pos.*);
     if (generated_source_end) |end| {
         if (pos.* != end) return error.UnsupportedSqlShape;
     }
@@ -29594,6 +29686,38 @@ test "sql adapter lower expr validates retained generated read body payloads" {
     } else return error.TestUnexpectedResult;
 }
 
+test "sql adapter lower expr validates generated read source alias payloads" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+
+    var malformed_alias = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'",
+    );
+    defer malformed_alias.deinit(alloc);
+    try corruptGeneratedReadSourceAliasRange(&malformed_alias);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_alias,
+        schema,
+        &.{},
+        .{},
+    ));
+}
+
 fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -34580,6 +34704,23 @@ fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
                 .read => |read| {
                     if (read.source_tokens == null or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.source_tokens = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadSourceAliasRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.source_table_tokens == null or read.source_alias_tokens == null or read.source_alias_name_tokens == null) return error.TestUnexpectedResult;
+                    read.source_alias_tokens = null;
+                    read.source_alias_name_tokens = null;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
