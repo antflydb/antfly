@@ -1200,18 +1200,21 @@ projection/source/predicate payloads, and requires top-level and CTE-body
 `WHERE`/`HAVING` generated predicate expression spans to match their retained
 clause bodies. Named `WINDOW` clauses now also validate generated window item
 boundaries, `name AS (...)` layout, partition/order list payloads, and frame
-expression spans before publishing a generated read family.
+expression spans before publishing a generated read family. Join classification
+now also validates join operator token sequences against generated join kind
+metadata and rejects conditionless join metadata unless the generated join kind
+is actually conditionless. Generated row-lock clauses now validate the complete
+`FOR` strength, optional `OF` target list, and `NOWAIT`/`SKIP LOCKED` wait
+policy layout instead of only checking the leading `FOR` token.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-   conditionless cartesian payload layout, generated `USING (...)` column-list
-   delimiter and expression-item validation, remaining exact join-item
-   segment/tail validation, operator-kind checks, and fail-closed right/full
-   plus conditionless
-   `NATURAL JOIN` metadata, expression AST
+   conditionless cartesian payload layout, remaining exact join-item
+   segment/tail validation and fail-closed right/full plus conditionless
+   `NATURAL JOIN` executable-contract coverage, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,

@@ -2294,9 +2294,7 @@ fn generatedReadAstHasValidClassificationPayload(
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_count_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.row_lock_tokens)) return false;
-    if (read_ast.row_lock_tokens) |row_lock_tokens| {
-        if (row_lock_tokens.start >= row_lock_tokens.end or !tokenMatchesKeyword(tokens[row_lock_tokens.start], .@"for")) return false;
-    }
+    if (!generatedReadRowLockPayloadIsValid(tokens, end, read_ast.row_lock_tokens)) return false;
     if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.set_operation_tokens)) return false;
     if (!generatedReadSetOperationPayloadIsValid(tokens, end, read_ast.set_operation_tokens, read_ast.set_operation)) return false;
     if (!generatedReadCtePayloadIsValid(tokens, end, select_index, read_ast)) return false;
@@ -2456,9 +2454,7 @@ fn generatedReadCtePayloadIsValid(
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_count_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_row_lock_tokens)) return false;
-        if (cte.body_row_lock_tokens) |row_lock_tokens| {
-            if (row_lock_tokens.start >= row_lock_tokens.end or !tokenMatchesKeyword(tokens[row_lock_tokens.start], .@"for")) return false;
-        }
+        if (!generatedReadRowLockPayloadIsValid(tokens, end, cte.body_row_lock_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_set_operation_tokens)) return false;
         if (!generatedReadSetOperationPayloadIsValid(tokens, end, cte.body_set_operation_tokens, cte.body_set_operation)) return false;
         if (!generatedReadAntflySourceItemsAreValid(tokens, end, cte.body_source_tokens, cte.body_source_antfly_function_items, cte.body_source_antfly_function_count)) return false;
@@ -2542,10 +2538,12 @@ fn generatedReadJoinItemIsValid(
     if (item.left_tokens.end != item.operator_tokens.start) return false;
     if (item.operator_tokens.end != item.right_tokens.start) return false;
     if (item.right_tokens.end > item.tokens.end) return false;
+    if (!generatedReadJoinKindMatchesOperator(tokens, item.operator_tokens, item.kind)) return false;
 
     return switch (item.condition_kind) {
         .none => item.condition_tokens.start == item.right_tokens.end and
             item.condition_tokens.end == item.right_tokens.end and
+            (item.kind == .cross or item.kind == .natural) and
             item.predicate_tokens == null and
             item.predicate_expression.tokens == null and
             item.using_tokens == null and
@@ -2591,6 +2589,53 @@ fn generatedReadJoinUsingColumnListIsValid(
         .reject_aliases = true,
         .reject_order_modifiers = true,
     });
+}
+
+fn generatedReadJoinKindMatchesOperator(
+    tokens: []const Token,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+    kind: generated_parser.GeneratedSqlJoinKind,
+) bool {
+    if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > tokens.len) return false;
+    switch (kind) {
+        .inner => {
+            if (operator_tokens.end == operator_tokens.start + 1) {
+                return tokens[operator_tokens.start].matchesKeywordTag(.join);
+            }
+            if (operator_tokens.end == operator_tokens.start + 2) {
+                return tokens[operator_tokens.start].matchesKeywordTag(.inner) and
+                    tokens[operator_tokens.start + 1].matchesKeywordTag(.join);
+            }
+            return false;
+        },
+        .left, .right, .full => {
+            const expected_keyword: TokenKeyword = switch (kind) {
+                .left => .left,
+                .right => .right,
+                .full => .full,
+                else => unreachable,
+            };
+            if (!tokens[operator_tokens.start].matchesKeywordTag(expected_keyword)) return false;
+            if (operator_tokens.end == operator_tokens.start + 2) {
+                return tokens[operator_tokens.start + 1].matchesKeywordTag(.join);
+            }
+            if (operator_tokens.end == operator_tokens.start + 3) {
+                return tokens[operator_tokens.start + 1].matchesKeywordTag(.outer) and
+                    tokens[operator_tokens.start + 2].matchesKeywordTag(.join);
+            }
+            return false;
+        },
+        .cross, .natural => {
+            const expected_keyword: TokenKeyword = switch (kind) {
+                .cross => .cross,
+                .natural => .natural,
+                else => unreachable,
+            };
+            return operator_tokens.end == operator_tokens.start + 2 and
+                tokens[operator_tokens.start].matchesKeywordTag(expected_keyword) and
+                tokens[operator_tokens.start + 1].matchesKeywordTag(.join);
+        },
+    }
 }
 
 fn generatedReadSetOperationPayloadIsValid(
@@ -2660,6 +2705,75 @@ fn generatedReadSetOperationPayloadIsEmpty(set_operation: generated_parser.Gener
         set_operation.right_source_tokens == null and
         set_operation.right_where_tokens == null and
         set_operation.right_where_expression.tokens == null;
+}
+
+fn generatedReadRowLockPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const range = maybe_range orelse return true;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, range)) return false;
+    if (!tokens[range.start].matchesKeywordTag(.@"for")) return false;
+
+    var cursor = range.start + 1;
+    if (cursor >= range.end) return false;
+    if (tokens[cursor].matchesKeywordTag(.update) or tokens[cursor].matchesKeywordTag(.share)) {
+        cursor += 1;
+    } else if (cursor + 1 < range.end and
+        tokens[cursor].matchesKeywordTag(.key) and
+        tokens[cursor + 1].matchesKeywordTag(.share))
+    {
+        cursor += 2;
+    } else if (cursor + 2 < range.end and
+        tokens[cursor].matchesKeywordTag(.no) and
+        tokens[cursor + 1].matchesKeywordTag(.key) and
+        tokens[cursor + 2].matchesKeywordTag(.update))
+    {
+        cursor += 3;
+    } else {
+        return false;
+    }
+
+    var wait_start = range.end;
+    if (range.end > cursor and tokens[range.end - 1].matchesKeywordTag(.nowait)) {
+        wait_start = range.end - 1;
+    } else if (range.end > cursor + 1 and
+        tokens[range.end - 2].matchesKeywordTag(.skip) and
+        tokens[range.end - 1].matchesKeywordTag(.locked))
+    {
+        wait_start = range.end - 2;
+    } else if (range.end > cursor and tokens[range.end - 1].matchesKeywordTag(.skip)) {
+        return false;
+    }
+
+    if (cursor < wait_start) {
+        if (!tokens[cursor].matchesKeywordTag(.of)) return false;
+        cursor += 1;
+        if (!generatedReadRowLockTargetListIsValid(tokens, cursor, wait_start)) return false;
+        cursor = wait_start;
+    }
+
+    if (cursor == range.end) return true;
+    if (cursor + 1 == range.end and tokens[cursor].matchesKeywordTag(.nowait)) return true;
+    return cursor + 2 == range.end and
+        tokens[cursor].matchesKeywordTag(.skip) and
+        tokens[cursor + 1].matchesKeywordTag(.locked);
+}
+
+fn generatedReadRowLockTargetListIsValid(tokens: []const Token, start: usize, end: usize) bool {
+    if (start >= end or end > tokens.len) return false;
+    var expect_target = true;
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (tokens[index].kind == .comma) {
+            if (expect_target) return false;
+            expect_target = true;
+        } else {
+            expect_target = false;
+        }
+    }
+    return !expect_target;
 }
 
 fn generatedReadWindowPayloadIsValid(
@@ -7353,6 +7467,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_row_lock_query.statement));
 
+    var generated_truncated_row_lock_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED");
+    defer generated_truncated_row_lock_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_truncated_row_lock_query.generatedStatementKind().?);
+
+    var malformed_truncated_row_lock_generated = generated_truncated_row_lock_query.generated_statement.?;
+    if (malformed_truncated_row_lock_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.row_lock_tokens.?.end -= 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_truncated_row_lock_query.statement = parseStatement(generated_truncated_row_lock_query.raw_statement, malformed_truncated_row_lock_generated, &generated_truncated_row_lock_query.tokenized_sql);
+    try std.testing.expect(generated_truncated_row_lock_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_truncated_row_lock_query.statement));
+
     var generated_cte_row_lock_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records FOR UPDATE SKIP LOCKED) SELECT id FROM source_rows");
     defer generated_cte_row_lock_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_row_lock_query.generatedStatementKind().?);
@@ -7369,6 +7500,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_cte_row_lock_query.statement = parseStatement(generated_cte_row_lock_query.raw_statement, malformed_cte_row_lock_generated, &generated_cte_row_lock_query.tokenized_sql);
     try std.testing.expect(generated_cte_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_row_lock_query.statement));
+
+    var generated_cte_of_row_lock_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records FOR NO KEY UPDATE OF usage_records NOWAIT) SELECT id FROM source_rows");
+    defer generated_cte_of_row_lock_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_of_row_lock_query.generatedStatementKind().?);
+
+    var malformed_cte_of_row_lock_generated = generated_cte_of_row_lock_query.generated_statement.?;
+    if (malformed_cte_of_row_lock_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_row_lock_tokens.?.end = read_ast.cte_items[0].body_row_lock_tokens.?.start + 5,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_of_row_lock_query.statement = parseStatement(generated_cte_of_row_lock_query.raw_statement, malformed_cte_of_row_lock_generated, &generated_cte_of_row_lock_query.tokenized_sql);
+    try std.testing.expect(generated_cte_of_row_lock_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_of_row_lock_query.statement));
 
     var generated_set_operation_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION ALL SELECT id FROM usage_archive");
     defer generated_set_operation_query.deinit(alloc);
@@ -7482,6 +7630,37 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
         return error.TestUnexpectedResult;
     }
     generated_join_query.statement = parseStatement(generated_join_query.raw_statement, malformed_join_tree_generated, &generated_join_query.tokenized_sql);
+    try std.testing.expect(generated_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
+
+    var malformed_join_kind_generated = generated_join_query.generated_statement.?;
+    if (malformed_join_kind_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.join_items[0].kind = .cross,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_join_query.statement = parseStatement(generated_join_query.raw_statement, malformed_join_kind_generated, &generated_join_query.tokenized_sql);
+    try std.testing.expect(generated_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
+
+    var malformed_join_condition_generated = generated_join_query.generated_statement.?;
+    if (malformed_join_condition_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                read_ast.join_items[0].condition_kind = .none;
+                read_ast.join_items[0].condition_tokens = .{ .start = read_ast.join_items[0].right_tokens.end, .end = read_ast.join_items[0].right_tokens.end };
+                read_ast.join_items[0].predicate_tokens = null;
+                read_ast.join_items[0].predicate_expression = .{};
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_join_query.statement = parseStatement(generated_join_query.raw_statement, malformed_join_condition_generated, &generated_join_query.tokenized_sql);
     try std.testing.expect(generated_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
 
