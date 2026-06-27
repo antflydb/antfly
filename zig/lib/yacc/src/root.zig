@@ -274,7 +274,7 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             active_rule = null;
             continue;
         }
-        if (std.mem.startsWith(u8, line, "%type ")) {
+        if (std.mem.startsWith(u8, line, "%type ") or std.mem.startsWith(u8, line, "%nterm ")) {
             active_rule = null;
             continue;
         }
@@ -305,7 +305,15 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 try grammar.rules.append(allocator, .{ .name = try dupToken(allocator, name) });
                 active_rule = grammar.rules.items.len - 1;
                 const rest = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
-                if (rest.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
+                if (rest.len != 0) {
+                    if (try splitUnclosedActionBlockPrefix(rest)) |split| {
+                        const prefix = std.mem.trim(u8, split.prefix, " \t\r");
+                        if (prefix.len != 0) try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], prefix);
+                        skip_brace_block_depth = split.depth;
+                    } else {
+                        try appendAlternatives(allocator, &grammar.rules.items[active_rule.?], rest);
+                    }
+                }
                 if (ends_rule) active_rule = null;
                 continue;
             }
@@ -320,7 +328,13 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
                 std.mem.trim(u8, line[1..], " \t\r")
             else
                 line;
-            try appendAlternatives(allocator, &grammar.rules.items[rule_idx], alt);
+            if (try splitUnclosedActionBlockPrefix(alt)) |split| {
+                const prefix = std.mem.trim(u8, split.prefix, " \t\r");
+                if (prefix.len != 0) try appendAlternatives(allocator, &grammar.rules.items[rule_idx], prefix);
+                skip_brace_block_depth = split.depth;
+            } else {
+                try appendAlternatives(allocator, &grammar.rules.items[rule_idx], alt);
+            }
             if (ends_rule) active_rule = null;
             continue;
         }
@@ -394,6 +408,31 @@ fn braceDepthAfterLine(line: []const u8, initial_depth: usize) !usize {
         }
     }
     return depth;
+}
+
+const UnclosedActionSplit = struct {
+    prefix: []const u8,
+    depth: usize,
+};
+
+fn splitUnclosedActionBlockPrefix(line: []const u8) !?UnclosedActionSplit {
+    var index: usize = 0;
+    var quote: ?u8 = null;
+    while (index < line.len) : (index += 1) {
+        if ((line[index] == '\'' or line[index] == '"') and (index == 0 or line[index - 1] != '\\')) {
+            if (quote == line[index]) {
+                quote = null;
+            } else if (quote == null) {
+                quote = line[index];
+            }
+            continue;
+        }
+        if (quote == null and line[index] == '{') {
+            const depth = try braceDepthAfterLine(line[index..], 0);
+            if (depth != 0) return .{ .prefix = line[0..index], .depth = depth };
+        }
+    }
+    return null;
 }
 
 fn stripCommentsAlloc(allocator: std.mem.Allocator, line: []const u8, in_block_comment: *bool) ![]const u8 {
@@ -1884,10 +1923,10 @@ test "parseGrammar skips multiline bison prologue directive and action blocks" {
         \\} <str>
         \\%start stmt
         \\%token <str> IDENT
+        \\%nterm <node> stmt
         \\%%
         \\stmt:
-        \\    IDENT
-        \\    {
+        \\    IDENT {
         \\        $$ = make_ident($1);
         \\        note("{ not grammar }");
         \\    }

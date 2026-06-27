@@ -48,13 +48,14 @@ also supports Yacc precedence declarations, including `%left`, `%right`,
 shift/reduce ambiguity can be resolved in table construction instead of being
 left as broad `%expect` debt. The grammar reader accepts the next layer of
 PostgreSQL/Bison source shape as parser-generator input: typed declaration
-tags such as `%token <str> IDENT`, ignored `%type` metadata, `%precedence`,
-`%%` section separators, literal precedence references through existing token
-aliases, declaration numeric token codes, double-quoted token display aliases
-such as `%token <str> IDENT 258 "identifier"`, and C/Bison semantic action
-blocks in rule alternatives. It also skips multi-line Bison prologue blocks,
-ignored directive blocks such as `%union`/`%destructor`, and standalone
-multi-line semantic action blocks that follow a production alternative. Bison
+tags such as `%token <str> IDENT`, ignored `%type` and `%nterm` metadata,
+`%precedence`, `%%` section separators, literal precedence references through
+existing token aliases, declaration numeric token codes, double-quoted token
+display aliases such as `%token <str> IDENT 258 "identifier"`, and C/Bison
+semantic action blocks in rule alternatives. It also skips multi-line Bison
+prologue blocks, ignored directive blocks such as `%union`/`%destructor`, and
+multi-line semantic action blocks that follow a production alternative,
+including actions that start after production symbols on the same line. Bison
 empty productions can be written as `%empty` or retained source comments such
 as `/* empty */` / `/*EMPTY*/`, and C-style block comments are stripped across
 lines without treating comment-like text inside quoted literal aliases or URLs
