@@ -81,7 +81,13 @@ overrides, while `|` starts a new alternative. The
 grammar seed uses `%expect` to record the current broad-grammar conflict count;
 regeneration fails if the parser table conflict count drifts without an
 intentional grammar update, and the checked-in generated metadata records
-nullable-symbol metadata alongside both actual and expected conflict counts. The
+nullable-symbol metadata alongside both actual and expected conflict counts.
+The emitted parser now also has a bounded stack-buffer reduction callback path
+that reports compact production/lhs/rhs-length reduction events while keeping
+raw parser states, action/goto tables, and symbol tables private. That is the
+production bridge for later generated AST construction: AST builders can consume
+the reduction stream without rediscovering syntax from SQL text or depending on
+table internals. The
 current broad Antfly SQL seed grammar generates deterministic parser metadata
 with tracked conflict reporting. Conflict drift now has a structured generator
 report path that prints the expected and actual conflict counts plus

@@ -215813,6 +215813,48 @@ pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void {
     }
 }
 
+pub const Reduction = struct {
+    production: u16,
+    lhs: u16,
+    rhs_len: u16,
+};
+
+pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void {
+    if (stack_buffer.len == 0) return ParseError.StackOverflow;
+    var stack_len: usize = 1;
+    stack_buffer[0] = 0;
+
+    var index: usize = 0;
+    while (true) {
+        const state = stack_buffer[stack_len - 1];
+        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
+        const action = findAction(state, lookahead) orelse return ParseError.UnexpectedToken;
+        switch (action.kind) {
+            .shift => {
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = action.target;
+                stack_len += 1;
+                index += 1;
+            },
+            .reduce => {
+                const production = productions[action.target];
+                if (production.rhs_len > stack_len - 1) return ParseError.StackUnderflow;
+                try reducer.reduce(.{
+                    .production = action.target,
+                    .lhs = production.lhs,
+                    .rhs_len = production.rhs_len,
+                });
+                stack_len -= production.rhs_len;
+                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return ParseError.InvalidGoto;
+                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
+                stack_buffer[stack_len] = goto_entry.target;
+                stack_len += 1;
+            },
+            .accept => return,
+        }
+    }
+}
+
 pub fn parseDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseDiagnostic {
     const info = try parseError(allocator, token_ids) orelse return null;
     return try parseDiagnosticFromInfo(allocator, info);
