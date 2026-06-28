@@ -2772,6 +2772,7 @@ pub fn build(b: *std.Build) void {
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
         "retrieval agent treats aggregations as first-class tool capability",
@@ -3803,6 +3804,10 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "provisioned group storage wires remote content to writer caches",
+            "startup runtime status snapshot publishes live db when active cache is empty",
+            "best effort startup runtime status publishes live db when cache is empty",
+            "idle startup runtime status publish is live when startup flag is still set",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

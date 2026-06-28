@@ -1387,7 +1387,7 @@ def serverless_api(serverless_runtime):
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
+        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
@@ -2256,7 +2256,7 @@ def backup_api():
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
+        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
