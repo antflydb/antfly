@@ -147,9 +147,10 @@ pub const Runtime = struct {
         if (session.statements.contains(plan.statement_name)) return error.PreparedStatementAlreadyExists;
         const key = try self.alloc.dupe(u8, plan.statement_name);
         errdefer self.alloc.free(key);
-        const owned_subject_sql = try self.ownedSubjectSqlForPreparePlanAlloc(plan);
-        errdefer self.alloc.free(owned_subject_sql);
-        var subject_parsed_sql = try self.ownedSubjectParsedSqlForPreparePlanAlloc(plan, owned_subject_sql);
+        const source_subject = plan.subject_parsed_sql orelse return error.UnsupportedSqlShape;
+        const owned_subject_source = try self.alloc.dupe(u8, source_subject.sql());
+        errdefer self.alloc.free(owned_subject_source);
+        var subject_parsed_sql = try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_subject_source, source_subject.items());
         errdefer subject_parsed_sql.deinit(self.alloc);
         const subject_family = preparedStatementFamilyFromParsedSql(&subject_parsed_sql) orelse return error.UnsupportedSqlShape;
         if (subject_family != plan.statement_family or preparedStatementSubjectKindFromFamily(subject_family) != plan.statement_kind) {
@@ -161,22 +162,6 @@ pub const Runtime = struct {
             .statement_family = plan.statement_family,
             .subject_parsed_sql = subject_parsed_sql,
         });
-    }
-
-    fn ownedSubjectSqlForPreparePlanAlloc(self: *@This(), plan: sql_adapter.PrepareStatementPlan) ![]const u8 {
-        if (plan.subject_parsed_sql) |parsed| return try self.alloc.dupe(u8, parsed.sql());
-        return try self.alloc.dupe(u8, plan.subject_sql orelse return error.UnsupportedSqlShape);
-    }
-
-    fn ownedSubjectParsedSqlForPreparePlanAlloc(
-        self: *@This(),
-        plan: sql_adapter.PrepareStatementPlan,
-        owned_subject_sql: []const u8,
-    ) !sql_adapter.ParsedSql {
-        if (plan.subject_parsed_sql) |parsed| {
-            return try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_subject_sql, parsed.items());
-        }
-        return try sql_adapter.ParsedSql.initAlloc(self.alloc, owned_subject_sql);
     }
 
     fn execute(
@@ -257,6 +242,30 @@ fn preparedStatementSubjectKindFromFamily(family: sql_adapter.PreparedStatementS
     };
 }
 
+fn prepareStatementPlanForTestAlloc(
+    alloc: std.mem.Allocator,
+    statement_name: []const u8,
+    parameter_count: usize,
+    statement_kind: sql_adapter.PreparedStatementSubjectKind,
+    statement_family: sql_adapter.PreparedStatementStatementKind,
+    subject_source: []const u8,
+) !sql_adapter.PrepareStatementPlan {
+    const owned_subject_source = try alloc.dupe(u8, subject_source);
+    errdefer alloc.free(owned_subject_source);
+    var subject_parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, owned_subject_source);
+    errdefer {
+        subject_parsed_sql.deinit(alloc);
+        alloc.free(owned_subject_source);
+    }
+    return .{
+        .statement_name = try alloc.dupe(u8, statement_name),
+        .parameter_count = parameter_count,
+        .statement_kind = statement_kind,
+        .statement_family = statement_family,
+        .subject_parsed_sql = subject_parsed_sql,
+    };
+}
+
 test "sql prepared statement runtime stores session scoped plans" {
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
@@ -264,13 +273,15 @@ test "sql prepared statement runtime stores session scoped plans" {
 
     const session_a: u64 = 101;
     const session_b: u64 = 202;
-    const prepare_read = sql_adapter.PrepareStatementPlan{
-        .statement_name = "usage_plan",
-        .parameter_count = 1,
-        .statement_kind = .read,
-        .statement_family = .read,
-        .subject_sql = "SELECT id FROM usage_records WHERE status = $1;",
-    };
+    var prepare_read = try prepareStatementPlanForTestAlloc(
+        alloc,
+        "usage_plan",
+        1,
+        .read,
+        .read,
+        "SELECT id FROM usage_records WHERE status = $1;",
+    );
+    defer prepare_read.deinit(alloc);
 
     try runtime.apply(.{ .prepare = prepare_read }, session_a);
     try std.testing.expectEqual(@as(usize, 1), runtime.statementCountForTest(session_a));
@@ -317,23 +328,23 @@ test "sql prepared statement runtime stores session scoped plans" {
     };
     const generated_executable = try runtime.executableForExecute(session_a, generated_execute);
     try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, generated_executable.statement_family);
-    try std.testing.expectEqualStrings(generated_prepare_sql, generated_executable.parsed_sql.sql());
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.sql());
     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.statementSql());
     try runtime.apply(.{ .deallocate = .{ .statement_name = "generated_usage_plan" } }, session_a);
 
-    try runtime.apply(.{ .prepare = .{
-        .statement_name = "read_plan",
-        .statement_kind = .read,
-        .statement_family = .read,
-        .subject_sql = "SELECT id FROM usage_records;",
-    } }, session_a);
-    try runtime.apply(.{ .prepare = .{
-        .statement_name = "write_plan",
-        .parameter_count = 1,
-        .statement_kind = .write,
-        .statement_family = .insert,
-        .subject_sql = "INSERT INTO usage_records(id, status) VALUES ($1, 'prepared');",
-    } }, session_a);
+    var read_plan = try prepareStatementPlanForTestAlloc(alloc, "read_plan", 0, .read, .read, "SELECT id FROM usage_records;");
+    defer read_plan.deinit(alloc);
+    try runtime.apply(.{ .prepare = read_plan }, session_a);
+    var write_plan = try prepareStatementPlanForTestAlloc(
+        alloc,
+        "write_plan",
+        1,
+        .write,
+        .insert,
+        "INSERT INTO usage_records(id, status) VALUES ($1, 'prepared');",
+    );
+    defer write_plan.deinit(alloc);
+    try runtime.apply(.{ .prepare = write_plan }, session_a);
     const write_args = [_]sql_adapter.SqlValue{.{ .string = "open" }};
     try std.testing.expect(!try runtime.planAllowedInReadOnly(session_a, .{ .execute = .{
         .statement_name = "write_plan",
@@ -350,20 +361,21 @@ test "sql prepared statement runtime rejects mismatched subject metadata" {
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = .{
-        .statement_name = "mismatched_read",
-        .statement_kind = .write,
-        .statement_family = .insert,
-        .subject_sql = "SELECT id FROM usage_records;",
-    } }, 303));
+    var mismatched_read = try prepareStatementPlanForTestAlloc(alloc, "mismatched_read", 0, .write, .insert, "SELECT id FROM usage_records;");
+    defer mismatched_read.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = mismatched_read }, 303));
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = .{
-        .statement_name = "mismatched_insert_source",
-        .statement_kind = .write,
-        .statement_family = .insert,
-        .subject_sql = "INSERT INTO usage_records(id) SELECT id FROM incoming_usage;",
-    } }, 303));
+    var mismatched_insert_source = try prepareStatementPlanForTestAlloc(
+        alloc,
+        "mismatched_insert_source",
+        0,
+        .write,
+        .insert,
+        "INSERT INTO usage_records(id) SELECT id FROM incoming_usage;",
+    );
+    defer mismatched_insert_source.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.apply(.{ .prepare = mismatched_insert_source }, 303));
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 
     var malformed_generated_read = try sql_adapter.ParsedSql.initAlloc(alloc, "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'");

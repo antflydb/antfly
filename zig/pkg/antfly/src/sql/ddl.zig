@@ -1964,12 +1964,14 @@ pub const PrepareStatementPlan = struct {
     parameter_count: usize = 0,
     statement_kind: PreparedStatementSubjectKind,
     statement_family: PreparedStatementStatementKind,
-    subject_sql: ?[]const u8 = null,
     subject_parsed_sql: ?tokenized.ParsedSql = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.subject_parsed_sql) |*parsed| parsed.deinit(alloc);
-        if (self.subject_sql) |subject_sql| alloc.free(@constCast(subject_sql));
+        if (self.subject_parsed_sql) |*parsed| {
+            const owned_subject_source = parsed.sql();
+            parsed.deinit(alloc);
+            alloc.free(@constCast(owned_subject_source));
+        }
         alloc.free(self.statement_name);
         self.* = undefined;
     }
@@ -2038,12 +2040,14 @@ pub const DeclareCursorPortalPlan = struct {
     binary: bool = false,
     hold: bool = false,
     statement_kind: PreparedStatementSubjectKind,
-    subject_sql: ?[]const u8 = null,
     subject_parsed_sql: ?tokenized.ParsedSql = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.subject_parsed_sql) |*parsed| parsed.deinit(alloc);
-        if (self.subject_sql) |subject_sql| alloc.free(@constCast(subject_sql));
+        if (self.subject_parsed_sql) |*parsed| {
+            const owned_subject_source = parsed.sql();
+            parsed.deinit(alloc);
+            alloc.free(@constCast(owned_subject_source));
+        }
         alloc.free(self.portal_name);
         self.* = undefined;
     }
@@ -3419,12 +3423,7 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
         .statement_family = statement_family,
     };
     errdefer plan.deinit(alloc);
-    plan.subject_parsed_sql = try tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, inner.start, inner.end);
-    errdefer if (plan.subject_parsed_sql) |*subject| {
-        subject.deinit(alloc);
-        plan.subject_parsed_sql = null;
-    };
-    plan.subject_sql = try alloc.dupe(u8, plan.subject_parsed_sql.?.statementSql());
+    plan.subject_parsed_sql = try parsedSqlFromTokenRangeAlloc(alloc, tokens[inner.start..inner.end]);
     return plan;
 }
 
@@ -7371,14 +7370,7 @@ pub fn parsePrepareStatementPlanTailAlloc(
     if (syntax.subject_token_start) |subject_start| {
         const subject_end = syntax.subject_token_end orelse return error.UnsupportedSqlShape;
         if (subject_start >= subject_end or subject_end > tokens.len) return error.UnsupportedSqlShape;
-        plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
-        errdefer {
-            if (plan.subject_sql) |subject_sql| {
-                alloc.free(@constCast(subject_sql));
-                plan.subject_sql = null;
-            }
-        }
-        plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+        plan.subject_parsed_sql = try parsedSqlFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
     }
     return plan;
 }
@@ -7419,14 +7411,7 @@ pub fn parseDeclareCursorPortalPlanTailAlloc(
     if (syntax.subject_token_start) |subject_start| {
         const subject_end = syntax.subject_token_end orelse return error.UnsupportedSqlShape;
         if (subject_start >= subject_end or subject_end > tokens.len) return error.UnsupportedSqlShape;
-        plan.subject_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
-        errdefer {
-            if (plan.subject_sql) |subject_sql| {
-                alloc.free(@constCast(subject_sql));
-                plan.subject_sql = null;
-            }
-        }
-        plan.subject_parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, plan.subject_sql.?);
+        plan.subject_parsed_sql = try parsedSqlFromTokenRangeAlloc(alloc, tokens[subject_start..subject_end]);
     }
     return plan;
 }
@@ -7478,6 +7463,12 @@ fn sqlTextFromTokenRangeAlloc(alloc: std.mem.Allocator, tokens: []const grammar.
         try out.writer.writeAll(token.text);
     }
     return try out.toOwnedSlice();
+}
+
+fn parsedSqlFromTokenRangeAlloc(alloc: std.mem.Allocator, tokens: []const grammar.Token) !tokenized.ParsedSql {
+    const owned_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens);
+    errdefer alloc.free(owned_sql);
+    return try tokenized.ParsedSql.initAlloc(alloc, owned_sql);
 }
 
 pub fn parseSavepointTransactionPlanTailAlloc(
@@ -18637,8 +18628,8 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
                 try std.testing.expectEqual(@as(usize, 1), prepare.parameter_count);
                 try std.testing.expectEqual(PreparedStatementSubjectKind.read, prepare.statement_kind);
                 try std.testing.expectEqual(PreparedStatementStatementKind.read, prepare.statement_family);
-                try std.testing.expect(prepare.subject_parsed_sql != null);
-                try std.testing.expect(std.mem.indexOf(u8, prepare.subject_sql orelse return error.TestUnexpectedResult, "SELECT id FROM usage_records") != null);
+                const subject = prepare.subject_parsed_sql orelse return error.TestUnexpectedResult;
+                try std.testing.expect(std.mem.indexOf(u8, subject.sql(), "SELECT id FROM usage_records") != null);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -18864,7 +18855,7 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
                     try std.testing.expectEqual(legacy.statement_kind, generated.statement_kind);
                     try std.testing.expectEqual(legacy.statement_family, generated.statement_family);
                     const subject = generated.subject_parsed_sql orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqualStrings(generated_prepare_sql, subject.sql());
+                    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.sql());
                     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.statementSql());
                 },
                 else => return error.TestUnexpectedResult,

@@ -9444,19 +9444,19 @@ pub const ApiHttpServer = struct {
     fn executePublicSqlDurablePlannedExecutionOrDiagnostic(
         self: *ApiHttpServer,
         durable_plan: *sql_adapter.DurableSqlPlan,
-        subject_sql: *const sql_adapter.ParsedSql,
+        subject_parsed_sql: *const sql_adapter.ParsedSql,
         execute_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
         stdin_payload: ?[]const u8,
     ) !PublicSqlResultOrResponse {
-        return self.executePublicSqlDurablePlannedExecution(durable_plan, subject_sql, session, authenticated_identity, stdin_payload) catch |err| switch (err) {
-            error.DocumentSqlViewMappingUnsupported => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, .init(.plan, .document_sql_view_mapping_unsupported)) },
+        return self.executePublicSqlDurablePlannedExecution(durable_plan, subject_parsed_sql, session, authenticated_identity, stdin_payload) catch |err| switch (err) {
+            error.DocumentSqlViewMappingUnsupported => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_parsed_sql, .init(.plan, .document_sql_view_mapping_unsupported)) },
             error.SqlReadOnlyTransaction => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, execute_sql, .init(.execute, .read_only_transaction)) },
-            error.PermissionDenied, error.Unauthorized => .{ .response = try self.publicSqlParsedDiagnosticResponse(403, subject_sql, .init(.bind, .permission_denied)) },
-            error.TableNotFound, error.InvalidSqlCatalog => .{ .response = try self.publicSqlParsedDiagnosticResponse(404, subject_sql, .init(.bind, .invalid_sql_catalog)) },
-            error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, .init(.bind, .invalid_sql_request)) },
-            error.UnsupportedSqlShape, error.UnsupportedOperation => .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject_sql, .init(.plan, .unsupported_sql_statement)) },
+            error.PermissionDenied, error.Unauthorized => .{ .response = try self.publicSqlParsedDiagnosticResponse(403, subject_parsed_sql, .init(.bind, .permission_denied)) },
+            error.TableNotFound, error.InvalidSqlCatalog => .{ .response = try self.publicSqlParsedDiagnosticResponse(404, subject_parsed_sql, .init(.bind, .invalid_sql_catalog)) },
+            error.InvalidRowsRequest, error.InvalidArgument, error.UnsupportedRowsSelector => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_parsed_sql, .init(.bind, .invalid_sql_request)) },
+            error.UnsupportedSqlShape, error.UnsupportedOperation => .{ .response = try self.publicSqlParsedDiagnosticResponse(501, subject_parsed_sql, .init(.plan, .unsupported_sql_statement)) },
             error.StatementTimeout => .{ .response = try self.publicSqlParsedDiagnosticResponse(408, execute_sql, .init(.execute, .statement_timeout)) },
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
@@ -9465,7 +9465,7 @@ pub const ApiHttpServer = struct {
             error.SavepointNotFound,
             error.InvalidRoleSetting,
             error.RoleSettingNotFound,
-            => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+            => .{ .response = try self.publicSqlParsedDiagnosticResponse(400, subject_parsed_sql, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
             else => return err,
         };
     }
