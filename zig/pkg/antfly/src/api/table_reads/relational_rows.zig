@@ -20,6 +20,7 @@ const metadata_transition_state = @import("../../metadata/transition_state.zig")
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const document_sql_runtime = @import("document_sql_runtime.zig");
+const sql_adapter = @import("../../sql/mod.zig");
 const sql_adapter_runtime = @import("../../sql/runtime.zig");
 const raft_mod = @import("../../raft/mod.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -1316,7 +1317,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
         }
     };
 
-    var lowered = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk WHERE depth > 1 ORDER BY id",
         schema,
@@ -3477,7 +3478,7 @@ test "lowered sql cross-table read plans execute through routed scans" {
 
     var catalog = FakeCatalog{};
     var fake = FakeRoutedSource{};
-    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogAlloc(
+    var lowered = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
         orders_schema,
@@ -3636,7 +3637,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         }
     };
 
-    var lowered = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -3678,7 +3679,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_distinct = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lowered_distinct = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -3718,7 +3719,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_intersect = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lowered_intersect = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -3756,7 +3757,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_tail = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lowered_tail = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id DESC LIMIT 2 OFFSET 1",
         schema,
@@ -3954,7 +3955,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     };
 
     var catalog = FakeCatalog{};
-    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogAlloc(
+    var lowered = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE",
         usage_schema,
@@ -4024,7 +4025,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_except = try sql_adapter_runtime.lowerReadPlanWithCatalogAlloc(
+    var lowered_except = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,
@@ -4062,7 +4063,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_intersect = try sql_adapter_runtime.lowerReadPlanWithCatalogAlloc(
+    var lowered_intersect = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,

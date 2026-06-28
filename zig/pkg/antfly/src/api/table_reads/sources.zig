@@ -6307,7 +6307,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
 
     const sql = try std.fmt.allocPrint(alloc, "SELECT id, name FROM docs FOR SYSTEM_TIME AS OF {d} WHERE id = 'row:1'", .{commit_sequence});
     defer alloc.free(sql);
-    var lowered = try sql_adapter_runtime.lowerReadPlanAlloc(alloc, sql, versioned_schema, &.{});
+    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(alloc, sql, versioned_schema, &.{});
     defer lowered.deinit(alloc);
 
     const FakeCatalog = struct {
@@ -6352,7 +6352,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        sql_adapter_runtime.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{}),
+        sql_adapter.lower_select.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{}),
     );
 }
 
@@ -6417,7 +6417,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var catalog = FakeCatalog{};
     var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
-    var lookup_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var lookup_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title, key, metadata->>'status' AS status, metadata#>>'{billing,plan}' AS plan FROM docs WHERE _id = 'doc:a'",
         schema,
@@ -6443,7 +6443,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var doc_projection_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var doc_projection_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, _doc FROM docs WHERE _id = 'doc:a'",
         schema,
@@ -6469,7 +6469,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs LIMIT 2",
         schema,
@@ -6496,7 +6496,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var star_scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var star_scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT * FROM docs LIMIT 1",
         schema,
@@ -6671,7 +6671,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         ),
     );
 
-    var full_text_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var full_text_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 1",
         schema,
@@ -6757,7 +6757,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         ),
     );
 
-    var like_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var like_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE title LIKE 'alp%' LIMIT 10",
         schema,
@@ -6784,7 +6784,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var full_text_count_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var full_text_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha')",
         schema,
@@ -6810,7 +6810,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var full_text_grouped_count_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var full_text_grouped_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha') GROUP BY key LIMIT 10",
         schema,
@@ -6837,7 +6837,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var scalar_count_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+    var scalar_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE key = 'document-key-field'",
         schema,
