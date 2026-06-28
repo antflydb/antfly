@@ -1629,6 +1629,10 @@ Current implementation status:
 - Direct generated-DML lowering validates both write family and recursive-CTE
   state from the published generated-aware write record before dispatching
   recursive or non-recursive write plans.
+- Catalog prebinding for generated top-level `INSERT ... SELECT` now consumes
+  retained generated DML target and child-read source-table metadata, and fails
+  closed when that retained source metadata is inconsistent instead of
+  rediscovering the source through token scanning.
 - Session, savepoint, notification, prepared-statement, cursor, and routine
   runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
   re-exports those protocol-neutral runtimes for API callers. Routine

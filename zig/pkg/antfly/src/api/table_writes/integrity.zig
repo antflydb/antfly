@@ -18,6 +18,7 @@ const metadata_admin = @import("../../metadata/admin.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const platform_clock = @import("../../platform/clock.zig");
+const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const distributed_txn = @import("../distributed_txn.zig");
@@ -115,7 +116,7 @@ pub fn promoteLocalUniqueConstraintAfterSchemaControllerResult(
     if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(result)) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
-    const enforced_schema_json = try tables_api.schemaWithUniqueConstraintValidationStateAlloc(
+    const enforced_schema_json = try sql_schema_mutation.schemaWithUniqueConstraintValidationStateAlloc(
         alloc,
         schema_json,
         constraint_name,
@@ -562,7 +563,7 @@ pub fn promoteLocalForeignKeyAfterSchemaControllerResult(
     const constraint_name = resultForeignKeyConstraintName(result) orelse return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
-    const enforced_schema_json = try tables_api.schemaWithForeignKeyValidationStateAlloc(
+    const enforced_schema_json = try sql_schema_mutation.schemaWithForeignKeyValidationStateAlloc(
         alloc,
         schema_json,
         constraint_name,

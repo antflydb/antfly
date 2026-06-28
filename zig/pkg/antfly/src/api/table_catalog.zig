@@ -24,6 +24,7 @@ const metadata_reconciler = @import("../metadata/reconciler.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const sql_schema_mutation = @import("../sql/schema_mutation.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const tables_api = @import("tables.zig");
 
@@ -943,7 +944,7 @@ fn promoteSecondaryIndexReadyOnService(
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const schema_json = tables_api.schemaWithSecondaryIndexReadyAlloc(
+    const schema_json = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
         alloc,
         table.schema_json,
         index_name,
@@ -977,7 +978,7 @@ pub fn promoteUniqueConstraintEnforced(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const schema_json = tables_api.schemaWithUniqueConstraintValidationStateAlloc(
+    const schema_json = sql_schema_mutation.schemaWithUniqueConstraintValidationStateAlloc(
         alloc,
         table.schema_json,
         constraint_name,

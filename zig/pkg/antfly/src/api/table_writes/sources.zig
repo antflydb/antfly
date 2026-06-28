@@ -51,6 +51,7 @@ const query_api = @import("../query.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const runtime_status = @import("../runtime_status.zig");
 const sql_adapter = @import("../../sql/mod.zig");
+const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const table_catalog = @import("../table_catalog.zig");
 const table_read_cache = @import("../table_reads/cache.zig");
@@ -19184,7 +19185,7 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
         ) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, table_name, self.table.name)) return false;
-            const updated = tables_api.schemaWithSecondaryIndexReadyAlloc(
+            const updated = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
                 allocator,
                 self.table.schema_json,
                 index_name,

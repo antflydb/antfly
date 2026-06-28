@@ -438,7 +438,11 @@ also retain source table and alias/name token ranges for simple `INSERT ...
 SELECT` sources, recursive DML CTE body reads, and `UPDATE`/`DELETE`/`MERGE`
 relation-source wrappers; parsed-statement classification and generated DML
 lowering validate those spans so corrupted child-read source alias metadata
-fails closed before typed command-body lowering continues. Deeper DML cutover still requires
+fails closed before typed command-body lowering continues. Catalog prebinding
+for generated top-level `INSERT ... SELECT` now consumes retained generated DML
+target-table and child-read source-table ranges directly, and fails closed when
+those retained ranges drift instead of rediscovering the source table through
+the legacy token scanner. Deeper DML cutover still requires
 replacing token-based recursive DML command-body lowering with complete
 generated AST-driven lowering beyond validated generated CTE child-read bodies,
 broader unsupported-shape diagnostics, and a later full statement-head

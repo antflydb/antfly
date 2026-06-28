@@ -41,6 +41,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const sql_schema_mutation = @import("../sql/schema_mutation.zig");
 const api_tables = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -5504,7 +5505,7 @@ fn promoteForeignKeySchemaControllerResult(
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const schema_json = try api_tables.schemaWithForeignKeyValidationStateAlloc(
+    const schema_json = try sql_schema_mutation.schemaWithForeignKeyValidationStateAlloc(
         service.alloc,
         table.schema_json,
         constraint_name,
@@ -5557,7 +5558,7 @@ fn promoteUniqueConstraintSchemaControllerResult(
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const schema_json = try api_tables.schemaWithUniqueConstraintValidationStateAlloc(
+    const schema_json = try sql_schema_mutation.schemaWithUniqueConstraintValidationStateAlloc(
         service.alloc,
         table.schema_json,
         constraint_name,

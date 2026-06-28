@@ -1859,7 +1859,45 @@ pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed
         },
         else => return error.UnsupportedSqlShape,
     }
+    if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
+        if (try insertSourceTableNamesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast)) |resolved| return resolved;
+    }
     return try insertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+}
+
+fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlDmlAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .dml => |*dml| dml,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
+fn insertSourceTableNamesFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    dml_ast: *const generated_parser.GeneratedSqlDmlAst,
+) !?InsertSourceTableNames {
+    if (dml_ast.kind != .insert_select or dml_ast.cte_recursive) return null;
+    if (dml_ast.cte_tokens != null or dml_ast.cte_prefix != null) return null;
+    const target_tokens = dml_ast.target_table_tokens orelse return error.UnsupportedSqlShape;
+    const source_read = dml_ast.source_read orelse return error.UnsupportedSqlShape;
+    const source_tokens = source_read.source_tokens orelse return error.UnsupportedSqlShape;
+    const source_table_tokens = source_read.source_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSimpleReadSourceTableTokens(tokens, source_tokens, source_table_tokens);
+
+    const target = try normalizeGeneratedSingleIdentifierAlloc(alloc, tokens, target_tokens);
+    errdefer alloc.free(target);
+    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_table_tokens.start].text);
+    errdefer alloc.free(source);
+    return .{
+        .target = target,
+        .source = source,
+    };
 }
 
 fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
@@ -3550,6 +3588,14 @@ test "sql adapter binder source table helpers validate parsed statement family" 
     try std.testing.expectEqualStrings("usage_records", insert_tables.target);
     try std.testing.expectEqualStrings("incoming_usage", insert_tables.source);
     try std.testing.expect((try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source)) == null);
+
+    if (insert_source.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| dml.source_read.?.source_table_tokens = dml.target_table_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, insertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source));
 
     var recursive_insert = try tokenized.ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM incoming_usage) INSERT INTO usage_records (id) SELECT id FROM source_rows");
     defer recursive_insert.deinit(alloc);

@@ -34,6 +34,7 @@ const indexes_api = @import("indexes.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_adapter = @import("../sql/mod.zig");
+const sql_schema_mutation = @import("../sql/schema_mutation.zig");
 const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
@@ -2366,64 +2367,13 @@ test "foreign key definition equality includes SQL compatibility fields" {
     try std.testing.expect(!foreignKeysSameDefinition(base, changed_deferrable));
 }
 
-fn foreignKeyValidationStateString(state: runtime_schema_mod.ForeignKeyValidationState) ![]const u8 {
-    return switch (state) {
-        .enforced => "enforced",
-        .unvalidated => "unvalidated",
-        .validating, .invalid => error.InvalidSchemaUpdateRequest,
-    };
-}
-
-fn uniqueConstraintValidationStateString(state: runtime_schema_mod.UniqueConstraintValidationState) ![]const u8 {
-    return switch (state) {
-        .enforced => "enforced",
-        .unvalidated => "unvalidated",
-        .validating, .invalid => error.InvalidSchemaUpdateRequest,
-    };
-}
-
 pub fn schemaWithForeignKeyValidationStateAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
     constraint_name: []const u8,
     state: runtime_schema_mod.ForeignKeyValidationState,
 ) ![]u8 {
-    const state_text = try foreignKeyValidationStateString(state);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-    const foreign_keys = root.getPtr("foreign_keys") orelse return error.ForeignKeyNotFound;
-    const foreign_key_items = switch (foreign_keys.*) {
-        .array => |*array| array.items,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-
-    var found = false;
-    for (foreign_key_items) |*foreign_key| {
-        const object = switch (foreign_key.*) {
-            .object => |*object| object,
-            else => return error.InvalidSchemaUpdateRequest,
-        };
-        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
-        if (name != .string) return error.InvalidSchemaUpdateRequest;
-        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
-
-        const validation_state = object.getPtr("validation_state") orelse return error.InvalidSchemaUpdateRequest;
-        validation_state.* = .{ .string = state_text };
-        found = true;
-        break;
-    }
-    if (!found) return error.ForeignKeyNotFound;
-
-    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-    errdefer alloc.free(updated);
-    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
-    validated.deinit(alloc);
-    return updated;
+    return try sql_schema_mutation.schemaWithForeignKeyValidationStateAlloc(alloc, schema_json, constraint_name, state);
 }
 
 pub fn schemaWithUniqueConstraintValidationStateAlloc(
@@ -2432,42 +2382,7 @@ pub fn schemaWithUniqueConstraintValidationStateAlloc(
     constraint_name: []const u8,
     state: runtime_schema_mod.UniqueConstraintValidationState,
 ) ![]u8 {
-    const state_text = try uniqueConstraintValidationStateString(state);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-    const unique_constraints = root.getPtr("unique_constraints") orelse return error.UniqueConstraintNotFound;
-    const constraint_items = switch (unique_constraints.*) {
-        .array => |*array| array.items,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-
-    var found = false;
-    for (constraint_items) |*constraint| {
-        const object = switch (constraint.*) {
-            .object => |*object| object,
-            else => return error.InvalidSchemaUpdateRequest,
-        };
-        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
-        if (name != .string) return error.InvalidSchemaUpdateRequest;
-        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
-
-        const validation_state = object.getPtr("validation_state") orelse return error.InvalidSchemaUpdateRequest;
-        validation_state.* = .{ .string = state_text };
-        found = true;
-        break;
-    }
-    if (!found) return error.UniqueConstraintNotFound;
-
-    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-    errdefer alloc.free(updated);
-    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
-    validated.deinit(alloc);
-    return updated;
+    return try sql_schema_mutation.schemaWithUniqueConstraintValidationStateAlloc(alloc, schema_json, constraint_name, state);
 }
 
 pub fn schemaWithSecondaryIndexReadyAlloc(
@@ -2476,42 +2391,7 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     index_name: []const u8,
     expected_generation: u64,
 ) ![]u8 {
-    if (expected_generation == 0) return error.InvalidSchemaUpdateRequest;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-    const default_type_value = root.get("default_type") orelse return error.InvalidSchemaUpdateRequest;
-    if (default_type_value != .string) return error.InvalidSchemaUpdateRequest;
-    const document_schemas = root.getPtr("document_schemas") orelse return error.InvalidSchemaUpdateRequest;
-    if (document_schemas.* != .object) return error.InvalidSchemaUpdateRequest;
-    const document_schema = document_schemas.object.getPtr(default_type_value.string) orelse return error.InvalidSchemaUpdateRequest;
-    if (document_schema.* != .object) return error.InvalidSchemaUpdateRequest;
-    const schema = document_schema.object.getPtr("schema") orelse return error.InvalidSchemaUpdateRequest;
-    if (schema.* != .object) return error.InvalidSchemaUpdateRequest;
-    const properties = schema.object.getPtr("properties") orelse return error.InvalidSchemaUpdateRequest;
-    if (properties.* != .object) return error.InvalidSchemaUpdateRequest;
-    const property = schemaPropertyForSecondaryIndex(properties, index_name) orelse return error.SecondaryIndexNotFound;
-    if (property.* != .object) return error.InvalidSchemaUpdateRequest;
-
-    const generation_value = property.object.get("x-antfly-index-generation") orelse return error.SecondaryIndexGenerationMismatch;
-    if (generation_value != .integer or generation_value.integer <= 0) return error.InvalidSchemaUpdateRequest;
-    const generation: u64 = @intCast(generation_value.integer);
-    if (generation != expected_generation) return error.SecondaryIndexGenerationMismatch;
-
-    const lifecycle_value = property.object.getPtr("x-antfly-index-lifecycle") orelse return error.SecondaryIndexNotBuilding;
-    if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
-    if (!std.mem.eql(u8, lifecycle_value.string, "building")) return error.SecondaryIndexNotBuilding;
-    lifecycle_value.* = .{ .string = "ready" };
-
-    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-    errdefer alloc.free(updated);
-    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
-    validated.deinit(alloc);
-    return updated;
+    return try sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(alloc, schema_json, index_name, expected_generation);
 }
 
 pub fn schemaWithSecondaryIndexBuildingAlloc(

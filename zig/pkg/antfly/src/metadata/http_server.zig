@@ -36,6 +36,7 @@ const catalog_jobs = @import("../api/catalog_jobs.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 const platform_time = @import("../platform/time.zig");
 const sql_adapter = @import("../sql/mod.zig");
+const sql_schema_mutation = @import("../sql/schema_mutation.zig");
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
 
@@ -268,7 +269,7 @@ pub const AdminSource = struct {
         var snapshot = try self.adminSnapshot();
         defer self.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        const schema_json = try tables_api.schemaWithForeignKeyValidationStateAlloc(
+        const schema_json = try sql_schema_mutation.schemaWithForeignKeyValidationStateAlloc(
             alloc,
             table.schema_json,
             constraint_name,
