@@ -10945,6 +10945,8 @@ fn catchUpManagedDb(
     table_name: []const u8,
     db: *db_mod.DB,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
+    const max_startup_catch_up_replay_passes: usize = 16;
+
     const before = db.listDerivedReplayDebt(alloc) catch |err| {
         std.log.warn("managed startup catch-up list debt failed table={s} err={}", .{ table_name, err });
         return err;
@@ -11005,29 +11007,38 @@ fn catchUpManagedDb(
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
         std.log.info("managed restore repair step complete table={s} group_id={d} repaired={}", .{ table_name, group_id, repaired_restore_runtime });
     } else if (had_debt) {
-        try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .startup_catch_up, db);
-        db.catchUpPendingDerivedReplayWithProgress(&progress_ctx, ProgressCtx.run) catch |err| {
-            std.log.warn("managed startup catch-up replay failed table={s} err={}", .{ table_name, err });
-            if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
-                return .{
-                    .had_debt = true,
-                    .cleared_debt = false,
-                    .busy = true,
-                };
-            }
-            return err;
-        };
-        db.runUntilIdle() catch |err| {
-            std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
-            if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
-                return .{
-                    .had_debt = true,
-                    .cleared_debt = false,
-                    .busy = true,
-                };
-            }
-            return err;
-        };
+        var pass: usize = 0;
+        var last_debt_signature = try startupReplayDebtSignature(alloc, db);
+        while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {
+            try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .startup_catch_up, db);
+            db.catchUpPendingDerivedReplayWithProgress(&progress_ctx, ProgressCtx.run) catch |err| {
+                std.log.warn("managed startup catch-up replay failed table={s} err={}", .{ table_name, err });
+                if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
+                    return .{
+                        .had_debt = true,
+                        .cleared_debt = false,
+                        .busy = true,
+                    };
+                }
+                return err;
+            };
+            db.runUntilIdle() catch |err| {
+                std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
+                if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
+                    return .{
+                        .had_debt = true,
+                        .cleared_debt = false,
+                        .busy = true,
+                    };
+                }
+                return err;
+            };
+
+            const next_debt_signature = try startupReplayDebtSignature(alloc, db);
+            if (next_debt_signature.remaining == 0) break;
+            if (next_debt_signature.applied_sum <= last_debt_signature.applied_sum and next_debt_signature.target_sum <= last_debt_signature.target_sum) break;
+            last_debt_signature = next_debt_signature;
+        }
         try db.core.index_manager.syncAll(false);
     }
 
@@ -11107,6 +11118,28 @@ fn catchUpManagedDb(
         .had_debt = had_debt or restore_repair_needed,
         .cleared_debt = had_debt or repaired_restore_runtime,
     };
+}
+
+const StartupReplayDebtSignature = struct {
+    remaining: usize = 0,
+    applied_sum: u128 = 0,
+    target_sum: u128 = 0,
+};
+
+fn startupReplayDebtSignature(alloc: std.mem.Allocator, db: *db_mod.DB) !StartupReplayDebtSignature {
+    const replay_debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+
+    var signature = StartupReplayDebtSignature{};
+    for (replay_debt) |status| {
+        signature.applied_sum += status.applied_sequence;
+        signature.target_sum += status.target_sequence;
+        if (status.catch_up_required) signature.remaining += 1;
+    }
+    return signature;
 }
 
 fn shouldDrainManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
