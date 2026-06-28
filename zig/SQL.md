@@ -1647,6 +1647,9 @@ Current implementation status:
 - Catalog prebinding for generated simple read sources now consumes retained
   generated source-table token metadata and fails closed when that metadata is
   inconsistent, instead of always rediscovering the source table from tokens.
+- Catalog prebinding for covered simple generated CTE reads now also consumes
+  retained CTE body source-table metadata, resolves CTE aliases from generated
+  CTE items, and fails closed when CTE body source metadata is inconsistent.
 - Query request contracts and public query parser helpers now live under
   `pkg/antfly/src/query/`; SQL query-function lowering uses that neutral
   contract directly instead of importing the API package.

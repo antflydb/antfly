@@ -1455,7 +1455,11 @@ classification rejects missing simple-source table metadata unless the source is
 a generated table function or join. Catalog prebinding for generated simple
 read sources now consumes the retained generated source-table range directly
 and fails closed when that range drifts into alias or non-source tokens instead
-of rediscovering the table through the legacy source scanner. Join classification
+of rediscovering the table through the legacy source scanner. Covered simple
+generated CTE reads now use retained CTE item and body source-table ranges for
+catalog prebinding, including recursive-anchor source resolution, and fail
+closed when generated CTE body source metadata is corrupted instead of
+recovering through the legacy token scanner. Join classification
 now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete

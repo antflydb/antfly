@@ -2872,8 +2872,11 @@ fn readSourceTableNamesFromGeneratedReadAstAlloc(
     tokens: []const Token,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !?ReadSourceTableNames {
-    if (read_ast.cte_tokens != null or
-        read_ast.join_items.len != 0 or
+    if (read_ast.cte_tokens != null) {
+        if (try readSourceTableNamesFromGeneratedCteReadAstAlloc(alloc, tokens, read_ast)) |resolved| return resolved;
+        return null;
+    }
+    if (read_ast.join_items.len != 0 or
         read_ast.source_antfly_function_items.len != 0 or
         read_ast.source_graph_function_items.len != 0 or
         read_ast.set_operation_tokens != null)
@@ -2891,6 +2894,70 @@ fn readSourceTableNamesFromGeneratedReadAstAlloc(
     };
 }
 
+fn readSourceTableNamesFromGeneratedCteReadAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) !?ReadSourceTableNames {
+    if (read_ast.join_items.len != 0 or
+        read_ast.source_antfly_function_items.len != 0 or
+        read_ast.source_graph_function_items.len != 0 or
+        read_ast.set_operation_tokens != null)
+    {
+        return null;
+    }
+
+    var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
+    defer {
+        for (cte_bindings.items) |*binding| binding.deinit(alloc);
+        cte_bindings.deinit(alloc);
+    }
+
+    for (read_ast.cte_items) |cte| {
+        const cte_name = try normalizeGeneratedSingleIdentifierAlloc(alloc, tokens, cte.name_tokens);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        if (cteBindingIndex(cte_bindings.items, cte_name) != null) return error.UnsupportedSqlShape;
+
+        if (cte.body_source_antfly_function_items.len != 0 or
+            cte.body_source_graph_function_items.len != 0 or
+            cte.body_join_items.len != 0)
+        {
+            alloc.free(cte_name);
+            return null;
+        }
+        if (cte.body_set_operation_tokens != null and !read_ast.cte_recursive) {
+            alloc.free(cte_name);
+            return null;
+        }
+        const body_source_tokens = cte.body_source_tokens orelse return error.UnsupportedSqlShape;
+        const body_table_tokens = cte.body_source_table_tokens orelse return error.UnsupportedSqlShape;
+        try validateGeneratedSimpleReadSourceTableTokens(tokens, body_source_tokens, body_table_tokens);
+        var cte_source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[body_table_tokens.start].text);
+        errdefer alloc.free(cte_source);
+        cte_source = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, cte_source);
+        if (read_ast.cte_recursive and std.mem.eql(u8, cte_source, cte_name)) return error.UnsupportedSqlShape;
+
+        try cte_bindings.append(alloc, .{
+            .name = cte_name,
+            .source = cte_source,
+        });
+        cte_name_transferred = true;
+    }
+
+    const source_tokens = read_ast.source_tokens orelse return null;
+    const table_tokens = read_ast.source_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSimpleReadSourceTableTokens(tokens, source_tokens, table_tokens);
+    var left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[table_tokens.start].text);
+    errdefer alloc.free(left);
+    left = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, left);
+    const source = try alloc.dupe(u8, left);
+    return .{
+        .left = left,
+        .source = source,
+    };
+}
+
 fn validateGeneratedSimpleReadSourceTableTokens(
     tokens: []const Token,
     source_tokens: generated_parser.GeneratedSqlTokenRange,
@@ -2905,6 +2972,17 @@ fn validateGeneratedSimpleReadSourceTableTokens(
         }
     }
     if (tokens[table_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+}
+
+fn normalizeGeneratedSingleIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (range.end != range.start + 1) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
 }
 
 fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
@@ -3338,6 +3416,25 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
         }
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &alias_source_sql));
+
+    var simple_cte_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, tenant FROM usage_records) SELECT id FROM open_orders WHERE tenant = 't1'",
+    );
+    defer simple_cte_sql.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, simple_cte_sql.generatedStatementKind().?);
+    var simple_cte = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &simple_cte_sql)).?;
+    defer simple_cte.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", simple_cte.left);
+    try std.testing.expectEqualStrings("usage_records", simple_cte.source);
+
+    if (simple_cte_sql.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .read => |*read| read.cte_items[0].body_source_table_tokens = read.cte_items[0].name_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &simple_cte_sql));
 
     var joined_sql = try tokenized.ParsedSql.initAlloc(
         alloc,

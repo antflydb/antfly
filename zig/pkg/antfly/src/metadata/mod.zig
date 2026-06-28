@@ -13,6 +13,11 @@
 // limitations.
 
 pub const storage = @import("storage/mod.zig");
+pub const catalog_lookup = @import("catalog_lookup.zig");
+
+test {
+    _ = catalog_lookup;
+}
 pub const runtime = @import("runtime.zig");
 pub const api = @import("api.zig");
 pub const admin = @import("admin.zig");

@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_catalog_lookup = @import("../metadata/catalog_lookup.zig");
 const metadata_server = @import("../metadata/server.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -374,7 +375,7 @@ pub fn nativeTableNameForCatalogTargetAlloc(
 ) ![]u8 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    _ = metadata_catalog_lookup.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
     return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
 }
 
@@ -433,7 +434,7 @@ pub fn resolveSingleRangeGroup(
 ) !?u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return null;
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
@@ -451,8 +452,8 @@ pub fn resolveForeignKeyRefOwnerGroups(
 ) !ForeignKeyRefOwnerResolution {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const child_table = tables_api.findTableByName(&snapshot, child_table_name) orelse return .{ .configured = false };
-    const parent_table = tables_api.findTableByName(&snapshot, parent_table_name) orelse return .{ .configured = false };
+    const child_table = metadata_catalog_lookup.findTableByName(&snapshot, child_table_name) orelse return .{ .configured = false };
+    const parent_table = metadata_catalog_lookup.findTableByName(&snapshot, parent_table_name) orelse return .{ .configured = false };
 
     var configured = false;
     var groups = std.ArrayListUnmanaged(u64).empty;
@@ -489,7 +490,7 @@ pub fn resolveUniqueConstraintOwnerGroups(
 ) !UniqueConstraintOwnerResolution {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{ .configured = false };
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return .{ .configured = false };
 
     var configured = false;
     var groups = std.ArrayListUnmanaged(u64).empty;
@@ -524,7 +525,7 @@ pub fn resolveGroupForKey(
 ) !?u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return null;
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
@@ -542,7 +543,7 @@ pub fn resolveTableDocKeyRanges(
 
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try alloc.alloc(TableDocKeyRangePlan, 0);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return try alloc.alloc(TableDocKeyRangePlan, 0);
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     sortRangeRefs(ranges);
@@ -588,7 +589,7 @@ pub fn tableExists(
 ) !bool {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    return tables_api.findTableByName(&snapshot, table_name) != null;
+    return metadata_catalog_lookup.findTableByName(&snapshot, table_name) != null;
 }
 
 pub fn topologyEpoch(
@@ -598,7 +599,7 @@ pub fn topologyEpoch(
 ) !u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return 0;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return 0;
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
@@ -634,7 +635,7 @@ pub fn tableSchemaJsonAlloc(
 ) !?[]u8 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return null;
     if (table.schema_json.len == 0) return null;
     return try alloc.dupe(u8, table.schema_json);
 }
@@ -660,7 +661,7 @@ pub fn validateGroupTopologyEpoch(
     if (expected_epoch == 0) return;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TopologyChanged;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TopologyChanged;
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (rangeRefsContainGroup(ranges, group_id) and tableTopologyEpochFromRanges(table.*, ranges) == expected_epoch) return;
@@ -698,7 +699,7 @@ pub fn validateResolvedDocFilterContextForGroups(
     if (group_ids.len == 0) return;
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     for (group_ids) |group_id| {
         const range = findRangeForTableGroup(snapshot.ranges, table.table_id, group_id) orelse return error.DocIdentityNamespaceMismatch;
         const status = findMergedGroupStatus(snapshot.merged_group_statuses, group_id) orelse return error.DocIdentityNamespaceMismatch;
@@ -719,7 +720,7 @@ fn validateDocIdentityReadyForTableMode(
 ) !void {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return;
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     for (ranges) |range| {
@@ -754,7 +755,7 @@ pub fn resolveGroupsForSpan(
 ) ![]u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try alloc.alloc(u64, 0);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return try alloc.alloc(u64, 0);
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
@@ -941,7 +942,7 @@ fn promoteSecondaryIndexReadyOnService(
 ) !bool {
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     const schema_json = tables_api.schemaWithSecondaryIndexReadyAlloc(
         alloc,
         table.schema_json,
@@ -975,7 +976,7 @@ pub fn promoteUniqueConstraintEnforced(
 ) !bool {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     const schema_json = tables_api.schemaWithUniqueConstraintValidationStateAlloc(
         alloc,
         table.schema_json,
