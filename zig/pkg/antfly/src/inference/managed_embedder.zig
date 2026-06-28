@@ -146,7 +146,7 @@ pub const QueryTemplateError = error{
 };
 
 const default_pacing_burst: u32 = 1;
-const pacing_safety_margin_ns: u64 = 5 * std.time.ns_per_ms;
+const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
@@ -207,12 +207,8 @@ const RequestPacer = struct {
 
     fn acquire(self: *RequestPacer) void {
         if (self.capacity <= 1.0) {
-            lockAtomic(&self.mutex);
-            const now_ns = monotonicNowNs();
-            const scheduled_ns = @max(now_ns, self.next_send_ns);
-            self.next_send_ns = (scheduled_ns +| self.interval_ns) +| pacing_safety_margin_ns;
-            self.mutex.unlock();
-            if (scheduled_ns > now_ns) sleepNs(scheduled_ns - now_ns);
+            self.beginSerialRequest();
+            self.endSerialRequest();
             return;
         }
 
@@ -235,6 +231,23 @@ const RequestPacer = struct {
             self.mutex.unlock();
             sleepNs(wait_ns);
         }
+    }
+
+    fn beginSerialRequest(self: *RequestPacer) void {
+        lockAtomic(&self.mutex);
+        while (true) {
+            const now_ns = monotonicNowNs();
+            if (now_ns >= self.next_send_ns) return;
+            const wait_ns = self.next_send_ns - now_ns;
+            self.mutex.unlock();
+            sleepNs(wait_ns);
+            lockAtomic(&self.mutex);
+        }
+    }
+
+    fn endSerialRequest(self: *RequestPacer) void {
+        self.next_send_ns = monotonicNowNs() +| self.interval_ns +| pacing_safety_margin_ns;
+        self.mutex.unlock();
     }
 };
 
@@ -417,6 +430,25 @@ fn attachRequestPacers(
         });
         entry.pacer = pacer;
     }
+}
+
+fn attachRequestPacerToEntry(
+    alloc: std.mem.Allocator,
+    entry: *ManagedEmbeddingEntry,
+) !?[]u8 {
+    if (entry.requests_per_minute == 0) return null;
+    const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
+    errdefer alloc.free(scope_key);
+    const pacer = try acquireSharedRequestPacer(scope_key, entry.requests_per_minute, entry.burst);
+    errdefer releaseSharedRequestPacer(scope_key);
+    entry.pacer = pacer;
+    return scope_key;
+}
+
+fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) void {
+    const scope_key = maybe_scope_key orelse return;
+    releaseSharedRequestPacer(scope_key);
+    alloc.free(scope_key);
 }
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
@@ -700,6 +732,21 @@ pub const ManagedEmbedder = struct {
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
     const pacer = entry.pacer orelse return;
     pacer.acquire();
+}
+
+fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) ?*RequestPacer {
+    const pacer = entry.pacer orelse return null;
+    if (pacer.capacity <= 1.0) {
+        pacer.beginSerialRequest();
+        return pacer;
+    }
+    pacer.acquire();
+    return null;
+}
+
+fn endEntryPacedRequest(serial_pacer: ?*RequestPacer) void {
+    const pacer = serial_pacer orelse return;
+    pacer.endSerialRequest();
 }
 
 pub fn translateEmbeddingsIndexConfigJson(
@@ -1128,6 +1175,8 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
         else => return err,
     };
     defer managed.deinit(alloc);
+    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
+    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -1144,6 +1193,8 @@ fn validateSparseEmbeddingForManagedConfig(
         else => return err,
     };
     defer managed.deinit(alloc);
+    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
+    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
     try validateSparseEmbeddingForEntry(alloc, &managed);
 }
 
@@ -1995,10 +2046,11 @@ fn embedBatchWithOpenAiCompatible(
     defer request.deinit();
 
     request.transfer_encoding = .{ .content_length = json_body.len };
-    waitForEntryPacer(entry);
     var body_writer = try request.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(json_body);
     try body_writer.end();
+    const serial_pacer = beginEntryPacedRequest(entry);
+    defer endEntryPacedRequest(serial_pacer);
     try request.connection.?.flush();
 
     var response = request.receiveHead(&.{}) catch |err| return err;

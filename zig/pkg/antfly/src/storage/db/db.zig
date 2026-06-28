@@ -3171,6 +3171,51 @@ pub const DB = struct {
         self.enrichment_runtime = runtime;
     }
 
+    fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
+        if (cfg.dense_embedder) |dense_embedder| {
+            dense_embedder.deinit(self.runtime_alloc);
+            cfg.dense_embedder = null;
+        }
+        if (cfg.sparse_embedder) |sparse_embedder| {
+            sparse_embedder.deinit(self.runtime_alloc);
+            cfg.sparse_embedder = null;
+        }
+        if (cfg.asset_producer) |producer| {
+            producer.deinit(self.runtime_alloc);
+            cfg.asset_producer = null;
+        }
+    }
+
+    pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var owned_cfg = cfg;
+        var cfg_owned = true;
+        errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
+
+        const query_visibility_hook = self.async_context.query_visibility_hook;
+        self.setQueryVisibilityHook(null);
+
+        if (self.enrichment_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.enrichment_runtime = null;
+        }
+        if (self.enrichment_append_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.enrichment_append_context = null;
+        }
+
+        try self.initOptionalEnrichmentRuntime(owned_cfg);
+        cfg_owned = false;
+        if (query_visibility_hook) |hook| self.setQueryVisibilityHook(hook);
+
+        if (self.enrichment_runtime) |runtime| {
+            try self.resumeGeneratedReplayFromJournalIfNeeded();
+            if (self.open_mode.allowsOptionalRuntimes()) try runtime.start();
+        }
+    }
+
     fn initResolutionRuntime(self: *DB) !void {
         // Always constructed so catalog/status/runUntilIdle APIs can observe
         // and drain replay. The background worker is started lazily only while
