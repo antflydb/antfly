@@ -8321,7 +8321,8 @@ pub const DB = struct {
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
-            if (self.resolverReplayNeedsDrain()) {
+            const drain_resolver_replay = self.resolverReplayNeedsDrain();
+            if (drain_resolver_replay) {
                 if (self.resolution_runtime) |runtime| {
                     if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
                     try runtime.catchUp();
@@ -8332,6 +8333,8 @@ pub const DB = struct {
                     if (latest > 0) runtime.notifySequence(latest - 1);
                     try runtime.catchUp();
                 }
+
+                try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             }
 
             const resolution_advanced = if (self.resolution_runtime) |runtime|
@@ -19737,7 +19740,9 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
                 .index_name = index_ref.name,
                 .sequence = stats.last_sequence,
             });
-        } else if (stats.scanned_entries == 0 and target_sequence > applied) {
+        } else if (stats.scanned_entries == 0 and target_sequence > applied and
+            try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
+        {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
@@ -19747,6 +19752,32 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     }
     try saveAppliedSequencesBatchContext(ctx, updates.items);
     try truncateReplayJournalIfSafeContext(ctx);
+}
+
+fn canAdvanceDerivedReplayTargetContext(
+    ctx: *const BatchExecutionContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    from_sequence: u64,
+    target_sequence: u64,
+) !bool {
+    if (target_sequence <= from_sequence) return true;
+    if (ctx.async_context) |async_ctx| {
+        return try canAdvanceDerivedToTargetAsync(async_ctx, index_ref, from_sequence, target_sequence);
+    }
+
+    var async_ctx = AsyncContext{
+        .alloc = ctx.alloc,
+        .io = ctx.io,
+        .store = ctx.store,
+        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
+        .index_manager = ctx.index_manager,
+        .apply_mutex = ctx.apply_mutex,
+        .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+        .resolution_runtime = ctx.resolution_runtime,
+        .promotion_runtime = ctx.promotion_runtime,
+    };
+    defer async_ctx.deinit(ctx.alloc);
+    return try canAdvanceDerivedToTargetAsync(&async_ctx, index_ref, from_sequence, target_sequence);
 }
 
 fn applyDerivedBatchToIndexReplayContext(
@@ -20128,7 +20159,9 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         if (stats.last_sequence > applied) {
             try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
-        } else if (stats.scanned_entries == 0 and target_sequence > applied) {
+        } else if (stats.scanned_entries == 0 and target_sequence > applied and
+            try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
+        {
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         }
@@ -29639,6 +29672,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
         }},
         .sync_level = .enrichments,
     });
+    try db.runUntilIdle();
     try db.runUntilIdle();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -39781,6 +39815,85 @@ test "db catch-up advances vacuous derived replay target gap" {
         try std.testing.expectEqual(target_sequence, after[0].target_sequence);
         try std.testing.expect(!after[0].catch_up_required);
     }
+}
+
+test "db catch-up rebuilds dense coverage before vacuous target advance" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const target_sequence: u64 = 7;
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(stored_key);
+    try db.core.store.putBatch(&.{
+        .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+    }, &.{});
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+    try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
+    var latest_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
+    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+    var batch = try db.core.store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(latest_key[0..], latest_raw[0..]);
+    try batch.commit();
+
+    {
+        const before = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (before) |*status| status.deinit(alloc);
+            alloc.free(before);
+        }
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(u64, 0), before[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, before[0].target_sequence);
+        try std.testing.expect(before[0].catch_up_required);
+    }
+
+    try db.catchUpPendingDerivedReplay();
+
+    {
+        const after = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (after) |*status| status.deinit(alloc);
+            alloc.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 1), after.len);
+        try std.testing.expectEqual(target_sequence, after[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, after[0].target_sequence);
+        try std.testing.expect(!after[0].catch_up_required);
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
 test "dense replay progress target matches replay debt target" {
