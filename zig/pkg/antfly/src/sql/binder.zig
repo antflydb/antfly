@@ -24,7 +24,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const generated_parser = @import("generated_parser.zig");
-const table_catalog = @import("../api/table_catalog.zig");
+const table_catalog = @import("../metadata/catalog_source.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
@@ -1987,7 +1987,35 @@ pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, p
         .truncate,
         => return null,
     }
+    if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
+        if (try joinedWriteSourceTableNamesFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast)) |resolved| return resolved;
+    }
     return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, statement_tokens);
+}
+
+fn joinedWriteSourceTableNamesFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    dml_ast: *const generated_parser.GeneratedSqlDmlAst,
+) !?InsertSourceTableNames {
+    switch (dml_ast.kind) {
+        .update, .delete, .merge => {},
+        else => return null,
+    }
+    if (dml_ast.cte_tokens != null or dml_ast.cte_prefix != null or dml_ast.cte_recursive) return null;
+    const source_read = dml_ast.source_read orelse return null;
+    const source_tokens = source_read.source_tokens orelse return null;
+    const source_table_tokens = source_read.source_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSimpleReadSourceTableTokens(tokens, source_tokens, source_table_tokens);
+
+    const target = try writeTargetTableNameFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
+    errdefer alloc.free(target);
+    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_table_tokens.start].text);
+    errdefer alloc.free(source);
+    return .{
+        .target = target,
+        .source = source,
+    };
 }
 
 pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) ![]const u8 {
@@ -3680,6 +3708,21 @@ test "sql adapter binder source table helpers validate parsed statement family" 
     defer recursive_tables.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", recursive_tables.target);
     try std.testing.expectEqualStrings("incoming_usage", recursive_tables.source);
+
+    var update_source = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = source.status FROM incoming_usage AS source WHERE source.id = usage_records.id");
+    defer update_source.deinit(alloc);
+    var update_tables = (try joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &update_source)).?;
+    defer update_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", update_tables.target);
+    try std.testing.expectEqualStrings("incoming_usage", update_tables.source);
+
+    if (update_source.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| dml.source_read.?.source_table_tokens = dml.target_table_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &update_source));
 }
 
 const MultiTableTestCatalog = struct {

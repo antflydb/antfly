@@ -2981,7 +2981,7 @@ pub const MetadataService = struct {
 
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.CatalogSource.fromMetadataService(self),
+            api_table_catalog.catalogSourceFromMetadataService(self),
         );
         write_source.backend_runtime = try self.ensureBackendRuntime();
         _ = write_source.withSecretStore(self.secret_store);
@@ -3089,7 +3089,7 @@ pub const MetadataService = struct {
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.CatalogSource.fromMetadataService(self),
+            api_table_catalog.catalogSourceFromMetadataService(self),
         );
         defer write_source.deinit();
         write_source.backend_runtime = try self.ensureBackendRuntime();
@@ -3107,7 +3107,7 @@ pub const MetadataService = struct {
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.CatalogSource.fromMetadataService(self),
+            api_table_catalog.catalogSourceFromMetadataService(self),
         );
         defer write_source.deinit();
         write_source.backend_runtime = try self.ensureBackendRuntime();
@@ -5114,7 +5114,7 @@ pub const MetadataHttpService = struct {
         if (now_ms < self.cdc_next_round_at_ms) return;
         self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
 
-        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
             // CDC is metadata-owned but data-applied; force the routed API path even
@@ -5235,7 +5235,7 @@ pub const MetadataHttpService = struct {
         if (!self.foreign_key_schema_controller.enabled) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
         var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
         var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -5256,7 +5256,7 @@ pub const MetadataHttpService = struct {
         if (!self.unique_constraint_schema_controller.enabled) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
         var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
         var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
             replica_root_dir,

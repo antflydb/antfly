@@ -506,12 +506,12 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1155,12 +1155,12 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1329,12 +1329,12 @@ test "public api e2e rejects table backup during active schema migration" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1433,12 +1433,12 @@ test "public api e2e rejects table restore for migration-state backup manifests"
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1550,12 +1550,12 @@ test "public api e2e rejects table restore when target already exists" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1657,12 +1657,12 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1772,12 +1772,12 @@ test "public api e2e validates backup and restore request shapes and locations" 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1972,12 +1972,12 @@ test "public api e2e backs up drops and restores a table" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2629,12 +2629,12 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2763,12 +2763,12 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2899,12 +2899,12 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3033,12 +3033,12 @@ test "public api e2e restores managed embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3219,12 +3219,12 @@ test "public api e2e supports managed sparse embeddings generation" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3334,12 +3334,12 @@ test "public api e2e supports hybrid query pruner and reranker" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3477,12 +3477,12 @@ test "public api e2e supports retrieval agent pipeline queries" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3573,12 +3573,12 @@ test "public api e2e supports retrieval agent generation step" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3678,12 +3678,12 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3803,12 +3803,12 @@ test "public api e2e supports retrieval agent tree search pipeline" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3909,12 +3909,12 @@ test "public api e2e supports retrieval agent tree search from roots" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4013,12 +4013,12 @@ test "public api e2e supports retrieval agent classification confidence and foll
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4124,12 +4124,12 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4259,12 +4259,12 @@ test "public api e2e retrieval streaming emits clarification events" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4379,12 +4379,12 @@ test "public api e2e supports bounded agentic retrieval mode" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4474,12 +4474,12 @@ test "public api e2e agentic retrieval selects the best declared query" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4567,12 +4567,12 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4676,12 +4676,12 @@ test "public api e2e agentic retrieval can require clarification and continue fr
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4784,12 +4784,12 @@ test "public api e2e restores managed sparse embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4980,12 +4980,12 @@ test "public api e2e supports embedding_template remote media helper" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5160,12 +5160,12 @@ test "public api e2e supports template chunked remote text enrichment and query 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5413,12 +5413,12 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5600,12 +5600,12 @@ test "public api e2e restores chunked managed embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5817,12 +5817,12 @@ test "public api e2e supports graph queries" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6503,12 +6503,12 @@ test "public api e2e graph queries respect full_index sync level" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6636,12 +6636,12 @@ test "public api e2e restores graph indexes from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6817,12 +6817,12 @@ test "public api smoke e2e queries across split ranges" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7011,12 +7011,12 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7202,12 +7202,12 @@ test "public api e2e serves cluster backup list and restore routes" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7466,12 +7466,12 @@ test "public api e2e reports partial cluster backup and restore statuses" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7646,12 +7646,12 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7885,12 +7885,12 @@ test "public api smoke e2e commits transaction across split ranges" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -8055,12 +8055,12 @@ test "public api smoke e2e commits transactions across two tables atomically" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -8260,12 +8260,12 @@ test "public api smoke e2e queries after merge finalization" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        table_catalog.catalogSourceFromMetadataService(&svc),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -8328,7 +8328,7 @@ test "public api smoke e2e queries after merge finalization" {
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         try metadata_client.triggerReallocate(metadata_api);
-        donor_group_id = (try table_catalog.resolveGroupForKey(std.testing.allocator, table_catalog.CatalogSource.fromMetadataService(&svc), "docs", "doc:z")) orelse 0;
+        donor_group_id = (try table_catalog.resolveGroupForKey(std.testing.allocator, table_catalog.catalogSourceFromMetadataService(&svc), "docs", "doc:z")) orelse 0;
         if (donor_group_id != 0 and donor_group_id != receiver_group_id) break;
     }
     try std.testing.expect(donor_group_id != 0);

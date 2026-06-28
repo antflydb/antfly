@@ -1637,6 +1637,10 @@ Current implementation status:
   metadata for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE`, and fails
   closed when the retained target range no longer matches the generated command
   layout instead of falling back to a legacy token scan.
+- Joined-source catalog prebinding for generated direct `UPDATE ... FROM`,
+  `DELETE ... USING`, and `MERGE ... USING` now consumes retained generated
+  relation-source metadata, and fails closed when source-table metadata drifts
+  instead of rediscovering it through token scanning.
 - Session, savepoint, notification, prepared-statement, cursor, and routine
   runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
   re-exports those protocol-neutral runtimes for API callers. Routine
@@ -1645,6 +1649,9 @@ Current implementation status:
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.
+- SQL catalog source wiring now uses `pkg/antfly/src/metadata/catalog_source.zig`
+  for the shared catalog service interface; API table-catalog helpers keep the
+  service adapter constructors and routing helpers.
 - Relational row request/plan/result contracts now live under
   `pkg/antfly/src/sql/`; the API module re-exports the surface for existing
   HTTP callers, while SQL lowerers and runtimes depend on the SQL-owned module

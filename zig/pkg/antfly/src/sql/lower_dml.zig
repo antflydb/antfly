@@ -30,7 +30,7 @@ const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const strings = @import("strings.zig");
 const test_support = @import("test_support.zig");
-const table_catalog = @import("../api/table_catalog.zig");
+const table_catalog = @import("../metadata/catalog_source.zig");
 const sql_value = @import("value.zig");
 const tokenized = @import("tokenized.zig");
 

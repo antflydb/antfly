@@ -2146,12 +2146,12 @@ pub const DataServer = struct {
             .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
+                antfly.public_api.table_catalog.catalogSourceFromMetadataService(svc),
                 antfly.raft.read_gate.noopReadableLeaseRequester(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
+                antfly.public_api.table_catalog.catalogSourceFromMetadataService(svc),
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
@@ -2178,12 +2178,12 @@ pub const DataServer = struct {
             .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                antfly.public_api.table_catalog.catalogSourceFromMetadataHttpService(svc),
                 antfly.raft.read_gate.noopReadableLeaseRequester(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                antfly.public_api.table_catalog.catalogSourceFromMetadataHttpService(svc),
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,

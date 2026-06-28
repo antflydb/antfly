@@ -14,9 +14,11 @@
 
 pub const storage = @import("storage/mod.zig");
 pub const catalog_lookup = @import("catalog_lookup.zig");
+pub const catalog_source = @import("catalog_source.zig");
 
 test {
     _ = catalog_lookup;
+    _ = catalog_source;
 }
 pub const runtime = @import("runtime.zig");
 pub const api = @import("api.zig");

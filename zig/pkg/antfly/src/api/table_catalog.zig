@@ -16,6 +16,7 @@ const std = @import("std");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_catalog_lookup = @import("../metadata/catalog_lookup.zig");
+const metadata_catalog_source = @import("../metadata/catalog_source.zig");
 const metadata_server = @import("../metadata/server.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -28,346 +29,75 @@ const sql_schema_mutation = @import("../sql/schema_mutation.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const tables_api = @import("tables.zig");
 
-pub const CatalogSource = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
+pub const CatalogSource = metadata_catalog_source.CatalogSource;
+pub const emptyCatalogSource = metadata_catalog_source.emptyCatalogSource;
+pub const unavailableCatalogSource = metadata_catalog_source.unavailableCatalogSource;
 
-    pub const VTable = struct {
-        admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
-        free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
-        begin_secondary_index_rebuild_range: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
-        ) anyerror!void = null,
-        finish_secondary_index_rebuild_range: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
-        ) anyerror!void = null,
-        invalidate_secondary_index_rebuild_range: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
-        ) anyerror!void = null,
-        begin_schema_rewrite_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SchemaRewriteJobBeginRequest,
-        ) anyerror!void = null,
-        finish_schema_rewrite_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SchemaRewriteJobFinishRequest,
-        ) anyerror!void = null,
-        invalidate_schema_rewrite_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
-        ) anyerror!void = null,
-        upsert_table_emptying_job: ?*const fn (
-            ptr: *anyopaque,
-            record: metadata_table_manager.TableEmptyingJobRecord,
-        ) anyerror!void = null,
-        upsert_table: ?*const fn (
-            ptr: *anyopaque,
-            record: metadata_table_manager.TableRecord,
-        ) anyerror!void = null,
-        apply_table_catalog_update_with_schema_rewrite_jobs: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
-        ) anyerror!void = null,
-        remove_table_emptying_job: ?*const fn (
-            ptr: *anyopaque,
-            job_id: u64,
-        ) anyerror!void = null,
-        begin_table_emptying_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableEmptyingJobBeginRequest,
-        ) anyerror!void = null,
-        finish_table_emptying_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableEmptyingJobFinishRequest,
-        ) anyerror!void = null,
-        invalidate_table_emptying_job: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
-        ) anyerror!void = null,
-        promote_table_emptying_barrier: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
-        ) anyerror!void = null,
-        reset_identity_allocators_for_table_emptying_barrier: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
-        ) anyerror!void = null,
-        supports_identity_allocator_reset_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque) bool = null,
-        promote_secondary_index_ready: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            index_name: []const u8,
-            expected_generation: u64,
-        ) anyerror!bool = null,
-        compare_and_swap_table_schema: ?*const fn (
-            ptr: *anyopaque,
-            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
-        ) anyerror!void = null,
-    };
-
-    pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
-        return try self.vtable.admin_snapshot(self.ptr);
-    }
-
-    pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
-        self.vtable.free_admin_snapshot(self.ptr, snapshot);
-    }
-
-    pub fn beginSecondaryIndexRebuildRange(
-        self: CatalogSource,
-        request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
-    ) !void {
-        const fn_ptr = self.vtable.begin_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn finishSecondaryIndexRebuildRange(
-        self: CatalogSource,
-        request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
-    ) !void {
-        const fn_ptr = self.vtable.finish_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn invalidateSecondaryIndexRebuildRange(
-        self: CatalogSource,
-        request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
-    ) !void {
-        const fn_ptr = self.vtable.invalidate_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn beginSchemaRewriteJob(
-        self: CatalogSource,
-        request: metadata_table_manager.SchemaRewriteJobBeginRequest,
-    ) !void {
-        const fn_ptr = self.vtable.begin_schema_rewrite_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn finishSchemaRewriteJob(
-        self: CatalogSource,
-        request: metadata_table_manager.SchemaRewriteJobFinishRequest,
-    ) !void {
-        const fn_ptr = self.vtable.finish_schema_rewrite_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn invalidateSchemaRewriteJob(
-        self: CatalogSource,
-        request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
-    ) !void {
-        const fn_ptr = self.vtable.invalidate_schema_rewrite_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn upsertTableEmptyingJob(
-        self: CatalogSource,
-        record: metadata_table_manager.TableEmptyingJobRecord,
-    ) !void {
-        const fn_ptr = self.vtable.upsert_table_emptying_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, record);
-    }
-
-    pub fn upsertTable(
-        self: CatalogSource,
-        record: metadata_table_manager.TableRecord,
-    ) !void {
-        const fn_ptr = self.vtable.upsert_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, record);
-    }
-
-    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
-        self: CatalogSource,
-        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
-    ) !void {
-        const fn_ptr = self.vtable.apply_table_catalog_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn removeTableEmptyingJob(
-        self: CatalogSource,
-        job_id: u64,
-    ) !void {
-        const fn_ptr = self.vtable.remove_table_emptying_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, job_id);
-    }
-
-    pub fn beginTableEmptyingJob(
-        self: CatalogSource,
-        request: metadata_table_manager.TableEmptyingJobBeginRequest,
-    ) !void {
-        const fn_ptr = self.vtable.begin_table_emptying_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn finishTableEmptyingJob(
-        self: CatalogSource,
-        request: metadata_table_manager.TableEmptyingJobFinishRequest,
-    ) !void {
-        const fn_ptr = self.vtable.finish_table_emptying_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn invalidateTableEmptyingJob(
-        self: CatalogSource,
-        request: metadata_table_manager.TableEmptyingJobInvalidateRequest,
-    ) !void {
-        const fn_ptr = self.vtable.invalidate_table_emptying_job orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn promoteTableEmptyingBarrier(
-        self: CatalogSource,
-        request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
-    ) !void {
-        const fn_ptr = self.vtable.promote_table_emptying_barrier orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(
-        self: CatalogSource,
-        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
-    ) !void {
-        const fn_ptr = self.vtable.reset_identity_allocators_for_table_emptying_barrier orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn supportsIdentityAllocatorResetForTableEmptyingBarrier(self: CatalogSource) bool {
-        if (self.vtable.supports_identity_allocator_reset_for_table_emptying_barrier) |fn_ptr| return fn_ptr(self.ptr);
-        return self.vtable.reset_identity_allocators_for_table_emptying_barrier != null;
-    }
-
-    pub fn promoteSecondaryIndexReady(
-        self: CatalogSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        index_name: []const u8,
-        expected_generation: u64,
-    ) !bool {
-        const fn_ptr = self.vtable.promote_secondary_index_ready orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name, expected_generation);
-    }
-
-    pub fn compareAndSwapTableSchema(
-        self: CatalogSource,
-        request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
-    ) !void {
-        const fn_ptr = self.vtable.compare_and_swap_table_schema orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, request);
-    }
-
-    pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
-        return .{
-            .ptr = svc,
-            .vtable = &.{
-                .admin_snapshot = metadataServiceAdminSnapshot,
-                .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
-                .begin_secondary_index_rebuild_range = metadataServiceBeginSecondaryIndexRebuildRange,
-                .finish_secondary_index_rebuild_range = metadataServiceFinishSecondaryIndexRebuildRange,
-                .invalidate_secondary_index_rebuild_range = metadataServiceInvalidateSecondaryIndexRebuildRange,
-                .begin_schema_rewrite_job = metadataServiceBeginSchemaRewriteJob,
-                .finish_schema_rewrite_job = metadataServiceFinishSchemaRewriteJob,
-                .invalidate_schema_rewrite_job = metadataServiceInvalidateSchemaRewriteJob,
-                .upsert_table_emptying_job = metadataServiceUpsertTableEmptyingJob,
-                .upsert_table = metadataServiceUpsertTable,
-                .apply_table_catalog_update_with_schema_rewrite_jobs = metadataServiceApplyTableCatalogUpdateWithSchemaRewriteJobs,
-                .remove_table_emptying_job = metadataServiceRemoveTableEmptyingJob,
-                .begin_table_emptying_job = metadataServiceBeginTableEmptyingJob,
-                .finish_table_emptying_job = metadataServiceFinishTableEmptyingJob,
-                .invalidate_table_emptying_job = metadataServiceInvalidateTableEmptyingJob,
-                .promote_table_emptying_barrier = metadataServicePromoteTableEmptyingBarrier,
-                .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
-                .supports_identity_allocator_reset_for_table_emptying_barrier = metadataServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
-                .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
-                .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
-            },
-        };
-    }
-
-    pub fn fromMetadataHttpService(svc: *metadata_service.MetadataHttpService) CatalogSource {
-        return .{
-            .ptr = svc,
-            .vtable = &.{
-                .admin_snapshot = metadataHttpServiceAdminSnapshot,
-                .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
-                .begin_secondary_index_rebuild_range = metadataHttpServiceBeginSecondaryIndexRebuildRange,
-                .finish_secondary_index_rebuild_range = metadataHttpServiceFinishSecondaryIndexRebuildRange,
-                .invalidate_secondary_index_rebuild_range = metadataHttpServiceInvalidateSecondaryIndexRebuildRange,
-                .begin_schema_rewrite_job = metadataHttpServiceBeginSchemaRewriteJob,
-                .finish_schema_rewrite_job = metadataHttpServiceFinishSchemaRewriteJob,
-                .invalidate_schema_rewrite_job = metadataHttpServiceInvalidateSchemaRewriteJob,
-                .upsert_table_emptying_job = metadataHttpServiceUpsertTableEmptyingJob,
-                .upsert_table = metadataHttpServiceUpsertTable,
-                .apply_table_catalog_update_with_schema_rewrite_jobs = metadataHttpServiceApplyTableCatalogUpdateWithSchemaRewriteJobs,
-                .remove_table_emptying_job = metadataHttpServiceRemoveTableEmptyingJob,
-                .begin_table_emptying_job = metadataHttpServiceBeginTableEmptyingJob,
-                .finish_table_emptying_job = metadataHttpServiceFinishTableEmptyingJob,
-                .invalidate_table_emptying_job = metadataHttpServiceInvalidateTableEmptyingJob,
-                .promote_table_emptying_barrier = metadataHttpServicePromoteTableEmptyingBarrier,
-                .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataHttpService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataHttpServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
-                .supports_identity_allocator_reset_for_table_emptying_barrier = metadataHttpServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
-                .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
-                .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
-            },
-        };
-    }
-
-    pub fn fromMetadataServer(srv: *metadata_server.MetadataServer) CatalogSource {
-        return .{
-            .ptr = srv,
-            .vtable = &.{
-                .admin_snapshot = metadataServerAdminSnapshot,
-                .free_admin_snapshot = metadataServerFreeAdminSnapshot,
-            },
-        };
-    }
-};
-
-pub fn emptyCatalogSource() CatalogSource {
+pub fn catalogSourceFromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
     return .{
-        .ptr = undefined,
+        .ptr = svc,
         .vtable = &.{
-            .admin_snapshot = emptyAdminSnapshot,
-            .free_admin_snapshot = emptyFreeAdminSnapshot,
+            .admin_snapshot = metadataServiceAdminSnapshot,
+            .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+            .begin_secondary_index_rebuild_range = metadataServiceBeginSecondaryIndexRebuildRange,
+            .finish_secondary_index_rebuild_range = metadataServiceFinishSecondaryIndexRebuildRange,
+            .invalidate_secondary_index_rebuild_range = metadataServiceInvalidateSecondaryIndexRebuildRange,
+            .begin_schema_rewrite_job = metadataServiceBeginSchemaRewriteJob,
+            .finish_schema_rewrite_job = metadataServiceFinishSchemaRewriteJob,
+            .invalidate_schema_rewrite_job = metadataServiceInvalidateSchemaRewriteJob,
+            .upsert_table_emptying_job = metadataServiceUpsertTableEmptyingJob,
+            .upsert_table = metadataServiceUpsertTable,
+            .apply_table_catalog_update_with_schema_rewrite_jobs = metadataServiceApplyTableCatalogUpdateWithSchemaRewriteJobs,
+            .remove_table_emptying_job = metadataServiceRemoveTableEmptyingJob,
+            .begin_table_emptying_job = metadataServiceBeginTableEmptyingJob,
+            .finish_table_emptying_job = metadataServiceFinishTableEmptyingJob,
+            .invalidate_table_emptying_job = metadataServiceInvalidateTableEmptyingJob,
+            .promote_table_emptying_barrier = metadataServicePromoteTableEmptyingBarrier,
+            .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
+            .supports_identity_allocator_reset_for_table_emptying_barrier = metadataServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
+            .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
+            .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
         },
     };
 }
 
-pub fn unavailableCatalogSource() CatalogSource {
+pub fn catalogSourceFromMetadataHttpService(svc: *metadata_service.MetadataHttpService) CatalogSource {
     return .{
-        .ptr = undefined,
+        .ptr = svc,
         .vtable = &.{
-            .admin_snapshot = unavailableAdminSnapshot,
-            .free_admin_snapshot = emptyFreeAdminSnapshot,
+            .admin_snapshot = metadataHttpServiceAdminSnapshot,
+            .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+            .begin_secondary_index_rebuild_range = metadataHttpServiceBeginSecondaryIndexRebuildRange,
+            .finish_secondary_index_rebuild_range = metadataHttpServiceFinishSecondaryIndexRebuildRange,
+            .invalidate_secondary_index_rebuild_range = metadataHttpServiceInvalidateSecondaryIndexRebuildRange,
+            .begin_schema_rewrite_job = metadataHttpServiceBeginSchemaRewriteJob,
+            .finish_schema_rewrite_job = metadataHttpServiceFinishSchemaRewriteJob,
+            .invalidate_schema_rewrite_job = metadataHttpServiceInvalidateSchemaRewriteJob,
+            .upsert_table_emptying_job = metadataHttpServiceUpsertTableEmptyingJob,
+            .upsert_table = metadataHttpServiceUpsertTable,
+            .apply_table_catalog_update_with_schema_rewrite_jobs = metadataHttpServiceApplyTableCatalogUpdateWithSchemaRewriteJobs,
+            .remove_table_emptying_job = metadataHttpServiceRemoveTableEmptyingJob,
+            .begin_table_emptying_job = metadataHttpServiceBeginTableEmptyingJob,
+            .finish_table_emptying_job = metadataHttpServiceFinishTableEmptyingJob,
+            .invalidate_table_emptying_job = metadataHttpServiceInvalidateTableEmptyingJob,
+            .promote_table_emptying_barrier = metadataHttpServicePromoteTableEmptyingBarrier,
+            .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(metadata_service.MetadataHttpService, "resetIdentityAllocatorsForTableEmptyingBarrier")) metadataHttpServiceResetIdentityAllocatorsForTableEmptyingBarrier else null,
+            .supports_identity_allocator_reset_for_table_emptying_barrier = metadataHttpServiceSupportsIdentityAllocatorResetForTableEmptyingBarrier,
+            .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
+            .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
         },
     };
 }
 
-fn emptyAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+pub fn catalogSourceFromMetadataServer(srv: *metadata_server.MetadataServer) CatalogSource {
     return .{
-        .status = .{
-            .metadata_group_id = 0,
-            .metrics = .{},
+        .ptr = srv,
+        .vtable = &.{
+            .admin_snapshot = metadataServerAdminSnapshot,
+            .free_admin_snapshot = metadataServerFreeAdminSnapshot,
         },
-        .tables = &.{},
-        .ranges = &.{},
-        .stores = &.{},
-        .placement_intents = &.{},
-        .split_transitions = &.{},
-        .merge_transitions = &.{},
     };
 }
-
-fn unavailableAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-    return error.UnsupportedOperation;
-}
-
-fn emptyFreeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
 pub fn nativeTableNameForCatalogTargetAlloc(
     alloc: std.mem.Allocator,

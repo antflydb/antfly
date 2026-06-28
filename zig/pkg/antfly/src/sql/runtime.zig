@@ -24,7 +24,7 @@ const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("mod.zig");
-const table_catalog = @import("../api/table_catalog.zig");
+const table_catalog = @import("../metadata/catalog_source.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 

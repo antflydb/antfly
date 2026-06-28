@@ -445,7 +445,11 @@ those retained ranges drift instead of rediscovering the source table through
 the legacy token scanner. Write-target binding for generated `INSERT`,
 `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements now consumes retained
 generated target-table metadata and validates that the target range sits at the
-generated command's target position before schema binding can continue. Deeper DML cutover still requires
+generated command's target position before schema binding can continue. Direct
+joined-source prebinding for generated `UPDATE ... FROM`, `DELETE ... USING`,
+and `MERGE ... USING` consumes retained relation-source wrapper metadata and
+fails closed when source table metadata is stale instead of reopening the
+legacy joined-write token scanner. Deeper DML cutover still requires
 replacing token-based recursive DML command-body lowering with complete
 generated AST-driven lowering beyond validated generated CTE child-read bodies,
 broader unsupported-shape diagnostics, and a later full statement-head

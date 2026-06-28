@@ -82,7 +82,7 @@ pub const MetadataServer = struct {
             const hosted_ops = try alloc.create(raft_hosted_shard_ops.HostedShardOperationAdapter);
             hosted_ops.* = raft_hosted_shard_ops.HostedShardOperationAdapter.initWithRouters(
                 alloc,
-                api_table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                api_table_catalog.catalogSourceFromMetadataHttpService(svc),
                 metadataStoreGroupRouter(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
@@ -96,7 +96,7 @@ pub const MetadataServer = struct {
             const hosted_db = try alloc.create(raft_hosted_shard_ops.HostedShardDbAdapter);
             hosted_db.* = raft_hosted_shard_ops.HostedShardDbAdapter.init(
                 alloc,
-                api_table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                api_table_catalog.catalogSourceFromMetadataHttpService(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
                 local_db,
@@ -135,7 +135,7 @@ pub const MetadataServer = struct {
             );
             owned_admin_http_server = admin_http_server;
 
-            const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(svc);
+            const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(svc);
             const data_router = metadataDataBearingStoreGroupRouter(svc);
             const replica_root_dir = svc.replica_root_dir orelse "";
 
