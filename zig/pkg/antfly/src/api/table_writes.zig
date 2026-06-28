@@ -3555,6 +3555,11 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn localWriteOwnerSource(self: *ProvisionedTableWriteSource) ?TableWriteSource {
+        const owner = self.local_write_owner orelse return null;
+        return owner.source();
+    }
+
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
         self.drainDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
@@ -6230,10 +6235,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginBulkIngest(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.beginBulkIngest(alloc, table_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
@@ -6243,11 +6249,12 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn finishBulkIngest(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.finishBulkIngest(alloc, table_name, options);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
@@ -6257,6 +6264,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn abortBulkIngest(ptr: *anyopaque, table_name: []const u8) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| {
+            owner.abortBulkIngest(table_name);
+            return;
+        }
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return;
@@ -6306,9 +6317,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: tables_api.CreateTableRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.local_write_owner) |owner| {
-            return try owner.source().createTable(alloc, table_name, req);
-        }
+        if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
@@ -6385,6 +6394,7 @@ pub const ProvisionedTableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.updateSchema(alloc, table_name, schema_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
@@ -6425,9 +6435,10 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        _: []const u8,
+        index_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.createIndex(alloc, table_name, index_name, index_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralCacheUpdate(table_name);
         errdefer self.abortLocalStructuralCacheUpdate(table_name);
@@ -6447,6 +6458,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralCacheUpdate(table_name);
         errdefer self.abortLocalStructuralCacheUpdate(table_name);
@@ -6467,6 +6479,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (group_ids.len == 0) return null;
 
@@ -6865,9 +6878,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.local_write_owner) |owner| {
-            return try owner.source().backupTable(alloc, table_name, plan);
-        }
+        if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
 
         const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         self.beginGroupOperation(table_name, group_id);
@@ -6939,6 +6950,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableRestorePlan,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.restoreTable(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
 
@@ -7436,6 +7448,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.localRuntimeStatuses(alloc, table_name);
         return try self.snapshotRuntimeStatusesBestEffort(alloc, table_name);
     }
 
@@ -7614,6 +7627,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.corruptEmbeddingArtifact(alloc, table_name, doc_key, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -7678,6 +7692,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
@@ -7690,6 +7705,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req);
         var result = db_mod.types.DocumentArtifactTableReprocessResult{};
         errdefer result.deinit(alloc);
         var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
@@ -7746,6 +7762,7 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.updateDocumentArtifactChildRangePlacement(alloc, table_name, doc_key, artifact_name, update);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
     }
@@ -7759,6 +7776,8 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.applyDocumentArtifactChildRangeBatch(alloc, group_id, table_name, doc_key, artifact_name, child_batch);
         return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
     }
 
@@ -7771,6 +7790,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactGroupLocal(alloc, group_id, table_name, doc_key, artifact_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -7835,6 +7855,7 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.updateDocumentArtifactChildRangePlacementGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, update);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -7894,11 +7915,12 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        _: []const u8,
-        _: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.applyDocumentArtifactChildRangeBatchGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, child_batch);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -7962,6 +7984,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactRangeGroupLocal(alloc, group_id, table_name, artifact_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -9618,8 +9641,16 @@ fn reconcileCachedLocalTableIndexCreate(
             cached_active = false;
             return err;
         };
-        try catchUpManagedIndexCreate(alloc, cached.db, index_name);
-        try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+        catchUpManagedIndexCreate(alloc, cached.db, index_name) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
         managed_visibility_changed = true;
     }
     return managed_visibility_changed;
@@ -9655,15 +9686,28 @@ fn reconcileCachedLocalTableIndexDrop(
         defer alloc.free(path);
 
         var cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, self.visibleRootGeneration(group_id), table_name, .default_async);
-        defer cached.deinit(alloc);
+        var cached_active = true;
+        defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
         _ = cached.db.deleteIndex(index_name) catch |err| switch (err) {
             error.IndexNotFound => {},
-            else => return err,
+            else => {
+                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                cached_active = false;
+                return err;
+            },
         };
-        try cached.db.runUntilIdle();
-        try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+        cached.db.runUntilIdle() catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
         managed_visibility_changed = true;
     }
     return managed_visibility_changed;
@@ -17157,6 +17201,22 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expect(write_cache.entries.items[0] == original_entry);
     try std.testing.expect(cached.db.core.index_manager.denseIndex("semantic_idx") != null);
+
+    var outer_cache = ProvisionedTableWriteCache.init(alloc);
+    defer outer_cache.deinit();
+    var outer_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    outer_source.write_cache = &outer_cache;
+    _ = outer_source.withLocalWriteOwner(&source);
+
+    Catalog.indexes_json_buf =
+        \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true}}
+    ;
+    _ = try outer_source.source().createIndex(alloc, "docs", "owner_forwarded_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
+
+    try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(write_cache.entries.items[0] == original_entry);
+    try std.testing.expect(cached.db.core.index_manager.denseIndex("owner_forwarded_idx") != null);
 }
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {

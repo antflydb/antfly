@@ -7115,18 +7115,21 @@ pub const DB = struct {
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7153,6 +7156,7 @@ pub const DB = struct {
         cfg: index_manager_mod.ResolverConfig,
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7211,6 +7215,7 @@ pub const DB = struct {
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
@@ -8113,6 +8118,7 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
@@ -8173,6 +8179,7 @@ pub const DB = struct {
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -39722,6 +39729,72 @@ test "db read-only open modes can share lsm root with live writer" {
             .ttl_cleanup = .{ .enabled = false },
         });
         defer status.close();
+    }
+}
+
+test "db read-only open modes reject catalog mutations before side effects" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer writer.close();
+
+        try writer.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        try writer.sync(true);
+    }
+
+    for ([_]OpenOptions.OpenMode{ .query_readonly, .status_only }) |mode| {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = mode,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing_idx"));
+        try std.testing.expectError(error.ReadOnly, readonly.addEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "readonly_asset_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.addResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.removeResolver("readonly_resolver_v1"));
     }
 }
 
