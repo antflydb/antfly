@@ -3816,6 +3816,7 @@ pub fn build(b: *std.Build) void {
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
+            "managed startup catch-up uses provided indexes json without catalog fetch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

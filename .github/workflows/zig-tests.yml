@@ -553,7 +553,7 @@ jobs:
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package
-        run: cargo build --manifest-path extensions/memoryaf/0.0.1/Cargo.toml --release --target wasm32-wasip2
+        run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh

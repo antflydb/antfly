@@ -5177,7 +5177,15 @@ pub const DataServer = struct {
                     };
                     defer self.clearProvisionedStartupCatchUpTarget();
 
-                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithIndexesJson(&self.write_source, self.alloc, group_id, table.name, table.indexes_json) catch |err| {
+                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithMetadata(&self.write_source, self.alloc, group_id, table.name, .{
+                        .indexes_json = table.indexes_json,
+                        .schema_json = table.schema_json,
+                        .identity_namespace = .{
+                            .table_id = table.table_id,
+                            .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                            .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                        },
+                    }) catch |err| {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;

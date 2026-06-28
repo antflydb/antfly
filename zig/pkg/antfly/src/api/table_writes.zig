@@ -4056,6 +4056,31 @@ pub const ProvisionedTableWriteSource = struct {
         finish_expired_auto_bulk_now_ns: ?u64,
         ensure_auto_bulk_now_ns: ?u64,
     ) !ProvisionedTableWriteCache.CachedDb {
+        return try self.getOrOpenCachedDbModeWithMetadata(
+            alloc,
+            cache,
+            path,
+            group_id,
+            table_name,
+            mode,
+            finish_expired_auto_bulk_now_ns,
+            ensure_auto_bulk_now_ns,
+            null,
+        );
+    }
+
+    fn getOrOpenCachedDbModeWithMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        mode: ManagedDbOpenMode,
+        finish_expired_auto_bulk_now_ns: ?u64,
+        ensure_auto_bulk_now_ns: ?u64,
+        preloaded_metadata: ?StartupCatchUpMetadata,
+    ) !ProvisionedTableWriteCache.CachedDb {
         return try self.getOrOpenCachedDbModeAtGeneration(
             alloc,
             cache,
@@ -4066,6 +4091,7 @@ pub const ProvisionedTableWriteSource = struct {
             mode,
             finish_expired_auto_bulk_now_ns,
             ensure_auto_bulk_now_ns,
+            preloaded_metadata,
         );
     }
 
@@ -4080,13 +4106,17 @@ pub const ProvisionedTableWriteSource = struct {
         mode: ManagedDbOpenMode,
         finish_expired_auto_bulk_now_ns: ?u64,
         ensure_auto_bulk_now_ns: ?u64,
+        preloaded_metadata: ?StartupCatchUpMetadata,
     ) !ProvisionedTableWriteCache.CachedDb {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
+        const identity_namespace = if (preloaded_metadata) |metadata|
+            metadata.identity_namespace
+        else
+            try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = identity_namespace;
         if (mode == .status_only) {
             lockAtomic(&self.local_db_mutex);
@@ -4152,7 +4182,14 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        if (try loadTableManagedMetadata(cache.alloc, self.catalog, table_name)) |metadata| {
+        if (preloaded_metadata) |metadata| {
+            if (metadata.indexes_json) |value| {
+                prepared_open.?.indexes_json = try cache.alloc.dupe(u8, value);
+            }
+            if (metadata.schema_json) |value| {
+                prepared_open.?.schema_json = try cache.alloc.dupe(u8, value);
+            }
+        } else if (try loadTableManagedMetadata(cache.alloc, self.catalog, table_name)) |metadata| {
             prepared_open.?.indexes_json = metadata.indexes_json;
             prepared_open.?.schema_json = metadata.schema_json;
         }
@@ -4713,7 +4750,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
 
         if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null);
+            var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null);
             defer cached.deinit(alloc);
             if (cached.entry) |entry| {
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
@@ -4751,6 +4788,18 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         cached_indexes_json: ?[]const u8,
     ) !StartupCatchUpResult {
+        return try self.catchUpTableGroupBestEffortWithMetadata(alloc, group_id, table_name, .{
+            .indexes_json = cached_indexes_json,
+        });
+    }
+
+    pub fn catchUpTableGroupBestEffortWithMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        metadata: StartupCatchUpMetadata,
+    ) !StartupCatchUpResult {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const lsm_root_generation = self.visibleRootGeneration(group_id);
@@ -4782,9 +4831,15 @@ pub const ProvisionedTableWriteSource = struct {
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
 
-        const owned_indexes_json = if (cached_indexes_json == null) try loadTableIndexesJson(alloc, self.catalog, table_name) else null;
+        const owned_indexes_json = if (metadata.indexes_json == null) try loadTableIndexesJson(alloc, self.catalog, table_name) else null;
         defer if (owned_indexes_json) |value| alloc.free(value);
-        const indexes_json = cached_indexes_json orelse owned_indexes_json;
+        const indexes_json = metadata.indexes_json orelse owned_indexes_json;
+        const identity_namespace = if (metadata.identity_namespace) |namespace|
+            namespace
+        else if (metadata.indexes_json == null)
+            try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id)
+        else
+            null;
         var configured_indexes_storage: ?StartupConfiguredIndexes = null;
         if (indexes_json) |value| configured_indexes_storage = try parseStartupConfiguredIndexes(alloc, value);
         defer if (configured_indexes_storage) |*summary| summary.deinit(alloc);
@@ -4813,17 +4868,17 @@ pub const ProvisionedTableWriteSource = struct {
         var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
         const db = db_blk: {
             if (startup_cache) |cache| {
-                cached_db = self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, startup_open_mode, null, null) catch |err| {
+                cached_db = self.getOrOpenCachedDbModeWithMetadata(alloc, cache, path, group_id, table_name, startup_open_mode, null, null, .{
+                    .indexes_json = indexes_json,
+                    .schema_json = metadata.schema_json,
+                    .identity_namespace = identity_namespace,
+                }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return .{ .busy = true };
                     return err;
                 };
                 break :db_blk cached_db.?.db;
             }
 
-            const identity_namespace = if (cached_indexes_json == null)
-                try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id)
-            else
-                null;
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(startup_open_mode, self.ha_async_mirror);
             uncached_db = if (indexes_json) |value|
                 openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -10348,6 +10403,12 @@ fn createManagedDbEnrichments(
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };
 }
+
+pub const StartupCatchUpMetadata = struct {
+    indexes_json: ?[]const u8 = null,
+    schema_json: ?[]const u8 = null,
+    identity_namespace: ?doc_identity.Namespace = null,
+};
 
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
     alloc: std.mem.Allocator,
@@ -21171,9 +21232,24 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
     const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
     {
-        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            alloc,
+            path,
+            indexes_json,
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            null,
+            null,
+            null,
+            identity_namespace,
+        );
         defer db.close();
     }
 
@@ -21202,11 +21278,19 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     var catalog = CountingCatalog{};
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.runtime_status_cache = &snapshot_cache;
-    const result = try source.catchUpTableGroupBestEffortWithIndexesJson(alloc, 7001, "docs", indexes_json);
+    source.startup_write_cache = &startup_write_cache;
+    const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = indexes_json,
+        .schema_json = "",
+        .identity_namespace = identity_namespace,
+    });
 
     try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+    try std.testing.expect(startup_write_cache.miss_count.load(.monotonic) > 0);
     try std.testing.expect(!result.busy);
     try std.testing.expect(!result.had_debt);
     try std.testing.expect(!result.cleared_debt);
