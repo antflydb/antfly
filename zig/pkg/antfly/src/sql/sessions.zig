@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const catalog_apply = @import("catalog_apply.zig");
-const catalog_resources = @import("../api/catalog_resources.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const ddl_plan = @import("ddl.zig");
 const tokenized = @import("tokenized.zig");
 

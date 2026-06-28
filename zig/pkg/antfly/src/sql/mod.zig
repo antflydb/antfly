@@ -18,6 +18,7 @@ pub const app_parity_fixture = @import("app_parity_fixture.zig");
 pub const binder = @import("binder.zig");
 pub const bulk_io = @import("bulk_io.zig");
 pub const catalog_apply = @import("catalog_apply.zig");
+pub const catalog_resources = @import("catalog_resources.zig");
 pub const statement_kind = @import("statement_kind.zig");
 pub const corpus = @import("corpus.zig");
 pub const cursors = @import("cursors.zig");

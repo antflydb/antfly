@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-const catalog_resources = @import("../api/catalog_resources.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");

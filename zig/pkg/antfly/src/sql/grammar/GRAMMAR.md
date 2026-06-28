@@ -22,6 +22,9 @@ The generated parser must not become a second control plane. It recognizes
 syntax and builds raw AST nodes with source spans. Catalog lookup, role checks,
 storage visibility, derived-index lifecycle, graph metric state, Lite behavior,
 and execution all stay in the binder, planner, and shared service layers.
+SQL catalog identity and session state are owned by the SQL package and
+re-exported for API callers, so generated-parser lowering does not depend on
+API-owned catalog-session types.
 
 The reusable generator machinery lives under `zig/lib/yacc`, following the same
 library-plus-codegen shape as `zig/lib/openapi`. Antfly SQL owns only the input

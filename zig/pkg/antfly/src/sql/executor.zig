@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-const catalog_resources = @import("../api/catalog_resources.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const binder = @import("binder.zig");
 const sql_statement_kind = @import("statement_kind.zig");

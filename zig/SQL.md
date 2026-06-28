@@ -1634,6 +1634,9 @@ Current implementation status:
   re-exports those protocol-neutral runtimes for API callers. Routine
   expression execution uses the storage row-expression evaluator directly, so
   routine catalog state no longer depends on API row handlers.
+- SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
+  and are re-exported by the API module, so binder, executor, DDL, and runtime
+  code no longer import catalog session types from the API package.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

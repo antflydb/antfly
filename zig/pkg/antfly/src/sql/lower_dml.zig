@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
-const catalog_resources = @import("../api/catalog_resources.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
