@@ -41,7 +41,6 @@ pub const parser_context = @import("parser_context.zig");
 pub const plan = @import("plan.zig");
 pub const query_function = @import("query_function.zig");
 pub const relational_rows = @import("relational_rows.zig");
-pub const routines = @import("routines.zig");
 pub const schema_json = @import("schema_json.zig");
 pub const schema_mutation = @import("schema_mutation.zig");
 pub const source_binding = @import("source_binding.zig");
