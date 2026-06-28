@@ -2026,7 +2026,31 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 ) !RelationalSqlDdlTarget {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    var durable_plan = try durableRelationalSqlDdlPlanFromParsedSqlAlloc(alloc, &parsed_sql, function_bindings);
+    return try relationalSqlDdlTargetParsedSqlWithSessionAndFunctionBindingsAlloc(alloc, &parsed_sql, session, function_bindings);
+}
+
+pub fn relationalSqlDdlTargetParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !RelationalSqlDdlTarget {
+    return try relationalSqlDdlTargetParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn relationalSqlDdlTargetParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlDdlTarget {
+    return try relationalSqlDdlTargetParsedSqlWithSessionAndFunctionBindingsAlloc(alloc, parsed_sql, session, .{});
+}
+
+pub fn relationalSqlDdlTargetParsedSqlWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: sql_adapter.SqlFunctionBindings,
+) !RelationalSqlDdlTarget {
+    var durable_plan = try durableRelationalSqlDdlPlanFromParsedSqlAlloc(alloc, parsed_sql, function_bindings);
     defer durable_plan.deinit(alloc);
     return switch (durable_plan) {
         .table_ddl => |table_plan| try relationalSqlDdlTargetForTablePlanWithSessionAlloc(alloc, table_plan, session),
@@ -5849,6 +5873,15 @@ test "metadata.schema update sql ddl exposes catalog target and create intent" {
     try std.testing.expectEqualStrings(default_namespace_name, create_target.namespace_name);
     try std.testing.expectEqualStrings("users", create_target.table_name);
     try std.testing.expect(create_target.createsTable());
+
+    var parsed_create_sql = try sql_adapter.ParsedSql.initAlloc(std.testing.allocator, "CREATE TABLE parsed_events (id uuid PRIMARY KEY);");
+    defer parsed_create_sql.deinit(std.testing.allocator);
+    var parsed_create_target = try relationalSqlDdlTargetParsedSqlAlloc(std.testing.allocator, &parsed_create_sql);
+    defer parsed_create_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_database_name, parsed_create_target.database_name);
+    try std.testing.expectEqualStrings(default_namespace_name, parsed_create_target.namespace_name);
+    try std.testing.expectEqualStrings("parsed_events", parsed_create_target.table_name);
+    try std.testing.expect(parsed_create_target.createsTable());
 
     const tenant_search_path: []const []const u8 = &.{ "analytics", default_namespace_name };
     var session_create_target = try relationalSqlDdlTargetWithSessionAlloc(std.testing.allocator, "CREATE TABLE events (id uuid PRIMARY KEY);", .{
