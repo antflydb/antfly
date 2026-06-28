@@ -534,6 +534,13 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_last_ns: u64 = 0,
         auto_bulk_ingest_finish_requested: bool = false,
 
+        fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setResolutionCandidateSource(null);
+            self.db.setEntitySink(null);
+            self.db.setPromotionOwner(null);
+            self.promotion_owner_state = .{};
+        }
+
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
@@ -554,6 +561,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.auto_bulk_ingest_last_ns = 0;
                 self.auto_bulk_ingest_finish_requested = false;
             }
+            self.detachRuntimeHooks();
             // Read-side cache invalidation must not turn the first query after
             // a large weak-sync load into a full derived-index drain. DB.close()
             // tears down async workers and flushes owned storage; callers that
@@ -20656,6 +20664,83 @@ test "managed startup catch-up bypasses shared write cache" {
     try std.testing.expect(!result.cleared_debt);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(write_cache.entries.items[0].db.start_index_workers);
+}
+
+test "provisioned write cache close detaches promotion leadership callback before stats" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-close-detaches-promotion-owner", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const PoisonLeadership = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) ProvisionedTableWriteCache.PromotionLeadershipSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .is_local_leader = isLocalLeader },
+            };
+        }
+
+        fn isLocalLeader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return false;
+        }
+    };
+
+    var leadership = PoisonLeadership{};
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    write_cache.setPromotionLeadershipSource(leadership.source());
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    try std.testing.expect(cached.db.promotion_runtime != null);
+    cached.db.promotion_runtime.?.notifySequence(1);
+    cached.deinit(alloc);
+
+    write_cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), leadership.calls);
 }
 
 test "managed startup catch-up invalidates stale cached writer status after replay clears debt" {
