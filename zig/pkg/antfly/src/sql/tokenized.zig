@@ -363,6 +363,31 @@ pub const ParsedSql = struct {
     }
 };
 
+pub const OwnedParsedSql = struct {
+    parsed: ParsedSql,
+
+    pub fn initChildStatementAlloc(
+        alloc: std.mem.Allocator,
+        parent: *const ParsedSql,
+        token_start: usize,
+        token_end: usize,
+    ) !OwnedParsedSql {
+        if (token_start >= token_end or token_end > parent.items().len) return error.UnsupportedSqlShape;
+        const tokens = parent.items()[token_start..token_end];
+        const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
+        errdefer alloc.free(owned_sql);
+        const parsed = try ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, tokens);
+        return .{ .parsed = parsed };
+    }
+
+    pub fn deinit(self: *OwnedParsedSql, alloc: std.mem.Allocator) void {
+        const owned_sql = self.parsed.sql();
+        self.parsed.deinit(alloc);
+        alloc.free(@constCast(owned_sql));
+        self.* = undefined;
+    }
+};
+
 fn parseGeneratedRawStatementAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -5520,6 +5545,25 @@ test "sql adapter parsed sql builds owned child statements from existing tokens"
     try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
     try std.testing.expectEqual(@as(usize, child.sql().len), child.items()[child.items().len - 1].source_end);
     try std.testing.expectEqualStrings("$1", child.items()[child.items().len - 1].text);
+}
+
+test "sql adapter owned parsed sql wraps rebased child statement lifetime" {
+    const alloc = std.testing.allocator;
+
+    var parent = try ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN SELECT id FROM usage_records WHERE status = $1;",
+    );
+    defer parent.deinit(alloc);
+
+    var child = try OwnedParsedSql.initChildStatementAlloc(alloc, &parent, 1, parent.items().len - 1);
+    defer child.deinit(alloc);
+
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", child.parsed.sql());
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, child.parsed.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, child.parsed.readStatementKind().?);
+    try std.testing.expectEqual(@as(usize, 0), child.parsed.items()[0].source_start);
+    try std.testing.expectEqual(@as(usize, child.parsed.sql().len), child.parsed.items()[child.parsed.items().len - 1].source_end);
 }
 
 test "sql adapter parsed sql owns typed statement variants" {

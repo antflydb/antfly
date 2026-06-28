@@ -97,7 +97,9 @@ Each phase has a narrow job:
   metadata without semantic allocation.
 - `ParsedSql` builds a catalog-free raw AST, including nested statement nodes
   for `EXPLAIN`, CTEs, relation population, `INSERT ... SELECT`, and future
-  embedded statements.
+  embedded statements. Generated child-read validation and `EXPLAIN` subject
+  lowering use owned nested `ParsedSql` values with rebased source spans where
+  the caller can hold the nested source lifetime.
 - `BoundSqlStatement` applies SQL session state, `current_database`,
   `search_path`, catalog identity, object versions, schemas, dependency facts,
   and role authorization.

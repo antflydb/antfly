@@ -780,7 +780,8 @@ unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
 generated option payloads and subject-range validation before the inner
-read/write statement is reparsed.
+read/write statement is lowered through an owned nested `ParsedSql` subject
+with rebased source spans.
 Generated unsupported utility command heads that require a subject, such as
 `CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `MATCH`, `NOTIFY`, `REINDEX`,
 `REVOKE`, and `UNLISTEN`, now fail closed through the generated parser when
@@ -957,10 +958,13 @@ Unsupported DDL remains on the existing parser until
    and validate them through the shared generated read-AST contract before typed
    write-plan lowering, so `INSERT ... SELECT`, relation-source mutation paths,
    and `MERGE ... USING` wrappers do not depend only on lightweight range
-   payload checks. Insert-source and recursive DML CTE retained generated
+   payload checks. Generated DML child-read validation now creates owned nested
+   `ParsedSql` child statements from retained token slices with rebased source
+   spans, so child validation no longer relies on parent-source span views.
+   Insert-source and recursive DML CTE retained generated
    child-read metadata now also validate `SELECT`, `FROM`, `WHERE`, and
    set-operation keyword layout plus statement/command source spans before the
-   child read is reparsed. Joined mutation and merge relation-source wrappers
+   child read is validated. Joined mutation and merge relation-source wrappers
    apply the same retained source-span validation before wrapping their source
    body in a generated child read.
    Recursive DML CTE prefixes now reparse each recorded generated CTE body as a

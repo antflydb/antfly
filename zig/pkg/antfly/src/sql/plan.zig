@@ -2566,7 +2566,7 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
 ) !LoweredExplainPlan {
     const inner_start = parsed.inner_token_start orelse return error.UnsupportedSqlShape;
     const inner_end = parsed.inner_token_end orelse return error.UnsupportedSqlShape;
-    var inner_sql = try tokenized.ParsedSql.initChildStatementAlloc(
+    var inner_sql = try tokenized.OwnedParsedSql.initChildStatementAlloc(
         alloc,
         parent_sql,
         inner_start,
@@ -2574,9 +2574,9 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
     );
     defer inner_sql.deinit(alloc);
 
-    const subject: LoweredExplainSubject = switch (inner_sql.statement) {
-        .read => .{ .read = try hooks.lower_read(hooks.ptr, &inner_sql) },
-        .write => .{ .write = try hooks.lower_write(hooks.ptr, &inner_sql) },
+    const subject: LoweredExplainSubject = switch (inner_sql.parsed.statement) {
+        .read => .{ .read = try hooks.lower_read(hooks.ptr, &inner_sql.parsed) },
+        .write => .{ .write = try hooks.lower_write(hooks.ptr, &inner_sql.parsed) },
         else => return error.UnsupportedSqlShape,
     };
     return .{

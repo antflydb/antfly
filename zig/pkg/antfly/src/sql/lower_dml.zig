@@ -13111,12 +13111,12 @@ fn validateGeneratedChildReadRangeAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     range: generated_parser.GeneratedSqlTokenRange,
 ) !void {
-    var child = tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, range.start, range.end) catch |err| switch (err) {
+    var child = tokenized.OwnedParsedSql.initChildStatementAlloc(alloc, parsed_sql, range.start, range.end) catch |err| switch (err) {
         error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
         else => return err,
     };
     defer child.deinit(alloc);
-    try validateGeneratedChildReadParsedSql(&child);
+    try validateGeneratedChildReadParsedSql(&child.parsed);
 }
 
 fn validateGeneratedDmlReadSourceBodyAlloc(
