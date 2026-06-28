@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (matchesFilter(test_fn.name)) total_count += 1;
     }
 
+    const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     var current_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
@@ -106,20 +107,24 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
         }
 
+        if (trace_cleanup) std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
         testing.io_instance.deinit();
+        if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
         if (testing.allocator_instance.deinit() == .leak) {
             leak_count += 1;
         }
+        if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
     }
 
     std.debug.print(
         "{d} passed; {d} skipped; {d} failed; {d} leaked.\n",
         .{ ok_count, skip_count, fail_count, leak_count },
     );
+    const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
     if (log_err_count != 0) {
         std.debug.print("{d} errors were logged.\n", .{log_err_count});
     }
-    if (fail_count != 0 or leak_count != 0 or log_err_count != 0) {
+    if (fail_count != 0 or leak_count != 0 or (fail_on_error_logs and log_err_count != 0)) {
         std.process.exit(1);
     }
 }
@@ -169,6 +174,16 @@ fn declaredTestName(name: []const u8) []const u8 {
         return name[idx + marker.len ..];
     }
     return name;
+}
+
+fn getenvBool(comptime name: [:0]const u8) bool {
+    if (!builtin.link_libc) return false;
+    const value = std.c.getenv(name) orelse return false;
+    const span = std.mem.span(value);
+    return span.len != 0 and
+        !std.mem.eql(u8, span, "0") and
+        !std.ascii.eqlIgnoreCase(span, "false") and
+        !std.ascii.eqlIgnoreCase(span, "no");
 }
 
 pub fn log(

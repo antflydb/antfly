@@ -70,6 +70,13 @@ func TestPDFProcessor_Process_Basic(t *testing.T) {
 	if _, ok := section.Metadata["total_pages"]; !ok {
 		t.Error("Section should have total_pages metadata")
 	}
+	doc := section.ToDocument()
+	if doc["doc_type"] != "pdf_page" {
+		t.Errorf("doc_type = %v, want pdf_page", doc["doc_type"])
+	}
+	if _, exists := doc["_type"]; exists {
+		t.Errorf("document section should not use reserved _type, got %v", doc["_type"])
+	}
 }
 
 func TestPDFProcessor_Process_EmptyBaseURL(t *testing.T) {

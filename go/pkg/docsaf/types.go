@@ -27,7 +27,7 @@ func (ds *DocumentSection) ToDocument() map[string]any {
 		"file_path": ds.FilePath,
 		"title":     ds.Title,
 		"content":   ds.Content,
-		"_type":     ds.Type,
+		"doc_type":  ds.Type,
 		"metadata":  ds.Metadata,
 	}
 	if ds.URL != "" {
@@ -144,7 +144,7 @@ func (q *Question) ToDocument() map[string]any {
 		"text":        q.Text,
 		"source_path": q.SourcePath,
 		"source_type": q.SourceType,
-		"_type":       "question",
+		"doc_type":    "question",
 	}
 	if q.SourceURL != "" {
 		doc["source_url"] = q.SourceURL

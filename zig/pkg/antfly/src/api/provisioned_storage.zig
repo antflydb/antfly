@@ -18,8 +18,11 @@ const builtin = @import("builtin");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const raft_mod = @import("../raft/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const runtime_status = @import("runtime_status.zig");
+const scraping = @import("antfly_scraping");
+const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
 
@@ -163,6 +166,7 @@ pub const ProvisionedGroupStorage = struct {
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
     read_cache: table_reads.ProvisionedTableReadCache,
     write_cache: table_writes.ProvisionedTableWriteCache,
+    startup_write_cache: table_writes.ProvisionedTableWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
@@ -175,11 +179,13 @@ pub const ProvisionedGroupStorage = struct {
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
             .read_cache = table_reads.ProvisionedTableReadCache.init(alloc),
             .write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
+            .startup_write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
         self.group_visible_root_generations.deinit(self.alloc);
+        self.startup_write_cache.deinit();
         self.write_cache.deinit();
         self.read_cache.deinit();
         self.runtime_status_cache.deinit();
@@ -214,6 +220,14 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.backend_runtime = self.backend_runtime;
         self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
+        self.write_cache.remote_content = write_source.remote_content;
+        self.startup_write_cache.lsm_cache = null;
+        self.startup_write_cache.hbc_cache = &self.hbc_cache;
+        self.startup_write_cache.resource_manager = &self.resource_manager;
+        self.startup_write_cache.backend_runtime = self.backend_runtime;
+        self.startup_write_cache.antfly_provider = write_source.antfly_provider;
+        self.startup_write_cache.secret_store = write_source.secret_store;
+        self.startup_write_cache.remote_content = write_source.remote_content;
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
@@ -221,6 +235,7 @@ pub const ProvisionedGroupStorage = struct {
         read_source.primary_lookup_db = write_source.primaryLookupDbSource();
         write_source.read_cache = &self.read_cache;
         write_source.write_cache = &self.write_cache;
+        write_source.startup_write_cache = &self.startup_write_cache;
         write_source.runtime_status_cache = &self.runtime_status_cache;
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }
@@ -234,6 +249,7 @@ pub const ProvisionedGroupStorage = struct {
         self.backend_runtime = runtime;
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
+        self.startup_write_cache.backend_runtime = runtime;
         read_source.backend_runtime = runtime;
         write_source.backend_runtime = runtime;
     }
@@ -309,6 +325,27 @@ test "provisioned group storage aligns lsm cache with resource budget" {
     const stats = storage.resource_manager.sliceStats(.lsm_block_table_cache);
     try std.testing.expect(stats.hard_limit_bytes > 0);
     try std.testing.expectEqual(stats.hard_limit_bytes, @as(u64, @intCast(storage.lsm_cache.max_bytes)));
+}
+
+test "provisioned group storage wires remote content to writer caches" {
+    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+    }, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.ProvisionedTableWriteSource.init("/tmp/unused-antfly-write", table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+    });
+    const remote_content = scraping.RemoteContentConfig{};
+    _ = write_source.withRemoteContent(&remote_content);
+
+    storage.attachSources(&read_source, &write_source);
+
+    try std.testing.expectEqual(&remote_content, storage.write_cache.remote_content.?);
+    try std.testing.expectEqual(&remote_content, storage.startup_write_cache.remote_content.?);
 }
 
 test "provisioned group storage derives all resource budgets" {
