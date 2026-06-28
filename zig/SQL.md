@@ -1653,11 +1653,10 @@ Current implementation status:
   relation-source metadata, and fails closed when source-table metadata drifts
   instead of rediscovering it through token scanning.
 - Session, savepoint, notification, prepared-statement, cursor, and routine
-  runtimes now live under `pkg/antfly/src/api/sql/`; those modules own
-  API/protocol session state and call into SQL-owned parsed, bound, and typed
-  plan surfaces. Routine expression execution uses the storage row-expression
-  evaluator directly, so routine catalog state no longer depends on API row
-  handlers.
+  runtimes now live under `pkg/antfly/src/sql/`; those modules own SQL
+  session/protocol state and call into parsed, bound, and typed plan surfaces.
+  Routine expression execution uses the storage row-expression evaluator
+  directly, so routine catalog state no longer depends on API row handlers.
 - Prepared-statement and cursor DDL plans now store subject statements as
   owned nested `ParsedSql` values cloned from retained token slices with rebased
   source spans, so subject execution no longer carries a parallel raw SQL field

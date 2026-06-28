@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const ddl_plan = @import("../../sql/ddl.zig");
-const sql_read_kind = @import("../../sql/statement_kind.zig");
-const sql_value = @import("../../sql/value.zig");
-const tokenized = @import("../../sql/tokenized.zig");
+const ddl_plan = @import("ddl_plan.zig");
+const sql_read_kind = @import("statement_kind.zig");
+const sql_value = @import("value.zig");
+const tokenized = @import("tokenized.zig");
 
 const sql_adapter = struct {
     const ParsedSql = tokenized.ParsedSql;

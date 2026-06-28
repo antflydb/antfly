@@ -19,7 +19,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("catalog_resources.zig");
@@ -1866,6 +1866,7 @@ pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed
 }
 
 fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlDmlAst {
+    _ = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -2988,6 +2989,7 @@ pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
 }
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {

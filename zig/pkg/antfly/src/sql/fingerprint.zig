@@ -16,7 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const corpus = @import("corpus.zig");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const diagnostics = @import("diagnostics.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -1276,6 +1276,14 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                 .{ plan.table_name, plan.if_exists },
             ),
         .alter_table => |plan| blk: {
+            if (plan.operations.len == 1) switch (plan.operations[0]) {
+                .drop_update_policy => |drop| break :blk try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_trigger:name={s}:table={s}:if_exists={}:cascade=false",
+                    .{ drop.trigger_name, plan.table_name, drop.if_exists },
+                ),
+                else => {},
+            };
             var fingerprint = try std.fmt.allocPrint(
                 alloc,
                 "ddl:alter_table:table={s}:ops={d}:if_exists={}",

@@ -14,18 +14,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const binder = @import("../../sql/binder.zig");
-const ddl_plan = @import("../../sql/ddl.zig");
-const executor = @import("../../sql/executor.zig");
-const extension_domain = @import("../../extensions/mod.zig");
-const lower_expr = @import("../../sql/lower_expr.zig");
-const relational_row_runtime = @import("../../storage/db/relational_rows.zig");
-const docstore_mod = @import("../../storage/docstore.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const sql_value = @import("../../sql/value.zig");
-const table_catalog = if (builtin.is_test) @import("../../metadata/catalog_source.zig") else struct {};
-const token_mod = @import("../../sql/token.zig");
-const tokenized = @import("../../sql/tokenized.zig");
+const binder = @import("binder.zig");
+const ddl_plan = @import("ddl_plan.zig");
+const executor = @import("executor.zig");
+const extension_domain = @import("../extensions/mod.zig");
+const lower_expr = @import("lower_expr.zig");
+const relational_row_runtime = @import("../storage/db/relational_rows.zig");
+const docstore_mod = @import("../storage/docstore.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const sql_value = @import("value.zig");
+const table_catalog = if (builtin.is_test) @import("../metadata/catalog_source.zig") else struct {};
+const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 
 const sql_adapter = struct {
     const CreateRoutinePlan = ddl_plan.CreateRoutinePlan;

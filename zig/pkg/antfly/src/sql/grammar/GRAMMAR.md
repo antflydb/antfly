@@ -458,10 +458,14 @@ fails closed when source table metadata is stale instead of reopening the
 legacy joined-write token scanner. Recursive DML CTE producer body slices are
 also reparsed as generated read ASTs and passed into the existing typed
 recursive CTE lowerers, so anchor/final child reads no longer enter recursive
-write planning as generated-unaware token slices. Deeper DML cutover still
-requires replacing token-based recursive DML mutation command-body lowering with
-complete generated AST-driven lowering beyond validated generated CTE
-child-read bodies,
+write planning as generated-unaware token slices. Generated recursive
+`INSERT`, `UPDATE`, `DELETE`, and `MERGE` write plans now parse the recursive
+CTE producer once, then lower the retained command body from the generated
+command start with recursive CTE context, requiring exact retained statement
+boundary consumption instead of rediscovering the whole recursive mutation
+through the legacy token entry points. Deeper DML cutover still requires
+complete generated AST-driven semantic lowering inside assignments,
+predicates, returning lists, conflict clauses, and merge action bodies,
 broader unsupported-shape diagnostics, and a later full statement-head
 promotion once generated coverage matches the currently supported typed DML
 surface.
@@ -986,8 +990,11 @@ Unsupported DDL remains on the existing parser until
    recursive `UPDATE`/`DELETE` forms that classify as joined mutation sources
    through their recursive CTE predicates validate the generated command body
    without requiring an explicit generated `FROM`/`USING` relation-source
-   payload, and recursive generated DML delegation now fails closed unless the
-   typed recursive parser consumes exactly the retained generated statement
+   payload. Recursive generated DML write lowering now parses the recursive CTE
+   producer once, starts supported `INSERT`, `UPDATE`, `DELETE`, and `MERGE`
+   command-body lowering at the retained generated command boundary with the
+   recursive CTE injected into the typed body parser context, and fails closed
+   unless the body parser consumes exactly the retained generated statement
    boundary.
    Generated DML AST kind also owns parsed-statement write-family
    classification for generated-covered writes without re-entering the
@@ -1025,12 +1032,12 @@ Unsupported DDL remains on the existing parser until
    legacy write-family classification when the generated grammar rejects them.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
-   generated command-body AST-driven lowering for `WITH`-prefixed recursive
-   CTE DML beyond
-   validated generated CTE child-read bodies and direct recursive write-plan
-   dispatch, broader unsupported-shape diagnostics, and full generated
-   `WITH` statement-head promotion once generated coverage can distinguish read
-   CTEs from write CTEs before successful generated parsing.
+   generated AST-driven semantic lowering for DML body internals that still use
+   typed token body parsers, including assignments, predicates, returning
+   expressions, conflict clauses, and merge actions. Remaining work also
+   includes broader unsupported-shape diagnostics and full generated `WITH`
+   statement-head promotion once generated coverage can distinguish read CTEs
+   from write CTEs before successful generated parsing.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for

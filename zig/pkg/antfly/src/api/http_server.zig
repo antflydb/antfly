@@ -31,10 +31,9 @@ const relational_sql_ddl = @import("relational_sql_ddl.zig");
 const sql_adapter_runtime = @import("../sql/runtime.zig");
 const catalog_jobs = @import("catalog_jobs.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const api_sql = @import("sql/mod.zig");
-const sql_routines = api_sql.routines;
-const sql_sessions = api_sql.sessions;
-const sql_transactions = api_sql.transactions;
+const sql_routines = sql_adapter.routines;
+const sql_sessions = sql_adapter.sessions;
+const sql_transactions = sql_adapter.transactions;
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -3558,12 +3557,12 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
-    sql_notification_runtime: api_sql.SqlNotificationRuntime = .{ .alloc = undefined },
-    sql_catalog_session_runtime: api_sql.SqlSessionRuntime = .{ .alloc = undefined },
-    sql_prepared_statement_runtime: api_sql.SqlPreparedStatementRuntime = .{ .alloc = undefined },
-    sql_cursor_runtime: api_sql.SqlCursorRuntime = .{ .alloc = undefined },
-    sql_routine_runtime: api_sql.SqlRoutineRuntime = .{ .alloc = undefined },
-    sql_savepoint_runtime: api_sql.SqlSavepointRuntime = .{ .alloc = undefined },
+    sql_notification_runtime: sql_adapter.SqlNotificationRuntime = .{ .alloc = undefined },
+    sql_catalog_session_runtime: sql_adapter.SqlSessionRuntime = .{ .alloc = undefined },
+    sql_prepared_statement_runtime: sql_adapter.SqlPreparedStatementRuntime = .{ .alloc = undefined },
+    sql_cursor_runtime: sql_adapter.SqlCursorRuntime = .{ .alloc = undefined },
+    sql_routine_runtime: sql_adapter.SqlRoutineRuntime = .{ .alloc = undefined },
+    sql_savepoint_runtime: sql_adapter.SqlSavepointRuntime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
     schema_rewrite_wake_registry: SchemaRewriteWakeRegistry = .{},
     table_emptying_wake_owner_id: u64 = 0,
@@ -3626,12 +3625,12 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
-            .sql_notification_runtime = api_sql.SqlNotificationRuntime.init(alloc),
-            .sql_catalog_session_runtime = api_sql.SqlSessionRuntime.init(alloc),
-            .sql_prepared_statement_runtime = api_sql.SqlPreparedStatementRuntime.init(alloc),
-            .sql_cursor_runtime = api_sql.SqlCursorRuntime.init(alloc),
-            .sql_routine_runtime = api_sql.SqlRoutineRuntime.init(alloc),
-            .sql_savepoint_runtime = api_sql.SqlSavepointRuntime.init(alloc),
+            .sql_notification_runtime = sql_adapter.SqlNotificationRuntime.init(alloc),
+            .sql_catalog_session_runtime = sql_adapter.SqlSessionRuntime.init(alloc),
+            .sql_prepared_statement_runtime = sql_adapter.SqlPreparedStatementRuntime.init(alloc),
+            .sql_cursor_runtime = sql_adapter.SqlCursorRuntime.init(alloc),
+            .sql_routine_runtime = sql_adapter.SqlRoutineRuntime.init(alloc),
+            .sql_savepoint_runtime = sql_adapter.SqlSavepointRuntime.init(alloc),
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),

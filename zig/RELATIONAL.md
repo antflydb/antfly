@@ -5138,7 +5138,7 @@ backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
 `sql/value.zig` untyped literal-to-JSON helper; and
 `sql/runtime.zig` only maps the resulting channel name, optional payload JSON,
 or `UNLISTEN *` flag into typed notification-channel plans. `ApiHttpServer`
-executes those plans through `api/sql/notifications.zig`, an Antfly-owned
+executes those plans through `sql/notifications.zig`, an Antfly-owned
 notification runtime that assigns stable SQL notification session ids to owned
 catalog sessions, records idempotent `LISTEN` subscriptions, applies
 `UNLISTEN`/`UNLISTEN *`, and appends ordered `NOTIFY` delivery events with
@@ -5625,7 +5625,7 @@ into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
 still lives in table-owned update-policy metadata created by `CREATE TRIGGER`.
-`ApiHttpServer` applies routine catalog DDL through `api/sql/routines.zig`,
+`ApiHttpServer` applies routine catalog DDL through `sql/routines.zig`,
 which stores routine records in a native runtime catalog. Safe
 `LANGUAGE sql AS 'SELECT ...'` expression bodies lower only when they map to a
 typed routine body hook carrying the same row-expression AST used by generated

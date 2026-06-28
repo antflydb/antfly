@@ -346,8 +346,9 @@ pub const ParsedSql = struct {
         if (self.generated_statement) |generated_statement| {
             if (generated_statement.kind() == .dml) {
                 const generated_kind = generatedDmlStatementKind(self.items(), generated_statement) orelse return null;
-                if (parsed_kind != generated_kind.write_kind) return null;
+                if (!generatedDmlWriteKindPublishesWithParsedKind(parsed_kind, generated_kind.write_kind)) return null;
                 if (parsed_recursive != generated_kind.recursive) return null;
+                return .{ .kind = generated_kind.write_kind, .recursive = parsed_recursive };
             }
         }
         return .{ .kind = parsed_kind, .recursive = parsed_recursive };
@@ -2281,6 +2282,18 @@ fn generatedDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) sql_st
     };
 }
 
+fn generatedDmlWriteKindPublishesWithParsedKind(
+    parsed_kind: sql_statement_kind.SqlWriteStatementKind,
+    generated_kind: sql_statement_kind.SqlWriteStatementKind,
+) bool {
+    if (parsed_kind == generated_kind) return true;
+    return switch (parsed_kind) {
+        .update => generated_kind == .update_source or generated_kind == .update_joined_source,
+        .delete => generated_kind == .delete_source or generated_kind == .delete_joined_source,
+        else => false,
+    };
+}
+
 fn generatedUpdateDmlAstWriteKind(dml_ast: generated_parser.GeneratedSqlDmlAst) sql_statement_kind.SqlWriteStatementKind {
     if (dml_ast.mutation_join_source) return .update_joined_source;
     if (dml_ast.mutation_source_tail) return .update_source;
@@ -2417,7 +2430,8 @@ fn generatedDmlUpdateLayoutIsValid(
     const assignments = dml_ast.assignments_tokens orelse return false;
     if (assignments.start == 0 or assignments.start >= assignments.end or assignments.end > end) return false;
     if (!tokens[assignments.start - 1].matchesKeywordTag(.set)) return false;
-    if (assignments.start - 1 != target_alias_end) return false;
+    const set_index = assignments.start - 1;
+    if (generatedDmlOptionalForPortionEnd(tokens, target_alias_end, set_index) == null) return false;
     if (dml_ast.source_tokens) |source| {
         if (source.start == 0 or source.start >= source.end or source.end > end) return false;
         if (!tokens[source.start - 1].matchesKeywordTag(.from)) return false;
@@ -2446,10 +2460,12 @@ fn generatedDmlDeleteLayoutIsValid(
     if (dml_ast.source_tokens) |source| {
         if (source.start == 0 or source.start >= source.end or source.end > end) return false;
         if (!tokens[source.start - 1].matchesKeywordTag(.using)) return false;
-        if (source.start - 1 != target_alias_end) return false;
+        if (generatedDmlOptionalForPortionEnd(tokens, target_alias_end, source.start - 1) == null) return false;
         return generatedDmlWhereReturningTailIsValid(tokens, end, source.end, dml_ast.where_tokens, dml_ast.returning_tokens, true);
     }
-    return generatedDmlWhereReturningTailIsValid(tokens, end, target_alias_end, dml_ast.where_tokens, dml_ast.returning_tokens, false);
+    const tail_start = generatedDmlDeleteTailStart(dml_ast, end) orelse return false;
+    const after_portion = generatedDmlOptionalForPortionEnd(tokens, target_alias_end, tail_start) orelse return false;
+    return generatedDmlWhereReturningTailIsValid(tokens, end, after_portion, dml_ast.where_tokens, dml_ast.returning_tokens, false);
 }
 
 fn generatedDmlTruncateLayoutIsValid(
@@ -2551,6 +2567,7 @@ fn generatedDmlTargetTailKeyword(tokens: []const Token, index: usize) bool {
         token.matchesKeywordTag(.from) or
         token.matchesKeywordTag(.using) or
         token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.@"for") or
         token.matchesKeywordTag(.returning) or
         token.matchesKeywordTag(.order) or
         token.matchesKeywordTag(.limit) or
@@ -2558,11 +2575,34 @@ fn generatedDmlTargetTailKeyword(tokens: []const Token, index: usize) bool {
         token.matchesKeywordTag(.fetch);
 }
 
+fn generatedDmlOptionalForPortionEnd(tokens: []const Token, start: usize, stop: usize) ?usize {
+    if (start > stop or stop > tokens.len) return null;
+    if (start == stop) return start;
+    if (start + 6 >= stop) return null;
+    if (!tokens[start].matchesKeywordTag(.@"for")) return null;
+    if (!tokens[start + 1].matchesKeywordTag(.portion)) return null;
+    if (!tokens[start + 2].matchesKeywordTag(.of)) return null;
+    if (tokens[start + 3].kind != .identifier) return null;
+    if (!tokens[start + 4].matchesKeywordTag(.from)) return null;
+    const to_index = findTopLevelKeyword(tokens, start + 5, stop, .to) orelse return null;
+    if (to_index == start + 5 or to_index + 1 >= stop) return null;
+    return stop;
+}
+
 fn generatedDmlInsertTailStart(
     dml_ast: generated_parser.GeneratedSqlDmlAst,
     end: usize,
 ) ?usize {
     if (dml_ast.conflict_tokens) |conflict| return if (conflict.start > 0) conflict.start - 1 else null;
+    if (dml_ast.returning_tokens) |returning| return if (returning.start > 0) returning.start - 1 else null;
+    return end;
+}
+
+fn generatedDmlDeleteTailStart(
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) ?usize {
+    if (dml_ast.where_tokens) |where| return if (where.start > 0) where.start - 1 else null;
     if (dml_ast.returning_tokens) |returning| return if (returning.start > 0) returning.start - 1 else null;
     return end;
 }
@@ -5668,6 +5708,22 @@ test "sql adapter parsed sql owns typed statement variants" {
     try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, published_write.kind);
     try std.testing.expect(!published_write.recursive);
 
+    var temporal_update = try ParsedSql.initAlloc(alloc, "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *");
+    defer temporal_update.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, temporal_update.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update_source, temporal_update.writeStatementKindIncludingGeneratedAst().?);
+    const published_temporal_update = temporal_update.writeStatementIncludingGeneratedAst() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update_source, published_temporal_update.kind);
+    try std.testing.expect(!published_temporal_update.recursive);
+
+    var temporal_delete = try ParsedSql.initAlloc(alloc, "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING sku");
+    defer temporal_delete.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.delete, temporal_delete.writeStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.delete_source, temporal_delete.writeStatementKindIncludingGeneratedAst().?);
+    const published_temporal_delete = temporal_delete.writeStatementIncludingGeneratedAst() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.delete_source, published_temporal_delete.kind);
+    try std.testing.expect(!published_temporal_delete.recursive);
+
     var generated_alias_write = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT s.id FROM ONLY incoming_usage AS s WHERE s.status = 'open'");
     defer generated_alias_write.deinit(alloc);
     try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, generated_alias_write.writeStatementKind().?);
@@ -7778,7 +7834,7 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
         .{ .sql = "INSERT INTO usage_records (id) SELECT id FROM incoming_usage", .generated = .insert_select, .write = .insert_source },
         .{ .sql = "UPDATE usage_records SET status = 'done' WHERE id = 'u1'", .generated = .update, .write = .update },
         .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id", .generated = .update, .write = .update_joined_source },
-        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING sku", .generated = .update, .write = .update_source },
+        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *", .generated = .update, .write = .update_source },
         .{ .sql = "DELETE FROM usage_records WHERE id = 'u1'", .generated = .delete, .write = .delete },
         .{ .sql = "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)", .generated = .delete, .write = .delete_joined_source },
         .{ .sql = "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING sku", .generated = .delete, .write = .delete_source },
@@ -7803,6 +7859,7 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
             .write => |statement| try std.testing.expectEqual(case.write, statement.kind),
             else => return error.TestUnexpectedResult,
         }
+        try std.testing.expectEqual(case.write, parsed.writeStatementKindIncludingGeneratedAst().?);
     }
 }
 

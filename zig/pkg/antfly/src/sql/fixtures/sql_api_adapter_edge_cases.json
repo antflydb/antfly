@@ -17,9 +17,9 @@
       "action": "select",
       "coverage": [
         "action_select",
-        "expected_error_invalid_sql_catalog"
+        "expected_error_unsupported_sql_shape"
       ],
-      "expected_error": "invalid_sql_catalog",
+      "expected_error": "unsupported_sql_shape",
       "sql": "SELECT row_number() OVER (ORDER BY id) FROM users"
     },
     {
@@ -28,9 +28,9 @@
       "coverage": [
         "action_select",
         "aggregate_duplicate_output_name_rejection",
-        "expected_error_invalid_sql_catalog"
+        "expected_error_unsupported_sql_shape"
       ],
-      "expected_error": "invalid_sql_catalog",
+      "expected_error": "unsupported_sql_shape",
       "sql": "SELECT organization_id, COUNT(*) AS organization_id FROM users GROUP BY organization_id ORDER BY organization_id"
     },
     {

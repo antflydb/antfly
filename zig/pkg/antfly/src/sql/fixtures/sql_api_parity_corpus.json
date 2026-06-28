@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "45d8c2fb3a205ef21e67afea28566652a9ac34aabe044b46bc2120ad46603f93",
-  "source_entry_count": 1029,
-  "entry_count": 1029,
+  "source_sha256": "c59893c225daa6e581771ea4d6610827d9579e69da9790d1f114405ec1ded716",
+  "source_entry_count": 1031,
+  "entry_count": 1031,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -162,13 +162,9 @@
     },
     {
       "name": "merge mutation-producing cte source",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_rows:ctes=0:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:data_ctes=1:data_cte_update=1:data_cte_returning=2:data_cte_claim_placeholder=1",
+      "family": "unsupported_merge_mutation",
+      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+      "classification_reason": "cte_mutation_source_plan",
       "sql": "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {
@@ -591,11 +587,10 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
-        "explain_subject": "read",
-        "explain_inner_kind": "query",
-        "explain_options": true,
         "predicates": 1,
-        "select": 1
+        "select": 1,
+        "explain_subject": "read",
+        "explain_inner_kind": "query"
       },
       "plan": "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "EXPLAIN SELECT id FROM usage_records WHERE status = 'open'"
@@ -605,11 +600,10 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
-        "explain_subject": "read",
-        "explain_inner_kind": "query",
-        "explain_analyze": true,
         "predicates": 1,
-        "select": 1
+        "select": 1,
+        "explain_subject": "read",
+        "explain_inner_kind": "query"
       },
       "plan": "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:verbose=1:costs=0",
       "sql": "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF) SELECT id FROM usage_records WHERE status = 'open'"
@@ -619,9 +613,9 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "returning": 1,
         "explain_subject": "write",
-        "explain_inner_kind": "insert",
-        "returning": 1
+        "explain_inner_kind": "insert"
       },
       "plan": "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
       "sql": "EXPLAIN INSERT INTO usage_records (id, status) VALUES ('u_explain', 'pending') RETURNING id"
@@ -631,10 +625,10 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
-        "explain_subject": "write",
-        "explain_inner_kind": "update_source",
         "predicates": 1,
-        "returning": 1
+        "returning": 1,
+        "explain_subject": "write",
+        "explain_inner_kind": "update_source"
       },
       "plan": "explain:kind=write:analyze=false:inner=update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
       "sql": "EXPLAIN UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR UPDATE RETURNING id"
@@ -644,30 +638,39 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
-        "explain_subject": "write",
-        "explain_inner_kind": "update_joined_source",
         "returning": 1,
-        "join_on": 1
+        "join_on": 1,
+        "explain_subject": "write",
+        "explain_inner_kind": "update_joined_source"
       },
       "plan": "explain:kind=write:analyze=false:inner=update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
       "sql": "EXPLAIN UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id"
+    },
+    {
+      "name": "explain merge write plan",
+      "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1,
+        "explain_subject": "write",
+        "explain_inner_kind": "merge_mutation"
+      },
+      "plan": "explain:kind=write:analyze=false:inner=merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=1:returning_expr=0:returning_all=0",
+      "sql": "EXPLAIN MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status) RETURNING target.id"
     },
     {
       "name": "explain analyze read plan",
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1,
         "explain_subject": "read",
         "explain_inner_kind": "query",
-        "explain_options": true,
-        "explain_analyze": true,
-        "explain_buffers": true,
-        "explain_timing": false,
-        "explain_summary": false,
-        "explain_settings": true,
-        "explain_wal": true,
-        "predicates": 1,
-        "select": 1
+        "explain_analyze": true
       },
       "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'"
@@ -677,10 +680,10 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
-        "explain_subject": "read",
-        "explain_inner_kind": "query",
         "predicates": 1,
-        "select": 1
+        "select": 1,
+        "explain_subject": "read",
+        "explain_inner_kind": "query"
       },
       "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:buffers=1:timing=0:summary=0:settings=1:wal=1",
       "sql": "EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records WHERE status = 'open'"
@@ -749,6 +752,7 @@
         "operations": 1
       },
       "plan": "ddl:maintenance:kind=reindex:target=index:name=usage_records_status_idx:concurrently=true",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "REINDEX INDEX CONCURRENTLY usage_records_status_idx"
     },
     {
@@ -760,6 +764,7 @@
         "operations": 1
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "CLUSTER usage_records USING usage_records_status_idx"
     },
     {
@@ -771,6 +776,7 @@
         "operations": 1
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=true",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "CLUSTER VERBOSE usage_records USING usage_records_status_idx"
     },
     {
@@ -1772,7 +1778,7 @@
       "sql": "SELECT id FROM usage_records WHERE false OR status = 'ready' ORDER BY created_at DESC LIMIT 5"
     },
     {
-      "name": "single table select all with named extras query",
+      "name": "single table select all disambiguated extras query",
       "family": "query",
       "summary": {
         "table_name": "usage_records",
@@ -1781,8 +1787,8 @@
         "order_by": 1,
         "limit": 5
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none:select_all=1",
-      "sql": "SELECT *, lower(status) AS status_key, metadata->>'source' AS source FROM usage_records ORDER BY id ASC LIMIT 5"
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=1:order=1:order_expr=0:limit=5:claim=none:select_all_alias0=status_3:select_all_expr0=status_2:select_all=1",
+      "sql": "SELECT *, lower(status) AS status, status FROM usage_records ORDER BY id ASC LIMIT 5"
     },
     {
       "name": "single table scalar membership query",
@@ -3736,6 +3742,7 @@
         "operations": 1
       },
       "plan": "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer"
     },
     {
@@ -3747,6 +3754,7 @@
         "operations": 1
       },
       "plan": "ddl:revoke_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer"
     },
     {
@@ -4808,150 +4816,150 @@
     },
     {
       "name": "query union all scalar or disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union all scalar in disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "access_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union all scalar in expression disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union all scalar in expression or disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 5,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=5:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=5:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union all scalar in expression expression-disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query union all expression or disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query union all mixed expression or disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query union scalar in set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "access_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union scalar in expression set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query union scalar in expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 5,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=5:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=5:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query union expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query union mixed expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 3,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query intersect scalar in set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "in_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query intersect scalar in expression set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
@@ -4959,203 +4967,203 @@
         "expression_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query intersect scalar in expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 4,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=4:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=4:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'"
     },
     {
       "name": "query intersect scalar or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query intersect expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'"
     },
     {
       "name": "query intersect mixed expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending')"
     },
     {
       "name": "query except scalar in set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "access_not_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_not=1",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_not=1",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived')"
     },
     {
       "name": "query except scalar or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=2:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=2:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' OR status = 'archived'"
     },
     {
       "name": "query except expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 1,
         "expression_not_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=1:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=1:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'"
     },
     {
       "name": "query except mixed expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "expression_not_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND (lower(status) = 'deleted' OR lower(status) = 'archived')"
     },
     {
       "name": "query except scalar in expression set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "expression_not_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'"
     },
     {
       "name": "query except scalar in expression or set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "expression_not_predicates": 4,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=4:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=4:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND (lower(status) = 'deleted' OR lower(status) = 'archived')"
     },
     {
       "name": "query intersect expression set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 2
       },
-      "plan": "query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT lower(status) AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "query union expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query intersect expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query except expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_not_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=1:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=1:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'"
     },
     {
       "name": "query union mixed scalar expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query intersect mixed scalar expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "expression_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query except mixed scalar expression predicate set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "predicates": 1,
         "expression_not_predicates": 1,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'"
     },
     {
       "name": "query union all set operation ordered page",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1,
@@ -5163,34 +5171,34 @@
         "limit": 5,
         "offset": 2
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:offset=2",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:offset=2",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' ORDER BY id USING < LIMIT 5 OFFSET 2"
     },
     {
       "name": "query union all set operation fetch tail",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1,
         "order_by": 1,
         "limit": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' ORDER BY id ASC FETCH FIRST ROW ONLY"
     },
     {
       "name": "query union all set operation null pagination tail",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' LIMIT NULL OFFSET NULL"
     },
     {
       "name": "query cte union set operation ordered page",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "ctes": 1,
@@ -5198,132 +5206,132 @@
         "order_by": 1,
         "limit": 2
       },
-      "plan": "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY"
     },
     {
       "name": "query union all boolean disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE UNION ALL SELECT id FROM usage_records WHERE enabled IS FALSE"
     },
     {
       "name": "query union all complementary inequality set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status != 'open'"
     },
     {
       "name": "query union all complementary distinct set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status IS DISTINCT FROM 'open'"
     },
     {
       "name": "query union all numeric complementary inequality set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE amount = 5 UNION ALL SELECT id FROM usage_records WHERE amount != 5"
     },
     {
       "name": "query union all numeric range disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE amount < 5 UNION ALL SELECT id FROM usage_records WHERE amount >= 5"
     },
     {
       "name": "query union all null equality disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IS NULL UNION ALL SELECT id FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "query union all null-test disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status IS NULL UNION ALL SELECT id FROM usage_records WHERE status IS NOT NULL"
     },
     {
       "name": "query union all expression disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
       "name": "query union all expression complementary inequality set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE lower(status) != 'open'"
     },
     {
       "name": "query union all numeric expression complementary inequality set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE amount + quantity = 5 UNION ALL SELECT id FROM usage_records WHERE amount + quantity != 5"
     },
     {
       "name": "query union all numeric expression range disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE amount + quantity < 5 UNION ALL SELECT id FROM usage_records WHERE amount + quantity >= 5"
     },
     {
       "name": "query union all expression null-test disjoint set operation",
-      "family": "query",
+      "family": "read",
       "summary": {
         "table_name": "usage_records",
         "expression_or_predicates": 2,
         "select": 1
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE lower(status) IS NULL UNION ALL SELECT id FROM usage_records WHERE lower(status) IS NOT NULL"
     },
     {
@@ -5901,7 +5909,7 @@
         "table_name": "usage_records"
       },
       "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
-      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE"
     },
     {
@@ -5911,7 +5919,7 @@
         "table_name": "usage_records"
       },
       "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
-      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {
@@ -5921,7 +5929,7 @@
         "table_name": "usage_records"
       },
       "plan": "read:set_operation:set_operation:op=intersect:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
-      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {
@@ -8312,7 +8320,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_update_policy=1:drop_update_policy_if_exists=1",
+      "plan": "ddl:drop_trigger:name=update_timestamp:table=usage_records:if_exists=true:cascade=false",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);", "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;"
@@ -9221,6 +9229,20 @@
       },
       "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
+      "name": "natural equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 26,
+        "join_select": 2
+      },
+      "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=26:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o NATURAL JOIN usage_records AS c WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
     },
     {
       "name": "cte column alias equality join",
@@ -10405,6 +10427,7 @@
       "plan": "insert:table=price_intervals:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:returning_all=1",
       "apply_setup_sql": ["CREATE TABLE price_intervals (sku text NOT NULL, valid_at numrange NOT NULL, price numeric, PRIMARY KEY (sku, valid_at WITHOUT OVERLAPS));"],
       "returning_rows": ["{\"sku\":\"sku:a\",\"valid_at_start\":1,\"valid_at_end\":10,\"price\":12.5}"],
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"sku\":{\"type\":\"keyword\"},\"price\":{\"type\":\"numeric\"},\"valid_at_start\":{\"type\":\"numeric\"},\"valid_at_end\":{\"type\":\"numeric\"}},\"required\":[\"sku\"],\"additionalProperties\":false}}},\"periods\":[{\"name\":\"valid_at\",\"start_column\":\"valid_at_start\",\"end_column\":\"valid_at_end\",\"range_type\":\"numrange\"}],\"primary_key\":{\"columns\":[\"sku\"],\"without_overlaps_period\":\"valid_at\"}}",
       "sql": "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:a', '[1,10)'::numrange, 12.5) RETURNING *"
     },
     {

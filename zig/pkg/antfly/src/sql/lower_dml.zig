@@ -19,7 +19,7 @@ const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -13143,31 +13143,12 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     _ = try generatedDmlCommandStart(tokens, ast, end);
     try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, parsed_sql, ast, end);
-    const parser_context = @import("parser_context.zig");
     switch (ast.kind) {
         .insert_select => {
             if (write_kind != .insert_source) return error.UnsupportedSqlShape;
             try validateGeneratedInsertSourceRanges(tokens, ast, end);
             try validateGeneratedDmlReadSourceBodyAlloc(alloc, parsed_sql, ast);
-            if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-            const source_schema = options.insert_source_schema orelse schema;
-            if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-            var parser_state = parser_context.ParserState{
-                .alloc = alloc,
-                .tokens = tokens,
-                .schema = schema,
-                .joined_source_schema = source_schema,
-                .insert_source_allows_different_table = true,
-                .params = params,
-                .unique_resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector,
-            };
-            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveInsertSource(&parser_state) catch |err| switch (err) {
-                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-                else => return err,
-            };
-            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
-            lowered.insert_source.sync_level = options.sync_level;
-            return .{ .recursive_insert_source = lowered };
+            return .{ .recursive_insert_source = try recursiveInsertSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, ast, schema, params, options, end) };
         },
         .update => {
             switch (write_kind) {
@@ -13187,21 +13168,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
             if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-            var parser_state = parser_context.ParserState{
-                .alloc = alloc,
-                .tokens = tokens,
-                .schema = schema,
-                .joined_source_schema = source_schema,
-                .params = params,
-                .mutation_claim = row_claim,
-            };
-            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
-                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-                else => return err,
-            };
-            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
-            lowered.mutation.sync_level = options.sync_level;
-            return .{ .recursive_update_joined_source = lowered };
+            return .{ .recursive_update_joined_source = try recursiveJoinedMutationSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, ast, schema, source_schema, params, row_claim, options.sync_level, .update, end) };
         },
         .delete => {
             switch (write_kind) {
@@ -13221,21 +13188,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
             if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-            var parser_state = parser_context.ParserState{
-                .alloc = alloc,
-                .tokens = tokens,
-                .schema = schema,
-                .joined_source_schema = source_schema,
-                .params = params,
-                .mutation_claim = row_claim,
-            };
-            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
-                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-                else => return err,
-            };
-            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
-            lowered.mutation.sync_level = options.sync_level;
-            return .{ .recursive_delete_joined_source = lowered };
+            return .{ .recursive_delete_joined_source = try recursiveJoinedMutationSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, ast, schema, source_schema, params, row_claim, options.sync_level, .delete, end) };
         },
         .merge => {
             if (write_kind != .merge) return error.UnsupportedSqlShape;
@@ -13244,23 +13197,207 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
             if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
             const source_schema = options.joined_source_schema orelse schema;
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-            var parser_state = parser_context.ParserState{
-                .alloc = alloc,
-                .tokens = tokens,
-                .schema = schema,
-                .joined_source_schema = source_schema,
-                .params = params,
-            };
-            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
-                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-                else => return err,
-            };
-            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
-            lowered.merge.sync_level = options.sync_level;
-            return .{ .recursive_merge_mutation = lowered };
+            return .{ .recursive_merge_mutation = try recursiveMergeMutationFromGeneratedDmlAstAlloc(alloc, parsed_sql, ast, schema, source_schema, params, options.sync_level, end) };
         },
         .insert_values, .truncate => return error.UnsupportedSqlShape,
     }
+}
+
+fn recursiveInsertSourceFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    end: usize,
+) !plan_mod.LoweredRecursiveInsertSource {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const source_schema = options.insert_source_schema orelse schema;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const unique_resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+    const tokens = parsed_sql.items();
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .insert_source_allows_different_table = true,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
+    );
+    errdefer recursive.deinit(alloc);
+    if (parser.matchToken(tokens, &parser_state.pos, .comma) != null) return error.UnsupportedSqlShape;
+    if (parser_state.pos != start) return error.UnsupportedSqlShape;
+
+    var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
+    defer if (base_table_name) |name| alloc.free(name);
+    const recursive_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = recursive.cte_name,
+        .query = recursive.anchor.plan.query,
+    }};
+    var insert_source = parseInsertSourceWithCtesAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+        .{
+            .ctes = recursive_ctes[0..],
+            .base_table_name = &base_table_name,
+        },
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    errdefer insert_source.deinit(alloc);
+    if (!std.mem.eql(u8, insert_source.insert_source.req.source.source_cte, recursive.cte_name)) return error.UnsupportedSqlShape;
+    if (insert_source.ctes.len != 0) return error.UnsupportedSqlShape;
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    insert_source.sync_level = options.sync_level;
+
+    return .{
+        .recursive = recursive,
+        .insert_source = insert_source,
+    };
+}
+
+fn recursiveJoinedMutationSourceFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+    sync_level: db_mod.types.SyncLevel,
+    kind: RecursiveJoinedMutationSourceKind,
+    end: usize,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    const tokens = parsed_sql.items();
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
+    );
+    errdefer recursive.deinit(alloc);
+    if (parser.matchToken(tokens, &parser_state.pos, .comma) != null) return error.UnsupportedSqlShape;
+    if (parser_state.pos != start) return error.UnsupportedSqlShape;
+
+    var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
+    defer if (base_table_name) |name| alloc.free(name);
+    const recursive_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = recursive.cte_name,
+        .query = recursive.anchor.plan.query,
+    }};
+    var mutation = switch (kind) {
+        .update => parseUpdateJoinedMutationSourceWithCtesAlloc(
+            alloc,
+            tokens,
+            &parser_state.pos,
+            try parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserOptions(&parser_state, recursive_ctes[0..], &base_table_name),
+        ),
+        .delete => parseDeleteJoinedMutationSourceWithCtesAlloc(
+            alloc,
+            tokens,
+            &parser_state.pos,
+            try parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserOptions(&parser_state, recursive_ctes[0..], &base_table_name),
+        ),
+    } catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    errdefer mutation.deinit(alloc);
+    if (!recursiveJoinedMutationSourceUsesCte(mutation.mutation.req, recursive.cte_name)) return error.UnsupportedSqlShape;
+    if (mutation.mutation.req.ctes.len == 0) return error.UnsupportedSqlShape;
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    mutation.sync_level = sync_level;
+
+    return .{
+        .recursive = recursive,
+        .mutation = mutation,
+    };
+}
+
+fn recursiveMergeMutationFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+    end: usize,
+) !plan_mod.LoweredRecursiveMergeMutation {
+    const tokens = parsed_sql.items();
+    const start = try generatedDmlCommandStart(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
+    );
+    errdefer recursive.deinit(alloc);
+    if (parser.matchToken(tokens, &parser_state.pos, .comma) != null) return error.UnsupportedSqlShape;
+    if (parser_state.pos != start) return error.UnsupportedSqlShape;
+
+    var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
+    defer if (base_table_name) |name| alloc.free(name);
+    const recursive_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = recursive.cte_name,
+        .query = recursive.anchor.plan.query,
+    }};
+    var merge = parseMergeMutationBodyAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
+        .{
+            .ctes = recursive_ctes[0..],
+            .base_table_name = &base_table_name,
+        },
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    errdefer merge.deinit(alloc);
+    if (!std.mem.eql(u8, merge.source.source_cte, recursive.cte_name)) return error.UnsupportedSqlShape;
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    merge.sync_level = sync_level;
+
+    return .{
+        .recursive = recursive,
+        .merge = merge,
+    };
 }
 
 fn validateGeneratedRecursiveDmlCtePayloadAlloc(
@@ -13375,9 +13512,11 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
     if (start + 4 >= end or !tokens[start].matchesKeywordTag(.insert) or !tokens[start + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
     const target_start = try generatedInsertTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
     var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
+    errdefer if (!table_transferred) plan_mod.freeTableAlias(alloc, target_table);
+    const table_name = target_table.name;
     const returning_start = if (ast.returning_tokens) |returning_range| blk: {
         if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
@@ -13408,6 +13547,8 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
         for (columns) |column| alloc.free(column);
         alloc.free(columns);
     };
+    var column_specs = std.ArrayListUnmanaged(InsertColumnSpec).empty;
+    defer column_specs.deinit(alloc);
     var rows: []const []const []const u8 = &.{};
     var owns_rows = false;
     errdefer if (owns_rows) {
@@ -13418,16 +13559,17 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
     var default_rows = [_][]const []const u8{default_row[0..]};
     if (ast.default_values) {
         if (ast.insert_columns_tokens != null or ast.values_tokens != null) return error.UnsupportedSqlShape;
-        if (body_end != start + 5 or !tokens[start + 3].matchesKeywordTag(.default) or !tokens[start + 4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
+        if (body_end != target_alias_end + 2 or !tokens[target_alias_end].matchesKeywordTag(.default) or !tokens[target_alias_end + 1].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
         rows = default_rows[0..];
     } else {
         const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
-        columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, schema);
+        if (column_range.start != target_alias_end) return error.UnsupportedSqlShape;
+        columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, schema, &column_specs);
         owns_columns = true;
         try validateSqlInsertColumnsUnique(schema, columns);
 
         const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
-        rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
+        rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, column_specs.items, schema, params);
         owns_rows = true;
     }
     var conflicts = std.ArrayListUnmanaged(ConflictClause).empty;
@@ -13447,7 +13589,7 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
             .function_bindings = function_bindings,
         };
         const insert_options = parser_context.ParserState.ContextAccessors.insertParserOptions(&parser_state);
-        const conflict_qualifiers = [_][]const u8{table_name};
+        const conflict_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         const scoped_tokens = tokens[0..conflict_range.end];
         var after_conflict_pos: ?usize = null;
         for (rows) |row| {
@@ -13488,12 +13630,13 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
             .function_bindings = function_bindings,
         };
         parser_state.pos = returning_range.start;
+        const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         returning = generatedReturningProjectionAlloc(
             alloc,
             tokens,
             returning_range,
             schema,
-            table_name,
+            &returning_qualifiers,
             &parser_state.pos,
             parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
         ) catch |err| {
@@ -13532,11 +13675,13 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
     freeConflictClauses(alloc, conflicts.items);
     conflicts.deinit(alloc);
 
+    const owned_table_name = target_table.name;
+    alloc.free(target_table.alias);
     table_transferred = true;
     const owned_returning = returning;
     returning = .{};
     return .{
-        .table_name = table_name,
+        .table_name = owned_table_name,
         .batch = batch,
         .sync_level = options.sync_level,
         .returning = owned_returning,
@@ -13764,10 +13909,11 @@ fn validateGeneratedUpdateSourceRanges(
     if (start + 3 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    _ = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+    const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
+    _ = try generatedDmlOptionalTemporalPortionEnd(tokens, target_alias_end, assignments_range.start - 1);
     try validateGeneratedDmlTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens);
 }
 
@@ -13780,8 +13926,49 @@ fn validateGeneratedDeleteSourceRanges(
     if (start + 2 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
-    try validateGeneratedDmlTailRanges(tokens, end, target_alias_end, ast.where_tokens, ast.returning_tokens);
+    const target_alias_end = try generatedDmlTargetAliasEnd(tokens, target_range, ast.target_alias_tokens, ast.target_alias_name_tokens, end);
+    const tail_start = if (ast.where_tokens) |where_range| blk: {
+        if (where_range.start == 0) return error.UnsupportedSqlShape;
+        break :blk where_range.start - 1;
+    } else if (ast.returning_tokens) |returning_range| blk: {
+        if (returning_range.start == 0) return error.UnsupportedSqlShape;
+        break :blk returning_range.start - 1;
+    } else end;
+    const after_portion = try generatedDmlOptionalTemporalPortionEnd(tokens, target_alias_end, tail_start);
+    try validateGeneratedDmlTailRanges(tokens, end, after_portion, ast.where_tokens, ast.returning_tokens);
+}
+
+fn generatedDmlOptionalTemporalPortionEnd(tokens: []const Token, start: usize, stop: usize) !usize {
+    if (start > stop or stop > tokens.len) return error.UnsupportedSqlShape;
+    if (start == stop) return start;
+    if (start + 6 >= stop) return error.UnsupportedSqlShape;
+    if (!tokens[start].matchesKeywordTag(.@"for")) return error.UnsupportedSqlShape;
+    if (!tokens[start + 1].matchesKeywordTag(.portion)) return error.UnsupportedSqlShape;
+    if (!tokens[start + 2].matchesKeywordTag(.of)) return error.UnsupportedSqlShape;
+    if (tokens[start + 3].kind != .identifier) return error.UnsupportedSqlShape;
+    if (!tokens[start + 4].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+
+    var depth: usize = 0;
+    var to_index: ?usize = null;
+    var cursor = start + 5;
+    while (cursor < stop) : (cursor += 1) {
+        switch (tokens[cursor].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and tokens[cursor].matchesKeywordTag(.to)) {
+            to_index = cursor;
+            break;
+        }
+    }
+
+    const to = to_index orelse return error.UnsupportedSqlShape;
+    if (to == start + 5 or to + 1 >= stop) return error.UnsupportedSqlShape;
+    return stop;
 }
 
 fn validateGeneratedDmlTailRanges(
@@ -14039,10 +14226,11 @@ fn updatePointFromGeneratedDmlAstAlloc(
     if (start + 5 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    _ = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
-    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    const target_alias_end = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
     var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
+    errdefer if (!table_transferred) plan_mod.freeTableAlias(alloc, target_table);
+    const table_name = target_table.name;
 
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
@@ -14129,7 +14317,7 @@ fn updatePointFromGeneratedDmlAstAlloc(
     if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlUpdateTargetPaths(schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);
 
-    const target_qualifiers = [_][]const u8{table_name};
+    const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_tokens = tokens[0..where_range.end];
     var where_pos = where_range.start;
     const where_json = try parsePointWhereJsonAlloc(alloc, where_tokens, &where_pos, params, schema, &target_qualifiers, parser_options.realtime_ns);
@@ -14140,7 +14328,8 @@ fn updatePointFromGeneratedDmlAstAlloc(
     errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
         parser_state.pos = returning_range.start;
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, &parser_state.pos, parser_options.returning_hooks);
+        const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, &returning_qualifiers, &parser_state.pos, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -14168,11 +14357,13 @@ fn updatePointFromGeneratedDmlAstAlloc(
     freeArrayTransformValues(alloc, array_update.items);
     array_update.deinit(alloc);
 
+    const owned_table_name = target_table.name;
+    alloc.free(target_table.alias);
     table_transferred = true;
     const owned_returning = returning;
     returning = .{};
     return .{
-        .table_name = table_name,
+        .table_name = owned_table_name,
         .batch = batch,
         .sync_level = options.sync_level,
         .returning = owned_returning,
@@ -14197,10 +14388,11 @@ fn deletePointFromGeneratedDmlAstAlloc(
     if (start + 4 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
-    _ = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
-    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
     var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
+    errdefer if (!table_transferred) plan_mod.freeTableAlias(alloc, target_table);
+    const table_name = target_table.name;
 
     const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
     if (where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
@@ -14221,7 +14413,7 @@ fn deletePointFromGeneratedDmlAstAlloc(
     };
     const parser_options = parser_context.ParserState.ContextAccessors.deleteParserOptions(&parser_state);
 
-    const target_qualifiers = [_][]const u8{table_name};
+    const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_tokens = tokens[0..where_range.end];
     var where_pos = where_range.start;
     const where_json = try parsePointWhereJsonAlloc(alloc, where_tokens, &where_pos, params, schema, &target_qualifiers, parser_options.realtime_ns);
@@ -14232,7 +14424,8 @@ fn deletePointFromGeneratedDmlAstAlloc(
     errdefer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
         parser_state.pos = returning_range.start;
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, &parser_state.pos, parser_options.returning_hooks);
+        const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, &returning_qualifiers, &parser_state.pos, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -14247,11 +14440,13 @@ fn deletePointFromGeneratedDmlAstAlloc(
     errdefer batch.deinit(alloc);
     batch.req.sync_level = options.sync_level;
 
+    const owned_table_name = target_table.name;
+    alloc.free(target_table.alias);
     table_transferred = true;
     const owned_returning = returning;
     returning = .{};
     return .{
-        .table_name = table_name,
+        .table_name = owned_table_name,
         .batch = batch,
         .sync_level = options.sync_level,
         .returning = owned_returning,
@@ -14265,15 +14460,14 @@ fn generatedReturningProjectionAlloc(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
     schema: runtime_schema.TableSchema,
-    table_name: []const u8,
+    returning_qualifiers: []const []const u8,
     pos: *usize,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
 ) !plan_mod.ReturningProjection {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     const scoped_tokens = tokens[0..range.end];
-    const returning_qualifiers = [_][]const u8{table_name};
     pos.* = range.start;
-    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, pos, schema, &returning_qualifiers, returning_hooks);
+    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, pos, schema, returning_qualifiers, returning_hooks);
     errdefer returning.deinit(alloc);
     if (pos.* != range.end) return error.UnsupportedSqlShape;
     return returning;
@@ -14284,6 +14478,7 @@ fn generatedInsertColumnsAlloc(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
     schema: runtime_schema.TableSchema,
+    column_specs: *std.ArrayListUnmanaged(InsertColumnSpec),
 ) ![]const []const u8 {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
@@ -14297,15 +14492,34 @@ fn generatedInsertColumnsAlloc(
         const column = try generatedDmlIdentifierAtAlloc(alloc, tokens, index);
         var column_transferred = false;
         errdefer if (!column_transferred) alloc.free(column);
-        if (binder.relationalColumnForField(schema, column, null) == null) return error.InvalidSqlCatalog;
-        try columns.append(alloc, column);
-        column_transferred = true;
+        if (binder.relationalColumnForField(schema, column, null) != null) {
+            try columns.append(alloc, column);
+            column_transferred = true;
+            try column_specs.append(alloc, .{ .column = column });
+        } else if (binder.relationalPeriodForDdl(schema.periods, column)) |period| {
+            const start_column = binder.relationalColumnForField(schema, period.start_column, null) orelse return error.InvalidSqlCatalog;
+            const end_column = binder.relationalColumnForField(schema, period.end_column, null) orelse return error.InvalidSqlCatalog;
+            if (start_column.field_type != end_column.field_type or !binder.relationalPeriodColumnType(start_column.field_type)) return error.InvalidSqlCatalog;
+            const start_name = try alloc.dupe(u8, start_column.name);
+            var start_transferred = false;
+            errdefer if (!start_transferred) alloc.free(start_name);
+            const end_name = try alloc.dupe(u8, end_column.name);
+            var end_transferred = false;
+            errdefer if (!end_transferred) alloc.free(end_name);
+            try columns.append(alloc, start_name);
+            start_transferred = true;
+            try columns.append(alloc, end_name);
+            end_transferred = true;
+            try column_specs.append(alloc, .{ .period = period });
+            alloc.free(column);
+            column_transferred = true;
+        } else return error.InvalidSqlCatalog;
         index += 1;
         if (index == range.end - 1) break;
         if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
         index += 1;
     }
-    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    if (columns.items.len == 0 or column_specs.items.len == 0) return error.UnsupportedSqlShape;
     return try columns.toOwnedSlice(alloc);
 }
 
@@ -14314,10 +14528,12 @@ fn generatedInsertValueRowsAlloc(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
     columns: []const []const u8,
+    column_specs: []const InsertColumnSpec,
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) ![][]const []const u8 {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (columns.len == 0 or column_specs.len == 0) return error.UnsupportedSqlShape;
     var rows = std.ArrayListUnmanaged([]const []const u8).empty;
     errdefer {
         freeInsertValueRows(alloc, rows.items);
@@ -14332,18 +14548,42 @@ fn generatedInsertValueRowsAlloc(
             for (row.items) |value| alloc.free(value);
             row.deinit(alloc);
         }
-        for (columns, 0..) |column_name, column_i| {
-            const column = binder.relationalColumnForField(schema, column_name, null) orelse return error.InvalidSqlCatalog;
-            const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &index, params, column, sql_value.currentRealtimeNs());
-            var value_transferred = false;
-            errdefer if (!value_transferred) alloc.free(value_json);
-            try row.append(alloc, value_json);
-            value_transferred = true;
-            if (column_i + 1 < columns.len) {
+        for (column_specs, 0..) |spec, spec_i| {
+            switch (spec) {
+                .column => |column_name| {
+                    const column = binder.relationalColumnForField(schema, column_name, null) orelse return error.InvalidSqlCatalog;
+                    const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &index, params, column, sql_value.currentRealtimeNs());
+                    var value_transferred = false;
+                    errdefer if (!value_transferred) alloc.free(value_json);
+                    try row.append(alloc, value_json);
+                    value_transferred = true;
+                },
+                .period => |period| {
+                    const pair = try lower_expr.parseSqlPeriodRangeValuePairAlloc(
+                        alloc,
+                        tokens,
+                        &index,
+                        params,
+                        schema,
+                        period,
+                        sql_value.currentRealtimeNs(),
+                    );
+                    var start_transferred = false;
+                    errdefer if (!start_transferred) alloc.free(pair.start_json);
+                    var end_transferred = false;
+                    errdefer if (!end_transferred) alloc.free(pair.end_json);
+                    try row.append(alloc, pair.start_json);
+                    start_transferred = true;
+                    try row.append(alloc, pair.end_json);
+                    end_transferred = true;
+                },
+            }
+            if (spec_i + 1 < column_specs.len) {
                 if (index >= range.end or tokens[index].kind != .comma) return error.UnsupportedSqlShape;
                 index += 1;
             }
         }
+        if (row.items.len != columns.len) return error.UnsupportedSqlShape;
         if (index >= range.end or tokens[index].kind != .rparen) return error.UnsupportedSqlShape;
         index += 1;
         const owned_row = try row.toOwnedSlice(alloc);

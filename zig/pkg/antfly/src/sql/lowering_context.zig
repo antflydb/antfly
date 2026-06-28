@@ -180,6 +180,7 @@ pub const ReadPlanLoweringContext = struct {
 };
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -203,6 +204,8 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !plan.LoweredReadPlan {
     const read_kind = try generatedReadStatementKind(parsed_sql.items(), read_ast);
+    const published_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    if (read_kind != published_kind) return error.UnsupportedSqlShape;
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
     return switch (read_ast.kind) {
         .query => blk: {
@@ -255,6 +258,18 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
         },
         .set_operation => blk: {
             try validateGeneratedSetOperationReadAst(parsed_sql.items(), read_ast);
+            if (context.callbacks.lower_query_plan(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.params,
+                context.function_bindings,
+            )) |query| {
+                break :blk .{ .query = query };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
             break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
                 context.alloc,
                 parsed_sql,
@@ -992,7 +1007,7 @@ fn validateGeneratedJoinAstRanges(
         try validateGeneratedReadTokenRange(tokens, read_ast, join.operator_tokens);
         try validateGeneratedReadTokenRange(tokens, read_ast, join.left_tokens);
         try validateGeneratedReadTokenRange(tokens, read_ast, join.right_tokens);
-        try validateGeneratedReadTokenRange(tokens, read_ast, join.condition_tokens);
+        if (join.condition_kind != .none) try validateGeneratedReadTokenRange(tokens, read_ast, join.condition_tokens);
         if (join.predicate_tokens) |predicate_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, predicate_tokens);
         if (join.using_tokens) |using_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, using_tokens);
         if (join.using_column_tokens) |using_column_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, using_column_tokens);
@@ -1341,14 +1356,28 @@ fn lowerGeneratedCteReadPlanAlloc(
             context.schema,
             context.params,
         ) },
-        .set_operation => .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
-            context.alloc,
-            parsed_sql,
-            context.schema,
-            context.source_schema,
-            context.params,
-            context.function_bindings,
-        ) },
+        .set_operation => blk: {
+            if (context.callbacks.lower_query_plan(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.params,
+                context.function_bindings,
+            )) |query| {
+                break :blk .{ .query = query };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
+            break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.source_schema,
+                context.params,
+                context.function_bindings,
+            ) };
+        },
         .recursive_cte => .{ .recursive_cte = try context.callbacks.lower_recursive_cte_plan(
             context.alloc,
             parsed_sql,
@@ -2868,7 +2897,6 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         return;
     }
     if (expression.over_name_tokens != null and expression.over_definition_tokens != null) return error.UnsupportedSqlShape;
-    if (expression.over_name_tokens == null and expression.over_definition_tokens == null) return error.UnsupportedSqlShape;
     const over_tokens = expression.over_tokens.?;
     if (expression.over_name_tokens) |name_tokens| {
         if (name_tokens.start != over_tokens.start + 1 or name_tokens.end != over_tokens.end or name_tokens.start >= name_tokens.end) {
@@ -2885,6 +2913,7 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         }
         return;
     }
+    if (expression.over_definition_tokens == null and over_tokens.end != over_tokens.start + 3) return error.UnsupportedSqlShape;
     if (expression.over_definition_tokens) |definition_tokens| {
         if (definition_tokens.start != over_tokens.start + 2 or definition_tokens.end != over_tokens.end - 1) return error.UnsupportedSqlShape;
     }
@@ -3023,7 +3052,9 @@ fn validateGeneratedFunctionCallClauseMetadata(
                 return error.UnsupportedSqlShape;
             }
         } else {
-            return error.UnsupportedSqlShape;
+            if (over_tokens.end != over_tokens.start + 3 or tokens[over_tokens.start + 1].kind != .lparen or tokens[over_tokens.end - 1].kind != .rparen) {
+                return error.UnsupportedSqlShape;
+            }
         }
     } else if (cursor != expression_tokens.end) {
         return error.UnsupportedSqlShape;
@@ -7545,7 +7576,7 @@ pub const WritePlanLoweringContext = struct {
         if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
             std.log.debug("write lowering using generated dml kind={}", .{dml_ast.kind});
             return self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options, self.function_bindings) catch |err| {
-                if (err == error.UnsupportedSqlShape) {
+                if (err == error.UnsupportedSqlShape or err == error.UnsupportedRowsQuery or err == error.UnsupportedRowsSelector) {
                     std.log.debug("write lowering generated dml unsupported kind={} err={}", .{ dml_ast.kind, err });
                 } else {
                     std.log.err("write lowering generated dml failed kind={} err={}", .{ dml_ast.kind, err });
@@ -7671,6 +7702,7 @@ pub const WritePlanLoweringContext = struct {
 };
 
 fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlDmlAst {
+    _ = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {

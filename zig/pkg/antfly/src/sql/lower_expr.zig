@@ -17,7 +17,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
@@ -2545,8 +2545,17 @@ fn validateGeneratedWindowOverClauseForSpec(
         if (name_range.start != over_range.start + 1 or name_range.end != over_range.end or name_range.start >= name_range.end) return error.UnsupportedSqlShape;
         return;
     }
-    const definition_range = expression.over_definition_tokens orelse return error.UnsupportedSqlShape;
     if (over_range.start + 2 > over_range.end or tokens[over_range.start + 1].kind != .lparen or tokens[over_range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    const definition_range = expression.over_definition_tokens orelse {
+        if (over_range.end != over_range.start + 3 or
+            expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or expression.over_partition_items.items.len != 0 or
+            expression.over_order_tokens != null or expression.over_order_items.count != 0 or expression.over_order_items.items.len != 0 or
+            expression.over_frame_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    };
     if (definition_range.start != over_range.start + 2 or definition_range.end != over_range.end - 1) return error.UnsupportedSqlShape;
 
     if (expression.over_partition_tokens) |partition_range| {
@@ -29616,6 +29625,7 @@ fn generatedReadAstForParsedSql(
     parsed_sql: *const tokenized.ParsedSql,
     expected_kind: generated_parser.GeneratedSqlReadKind,
 ) ?*const generated_parser.GeneratedSqlReadAst {
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -29630,6 +29640,7 @@ fn generatedReadAstForParsedSql(
 fn generatedQueryPlanReadAstForParsedSql(
     parsed_sql: *const tokenized.ParsedSql,
 ) ?*const generated_parser.GeneratedSqlReadAst {
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -29644,6 +29655,7 @@ fn generatedQueryPlanReadAstForParsedSql(
 fn generatedCteReadAstForParsedSql(
     parsed_sql: *const tokenized.ParsedSql,
 ) ?*const generated_parser.GeneratedSqlReadAst {
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {

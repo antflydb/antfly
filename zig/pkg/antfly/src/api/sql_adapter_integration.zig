@@ -21,7 +21,7 @@ const sql_adapter_runtime = @import("../sql/runtime.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const ddl_plan = @import("../sql/ddl.zig");
+const ddl_plan = @import("../sql/ddl_plan.zig");
 const table_catalog = @import("table_catalog.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
@@ -86,18 +86,72 @@ const adapterNoopFingerprintAlloc = sql_adapter.appParityAdapterNoopFingerprintA
 const expectFailClosedUnsupported = sql_adapter.expectFailClosedUnsupported;
 const expectTypedInvalid = sql_adapter.expectTypedInvalid;
 
+fn parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql: *const sql_adapter.ParsedSql) bool {
+    switch (parsed_sql.statement) {
+        .read, .write => {},
+        else => return false,
+    }
+    const tokens = parsed_sql.items();
+    return tokens.len >= 2 and
+        tokens[0].matchesKeywordTag(.select) and
+        (tokens[1].matchesKeyword("pg_advisory_lock") or
+            tokens[1].matchesKeyword("pg_advisory_unlock"));
+}
+
 fn planLogicalDdlParsedForAppParityAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
-    switch (parsed_sql.statement) {
-        .read, .write => return error.UnsupportedSqlShape,
-        .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {},
+    if (parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
+        return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
     }
     return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
         .function_bindings = .{},
     });
+}
+
+fn planLogicalDdlEntryForAppParityAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !sql_adapter.LogicalSqlPlan {
+    if (entry.summary.ddl_tag == .advisory_lock and parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
+        return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+    }
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
+    if (catalog_opt) |*catalog| {
+        defer catalog.deinit(alloc);
+        return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
+            .catalog = catalog.iface(),
+            .function_bindings = .{},
+        });
+    }
+    return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+}
+
+fn expectAdapterNoopLogicalPlan(
+    entry: AppParityCorpusEntry,
+    logical: sql_adapter.LogicalSqlPlan,
+) !void {
+    switch (logical) {
+        .other_ddl => |plan| switch (plan) {
+            .adapter_noop => |noop| try std.testing.expectEqualStrings(entry.classification_reason, @tagName(noop.reason)),
+            else => return error.TestUnexpectedResult,
+        },
+        .catalog_ddl => |plan| switch (plan) {
+            .schema_namespace_catalog => |schema_plan| switch (schema_plan) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("schema_namespace", entry.classification_reason);
+                    try std.testing.expect(create.if_not_exists);
+                    try std.testing.expect(std.ascii.eqlIgnoreCase(create.schema_name, "public"));
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 const appParityLimitValue = sql_adapter.appParityLimitValue;
@@ -387,7 +441,18 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
                 try expectOptionalTableName(summary.table_name, drop.sequence_name);
             },
         },
-        .trigger_catalog => return error.TestUnexpectedResult,
+        .trigger_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(AppParityDdlTag.create_trigger, expected);
+                try expectOptionalTableName(summary.table_name, create.table_name);
+                try expectOptionalUsize(summary.operations, 1);
+            },
+            .drop => |drop| {
+                try std.testing.expectEqual(AppParityDdlTag.drop_trigger, expected);
+                try expectOptionalTableName(summary.table_name, drop.table_name);
+                try expectOptionalUsize(summary.operations, 1);
+            },
+        },
         .identity_allocator_catalog => |plan| {
             try std.testing.expectEqual(AppParityDdlTag.identity_allocator, expected);
             try expectOptionalTableName(summary.table_name, plan.table_name);
@@ -783,6 +848,17 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
             try expectOptionalTableName(summary.table_name, plan.table_name);
         },
         .alter_table => |plan| {
+            if (expected == .drop_trigger and plan.operations.len == 1) {
+                switch (plan.operations[0]) {
+                    .drop_update_policy => |drop| {
+                        try expectOptionalTableName(summary.table_name, plan.table_name);
+                        try expectOptionalUsize(summary.operations, plan.operations.len);
+                        _ = drop;
+                        return;
+                    },
+                    else => {},
+                }
+            }
             try std.testing.expectEqual(AppParityDdlTag.alter_table, expected);
             try expectOptionalTableName(summary.table_name, plan.table_name);
             try expectOptionalUsize(summary.operations, plan.operations.len);
@@ -1208,10 +1284,26 @@ fn expectAppParityCorpusEntry(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+
     var effective_schema = schema;
     var owned_setup_schema: ?runtime_schema.TableSchema = null;
     defer if (owned_setup_schema) |value| runtime_schema.freeSchema(alloc, value);
-    if (entry.family != .ddl and entry.apply_setup_sql.len > 0) {
+    if (entry.family != .ddl and entry.source_schema_json.len > 0) {
+        if (try sql_adapter.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql)) |source_table_name| {
+            defer alloc.free(@constCast(source_table_name));
+            if (entry.summary.table_name) |table_name| {
+                if (std.mem.eql(u8, table_name, source_table_name)) {
+                    var parsed_source_schema = try schema_api.parseValidatedTableSchema(alloc, entry.source_schema_json);
+                    defer parsed_source_schema.deinit(alloc);
+                    owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
+                    effective_schema = owned_setup_schema.?;
+                }
+            }
+        }
+    }
+    if (owned_setup_schema == null and entry.family != .ddl and entry.apply_setup_sql.len > 0) {
         const setup_schema_json = try schemaJsonFromSetupSqlAlloc(alloc, entry.apply_setup_sql);
         defer alloc.free(setup_schema_json);
         var parsed_setup_schema = try schema_api.parseValidatedTableSchema(alloc, setup_schema_json);
@@ -1228,9 +1320,6 @@ fn expectAppParityCorpusEntry(
         override_resolver_ctx.resolver()
     else
         unique_resolver;
-
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
 
     if (appParityPlanFamilyIsSupportedRead(entry.family)) {
         return try expectAppParityReadPlanEntry(alloc, effective_schema, entry, &parsed_sql);
@@ -1250,7 +1339,7 @@ fn expectAppParityCorpusEntry(
 
     switch (entry.family) {
         .ddl => {
-            var logical = try planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_sql);
+            var logical = try planLogicalDdlEntryForAppParityAlloc(alloc, entry, &parsed_sql);
             defer logical.deinit(alloc);
             try expectDdlSummary(entry.summary, logical);
             const fingerprint = try ddlFingerprintAlloc(alloc, logical);
@@ -1310,16 +1399,10 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (planLogicalDdlParsedForAppParityAlloc(alloc, &parsed_sql)) |logical_value| {
+            if (sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{})) |logical_value| {
                 var logical = logical_value;
                 defer logical.deinit(alloc);
-                switch (logical) {
-                    .other_ddl => |plan| switch (plan) {
-                        .adapter_noop => |noop| try std.testing.expectEqualStrings(entry.classification_reason, @tagName(noop.reason)),
-                        else => return error.TestUnexpectedResult,
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
+                try expectAdapterNoopLogicalPlan(entry, logical);
                 const fingerprint = try adapterNoopFingerprintAlloc(alloc, "ddl", entry.classification_reason);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);

@@ -3896,8 +3896,8 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
     try validateGeneratedDdlAstSpans(tokens, ast);
     return switch (ast.kind) {
         .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
-        .create_schema => .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
-        .create_extension => .{ .extension_catalog = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .create_schema => try createSchemaNamespacePlanOrAdapterNoopFromGeneratedDdlAstAlloc(alloc, tokens, ast),
+        .create_extension => try createExtensionPlanOrAdapterNoopFromGeneratedDdlAstAlloc(alloc, tokens, ast),
         .alter_database => .{ .database_catalog = .{ .alter = try alterDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .alter_extension => .{ .extension_catalog = .{ .update = try updateExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .alter_schema => .{ .schema_namespace_catalog = .{ .rename = try renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
@@ -4206,8 +4206,8 @@ fn simpleLogicalDdlPlanFromGeneratedAstAlloc(
     try validateGeneratedDdlAstSpans(tokens, ast);
     return switch (ast.kind) {
         .create_database => .{ .catalog_ddl = .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
-        .create_schema => .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
-        .create_extension => .{ .extension = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .create_schema => try createSchemaNamespaceLogicalPlanOrAdapterNoopFromGeneratedDdlAstAlloc(alloc, tokens, ast),
+        .create_extension => try createExtensionLogicalPlanOrAdapterNoopFromGeneratedDdlAstAlloc(alloc, tokens, ast),
         .alter_database => .{ .catalog_ddl = .{ .database_catalog = .{ .alter = try alterDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
         .alter_extension => .{ .extension = .{ .update = try updateExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .alter_schema => .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .rename = try renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
@@ -6048,6 +6048,32 @@ fn createSchemaNamespacePlanFromGeneratedDdlAstAlloc(
     return createSchemaNamespacePlanFromSyntax(&syntax);
 }
 
+fn createSchemaNamespacePlanOrAdapterNoopFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !LegacyDdlParserPlan {
+    var create_schema = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast);
+    if (create_schema.if_not_exists and std.ascii.eqlIgnoreCase(create_schema.schema_name, "public")) {
+        create_schema.deinit(alloc);
+        return .{ .adapter_noop = .{ .reason = .schema_namespace } };
+    }
+    return .{ .schema_namespace_catalog = .{ .create = create_schema } };
+}
+
+fn createSchemaNamespaceLogicalPlanOrAdapterNoopFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !binder.LogicalSqlPlan {
+    var create_schema = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast);
+    if (create_schema.if_not_exists and std.ascii.eqlIgnoreCase(create_schema.schema_name, "public")) {
+        create_schema.deinit(alloc);
+        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .schema_namespace } } };
+    }
+    return .{ .catalog_ddl = .{ .schema_namespace_catalog = .{ .create = create_schema } } };
+}
+
 fn createExtensionPlanFromGeneratedDdlAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -6094,6 +6120,32 @@ fn createExtensionPlanFromGeneratedDdlAstAlloc(
     version_transferred = true;
     defer syntax.deinit(alloc);
     return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
+}
+
+fn createExtensionPlanOrAdapterNoopFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !LegacyDdlParserPlan {
+    var create_extension = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name);
+    if (create_extension.if_not_exists and isAdapterNoopExtensionName(create_extension.extension_name)) {
+        create_extension.deinit(alloc);
+        return .{ .adapter_noop = .{ .reason = .extension } };
+    }
+    return .{ .extension_catalog = .{ .create = create_extension } };
+}
+
+fn createExtensionLogicalPlanOrAdapterNoopFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !binder.LogicalSqlPlan {
+    var create_extension = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name);
+    if (create_extension.if_not_exists and isAdapterNoopExtensionName(create_extension.extension_name)) {
+        create_extension.deinit(alloc);
+        return .{ .other_ddl = .{ .adapter_noop = .{ .reason = .extension } } };
+    }
+    return .{ .extension = .{ .create = create_extension } };
 }
 
 fn alterDatabasePlanFromGeneratedDdlAstAlloc(
@@ -12747,14 +12799,8 @@ pub fn planGeneratedLogicalDdlAstAlloc(
         .graph => |graph_ast| return try graphLogicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
         .unsupported => |unsupported_ast| {
             if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
-                if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
-                    return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } };
-                }
                 return logicalDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
-                    error.UnsupportedSqlShape => switch (boundary.family) {
-                        .update_policy_trigger => return .{ .routine = .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) } },
-                        else => return err,
-                    },
+                    error.UnsupportedSqlShape => return err,
                     else => return err,
                 };
             }
@@ -13000,14 +13046,8 @@ fn legacyDdlParserPlanFromGeneratedAstAlloc(
         .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
         .unsupported => |unsupported_ast| {
             if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
-                if (boundary.family == .update_policy_trigger and boundary.kind == .drop_trigger) {
-                    return .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) };
-                }
                 return catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
-                    error.UnsupportedSqlShape => switch (boundary.family) {
-                        .update_policy_trigger => .{ .trigger_catalog = try lowerRoutineTriggerCatalogPlanParsedSqlAlloc(alloc, parsed_sql) },
-                        else => return err,
-                    },
+                    error.UnsupportedSqlShape => return err,
                     else => return err,
                 };
             }
@@ -17553,6 +17593,32 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
             },
             .extension_catalog => |generated_plan| switch (legacy) {
                 .extension_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    const adapter_noop_cases = [_]struct {
+        sql: []const u8,
+        reason: AdapterNoopDdlReason,
+    }{
+        .{ .sql = "CREATE SCHEMA IF NOT EXISTS public;", .reason = .schema_namespace },
+        .{ .sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto;", .reason = .extension },
+        .{ .sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;", .reason = .extension },
+    };
+    for (adapter_noop_cases) |case| {
+        var generated = try generatedSimpleDdlPlanForTestAlloc(alloc, case.sql);
+        defer generated.deinit(alloc);
+        var legacy = try legacyDdlParserPlanForTestAlloc(alloc, case.sql);
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+        switch (generated) {
+            .adapter_noop => |generated_noop| switch (legacy) {
+                .adapter_noop => |legacy_noop| {
+                    try std.testing.expectEqual(legacy_noop.reason, generated_noop.reason);
+                    try std.testing.expectEqual(case.reason, generated_noop.reason);
+                },
                 else => return error.TestUnexpectedResult,
             },
             else => return error.TestUnexpectedResult,

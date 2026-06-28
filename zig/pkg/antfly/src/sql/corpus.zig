@@ -19,7 +19,7 @@ const binder = @import("binder.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const logical_ddl_plan = @import("logical_ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -155,6 +155,8 @@ pub const AppParityDdlTag = enum {
     drop_function,
     create_procedure,
     drop_procedure,
+    create_trigger,
+    drop_trigger,
     call_procedure,
     create_role,
     alter_role,
@@ -392,6 +394,7 @@ pub const AppParityCorpusEntry = struct {
 pub const AppParityCatalogTable = struct {
     name: []const u8,
     schema_json: []const u8,
+    indexes_json: []const u8 = "",
 };
 
 pub const AppParitySourceSchemaCatalog = struct {
@@ -438,6 +441,7 @@ pub const AppParitySourceSchemaCatalog = struct {
                 .name = owned_name,
                 .placement_role = "data",
                 .schema_json = table.schema_json,
+                .indexes_json = table.indexes_json,
             };
         }
         return .{ .owned_tables = records, .owned_table_names = names, .table_count = catalog_tables.len };
@@ -500,7 +504,15 @@ pub fn appParityCatalogForEntryParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
 ) !?AppParitySourceSchemaCatalog {
     if (entry.source_schema_json.len > 0 and entry.catalog_tables.len > 0) return error.InvalidSqlCatalog;
+    if (entry.source_schema_json.len > 0) {
+        if (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) |catalog| {
+            return catalog;
+        }
+    }
     if (entry.catalog_tables.len > 0) {
+        if (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) |catalog| {
+            return catalog;
+        }
         return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, entry.catalog_tables);
     }
     const source_table_name = (try appParitySourceTableNameParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return null;
@@ -606,6 +618,7 @@ fn appParityBindingCoverageWriteSourceTableNameAlloc(
     parsed_sql: *const tokenized.ParsedSql,
 ) !?[]const u8 {
     switch (entry.family) {
+        .insert => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
             if (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved| {
                 var tables = resolved;
@@ -671,6 +684,7 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
     if (entry.source_schema_json.len == 0) return null;
 
     switch (entry.family) {
+        .insert => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
             var tables = (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
@@ -1480,11 +1494,12 @@ fn parseAppParityCatalogTablesAlloc(
     errdefer tables.deinit(alloc);
     for (array.items) |item| {
         const table_object = try fixtureJsonObject(item);
-        try fixtureRequireOnlyKeys(table_object, &.{ "name", "schema_json" });
+        try fixtureRequireOnlyKeys(table_object, &.{ "name", "schema_json", "indexes_json" });
         const name = try fixtureJsonString(table_object.get("name") orelse return error.TestUnexpectedResult);
         const schema_json = try fixtureJsonString(table_object.get("schema_json") orelse return error.TestUnexpectedResult);
+        const indexes_json = try fixtureJsonOptionalString(table_object, "indexes_json", "");
         if (name.len == 0 or schema_json.len == 0) return error.TestUnexpectedResult;
-        try tables.append(alloc, .{ .name = name, .schema_json = schema_json });
+        try tables.append(alloc, .{ .name = name, .schema_json = schema_json, .indexes_json = indexes_json });
     }
     return try tables.toOwnedSlice(alloc);
 }
@@ -2301,10 +2316,9 @@ fn fixtureWriteCatalogTablesField(writer: anytype, first: *bool, indent: []const
     try writer.print("{s}\"catalog_tables\": [", .{indent});
     for (tables, 0..) |table, i| {
         if (i > 0) try writer.writeAll(", ");
-        try writer.print(
-            "{{\"name\": {f}, \"schema_json\": {f}}}",
-            .{ std.json.fmt(table.name, .{}), std.json.fmt(table.schema_json, .{}) },
-        );
+        try writer.print("{{\"name\": {f}, \"schema_json\": {f}", .{ std.json.fmt(table.name, .{}), std.json.fmt(table.schema_json, .{}) });
+        if (table.indexes_json.len > 0) try writer.print(", \"indexes_json\": {f}", .{std.json.fmt(table.indexes_json, .{})});
+        try writer.writeByte('}');
     }
     try writer.writeByte(']');
 }
@@ -2740,9 +2754,11 @@ pub fn corpusFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool 
 
 pub fn corpusFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
+        .ddl,
         .read,
         .join,
         .lateral,
+        .insert,
         .insert_source,
         .recursive_insert_source,
         .update_joined_source,
@@ -2932,7 +2948,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .identity_allocator => false,
         .create_schema_namespace, .rename_schema_namespace, .drop_schema_namespace => false,
         .create_extension, .alter_extension_update, .drop_extension => false,
-        .create_function, .drop_function, .create_procedure, .drop_procedure, .call_procedure => false,
+        .create_function, .drop_function, .create_procedure, .drop_procedure, .create_trigger, .drop_trigger, .call_procedure => false,
         .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
         .copy_from, .copy_to => false,
         .prepare_transaction, .commit_prepared, .rollback_prepared => false,
@@ -3285,13 +3301,31 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
     if (entry.catalog_tables.len == 0) return true;
     for (entry.catalog_tables, 0..) |table, i| {
         if (table.name.len == 0 or table.schema_json.len == 0) return false;
-        if (!corpusFixturePlanMatchesSourceTable(entry, table.name)) return false;
+        if (!corpusFixturePlanMatchesSourceTable(entry, table.name) and
+            !(entry.family == .ddl and table.indexes_json.len > 0) and
+            !corpusFixtureReadSetOperationCatalogTableIsTarget(entry, table.name) and
+            !corpusFixtureDdlCatalogTablesAreSchemaWide(entry))
+        {
+            return false;
+        }
         var j: usize = i + 1;
         while (j < entry.catalog_tables.len) : (j += 1) {
             if (std.mem.eql(u8, table.name, entry.catalog_tables[j].name)) return false;
         }
     }
     return true;
+}
+
+fn corpusFixtureReadSetOperationCatalogTableIsTarget(entry: AppParityCorpusEntry, table_name: []const u8) bool {
+    if (entry.family != .read or !readPlanHasKind(entry.plan, "set_operation")) return false;
+    const target_table = entry.summary.table_name orelse return false;
+    return std.mem.eql(u8, table_name, target_table);
+}
+
+fn corpusFixtureDdlCatalogTablesAreSchemaWide(entry: AppParityCorpusEntry) bool {
+    if (entry.family != .ddl) return false;
+    return (entry.summary.ddl_tag == .grant_privilege or entry.summary.ddl_tag == .revoke_privilege) and
+        std.mem.indexOf(u8, entry.plan, ":object=ALL_TABLES_IN_SCHEMA") != null;
 }
 
 pub fn fixtureJsonTextIsObjectAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
@@ -3306,11 +3340,11 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .create_table,
         .relation_lifetime,
         => planUsizeOptionalTokenSumMatches(entry.plan, &.{ ":unique=", ":fk=", ":checks=" }, expected),
-        .alter_table,
         .alter_domain,
         .alter_database,
         .alter_sequence,
         => planHasExactUsizeToken(entry.plan, ":ops=", expected),
+        .alter_table => if (std.mem.startsWith(u8, entry.plan, "ddl:drop_trigger:")) expected == 1 else planHasExactUsizeToken(entry.plan, ":ops=", expected),
         .create_sequence => planHasExactUsizeToken(entry.plan, ":options=", expected),
         .identity_allocator => (planBoolTokenUsize(entry.plan, ":primary=") orelse return false) == expected,
         .create_function,
@@ -3319,6 +3353,9 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .drop_procedure,
         .call_procedure,
         => planHasExactUsizeToken(entry.plan, ":args=", expected),
+        .create_trigger,
+        .drop_trigger,
+        => expected == 1,
         .alter_role => (planNonNoneStringTokenUsize(entry.plan, ":setting=") orelse return false) == expected,
         .grant_privilege,
         .revoke_privilege,
@@ -6799,6 +6836,18 @@ test "sql adapter corpus data-driven summary regressions" {
     }
 }
 
+test "sql adapter corpus coverage counts unsupported merge data modifying cte" {
+    var coverage = AppParityCorpusCoverage{};
+    try coverage.observe(std.testing.allocator, .{
+        .name = "merge mutation-producing cte source",
+        .family = .unsupported_merge_mutation,
+        .plan = "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+        .classification_reason = "cte_mutation_source_plan",
+        .sql = "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+    });
+    try std.testing.expect(coverage.merge_mutation_data_modifying_cte);
+}
+
 test "sql adapter corpus validates summary assertion requirements" {
     const alloc = std.testing.allocator;
     var required_assertions = try parseAppParitySummaryAssertionRequirementsAlloc(alloc);
@@ -8377,6 +8426,9 @@ pub const AppParityCorpusCoverage = struct {
         const applied_rewrite = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
         const setup_summary = try appParitySetupSqlSummaryAlloc(alloc, entry.apply_setup_sql);
         try self.observeBoundCatalogFacts(alloc, entry, &parsed_sql);
+        self.merge_mutation_data_modifying_cte = self.merge_mutation_data_modifying_cte or
+            (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
+                sql_adapter.planHasExactStringToken(entry.plan, "unsupported:merge_mutation:requires=", "cte_mutation_source_plan"));
         if (entry.params.len > 0) {
             switch (entry.family) {
                 .query => self.parameterized_query = true,
@@ -8552,12 +8604,19 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
             entry.apply_setup_sql.len > 0 and
             entry.resolver_row_json.len > 0);
-        self.query_set_operation_order_limit = self.query_set_operation_order_limit or (entry.family == .query and
-            appParityTokensHaveKeyword(sql_tokens, .@"union") and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
-            sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
-            sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
-            sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5"));
+        self.query_set_operation_order_limit = self.query_set_operation_order_limit or
+            ((entry.family == .query or (entry.family == .read and sql_adapter.readPlanHasKind(entry.plan, "query"))) and
+                appParityTokensHaveKeyword(sql_tokens, .@"union") and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
+                sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5")) or
+            (entry.family == .read and
+                sql_adapter.readPlanHasKind(entry.plan, "set_operation") and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
+                sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
             (appParityTokensHaveKeyword(sql_tokens, .intersect) or
                 appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all })) and
@@ -9184,7 +9243,10 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_delete => {},
             .unsupported_update_joined_source => {},
             .unsupported_delete_joined_source => {},
-            .unsupported_merge_mutation => {},
+            .unsupported_merge_mutation => {
+                self.merge_mutation_data_modifying_cte = self.merge_mutation_data_modifying_cte or
+                    std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan");
+            },
             .read => {
                 const is_read_query = sql_adapter.readPlanHasKind(entry.plan, "query");
                 const is_read_aggregate = sql_adapter.readPlanHasKind(entry.plan, "aggregate");
@@ -9519,6 +9581,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_procedure_drop = true;
                     self.ddl_procedure_drop_cascade = self.ddl_procedure_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
+                .create_trigger,
+                .drop_trigger,
+                => {},
                 .call_procedure => {},
                 .create_role => self.ddl_role_create = true,
                 .alter_role => {
@@ -9984,7 +10049,7 @@ pub const AppParityCorpusCoverage = struct {
         });
         self.query_select_all_disambiguated_outputs = self.query_select_all_disambiguated_outputs or
             (entry.family == .query and
-                sql_adapter.planHasExactBoolToken(entry.plan, "select_all=", true) and
+                sql_adapter.planHasExactUsizeToken(entry.plan, ":select_all=", 1) and
                 planHasExactStringToken(entry.plan, ":select_all_alias0=", "status_3") and
                 planHasExactStringToken(entry.plan, ":select_all_expr0=", "status_2"));
         self.query_access_or_predicates = self.query_access_or_predicates or

@@ -6622,6 +6622,7 @@ fn generatedDmlTargetTailKeyword(tokens: []const token_mod.Token, index: usize) 
         token.matchesKeywordTag(.from) or
         token.matchesKeywordTag(.using) or
         token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.@"for") or
         token.matchesKeywordTag(.returning) or
         token.matchesKeywordTag(.order) or
         token.matchesKeywordTag(.limit) or
@@ -7067,9 +7068,9 @@ fn buildGeneratedExpressionAstInPlace(
         ast.timestamp_value_tokens = timestamp_literal.value_tokens;
         return;
     }
-    if (generatedCurrentTimestampExpression(tokens, range)) |precision_tokens| {
+    if (generatedCurrentTimestampExpression(tokens, range)) |current_timestamp| {
         ast.kind = .current_timestamp;
-        ast.current_timestamp_precision_tokens = precision_tokens;
+        ast.current_timestamp_precision_tokens = current_timestamp.precision_tokens;
         return;
     }
     if (generatedCurrentDateExpression(tokens, range)) {
@@ -7410,15 +7411,19 @@ fn generatedCurrentDateExpression(tokens: []const token_mod.Token, range: Genera
     return range.start < range.end and range.end <= tokens.len and range.end - range.start == 1 and tokens[range.start].matchesKeywordTag(.current_date);
 }
 
-fn generatedCurrentTimestampExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+const GeneratedCurrentTimestampExpression = struct {
+    precision_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+fn generatedCurrentTimestampExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedCurrentTimestampExpression {
     if (range.start >= range.end or range.end > tokens.len) return null;
     if (!tokens[range.start].matchesKeywordTag(.current_timestamp)) return null;
-    if (range.end - range.start == 1) return .{ .start = range.start + 1, .end = range.start + 1 };
+    if (range.end - range.start == 1) return .{};
     if (range.end - range.start != 4) return null;
     if (tokens[range.start + 1].kind != .lparen) return null;
     if (tokens[range.start + 2].kind != .number) return null;
     if (tokens[range.start + 3].kind != .rparen) return null;
-    return .{ .start = range.start + 2, .end = range.start + 3 };
+    return .{ .precision_tokens = .{ .start = range.start + 2, .end = range.start + 3 } };
 }
 
 const GeneratedExtractExpression = struct {
@@ -7540,10 +7545,9 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
             over_name_tokens = .{ .start = cursor + 1, .end = range.end };
         } else if (tokens[cursor + 1].kind == .lparen) {
             const over_close = findMatchingParen(tokens, cursor + 1, range.end) orelse return null;
-            if (over_close + 1 != range.end) return null;
-            over_tokens = .{ .start = cursor, .end = range.end };
-            over_definition_tokens = .{ .start = cursor + 2, .end = over_close };
-            const definition = over_definition_tokens.?;
+            over_tokens = .{ .start = cursor, .end = over_close + 1 };
+            const definition = GeneratedSqlTokenRange{ .start = cursor + 2, .end = over_close };
+            if (definition.start < definition.end) over_definition_tokens = definition;
             const partition_index = findTopLevelKeywordSequence(tokens, definition.start, definition.end, .partition, .by);
             const order_index = findTopLevelKeywordSequence(tokens, definition.start, definition.end, .order, .by);
             const rows_index = findTopLevelKeyword(tokens, definition.start, definition.end, .rows);
@@ -7563,7 +7567,7 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
         } else {
             return null;
         }
-        cursor = range.end;
+        cursor = over_tokens.?.end;
     }
     if (cursor != range.end) return null;
     return .{
@@ -13448,6 +13452,20 @@ test "generated SQL parser exposes current temporal keyword AST metadata" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const bare_current_timestamp_sql = "SELECT CURRENT_TIMESTAMP AS planned_at_ns FROM users WHERE id = $1";
+    const bare_current_timestamp_result = try parseSqlAlloc(alloc, bare_current_timestamp_sql);
+    switch (bare_current_timestamp_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.current_timestamp, read.projection_first_expression.kind);
+            try std.testing.expect(read.projection_first_expression.current_timestamp_precision_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

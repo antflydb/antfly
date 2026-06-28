@@ -370,7 +370,7 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
         _ = (try write_source.source().batch(allocator, target_table, rows_batch.req)) orelse return error.TableNotFound;
     }
 
-    return try encodeRowsBatchResultAlloc(allocator, session.sessionId(), liteStatementKindForLogicalPlan(logical_plan), rows_batch.*);
+    return try encodeRowsBatchResultAlloc(allocator, session.sessionId(), try liteStatementKindForParsedLogicalPlan(logical_plan, parsed_sql), rows_batch.*);
 }
 
 fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
@@ -388,7 +388,7 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     });
     defer logical_plan.deinit(allocator);
     const statement_kind = switch (logical_plan) {
-        .catalog_read => |catalog_read| catalog_read.statement.readKind() orelse return error.UnsupportedSqlShape,
+        .catalog_read => |catalog_read| try liteReadStatementKindForParsedCatalogRead(&catalog_read, parsed_sql),
         else => return error.UnsupportedSqlShape,
     };
     if (try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind)) |body| return body;
@@ -419,7 +419,7 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     )) orelse return error.TableNotFound;
     defer result.deinit(allocator);
 
-    return try encodeReadResultAlloc(allocator, session.sessionId(), liteStatementKindForLogicalPlan(logical_plan), result);
+    return try encodeReadResultAlloc(allocator, session.sessionId(), try liteStatementKindForParsedLogicalPlan(logical_plan, parsed_sql), result);
 }
 
 fn executeAntflyQueryFunctionReadAlloc(
@@ -477,10 +477,28 @@ const NonRowResponse = struct {
     applied: tables_api.AppliedRelationalSqlDdlRecord,
 };
 
-fn liteStatementKindForLogicalPlan(plan: sql_adapter.LogicalSqlPlan) []const u8 {
+fn liteReadStatementKindForParsedCatalogRead(
+    read: *const sql_adapter.CatalogLogicalReadPlan,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !sql_adapter.SqlReadStatementKind {
+    const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
+    if (parsed_sql.generatedStatementKind() == .read) return parsed_kind orelse error.UnsupportedSqlShape;
+    return read.statement.readKind() orelse parsed_kind orelse error.UnsupportedSqlShape;
+}
+
+fn liteWriteStatementKindForParsedCatalogWrite(
+    write: *const sql_adapter.CatalogLogicalWritePlan,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !sql_adapter.SqlWriteStatementKind {
+    const parsed_kind = parsed_sql.writeStatementKindIncludingGeneratedAst();
+    if (parsed_sql.generatedStatementKind() == .dml) return parsed_kind orelse error.UnsupportedSqlShape;
+    return write.statement.writeKind() orelse parsed_kind orelse error.UnsupportedSqlShape;
+}
+
+fn liteStatementKindForParsedLogicalPlan(plan: sql_adapter.LogicalSqlPlan, parsed_sql: *const sql_adapter.ParsedSql) ![]const u8 {
     return switch (plan) {
-        .catalog_read => |read| if (read.statement.readKind()) |kind| @tagName(kind) else "read",
-        .catalog_write => |write| if (write.statement.writeKind()) |kind| @tagName(kind) else "write",
+        .catalog_read => |read| @tagName(try liteReadStatementKindForParsedCatalogRead(&read, parsed_sql)),
+        .catalog_write => |write| @tagName(try liteWriteStatementKindForParsedCatalogWrite(&write, parsed_sql)),
         .table_ddl => "table_ddl",
         .catalog_ddl => "catalog_ddl",
         .other_ddl => "other_ddl",
