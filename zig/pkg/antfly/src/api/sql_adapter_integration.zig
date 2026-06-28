@@ -897,7 +897,7 @@ fn lowerAppParityReadPlanParsedSqlAlloc(
             .catalog = catalog.iface(),
         });
         defer logical_plan.deinit(alloc);
-        return try sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        return try sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             alloc,
             parsed_sql,
             &logical_plan,
@@ -3017,13 +3017,13 @@ const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_
 const lowerInsertWithResolverParsedSqlAlloc = sql_adapter_runtime.lowerInsertWithResolverParsedSqlAlloc;
 const lowerInsertWithResolverStrictParsedSqlAlloc = sql_adapter_runtime.lowerInsertWithResolverStrictParsedSqlAlloc;
 const lowerMergeMutationPlanParsedSqlAlloc = sql_adapter_runtime.lowerMergeMutationPlanParsedSqlAlloc;
-const lowerQueryPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerQueryPlanWithFunctionBindingsParsedSqlAlloc;
-const lowerReadPlanAlloc = sql_adapter_runtime.lowerReadPlanAlloc;
-const lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerReadPlanWithCatalogAlloc = sql_adapter_runtime.lowerReadPlanWithCatalogAlloc;
-const lowerReadPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerReadPlanWithFunctionBindingsParsedSqlAlloc;
+const lowerQueryPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerQueryPlanWithFunctionBindingsParsedSqlAlloc;
+const lowerReadPlanAlloc = sql_adapter.lower_select.lowerReadPlanAlloc;
+const lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerReadPlanWithCatalogAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc;
+const lowerReadPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithFunctionBindingsParsedSqlAlloc;
 const lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerSelectParsedSqlAlloc = sql_adapter_runtime.lowerSelectParsedSqlAlloc;
+const lowerSelectParsedSqlAlloc = sql_adapter.lower_select.lowerSelectParsedSqlAlloc;
 const lowerUpdateJoinedMutationSourceWithSchemasAlloc = sql_adapter_runtime.lowerUpdateJoinedMutationSourceWithSchemasAlloc;
 const lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter_runtime.lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc;
 const lowerUpdateMutationSourceParsedSqlAlloc = sql_adapter_runtime.lowerUpdateMutationSourceParsedSqlAlloc;

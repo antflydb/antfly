@@ -6928,7 +6928,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             logical_plan,
@@ -7385,7 +7385,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             &logical_plan,
@@ -9974,9 +9974,9 @@ pub const ApiHttpServer = struct {
                 .function_bindings = function_bindings,
             });
             defer logical_plan.deinit(alloc);
-            return try sql_adapter_runtime.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, &parsed_sql, &logical_plan, schema, params, function_bindings);
+            return try sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, &parsed_sql, &logical_plan, schema, params, function_bindings);
         }
-        return try sql_adapter_runtime.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
+        return try sql_adapter.lower_select.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
     }
 
     fn planBulkSqlExecutionWithSessionAlloc(
