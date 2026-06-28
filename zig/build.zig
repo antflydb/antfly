@@ -3495,6 +3495,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
+        "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
         "api http server serves public transaction commit route",

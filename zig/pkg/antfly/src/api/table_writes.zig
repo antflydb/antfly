@@ -10421,6 +10421,8 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         .stats = .{},
     };
     var status_initialized = false;
+    var status_from_cached_best_effort = false;
+    var cached_best_effort_source: runtime_status.RuntimeStatusSource = .unknown;
     defer {
         if (status_initialized) {
             var owned = status;
@@ -10431,8 +10433,10 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         cached_startup = cached_status.stats.async_indexing.startup;
         switch (mode) {
             .best_effort => {
+                cached_best_effort_source = cached_status.metadata.source;
                 status = cached_status;
                 status_initialized = true;
+                status_from_cached_best_effort = true;
                 db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
             },
             .consistent => {
@@ -10463,7 +10467,6 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
                 status_initialized = true;
             },
         }
-        markRuntimeStatusFromDb(&status, phase);
     }
     if (!status_initialized) {
         status = .{
@@ -10475,7 +10478,6 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             },
         };
         status_initialized = true;
-        markRuntimeStatusFromDb(&status, phase);
     }
     var startup = startupCatchUpStatsForPhase(phase, db);
     if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
@@ -10484,7 +10486,16 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         startup.wal_retained_bytes = cached_startup.wal_retained_bytes;
     }
     applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
-    try snapshot_cache.upsertGroupStatus(table_name, status);
+    if (phase == .idle and status_from_cached_best_effort and
+        cachedBestEffortStartupPlaceholderSource(cached_best_effort_source) and
+        !statusHasRuntimeFactsIgnoringMetadataSource(status))
+    {
+        markClearedStartupRuntimeStatus(&status);
+        try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+    } else {
+        markRuntimeStatusFromDb(&status, phase);
+        try snapshot_cache.upsertGroupStatus(table_name, status);
+    }
 }
 
 fn markRuntimeStatusFromDb(
@@ -10498,6 +10509,19 @@ fn markRuntimeStatusFromDb(
         else
             .live_writer_publish,
         .freshness = .fresh,
+    };
+}
+
+fn statusHasRuntimeFactsIgnoringMetadataSource(status: runtime_status.LocalTableRuntimeStatus) bool {
+    var runtime_fact_probe = status;
+    runtime_fact_probe.metadata.source = .cached_snapshot;
+    return runtime_status.statusHasRuntimeFacts(runtime_fact_probe);
+}
+
+fn cachedBestEffortStartupPlaceholderSource(source: runtime_status.RuntimeStatusSource) bool {
+    return switch (source) {
+        .live_writer_publish, .background_refresh, .remote_store => false,
+        .unknown, .synthetic_config, .cached_snapshot, .startup_catch_up => true,
     };
 }
 
@@ -20317,6 +20341,63 @@ test "idle startup runtime status publish is live when startup flag is still set
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
 }
 
+test "idle startup runtime status preserves live empty cached status" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-idle-live-empty/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", .{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 1,
+        },
+        .stats = .{},
+    });
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-status-startup-idle-live-empty", NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+    source.startup_catch_up_active.store(true, .monotonic);
+
+    try publishRuntimeStatusSnapshotWithStartupPhase(&source, alloc, "docs", 7001, .idle, &db);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
+}
+
 test "provisioned table write source startup snapshot builds synthetic status from object-form indexes json" {
     const alloc = std.testing.allocator;
 
@@ -20577,6 +20658,8 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
 }
 
 test "managed startup catch-up reclaims due obsolete primary run files" {
