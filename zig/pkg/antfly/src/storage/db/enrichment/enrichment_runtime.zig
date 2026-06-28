@@ -942,6 +942,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
     }
 
+    pub fn stop(self: *@This()) void {
+        _ = self;
+    }
+
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
