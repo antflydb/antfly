@@ -3017,11 +3017,11 @@ fn validateGeneratedJoinExecutableContract(
     const join = read.join_items[0];
     if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
     switch (join.kind) {
-        .inner, .left, .cross => {},
-        .right, .full, .natural => return error.UnsupportedSqlShape,
+        .inner, .left, .cross, .natural => {},
+        .right, .full => return error.UnsupportedSqlShape,
     }
     switch (join.condition_kind) {
-        .none => if (join.kind != .cross) return error.UnsupportedSqlShape,
+        .none => if (join.kind != .cross and join.kind != .natural) return error.UnsupportedSqlShape,
         .on => if (join.predicate_tokens == null) return error.UnsupportedSqlShape,
         .using => if (join.using_tokens == null or join.using_column_tokens == null or join.using_columns.count == 0) return error.UnsupportedSqlShape,
     }
@@ -20476,8 +20476,12 @@ pub fn parseJoinAlloc(
     defer plan_mod.freeTableAlias(alloc, left_table);
     const operator_tokens_start = pos.*;
 
-    const cross_join = parser.matchKeyword(tokens, pos, "cross");
-    const join_type: db_mod.types.RelationalRowsJoinType = if (cross_join) blk: {
+    const natural_join = parser.matchKeyword(tokens, pos, "natural");
+    const cross_join = if (natural_join) false else parser.matchKeyword(tokens, pos, "cross");
+    const join_type: db_mod.types.RelationalRowsJoinType = if (natural_join) blk: {
+        try parser.expectKeyword(tokens, pos, "join");
+        break :blk .inner;
+    } else if (cross_join) blk: {
         try parser.expectKeyword(tokens, pos, "join");
         break :blk .inner;
     } else if (parser.matchKeyword(tokens, pos, "left")) blk: {
@@ -20720,6 +20724,17 @@ pub fn parseJoinAlloc(
             .{ .start = left_tokens_start, .end = operator_tokens_start },
             .{ .start = operator_tokens_start, .end = right_tokens_start },
             .cross,
+            .{ .start = right_tokens_start, .end = condition_tokens_start },
+        );
+    } else if (natural_join) {
+        try appendNaturalJoinColumnsAlloc(alloc, current_context.schema, current_context.joined_source_schema, &on);
+        try validateGeneratedSingleConditionlessJoinForClause(
+            options.generated_read_ast,
+            .join,
+            tokens,
+            .{ .start = left_tokens_start, .end = operator_tokens_start },
+            .{ .start = operator_tokens_start, .end = right_tokens_start },
+            .natural,
             .{ .start = right_tokens_start, .end = condition_tokens_start },
         );
     } else if (parser.matchKeyword(tokens, pos, "on")) {
@@ -27699,6 +27714,25 @@ fn appendJoinUsingColumnsAlloc(
         left_transferred = true;
         right_transferred = true;
     }
+}
+
+fn appendNaturalJoinColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    out: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn),
+) !void {
+    const right_schema = joined_source_schema orelse schema;
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    defer columns.deinit(alloc);
+    for (schema.relational_columns) |left_column| {
+        for (right_schema.relational_columns) |right_column| {
+            if (!std.mem.eql(u8, left_column.name, right_column.name)) continue;
+            try columns.append(alloc, left_column.name);
+            break;
+        }
+    }
+    try appendJoinUsingColumnsAlloc(alloc, columns.items, schema, joined_source_schema, out);
 }
 
 pub fn parseLateralWhereAlloc(
@@ -41673,6 +41707,22 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqual(@as(u32, 4), fetch_paginated_join.join.limit.?);
     try std.testing.expectEqual(@as(u32, 2), fetch_paginated_join.join.offset);
 
+    var natural_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o NATURAL JOIN usage_records AS c WHERE o.kind = 'order' ORDER BY order_id LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer natural_join.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, natural_join.join.join_type);
+    try std.testing.expect(natural_join.join.on.len > 0);
+    try std.testing.expectEqualStrings("kind", natural_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("kind", natural_join.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), natural_join.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", natural_join.join.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"order\"", natural_join.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(u32, 2), natural_join.join.limit.?);
+
     const unsupported_generated_join_kinds = [_]struct {
         sql: []const u8,
         kind: generated_parser.GeneratedSqlJoinKind,
@@ -41684,10 +41734,6 @@ test "sql adapter lower expr lowers equality join queries" {
         .{
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id",
             .kind = .full,
-        },
-        .{
-            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o NATURAL JOIN usage_records AS c",
-            .kind = .natural,
         },
     };
     for (unsupported_generated_join_kinds) |case| {

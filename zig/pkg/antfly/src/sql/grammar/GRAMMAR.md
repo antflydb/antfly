@@ -537,11 +537,12 @@ typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
 compatibility metadata, and `ON`/`USING` condition payloads. The executable
 join contract is intentionally limited to one generated binary inner/left/cross
-join until the row-plan API grows N-way, right/full outer-join, and
-natural-join semantics;
+or natural join until the row-plan API grows N-way and right/full outer-join
+semantics;
 generated binary `JOIN ... USING (...)` lowers through schema-checked equality
-keys, generated `CROSS JOIN` lowers through a cartesian row-engine path, while
-generated right/full joins, conditionless natural joins, and generated
+keys, generated `CROSS JOIN` lowers through a cartesian row-engine path,
+generated `NATURAL JOIN` lowers through schema-derived common-column equality
+keys, while generated right/full joins and generated
 join/lateral multi-join ASTs still fail closed before the typed lowerers can
 partially parse them;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
@@ -1157,9 +1158,9 @@ metadata, first-join compatibility fields, and `ON`/`USING` condition
 payloads before invoking typed join lowering. Binary `JOIN ... USING (...)`
 now lowers generated column-list metadata into schema-checked equality join
 keys. Generated `CROSS JOIN` lowers through an explicit cartesian row-engine
-path represented as an inner join with no equality keys; generated
-`NATURAL JOIN` still fails closed because it requires schema-derived common
-column expansion. Generated `RIGHT` and `FULL` joins remain parsed
+path represented as an inner join with no equality keys; generated binary
+`NATURAL JOIN` lowers through schema-derived common-column equality keys.
+Generated `RIGHT` and `FULL` joins remain parsed
 PostgreSQL-compatible join ASTs but fail closed at the executable join
 contract until storage and API row plans grow those outer-join semantics.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
@@ -1515,10 +1516,10 @@ diagnostic path instead of being routed by handwritten classification first.
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
-   validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-   conditionless cartesian payload layout, future executable right/full outer
-   join and `NATURAL JOIN` semantics beyond the current fail-closed generated
-   contract, expression AST
+   validated binary inner/left/cross/natural join nodes with retained
+   `ON`/`USING`, cartesian, or schema-derived natural-join payload layout,
+   future executable right/full outer join semantics beyond the current
+   fail-closed generated contract, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,
@@ -1906,8 +1907,8 @@ Generated grammar work needs evidence at multiple levels:
   non-recursive CTE plans,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
-  prefixes, binary `JOIN ... USING (...)` lowering through schema-checked
-  equality keys, single- and multi-join component range/tree coverage with
+  prefixes, binary `JOIN ... USING (...)` and `NATURAL JOIN` lowering through
+  schema-checked equality keys, single- and multi-join component range/tree coverage with
   fail-closed executable-contract validation for unsupported generated
   join/lateral multi-join ASTs, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,

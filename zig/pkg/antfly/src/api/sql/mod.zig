@@ -19,3 +19,11 @@ pub const routines = @import("routines.zig");
 pub const savepoints = @import("savepoints.zig");
 pub const sessions = @import("sessions.zig");
 pub const transactions = @import("transactions.zig");
+
+pub const SqlCursorRuntime = cursors.Runtime;
+pub const SqlNotificationRuntime = notifications.Runtime;
+pub const SqlPreparedStatementRuntime = prepared_statements.Runtime;
+pub const SqlRoutineRuntime = routines.Runtime;
+pub const SqlSavepointRuntime = savepoints.Runtime;
+pub const SqlSessionRuntime = sessions.Runtime;
+pub const SqlTransactionRuntime = transactions.Runtime;
