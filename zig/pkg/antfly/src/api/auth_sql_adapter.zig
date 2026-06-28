@@ -34,6 +34,14 @@ pub fn executeRelationalSqlDdlOnUserManager(
     return try executeRelationalSqlDdlOnUserManagerWithCatalog(manager, alloc, sql, .{});
 }
 
+pub fn executeRelationalSqlDdlParsedSqlOnUserManager(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    return try executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalog(manager, alloc, parsed_sql, .{});
+}
+
 pub const SqlAuthTableRef = struct {
     database_name: []const u8,
     namespace_name: []const u8,
@@ -250,6 +258,15 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
     catalog: SqlAuthCatalog,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     return try executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(manager, alloc, sql, catalog, .{});
+}
+
+pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalog(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    catalog: SqlAuthCatalog,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    return try executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(manager, alloc, parsed_sql, catalog, .{});
 }
 
 pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
@@ -1163,7 +1180,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     var create_role_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "CREATE ROLE app_writer;");
     defer create_role_sql.deinit(alloc);
-    var created = (try executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(&manager, alloc, &create_role_sql, .{}, .{})).?;
+    var created = (try executeRelationalSqlDdlParsedSqlOnUserManager(&manager, alloc, &create_role_sql)).?;
     defer created.deinit(alloc);
 
     const subjects_after_create = try manager.listAuthSubjects();
