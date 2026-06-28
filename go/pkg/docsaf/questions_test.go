@@ -372,11 +372,14 @@ func TestQuestion_ToDocument(t *testing.T) {
 	if doc["source_type"] != "frontmatter" {
 		t.Errorf("Expected source_type 'frontmatter', got %v", doc["source_type"])
 	}
+	if doc["doc_type"] != "question" {
+		t.Errorf("Expected doc_type 'question', got %v", doc["doc_type"])
+	}
 	if doc["context"] != "Installation Guide" {
 		t.Errorf("Expected context 'Installation Guide', got %v", doc["context"])
 	}
-	if doc["_type"] != "question" {
-		t.Errorf("Expected _type 'question', got %v", doc["_type"])
+	if _, exists := doc["_type"]; exists {
+		t.Errorf("question document should not use reserved _type, got %v", doc["_type"])
 	}
 
 	metadata, ok := doc["metadata"].(map[string]any)
@@ -402,8 +405,11 @@ func TestQuestion_ToDocument_MinimalFields(t *testing.T) {
 	if doc["id"] != "q_minimal" {
 		t.Errorf("Expected id 'q_minimal', got %v", doc["id"])
 	}
-	if doc["_type"] != "question" {
-		t.Errorf("Expected _type 'question', got %v", doc["_type"])
+	if doc["doc_type"] != "question" {
+		t.Errorf("Expected doc_type 'question', got %v", doc["doc_type"])
+	}
+	if _, exists := doc["_type"]; exists {
+		t.Errorf("question document should not use reserved _type, got %v", doc["_type"])
 	}
 
 	// These should not be present when empty

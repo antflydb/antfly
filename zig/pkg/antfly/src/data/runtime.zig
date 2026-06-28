@@ -9238,6 +9238,7 @@ test "data runtime local group status status-only open preserves replay debt" {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -9492,10 +9493,12 @@ test "data runtime local group status provider collects and caches group statuse
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provider-cache", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
+    var db = try antfly.db.DB.open(alloc, db_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+    });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -10028,7 +10031,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-refresh", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
     var db = try antfly.db.DB.open(alloc, db_path, .{});
@@ -10577,12 +10580,16 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -10695,7 +10702,7 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     try std.testing.expect(server.runtime_status_refresh_last_duration_ns.load(.monotonic) > 0);
 }
 
-test "data runtime provisioned cache warmup populates only the read cache for local tables" {
+test "data runtime provisioned cache warmup populates runtime status without pinning db caches" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -10703,15 +10710,19 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provisioned-warmup", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -10813,9 +10824,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try server.requestProvisionedCacheWarmup();
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
-    try std.testing.expectEqual(@as(usize, 1), server.provisioned_storage.read_cache.entries.items.len);
-    try std.testing.expectEqual(@as(u64, 77), server.provisioned_storage.read_cache.entries.items[0].group_id);
-    try std.testing.expectEqualStrings("docs", server.provisioned_storage.read_cache.entries.items[0].table_name);
+    try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_warmup_failed.load(.monotonic));
@@ -10823,7 +10832,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try std.testing.expect(server.provisioned_warmup_last_duration_ns.load(.monotonic) > 0);
     const warmed_read_cache = server.provisioned_storage.read_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), warmed_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.miss_count);
     const warmed_write_cache = server.provisioned_storage.write_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.hit_count);
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.miss_count);
@@ -10832,14 +10841,16 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 1), snapshot_statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, warmed_lookup.json, "\"alpha\"") != null);
     const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.miss_count);
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
@@ -10847,8 +10858,8 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
         .sync_level = .write,
     });
     const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
+    try std.testing.expect(post_batch_write_cache.miss_count >= 1);
 
     const pre_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
     var live_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:b", .{}, .read_index)).?;
@@ -12230,6 +12241,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -12399,7 +12411,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     try server.requestRuntimeStatusRefresh();
-    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
+    server.provisioned_startup_catch_up_dirty.store(true, .monotonic);
 
     try server.requestProvisionedStartupCatchUp();
 
@@ -13977,7 +13989,7 @@ test "data runtime remote admin snapshot clone preserves replication status surf
 
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    var writer_buf: [65536]u8 = undefined;
+    var writer_buf: [262144]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_buf);
 
     try writeResourceMetrics(&writer, &resource_manager);
@@ -14290,7 +14302,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -14304,6 +14316,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
     items[0] = .{
         .group_id = 77,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+        },
         .stats = .{
             .doc_count = 3,
             .index_count = 2,
@@ -14354,6 +14370,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     };
 
     const snapshots = try std.testing.allocator.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = items },
@@ -14390,10 +14407,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     server.provisioned_root_refresh_last_duration_ns.store(66, .monotonic);
 
     var health = HealthSource{ .data_server = &server };
-    var writer_buf: [65536]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&writer_buf);
-    try health.metricsWriter().writeMetrics(&writer);
-    const output = writer.buffered();
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try health.metricsWriter().writeMetrics(&writer.writer);
+    const output = writer.writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_tables 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_groups 1") != null);

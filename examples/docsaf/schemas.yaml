@@ -29,7 +29,7 @@ markdown_section:
       x-antfly-types:
         - text
         - search_as_you_type
-    _type:
+    doc_type:
       type: string
       description: Document type (markdown_section)
       x-antfly-types:
@@ -59,7 +59,7 @@ markdown_section:
     - file_path
     - title
     - content
-    - _type
+    - doc_type
 
 # Schema for MDX sections (same as markdown but with MDX flag)
 mdx_section:
@@ -89,7 +89,7 @@ mdx_section:
       x-antfly-types:
         - text
         - search_as_you_type
-    _type:
+    doc_type:
       type: string
       description: Document type (mdx_section)
       x-antfly-types:
@@ -119,7 +119,7 @@ mdx_section:
     - file_path
     - title
     - content
-    - _type
+    - doc_type
 
 # Schema for OpenAPI info sections
 openapi_info:
@@ -148,7 +148,7 @@ openapi_info:
       description: JSON representation of the info object
       x-antfly-types:
         - text
-    _type:
+    doc_type:
       type: string
       description: Document type (openapi_info)
       x-antfly-types:
@@ -174,7 +174,7 @@ openapi_info:
     - file_path
     - title
     - content
-    - _type
+    - doc_type
 
 # Schema for OpenAPI path operations
 openapi_path:
@@ -203,7 +203,7 @@ openapi_path:
       description: JSON representation of the operation
       x-antfly-types:
         - text
-    _type:
+    doc_type:
       type: string
       description: Document type (openapi_path)
       x-antfly-types:
@@ -249,7 +249,7 @@ openapi_path:
     - file_path
     - title
     - content
-    - _type
+    - doc_type
 
 # Schema for NER-extracted entities (used with knowledge graph index)
 entity:
@@ -272,7 +272,7 @@ entity:
       description: Entity type label (e.g., technology, concept, person)
       x-antfly-types:
         - keyword
-    _type:
+    doc_type:
       type: string
       description: Document type (entity)
       x-antfly-types:
@@ -284,7 +284,7 @@ entity:
     - id
     - name
     - label
-    - _type
+    - doc_type
 
 # Schema for OpenAPI component schemas
 openapi_schema:
@@ -313,7 +313,7 @@ openapi_schema:
       description: JSON representation of the schema
       x-antfly-types:
         - text
-    _type:
+    doc_type:
       type: string
       description: Document type (openapi_schema)
       x-antfly-types:
@@ -344,4 +344,4 @@ openapi_schema:
     - file_path
     - title
     - content
-    - _type
+    - doc_type

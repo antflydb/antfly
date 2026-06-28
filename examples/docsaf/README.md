@@ -16,7 +16,7 @@ derived artifact lifecycle from the source row.
   "mime_type": "text/markdown",
   "sha256": "...",
   "source_path": "guide.md",
-  "_type": "source_document"
+  "doc_type": "source_document"
 }
 ```
 

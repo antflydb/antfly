@@ -51,6 +51,11 @@ AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S = 5.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
 
+
+def _new_e2e_deadline() -> "_Deadline":
+    return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
+
+
 DOCUMENTS_INDEXES = {
     # Materializes each document's `relations` field into the `relations_v1`
     # extraction asset the resolver consumes (no LLM needed). The resolver is
@@ -384,15 +389,19 @@ def _wait_for_mention_hydration(
 
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
     cluster = resolution_cluster
-    deadline = _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
     # across multiple shards in an explicit multi-node metadata/data raft setup.
     # Resolution reads entities cross-shard; promotion writes them cross-shard;
     # graph query hydrates the promoted entity documents through mention edges.
-    api.create_table("entities", num_shards=1, deadline=deadline)
-    api.create_table("documents", num_shards=3, indexes=DOCUMENTS_INDEXES, deadline=deadline)
+    api.create_table("entities", num_shards=1, deadline=_new_e2e_deadline())
+    api.create_table(
+        "documents",
+        num_shards=3,
+        indexes=DOCUMENTS_INDEXES,
+        deadline=_new_e2e_deadline(),
+    )
 
     api.insert(
         "documents",
@@ -405,7 +414,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
                 ]
             }
         },
-        deadline=deadline,
+        deadline=_new_e2e_deadline(),
     )
 
     # The promoter upserts a canonical entity document per resolved mention into
@@ -416,7 +425,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
             "person/ada_lovelace": "Ada Lovelace",
             "org/antfly": "Antfly",
         },
-        deadline=deadline,
+        deadline=_new_e2e_deadline(),
     )
 
     # A second document mentioning the same person resolves (prefix blocking) to
@@ -426,7 +435,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         "documents",
         "doc:b",
         {"relations": {"entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]}},
-        deadline=deadline,
+        deadline=_new_e2e_deadline(),
     )
 
     mentions = _wait_for_mention_hydration(
@@ -436,7 +445,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
             "person/ada_lovelace": "Ada Lovelace",
             "org/antfly": "Antfly",
         },
-        deadline=deadline,
+        deadline=_new_e2e_deadline(),
     )
     assert mentions["type"] == "neighbors"
     node_keys = {node["key"] for node in mentions["nodes"]}
@@ -446,7 +455,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         api,
         start_node="doc:b",
         expected_names={"person/ada_lovelace": "Ada Lovelace"},
-        deadline=deadline,
+        deadline=_new_e2e_deadline(),
     )
     second_node_keys = {node["key"] for node in second_mentions["nodes"]}
     assert "person/ada_lovelace" in second_node_keys

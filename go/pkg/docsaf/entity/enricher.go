@@ -59,7 +59,7 @@ func (r EntityRecord) ToDocument() map[string]any {
 		"id":            r.ID,
 		"name":          r.Name,
 		"label":         r.Label,
-		"_type":         "entity",
+		"doc_type":      "entity",
 		"mention_count": r.MentionCount,
 	}
 }
@@ -90,7 +90,7 @@ func (r RelationRecord) ToDocument() map[string]any {
 		"head_label":    r.HeadLabel,
 		"tail_label":    r.TailLabel,
 		"weight":        r.Weight,
-		"_type":         "relation",
+		"doc_type":      "relation",
 		"mention_count": r.MentionCount,
 	}
 }
