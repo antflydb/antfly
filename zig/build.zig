@@ -3032,6 +3032,7 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime live writer source follows raft apply ownership",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback derives receiver identity namespace from catalog",

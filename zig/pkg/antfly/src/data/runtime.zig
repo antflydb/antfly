@@ -369,7 +369,8 @@ pub const HealthSource = struct {
         const runtime_summary = self.data_server.provisioned_storage.runtime_status_cache.summary();
         const read_cache_stats = self.data_server.provisioned_storage.read_cache.cacheStats();
         const write_cache_stats = self.data_server.provisioned_storage.write_cache.cacheStats();
-        const auto_bulk_stats = self.data_server.write_source.autoBulkIngestStatsBestEffort();
+        const live_write_source = self.data_server.liveRuntimeWriteSource();
+        const auto_bulk_stats = live_write_source.autoBulkIngestStatsBestEffort();
         const fanout_metrics = antfly.public_api.table_reads.parallelFanoutMetricsSnapshot();
         const graph_fanout_metrics = antfly.public_api.distributed_graph.graphFanoutMetricsSnapshot();
         const api_request_stats = if (self.data_server.http_server) |*http_server|
@@ -476,11 +477,11 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_misses_total", "counter", "Provisioned write-cache opens that had to open a local table DB", write_cache_stats.miss_count);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
-        try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
-        try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
+        try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
+        try writeFullTextMemoryMetrics(writer, live_write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", live_write_source.lsmMaintenanceScoreBestEffort());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(live_write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_completed_total", "counter", "Data server LSM maintenance background worker wake cycles completed with no immediate work remaining", self.data_server.lsm_maintenance_completed.load(.monotonic));
@@ -492,9 +493,9 @@ pub const HealthSource = struct {
         const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
         try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
-        try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
-        try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
-        try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
+        try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
+        try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
+        try writeAsyncIndexingMetrics(writer, live_write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
     }
 
@@ -554,7 +555,7 @@ pub const HealthSource = struct {
         if (!should_refresh) return cached;
 
         const refresh_started_ns: u64 = @intCast(platform_time.monotonicNs());
-        const refreshed_stats = self.data_server.write_source.lsmMaintenanceStatsBestEffort();
+        const refreshed_stats = self.data_server.liveRuntimeWriteSource().lsmMaintenanceStatsBestEffort();
         const refresh_finished_ns: u64 = @intCast(platform_time.monotonicNs());
 
         lockAtomic(&self.lsm_maintenance_metrics_mutex);
@@ -2729,7 +2730,7 @@ pub const DataServer = struct {
 
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
-        _ = self.write_source.runLsmMaintenanceRound() catch |err| switch (err) {
+        _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,
@@ -2817,14 +2818,15 @@ pub const DataServer = struct {
 
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
-        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+        const live_write_source = self.liveRuntimeWriteSource();
+        if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             return true;
         }
         if (self.densePostingMaintenanceDue(now_ns)) return true;
         const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
         if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
-        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+        if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
             if (delay_ns > 0) {
                 self.deferLsmObsoleteReclaim(now_ns, delay_ns);
                 return false;
@@ -2895,10 +2897,11 @@ pub const DataServer = struct {
 
             self.lsm_maintenance_active.store(true, .release);
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
+            const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const did_work = self.write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
+                const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -2911,10 +2914,10 @@ pub const DataServer = struct {
                     break;
                 };
                 if (!did_work) {
-                    if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                         if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
@@ -2922,9 +2925,9 @@ pub const DataServer = struct {
                 }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
-                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                     self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                     if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                 }
             }
@@ -2935,7 +2938,7 @@ pub const DataServer = struct {
             // work alongside the regular LSM maintenance.
             const posting_now_ns = platform_time.monotonicNs();
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
-                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const posting_steps = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
                 const next_delay_ns: u64 = if (posting_steps > 0)
                     dense_posting_maintenance_retry_interval_ns
                 else
@@ -5461,7 +5464,7 @@ pub const DataServer = struct {
         _ = self.auto_bulk_finish_started.fetchAdd(1, .monotonic);
         defer self.auto_bulk_finish_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
-        const finished = self.write_source.tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
+        const finished = self.liveRuntimeWriteSource().tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
             _ = self.auto_bulk_finish_lock_deferred.fetchAdd(1, .monotonic);
             _ = self.auto_bulk_finish_completed.fetchAdd(1, .monotonic);
             return;
@@ -8942,6 +8945,47 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
+}
+
+test "data runtime live writer source follows raft apply ownership" {
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = undefined;
+    server.data_raft_apply = null;
+    server.write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-live-writer-source", Catalog.iface());
+    defer server.write_source.deinit();
+
+    try std.testing.expectEqual(&server.write_source, server.liveRuntimeWriteSource());
+
+    var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
+    defer apply_sm.deinit();
+    server.data_raft_apply = &apply_sm;
+
+    try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
 }
 
 test "data server can register a store without enabling data raft" {

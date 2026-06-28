@@ -7803,24 +7803,28 @@ pub const DB = struct {
     }
 
     pub fn compactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.bestEffortForceCompactTextIndexes();
@@ -39795,6 +39799,10 @@ test "db read-only open modes reject catalog mutations before side effects" {
             .config_generation = 1,
         }));
         try std.testing.expectError(error.ReadOnly, readonly.removeResolver("readonly_resolver_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.drainScheduledTextMerges());
+        try std.testing.expectError(error.ReadOnly, readonly.forceCompactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.bestEffortForceCompactTextIndexes());
     }
 }
 
