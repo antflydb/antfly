@@ -1604,6 +1604,23 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
     return try applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, &parsed_sql, session, function_bindings);
 }
 
+pub fn applyRelationalSqlDdlParsedSqlToTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !AppliedRelationalSqlDdlRecord {
+    return try applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAlloc(alloc, table, parsed_sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
+    return try applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, parsed_sql, session, .{});
+}
+
 pub fn applyRelationalSqlDdlParsedSqlToTableRecordWithSessionAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
@@ -3981,6 +3998,25 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
     return try applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindingsAlloc(alloc, svc, snapshot, &parsed_sql, session, function_bindings);
 }
 
+pub fn applyRelationalCatalogDdlParsedSqlOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !?AppliedRelationalSqlDdlRecord {
+    return try applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAlloc(alloc, svc, snapshot, parsed_sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    session: catalog_resources.SqlCatalogSession,
+) !?AppliedRelationalSqlDdlRecord {
+    return try applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindingsAlloc(alloc, svc, snapshot, parsed_sql, session, .{});
+}
+
 pub fn applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
@@ -5309,7 +5345,9 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
         fn applyWithSession(self: *@This(), alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) !AppliedRelationalSqlDdlRecord {
             var snapshot_value = try self.snapshot(alloc);
             defer self.freeSnapshot(alloc, &snapshot_value);
-            return (try applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, self, &snapshot_value, sql, session)) orelse error.UnsupportedSqlShape;
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+            defer parsed_sql.deinit(alloc);
+            return (try applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAlloc(alloc, self, &snapshot_value, &parsed_sql, session)) orelse error.UnsupportedSqlShape;
         }
     };
 
@@ -5966,10 +6004,12 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
         .replication_sources_json = "[]",
         .placement_role = "data",
     };
-    var qualified_created = try applyRelationalSqlDdlToTableRecordAlloc(
+    var qualified_create_sql = try sql_adapter.ParsedSql.initAlloc(std.testing.allocator, "CREATE TABLE analytics.users (id uuid PRIMARY KEY);");
+    defer qualified_create_sql.deinit(std.testing.allocator);
+    var qualified_created = try applyRelationalSqlDdlParsedSqlToTableRecordAlloc(
         std.testing.allocator,
         &qualified_table,
-        "CREATE TABLE analytics.users (id uuid PRIMARY KEY);",
+        &qualified_create_sql,
     );
     defer qualified_created.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("users", qualified_created.table.name);
