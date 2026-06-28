@@ -218,3 +218,98 @@ fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []co
     }
     return properties.object.getPtr(index_name);
 }
+
+pub fn schemaVersion(schema_json: []const u8) !u32 {
+    if (schema_json.len == 0) return 0;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const version_value = root.get("version") orelse return 0;
+    return switch (version_value) {
+        .integer => |value| std.math.cast(u32, value) orelse error.InvalidSchemaUpdateRequest,
+        else => error.InvalidSchemaUpdateRequest,
+    };
+}
+
+pub fn documentSchemasChanged(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
+    const current = try extractCanonicalObjectField(alloc, current_schema_json, "document_schemas");
+    defer if (current) |value| alloc.free(value);
+    const next = try extractCanonicalObjectField(alloc, next_schema_json, "document_schemas");
+    defer if (next) |value| alloc.free(value);
+
+    if (current == null and next == null) return false;
+    if (current == null or next == null) return true;
+    return !std.mem.eql(u8, current.?, next.?);
+}
+
+fn extractCanonicalObjectField(alloc: std.mem.Allocator, schema_json: []const u8, field_name: []const u8) !?[]u8 {
+    if (schema_json.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const value = root.get(field_name) orelse return null;
+    return try stringifyJsonValue(alloc, value);
+}
+
+pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+    const source = if (schema_json.len > 0) schema_json else "{}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, &out, "version");
+    try out.append(alloc, ':');
+    const encoded_version = try std.fmt.allocPrint(alloc, "{d}", .{version});
+    defer alloc.free(encoded_version);
+    try out.appendSlice(alloc, encoded_version);
+
+    const relational_storage = blk: {
+        const storage_mode = root.get("storage_mode") orelse break :blk false;
+        break :blk storage_mode == .string and std.mem.eql(u8, storage_mode.string, "relational");
+    };
+    if (relational_storage) {
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "enforce_types");
+        try out.appendSlice(alloc, ":true");
+    }
+
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "version")) continue;
+        if (relational_storage and std.mem.eql(u8, entry.key_ptr.*, "enforce_types")) continue;
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        const encoded = try stringifyJsonValue(alloc, entry.value_ptr.*);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(escaped);
+    try out.appendSlice(alloc, escaped);
+}
+
+fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+}

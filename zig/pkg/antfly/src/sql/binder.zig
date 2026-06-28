@@ -1994,7 +1994,73 @@ pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
     const tokens = parsed_sql.items();
     const raw = parsed_sql.statement.raw();
     if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
+    if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
+        return try writeTargetTableNameFromGeneratedDmlAstAlloc(alloc, tokens, dml_ast);
+    }
     return try writeTargetTableNameFromTokensAlloc(alloc, tokens[raw.token_start..raw.token_end]);
+}
+
+fn writeTargetTableNameFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    dml_ast: *const generated_parser.GeneratedSqlDmlAst,
+) ![]const u8 {
+    const command_index = try generatedDmlCommandTokenIndex(tokens, dml_ast);
+    const expected_target_start = try generatedDmlExpectedTargetStart(tokens, dml_ast, command_index);
+    const target_tokens = dml_ast.target_table_tokens orelse return error.UnsupportedSqlShape;
+    if (target_tokens.start != expected_target_start) return error.UnsupportedSqlShape;
+    return try normalizeGeneratedSingleIdentifierAlloc(alloc, tokens, target_tokens);
+}
+
+fn generatedDmlCommandTokenIndex(tokens: []const Token, dml_ast: *const generated_parser.GeneratedSqlDmlAst) !usize {
+    const command_index = if (dml_ast.cte_tokens) |cte_tokens| blk: {
+        if (cte_tokens.start >= cte_tokens.end or cte_tokens.end >= tokens.len) return error.UnsupportedSqlShape;
+        break :blk cte_tokens.end;
+    } else 0;
+    if (command_index >= tokens.len or !generatedDmlCommandTokenMatchesKind(tokens[command_index], dml_ast.kind)) {
+        return error.UnsupportedSqlShape;
+    }
+    return command_index;
+}
+
+fn generatedDmlExpectedTargetStart(
+    tokens: []const Token,
+    dml_ast: *const generated_parser.GeneratedSqlDmlAst,
+    command_index: usize,
+) !usize {
+    var index: usize = switch (dml_ast.kind) {
+        .insert_values, .insert_select => blk: {
+            if (command_index + 1 >= tokens.len or !tokens[command_index + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+            break :blk command_index + 2;
+        },
+        .update => command_index + 1,
+        .delete => blk: {
+            if (command_index + 1 >= tokens.len or !tokens[command_index + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+            break :blk command_index + 2;
+        },
+        .truncate => blk: {
+            var target_index = command_index + 1;
+            if (target_index < tokens.len and tokens[target_index].matchesKeywordTag(.table)) target_index += 1;
+            break :blk target_index;
+        },
+        .merge => blk: {
+            if (command_index + 1 >= tokens.len or !tokens[command_index + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+            break :blk command_index + 2;
+        },
+    };
+    _ = consumeKeyword(tokens, &index, .only);
+    if (index >= tokens.len) return error.UnsupportedSqlShape;
+    return index;
+}
+
+fn generatedDmlCommandTokenMatchesKind(token: Token, kind: generated_parser.GeneratedSqlDmlKind) bool {
+    return switch (kind) {
+        .insert_values, .insert_select => token.matchesKeywordTag(.insert),
+        .update => token.matchesKeywordTag(.update),
+        .delete => token.matchesKeywordTag(.delete),
+        .truncate => token.matchesKeywordTag(.truncate),
+        .merge => token.matchesKeywordTag(.merge),
+    };
 }
 
 fn writeTargetTableNameFromTokensAlloc(alloc: std.mem.Allocator, statement_tokens: []const Token) ![]const u8 {
@@ -3561,6 +3627,16 @@ test "sql adapter binder resolves write target tables from parsed statements" {
         defer alloc.free(target);
         try std.testing.expectEqualStrings(case.target, target);
     }
+
+    var malformed_generated_target = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage");
+    defer malformed_generated_target.deinit(alloc);
+    if (malformed_generated_target.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| dml.target_table_tokens = dml.source_read.?.source_table_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, writeTargetTableNameFromParsedSqlAlloc(alloc, &malformed_generated_target));
 
     var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
     defer read_sql.deinit(alloc);

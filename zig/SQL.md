@@ -1633,6 +1633,10 @@ Current implementation status:
   retained generated DML target and child-read source-table metadata, and fails
   closed when that retained source metadata is inconsistent instead of
   rediscovering the source through token scanning.
+- Write-target binding for generated DML now consumes retained generated target
+  metadata for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE`, and fails
+  closed when the retained target range no longer matches the generated command
+  layout instead of falling back to a legacy token scan.
 - Session, savepoint, notification, prepared-statement, cursor, and routine
   runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
   re-exports those protocol-neutral runtimes for API callers. Routine

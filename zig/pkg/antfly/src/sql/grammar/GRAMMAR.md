@@ -442,7 +442,10 @@ fails closed before typed command-body lowering continues. Catalog prebinding
 for generated top-level `INSERT ... SELECT` now consumes retained generated DML
 target-table and child-read source-table ranges directly, and fails closed when
 those retained ranges drift instead of rediscovering the source table through
-the legacy token scanner. Deeper DML cutover still requires
+the legacy token scanner. Write-target binding for generated `INSERT`,
+`UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements now consumes retained
+generated target-table metadata and validates that the target range sits at the
+generated command's target position before schema binding can continue. Deeper DML cutover still requires
 replacing token-based recursive DML command-body lowering with complete
 generated AST-driven lowering beyond validated generated CTE child-read bodies,
 broader unsupported-shape diagnostics, and a later full statement-head
@@ -1463,7 +1466,10 @@ of rediscovering the table through the legacy source scanner. Covered simple
 generated CTE reads now use retained CTE item and body source-table ranges for
 catalog prebinding, including recursive-anchor source resolution, and fail
 closed when generated CTE body source metadata is corrupted instead of
-recovering through the legacy token scanner. Join classification
+recovering through the legacy token scanner. Generated DML write-target binding
+now validates retained target table ranges against the generated command layout
+for insert/update/delete/truncate/merge before falling back to legacy token
+scanning for non-generated statements. Join classification
 now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete
