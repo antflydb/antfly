@@ -9803,6 +9803,20 @@
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
     },
     {
+      "name": "natural equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 1,
+        "join_select": 2
+      },
+      "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o NATURAL JOIN usage_records AS c WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
       "name": "cte column alias equality join",
       "family": "join",
       "summary": {

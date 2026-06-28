@@ -455,9 +455,13 @@ the target through the legacy DML alias parser. Direct
 joined-source prebinding for generated `UPDATE ... FROM`, `DELETE ... USING`,
 and `MERGE ... USING` consumes retained relation-source wrapper metadata and
 fails closed when source table metadata is stale instead of reopening the
-legacy joined-write token scanner. Deeper DML cutover still requires
-replacing token-based recursive DML command-body lowering with complete
-generated AST-driven lowering beyond validated generated CTE child-read bodies,
+legacy joined-write token scanner. Recursive DML CTE producer body slices are
+also reparsed as generated read ASTs and passed into the existing typed
+recursive CTE lowerers, so anchor/final child reads no longer enter recursive
+write planning as generated-unaware token slices. Deeper DML cutover still
+requires replacing token-based recursive DML mutation command-body lowering with
+complete generated AST-driven lowering beyond validated generated CTE
+child-read bodies,
 broader unsupported-shape diagnostics, and a later full statement-head
 promotion once generated coverage matches the currently supported typed DML
 surface.
@@ -973,7 +977,12 @@ Unsupported DDL remains on the existing parser until
    body in a generated child read.
    Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
    child read and validate that child through the shared generated read-AST
-   contract before dispatching to typed recursive write-plan lowering; selector-based
+   contract before dispatching to typed recursive write-plan lowering.
+   Recursive CTE anchor/final child-select parser hooks now also parse detached
+   CTE body token slices through the generated read parser when no parent read
+   AST is available, so recursive DML CTE bodies feed generated read metadata
+   into the typed recursive CTE lowerers instead of falling back to
+   generated-unaware token slices; selector-based
    recursive `UPDATE`/`DELETE` forms that classify as joined mutation sources
    through their recursive CTE predicates validate the generated command body
    without requiring an explicit generated `FROM`/`USING` relation-source

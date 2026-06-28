@@ -3433,9 +3433,9 @@ pub fn addAPITableTestSteps(
     const rows = addSimpleAPITestRun(b, modules.rows, &APITestFilters.rows, true);
     const sql_api_parity = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity, false);
     const sql_api_parity_fixture_promote = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity_fixture, false);
-    sql_api_parity_fixture_promote.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
+    sql_api_parity_fixture_promote.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE", "pkg/antfly/src/sql/fixtures/sql_api_parity_corpus.json");
     const sql_api_parity_fixture_check = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity_fixture, false);
-    sql_api_parity_fixture_check.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
+    sql_api_parity_fixture_check.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/sql/fixtures/sql_api_parity_corpus.json");
     const internal_group_write_routes = addSimpleAPITestRun(b, modules.internal_group_write_routes, &APITestFilters.internal_group_write_routes, false);
     const raft_transition_runtime_docid = addSimpleAPITestRun(b, modules.raft_transition_runtime_docid, &APITestFilters.raft_transition_runtime_docid, false);
 
