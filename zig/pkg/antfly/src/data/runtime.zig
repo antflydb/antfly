@@ -2233,6 +2233,7 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
+            _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
@@ -3132,7 +3133,8 @@ pub const DataServer = struct {
                 if (req.sync_level != .propose) {
                     try self.waitForLocalRaftBatchApply(group_id, index, deadline_ns);
                 }
-                try self.write_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
                 return;
             }
 
@@ -3152,6 +3154,7 @@ pub const DataServer = struct {
                             const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
                             defer alloc.free(body);
                             var response = client.fetchGroupBatch(base_uri, group_id, table_name, body) catch |err| switch (err) {
+                                error.LeaderUnavailable,
                                 error.UnexpectedHttpStatus,
                                 error.HttpConnectionClosing,
                                 error.ConnectionResetByPeer,
@@ -3281,6 +3284,7 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         var response = client.fetchGroupBatch(target_store.api_url, group_id, table_name, body) catch |err| switch (err) {
+            error.LeaderUnavailable,
             error.UnexpectedHttpStatus,
             error.HttpConnectionClosing,
             error.ConnectionResetByPeer,
@@ -3829,17 +3833,43 @@ pub const DataServer = struct {
         return db.core.identity_namespace;
     }
 
+    fn tableNameForLocalGroupAlloc(self: *DataServer, group_id: u64) !?[]u8 {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        const table = findTableById(snapshot.tables, range.table_id) orelse return null;
+        return try self.alloc.dupe(u8, table.name);
+    }
+
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
         var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
         if ((try source_store.latestBatch(source_group_id)) != null) return;
+
+        if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
+            defer self.alloc.free(table_name);
+            if (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
+                var cached = cached_db;
+                defer cached.deinit(self.alloc);
+                try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, cached.db);
+                return;
+            }
+        }
 
         var db = antfly.db.DB.open(self.alloc, source_root_dir, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer db.close();
+        try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, &db);
+    }
 
+    fn seedSplitSourceApplyStoreFromDb(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_group_id: u64,
+        db: *antfly.db.DB,
+    ) !void {
         var ops = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (ops.items) |op| self.alloc.free(op);
@@ -6077,10 +6107,12 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
+        const refresh_write_source = self.liveRuntimeWriteSource();
         self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
             self.provisioned_storage.read_cache.clear();
-            self.write_source.clearWriteCache();
+            refresh_write_source.clearWriteCache();
+            if (refresh_write_source != &self.write_source) self.write_source.clearWriteCache();
             self.last_provision_fingerprint = null;
             self.last_provision_metadata_epoch = head.metadata_epoch;
             self.invalidateLocalGroupStatusCache();
@@ -6101,8 +6133,8 @@ pub const DataServer = struct {
 
         const fingerprint = blk: {
             const next_fingerprint = blk_fingerprint: {
-                lockAtomic(self.write_source.localDbMutex());
-                defer self.write_source.localDbMutex().unlock();
+                lockAtomic(refresh_write_source.localDbMutex());
+                defer refresh_write_source.localDbMutex().unlock();
 
                 try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
@@ -6124,23 +6156,25 @@ pub const DataServer = struct {
                 const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
                 const table = findTableById(snapshot.tables, range.table_id) orelse continue;
 
-                var activity = self.write_source.beginGroupRefreshActivity(table.name, group_id);
-                defer activity.deinit();
-
-                var group_ids_one = [_]u64{group_id};
                 {
-                    lockAtomic(self.write_source.localDbMutex());
-                    defer self.write_source.localDbMutex().unlock();
-                    _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-                        self.alloc,
-                        head.metadata_group_id,
-                        group_ids_one[0..],
-                        snapshot.tables,
-                        snapshot.ranges,
-                        backend_runtime,
-                    );
+                    var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                    defer activity.deinit();
+
+                    var group_ids_one = [_]u64{group_id};
+                    {
+                        lockAtomic(refresh_write_source.localDbMutex());
+                        defer refresh_write_source.localDbMutex().unlock();
+                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                            self.alloc,
+                            head.metadata_group_id,
+                            group_ids_one[0..],
+                            snapshot.tables,
+                            snapshot.ranges,
+                            backend_runtime,
+                        );
+                    }
+                    try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
                 }
-                try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
             }
             self.provisioned_storage.read_cache.clear();
             break :blk next_fingerprint;
@@ -9715,6 +9749,101 @@ test "data runtime local split fallback preserves source identity namespace" {
     try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
     try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "data runtime split apply store seeding reuses cached source writer" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-seed-cached-writer", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 180);
+    defer alloc.free(source_db_path);
+
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 180,
+        .range_id = 9000,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 180,
+                    .table_id = 7,
+                    .range_id = 9000,
+                    .start_key = "doc:a",
+                    .end_key = "doc:z",
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = antfly.public_api.table_writes.ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    server.write_source.write_cache = &write_cache;
+    defer server.deinit();
+
+    var held = (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
+    defer held.deinit(alloc);
+
+    try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
+
+    var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });
+    defer source_store.deinit();
+    const latest = (try source_store.latestBatch(180)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(latest.entry_count > 0);
 }
 
 test "data runtime local merge fallback derives receiver identity namespace from catalog" {

@@ -867,6 +867,7 @@ fn localRangeHasSchemaVersionIndex(
     defer alloc.free(path);
 
     var open_options = provisioningDbOpenOptions();
+    open_options.open_mode = .query_readonly;
     open_options.backend_runtime = options.backend_runtime;
     var db = try db_mod.DB.open(alloc, path, open_options);
     defer db.close();
@@ -2411,6 +2412,51 @@ test "table provisioner reports local schema progress once all local shards have
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
     try std.testing.expectEqual(@as(u64, 7), progress[0].node_id);
     try std.testing.expectEqual(@as(u32, 1), progress[0].schema_version);
+}
+
+test "table provisioner schema progress probes do not take a writer lease" {
+    const path = "/tmp/antfly-metadata-table-provisioner-progress-live-writer";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2004);
+    defer std.testing.allocator.free(db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), db_path);
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" });
+
+    const progress = try collectLocalSchemaProgress(
+        std.testing.allocator,
+        path,
+        100,
+        7,
+        &.{ 100, 2004 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .schema_json = "{\"version\":1}",
+            .read_schema_json = "{\"version\":0}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        }},
+        &.{.{
+            .group_id = 2004,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    defer std.testing.allocator.free(progress);
+
+    try std.testing.expectEqual(@as(usize, 1), progress.len);
+    try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {

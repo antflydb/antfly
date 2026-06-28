@@ -983,7 +983,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
                     },
                 );
             }
-            if (opts.storage == null) {
+            if (opts.storage == null and !opts.read_only) {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
@@ -3900,6 +3900,27 @@ test "wal can use lsm backend for append reopen and truncate" {
         try std.testing.expectEqual(@as(u64, 3), entries[0].lsn);
         try std.testing.expectEqualStrings("gamma", entries[0].data);
     }
+}
+
+test "wal read-only lsm backend does not create missing root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path_raw = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-readonly-lsm-missing", .{tmp.sub_path});
+    defer std.testing.allocator.free(path_raw);
+    const path = try std.testing.allocator.dupeZ(u8, path_raw);
+    defer std.testing.allocator.free(path);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
+    var wal = try WAL.open(path, .{
+        .backend = .lsm,
+        .read_only = true,
+    });
+    defer wal.close();
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
 }
 
 test "wal can use in-memory lsm backend without creating durable state" {

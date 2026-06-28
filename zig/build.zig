@@ -3030,6 +3030,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
+        "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data runtime resolves extension package store env before local default",
         "data runtime cli accepts ARD identity flags",
@@ -3826,6 +3827,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
+            "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
