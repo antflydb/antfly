@@ -62,7 +62,6 @@ pub const applyTableDdlPlanToSchemaJsonAlloc = catalog_apply.applyTableDdlPlanTo
 pub const applyOwnedSessionCatalogPlanAlloc = catalog_apply.applyOwnedSessionCatalogPlanAlloc;
 pub const applySessionCatalogPlanAlloc = catalog_apply.applySessionCatalogPlanAlloc;
 pub const appliedDdlTableWorkItemsForFlagsAlloc = catalog_apply.appliedDdlTableWorkItemsForFlagsAlloc;
-pub const classifyParsedSqlForExecution = executor.classifyParsedSql;
 pub const enforceSqlStatementTimeoutAt = catalog_apply.enforceSqlStatementTimeoutAt;
 pub const executePreparedTransactionRecoveryIntent = catalog_apply.executePreparedTransactionRecoveryIntent;
 pub const executePreparedTransactionRecoveryPlan = catalog_apply.executePreparedTransactionRecoveryPlan;

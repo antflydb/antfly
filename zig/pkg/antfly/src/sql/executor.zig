@@ -17,7 +17,6 @@ const std = @import("std");
 const catalog_resources = @import("catalog_resources.zig");
 const table_catalog = @import("../metadata/catalog_source.zig");
 const binder = @import("binder.zig");
-const sql_statement_kind = @import("statement_kind.zig");
 const logical_ddl_plan = @import("logical_ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
@@ -43,14 +42,6 @@ pub const PlannedSqlStatement = struct {
         self.* = undefined;
     }
 };
-
-pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPlan {
-    return switch (parsed_sql.statement) {
-        .write => |statement| .{ .write = statement.kind },
-        .read => |statement| .{ .read = statement.kind },
-        else => null,
-    };
-}
 
 pub fn planParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
@@ -118,18 +109,8 @@ pub fn planParsedDdlSqlWithSessionAuthorizationEvidenceAlloc(
     };
 }
 
-test "sql executor classifies statement families and owns ddl plans" {
+test "sql executor owns ddl logical plans" {
     const alloc = std.testing.allocator;
-
-    var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
-    defer read_sql.deinit(alloc);
-    const read_plan = classifyParsedSql(&read_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, read_plan.read);
-
-    var write_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('evt-1')");
-    defer write_sql.deinit(alloc);
-    const write_plan = classifyParsedSql(&write_sql) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, write_plan.write);
 
     var ddl_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
     defer ddl_sql.deinit(alloc);
