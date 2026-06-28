@@ -1646,10 +1646,11 @@ Current implementation status:
   relation-source metadata, and fails closed when source-table metadata drifts
   instead of rediscovering it through token scanning.
 - Session, savepoint, notification, prepared-statement, cursor, and routine
-  runtimes now live under `pkg/antfly/src/sql/`; `api/sql/mod.zig` only
-  re-exports those protocol-neutral runtimes for API callers. Routine
-  expression execution uses the storage row-expression evaluator directly, so
-  routine catalog state no longer depends on API row handlers.
+  runtimes now live under `pkg/antfly/src/api/sql/`; those modules own
+  API/protocol session state and call into SQL-owned parsed, bound, and typed
+  plan surfaces. Routine expression execution uses the storage row-expression
+  evaluator directly, so routine catalog state no longer depends on API row
+  handlers.
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.

@@ -62,12 +62,12 @@ pub const Runtime = struct {
         parameter_count: usize,
         statement_kind: sql_adapter.PreparedStatementSubjectKind,
         statement_family: sql_adapter.PreparedStatementStatementKind,
-        subject_sql: []const u8,
         subject_parsed_sql: sql_adapter.ParsedSql,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            const owned_source_sql = self.subject_parsed_sql.sql();
             self.subject_parsed_sql.deinit(alloc);
-            alloc.free(@constCast(self.subject_sql));
+            alloc.free(@constCast(owned_source_sql));
             self.* = undefined;
         }
     };
@@ -159,7 +159,6 @@ pub const Runtime = struct {
             .parameter_count = plan.parameter_count,
             .statement_kind = plan.statement_kind,
             .statement_family = plan.statement_family,
-            .subject_sql = owned_subject_sql,
             .subject_parsed_sql = subject_parsed_sql,
         });
     }
