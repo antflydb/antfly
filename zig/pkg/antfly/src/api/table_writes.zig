@@ -17224,19 +17224,20 @@ test "provisioned table write cache retires stale db when index metadata changes
 
     Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
 
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs"));
+
+    const first_entry = first.entry.?;
+    first.deinit(alloc);
+    first_released = true;
+
     var second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     defer second.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
-    try std.testing.expect(first.entry.?.retired);
-    try std.testing.expect(second.entry.? != first.entry.?);
+    try std.testing.expect(second.entry.? != first_entry);
     try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
     try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
-
-    first.deinit(alloc);
-    first_released = true;
-    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
 test "provisioned create index updates cached writer in place" {

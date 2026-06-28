@@ -2214,7 +2214,11 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
 }
 
 test "table provisioner removes indexes missing from metadata" {
-    const path = "/tmp/antfly-metadata-table-provisioner-drop";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-provisioner-drop", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2225,9 +2229,12 @@ test "table provisioner removes indexes missing from metadata" {
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
-    defer db.close();
+    var db_open = true;
+    defer if (db_open) db.close();
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.addIndex(.{ .name = "embed_idx", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    db.close();
+    db_open = false;
 
     const summary = try reconcileReplicaRoot(
         std.testing.allocator,

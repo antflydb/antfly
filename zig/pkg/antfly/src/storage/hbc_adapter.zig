@@ -9931,6 +9931,10 @@ test "hbc bulk ingest mutation batches defer manifest without direct sorted inge
             .storage_backend = .lsm,
         }, .{
             .backend_options = .{
+                .backend = .{
+                    .read_only = true,
+                    .create_if_missing = false,
+                },
                 .flush_threshold = 1,
                 .bulk_ingest_flush_threshold_multiplier = 4,
             },
@@ -9961,6 +9965,10 @@ test "hbc bulk ingest mutation batches defer manifest without direct sorted inge
             .storage_backend = .lsm,
         }, .{
             .backend_options = .{
+                .backend = .{
+                    .read_only = true,
+                    .create_if_missing = false,
+                },
                 .flush_threshold = 1,
                 .bulk_ingest_flush_threshold_multiplier = 4,
             },
@@ -9990,7 +9998,8 @@ test "hbc reset stored structure preserves an empty query root" {
         .use_quantization = false,
         .storage_backend = .lsm,
     }, .{});
-    defer idx.close();
+    var idx_open = true;
+    defer if (idx_open) idx.close();
 
     try idx.resetStoredStructure();
     try std.testing.expectEqual(@as(u64, 1), idx.stats().root_node);
@@ -10005,6 +10014,9 @@ test "hbc reset stored structure preserves an empty query root" {
         try std.testing.expect(root.is_leaf);
         try std.testing.expectEqual(@as(usize, 0), root.members.len);
     }
+
+    idx.close();
+    idx_open = false;
 
     var reopened = try HBCIndex.openWithLsmOptions(alloc, path, .{
         .dims = 2,

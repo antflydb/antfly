@@ -24622,6 +24622,7 @@ fn cleanupTempDir(path: [*:0]const u8) void {
 
 const default_test_wait_attempts: usize = 100;
 const slow_test_wait_attempts: usize = 500;
+const graph_replay_test_wait_attempts: usize = 2000;
 
 fn waitForSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     return waitForSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
@@ -24640,6 +24641,64 @@ fn waitForSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchR
         return error.Timeout;
     }
     return last;
+}
+
+fn waitForGraphEdges(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+) ![]graph_mod.Edge {
+    return waitForGraphEdgesWithAttempts(alloc, db, index_name, key, edge_type, direction, min_edges, graph_replay_test_wait_attempts);
+}
+
+fn replayStageHasPendingWork(stats: types.ReplayStageStats) bool {
+    if (stats.blocked or stats.error_count != 0) return false;
+    return stats.catch_up_required or stats.applied_sequence < stats.target_sequence;
+}
+
+fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: *DB, index_name: []const u8) !bool {
+    const graph_applied = try db.core.loadAppliedSequence(alloc, index_name);
+    if (graph_applied < db.core.nextDerivedSequence()) return true;
+    const pending = db.pendingWorkStats();
+    return replayStageHasPendingWork(pending.resolution) or
+        replayStageHasPendingWork(pending.promotion);
+}
+
+fn waitForGraphEdgesWithAttempts(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+    max_attempts: usize,
+) ![]graph_mod.Edge {
+    var drained_without_edges: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+        if (edges.len >= min_edges) return edges;
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try db.runUntilIdle();
+        if (try graphEdgeProducerHasPendingWork(alloc, db, index_name)) {
+            drained_without_edges = 0;
+        } else {
+            drained_without_edges += 1;
+            if (drained_without_edges >= default_test_wait_attempts) return error.Timeout;
+        }
+        sleepPollInterval();
+    }
+    const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+    if (edges.len < min_edges) {
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        return error.Timeout;
+    }
+    return edges;
 }
 
 fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
@@ -29837,7 +29896,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    const edges = try waitForGraphEdges(alloc, &db, "relations_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
@@ -30571,7 +30630,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 
     // Outbound: doc:a mentions both canonical entities.
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 2), out.len);
         // Each mention edge records the resolved DocRef target table so the
@@ -30582,7 +30641,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     }
     // Inbound provenance: "which documents mention this entity" == inbound edges.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
         try std.testing.expectEqualStrings("doc:a", inbound[0].source);
@@ -30689,7 +30748,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
     }
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
         var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
@@ -30702,7 +30761,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
     }
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -30818,7 +30877,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
-    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
@@ -30870,7 +30929,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     });
     try db.runUntilIdle();
 
-    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
@@ -30920,7 +30979,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
 
     // The mention edge points at the resolved DocRef from the resolution artifact.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -34393,14 +34452,18 @@ test "db managed dense enrichment remains searchable after transient rate limits
     while (attempts_after_release < 500) : (attempts_after_release += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        if (stats.indexes[0].doc_count == 3 and
-            stats.indexes[0].replay_applied_sequence >= 2 and
-            stats.indexes[0].replay_applied_sequence == stats.indexes[0].replay_target_sequence and
-            !stats.indexes[0].backfill_active)
-        {
-            ready = true;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "semantic_idx")) continue;
+            if (item.doc_count == 3 and
+                item.replay_applied_sequence >= 2 and
+                item.replay_applied_sequence == item.replay_target_sequence and
+                !item.backfill_active)
+            {
+                ready = true;
+            }
             break;
         }
+        if (ready) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
     try std.testing.expect(ready);

@@ -5073,6 +5073,45 @@ fn waitForPathForTest(path: []const u8, timeout_ns: u64) !void {
     return error.TestTimedOutWaitingForPath;
 }
 
+fn makePipeForTest() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.pipe(&fds))) {
+        .SUCCESS => return fds,
+        .INTR => continue,
+        else => return error.Unexpected,
+    };
+}
+
+fn writeSignalForTest(fd: std.posix.fd_t) !void {
+    const byte: [1]u8 = .{1};
+    while (true) {
+        const rc = std.posix.system.write(fd, &byte, byte.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc != 1) return error.Unexpected;
+                return;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn waitSignalForTest(fd: std.posix.fd_t) !void {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const rc = std.posix.system.read(fd, &byte, byte.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc != 1) return error.Unexpected;
+                return;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
 test "lsm backend default base level target absorbs L0 pressure output" {
     var backend = Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -11966,48 +12005,39 @@ test "lsm backend cross-process writer lock child helper" {
 }
 
 test "lsm backend native writer lock rejects writable opens across processes" {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
 
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "cross-process-single-writer-root");
     defer repository_mod.cleanupTmp(path);
 
     const root_path = std.mem.span(path);
-    const ready_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.child-ready.marker", .{root_path});
-    defer std.testing.allocator.free(ready_path);
-    std.Io.Dir.cwd().deleteFile(std.testing.io, ready_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, ready_path) catch {};
-    const release_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.child-release.marker", .{root_path});
-    defer std.testing.allocator.free(release_path);
-    std.Io.Dir.cwd().deleteFile(std.testing.io, release_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, release_path) catch {};
+    const child_ready = try makePipeForTest();
+    defer {
+        _ = std.posix.system.close(child_ready[0]);
+        _ = std.posix.system.close(child_ready[1]);
+    }
+    const child_release = try makePipeForTest();
+    defer {
+        _ = std.posix.system.close(child_release[0]);
+        _ = std.posix.system.close(child_release[1]);
+    }
 
-    const exe_path = try std.process.executablePathAlloc(std.testing.io, std.testing.allocator);
-    defer std.testing.allocator.free(exe_path);
+    const pid = std.posix.system.fork();
+    if (pid == 0) {
+        _ = std.posix.system.close(child_ready[0]);
+        _ = std.posix.system.close(child_release[1]);
+        var writer = Backend.open(std.heap.page_allocator, root_path, .{ .flush_threshold = 1 }) catch std.posix.system.exit(1);
+        writeSignalForTest(child_ready[1]) catch std.posix.system.exit(2);
+        waitSignalForTest(child_release[0]) catch std.posix.system.exit(3);
+        writer.close();
+        std.posix.system.exit(0);
+    }
+    if (pid < 0) return error.Unexpected;
+    var child_released = false;
+    defer if (!child_released) writeSignalForTest(child_release[1]) catch {};
 
-    var env_map = try std.testing.environ.createMap(std.testing.allocator);
-    defer env_map.deinit();
-    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_ROOT", root_path);
-    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_READY", ready_path);
-    try env_map.put("ANTFLY_LSM_WRITER_LOCK_CHILD_RELEASE", release_path);
-
-    var child = try std.process.spawn(std.testing.io, .{
-        .argv = &.{
-            exe_path,
-            "--test-filter",
-            "lsm backend cross-process writer lock child helper",
-        },
-        .environ_map = &env_map,
-        .stdout = .ignore,
-        .stderr = .inherit,
-    });
-    var child_waited = false;
-    defer if (!child_waited) {
-        writeMarkerForTest(release_path) catch {};
-        _ = child.wait(std.testing.io) catch {};
-    };
-
-    try waitForPathForTest(ready_path, 10 * std.time.ns_per_s);
+    try waitSignalForTest(child_ready[0]);
 
     const same_root_path = try std.fs.path.join(std.testing.allocator, &.{
         std.fs.path.dirname(root_path) orelse ".",
@@ -12017,10 +12047,17 @@ test "lsm backend native writer lock rejects writable opens across processes" {
     defer std.testing.allocator.free(same_root_path);
     try std.testing.expectError(error.LsmRootWriterAlreadyOpen, Backend.open(std.testing.allocator, same_root_path, .{}));
 
-    try writeMarkerForTest(release_path);
-    const term = try child.wait(std.testing.io);
-    child_waited = true;
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try writeSignalForTest(child_release[1]);
+    child_released = true;
+
+    const WaitStatus = if (builtin.link_libc) c_int else u32;
+    var status: WaitStatus = 0;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(@intCast(pid), &status, 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.Unexpected,
+    };
+    try std.testing.expectEqual(@as(WaitStatus, 0), status);
 }
 
 test "lsm backend wal operation lock blocks read-only replay during live append critical section" {
