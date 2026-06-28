@@ -8316,6 +8316,8 @@ pub const DB = struct {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
             const starting_sequence = self.core.nextDerivedSequence();
+            const starting_resolution_applied = if (self.resolution_runtime) |runtime| runtime.stats().applied_sequence else 0;
+            const starting_promotion_applied = if (self.promotion_runtime) |runtime| runtime.stats().applied_sequence else 0;
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
@@ -8332,7 +8334,15 @@ pub const DB = struct {
                 }
             }
 
-            if (self.core.nextDerivedSequence() <= starting_sequence) return;
+            const resolution_advanced = if (self.resolution_runtime) |runtime|
+                runtime.stats().applied_sequence > starting_resolution_applied
+            else
+                false;
+            const promotion_advanced = if (self.promotion_runtime) |runtime|
+                runtime.stats().applied_sequence > starting_promotion_applied
+            else
+                false;
+            if (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }
