@@ -1666,6 +1666,9 @@ Current implementation status:
   protocol boundary and routes it through the parsed SQL execution path used by
   prepared portals, instead of handing raw statement text back to the public
   HTTP SQL parser.
+- Parsed-SQL external execution/describe requests now build protocol session
+  state from shared session fields directly, so parsed ingress does not need to
+  synthesize a raw SQL request just to reuse session loading.
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.

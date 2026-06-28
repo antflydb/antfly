@@ -5209,7 +5209,32 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const PublicSqlSessionRequest = struct {
+        session_id: ?u64 = null,
+        database: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+        read_only: ?bool = null,
+    };
+
     fn ownedSqlCatalogSessionForPublicRequestAlloc(self: *ApiHttpServer, request: PublicSqlRequest) !sql_adapter.OwnedSqlCatalogSession {
+        return try self.ownedSqlCatalogSessionForPublicSessionRequestAlloc(.{
+            .session_id = request.session_id,
+            .database = request.database,
+            .namespace = request.namespace,
+            .read_only = request.read_only,
+        });
+    }
+
+    fn ownedSqlCatalogSessionForPublicParsedSqlRequestAlloc(self: *ApiHttpServer, request: PublicParsedSqlRequest) !sql_adapter.OwnedSqlCatalogSession {
+        return try self.ownedSqlCatalogSessionForPublicSessionRequestAlloc(.{
+            .session_id = request.session_id,
+            .database = request.database,
+            .namespace = request.namespace,
+            .read_only = request.read_only,
+        });
+    }
+
+    fn ownedSqlCatalogSessionForPublicSessionRequestAlloc(self: *ApiHttpServer, request: PublicSqlSessionRequest) !sql_adapter.OwnedSqlCatalogSession {
         var session = try self.sql_catalog_session_runtime.loadAlloc(request.session_id);
         errdefer session.deinit(self.alloc);
         if (request.database) |database| {
@@ -9627,15 +9652,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn executePublicParsedSqlExternalRequestResult(self: *ApiHttpServer, request: PublicParsedSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
-        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(.{
-            .sql = request.parsed_sql.sql(),
-            .session_id = request.session_id,
-            .database = request.database,
-            .namespace = request.namespace,
-            .read_only = request.read_only,
-            .params = request.params,
-            .stdin_payload = request.stdin_payload,
-        }) catch |err| switch (err) {
+        var session = self.ownedSqlCatalogSessionForPublicParsedSqlRequestAlloc(request) catch |err| switch (err) {
             error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
@@ -9708,15 +9725,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicParsedSqlExternalDescribeRequestResult(self: *ApiHttpServer, request: PublicParsedSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {
-        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(.{
-            .sql = request.parsed_sql.sql(),
-            .session_id = request.session_id,
-            .database = request.database,
-            .namespace = request.namespace,
-            .read_only = request.read_only,
-            .params = request.params,
-            .stdin_payload = request.stdin_payload,
-        }) catch |err| switch (err) {
+        var session = self.ownedSqlCatalogSessionForPublicParsedSqlRequestAlloc(request) catch |err| switch (err) {
             error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             else => return err,
         };
