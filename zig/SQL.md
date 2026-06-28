@@ -1662,6 +1662,10 @@ Current implementation status:
   owned nested `ParsedSql` values cloned from retained token slices with rebased
   source spans, so subject execution no longer carries a parallel raw SQL field
   or reparses a reconstructed subject string.
+- Pgwire simple-query execution now parses each split statement once at the
+  protocol boundary and routes it through the parsed SQL execution path used by
+  prepared portals, instead of handing raw statement text back to the public
+  HTTP SQL parser.
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.

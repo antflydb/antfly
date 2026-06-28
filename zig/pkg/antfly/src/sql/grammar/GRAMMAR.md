@@ -1857,6 +1857,10 @@ Generated grammar work needs evidence at multiple levels:
   prepared-transaction lowering has parity coverage for `PREPARE TRANSACTION`,
   `COMMIT PREPARED`, and `ROLLBACK PREPARED`, and malformed generated action or
   GID ranges fail closed before reaching typed planning.
+  Pgwire simple-query execution now parses each split statement once at the
+  protocol boundary before calling the parsed SQL execution path shared with
+  prepared portals, leaving raw SQL parsing only at external raw-request
+  ingress points.
   Remaining rich DDL compatibility debt is limited to generated metadata that
   still cannot represent every semantic subshape natively, especially broader
   ALTER subcommands outside the supported runtime DDL operation families.

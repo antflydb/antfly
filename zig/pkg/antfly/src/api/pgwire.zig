@@ -475,7 +475,7 @@ const Connection = struct {
                 const statement = std.mem.trim(u8, rest[0..end], " \t\r\n");
                 if (statement.len != 0) {
                     executed = true;
-                    if (!try self.executeAndEncodeOne(statement, &.{}, &.{}, true, true)) return;
+                    if (!try self.executeSimpleStatementAndEncodeParsed(statement)) return;
                 }
                 rest = rest[end + 1 ..];
                 continue;
@@ -484,7 +484,7 @@ const Connection = struct {
             const trailing = std.mem.trim(u8, rest, " \t\r\n");
             if (trailing.len != 0) {
                 executed = true;
-                if (!try self.executeAndEncodeOne(trailing, &.{}, &.{}, true, true)) return;
+                if (!try self.executeSimpleStatementAndEncodeParsed(trailing)) return;
             }
             break;
         }
@@ -761,13 +761,24 @@ const Connection = struct {
         return self.described_portals.contains(name);
     }
 
-    fn describeAndEncodeOne(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue, result_formats: []const i16) !bool {
-        var outcome = self.describeSql(sql, params) catch |err| {
-            std.log.warn("pgwire sql describe failed err={}", .{err});
-            try self.sendError("XX000", "internal sql describe error");
-            return false;
+    fn executeSimpleStatementAndEncodeParsed(self: *Connection, sql: []const u8) !bool {
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => {
+                self.markTransactionError();
+                try self.sendError("0A000", "unsupported sql statement");
+                try self.sendReadyForQuery();
+                return false;
+            },
+            error.UnexpectedToken => {
+                self.markTransactionError();
+                try self.sendError("42601", "invalid sql statement");
+                try self.sendReadyForQuery();
+                return false;
+            },
+            else => return err,
         };
-        return try self.encodeDescribeOutcome(&outcome, result_formats);
+        defer parsed_sql.deinit(self.alloc);
+        return try self.executeAndEncodeParsed(&parsed_sql, &.{}, &.{}, true, true);
     }
 
     fn describeAndEncodeParsed(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, result_formats: []const i16) !bool {
@@ -805,42 +816,6 @@ const Connection = struct {
                 return true;
             },
         }
-    }
-
-    fn executeAndEncodeOne(
-        self: *Connection,
-        sql: []const u8,
-        params: []const sql_adapter.SqlValue,
-        result_formats: []const i16,
-        send_ready_on_error: bool,
-        include_row_description: bool,
-    ) !bool {
-        if (self.consumeCancelRequested()) {
-            self.markTransactionError();
-            try self.sendError("57014", "canceling statement due to user request");
-            if (send_ready_on_error) try self.sendReadyForQuery();
-            return false;
-        }
-        self.active_execution.store(true, .release);
-        var outcome = self.executeSql(sql, params) catch |err| {
-            self.active_execution.store(false, .release);
-            std.log.warn("pgwire sql execution failed err={}", .{err});
-            try self.sendError("XX000", "internal sql execution error");
-            if (send_ready_on_error) try self.sendReadyForQuery();
-            return false;
-        };
-        self.active_execution.store(false, .release);
-        if (self.consumeCancelRequested()) {
-            switch (outcome) {
-                .response => |*response| response.deinit(self.api_server.alloc),
-                .result => |*result| result.deinit(self.api_server.alloc),
-            }
-            self.markTransactionError();
-            try self.sendError("57014", "canceling statement due to user request");
-            if (send_ready_on_error) try self.sendReadyForQuery();
-            return false;
-        }
-        return try self.encodeExecutionOutcome(&outcome, result_formats, send_ready_on_error, include_row_description);
     }
 
     fn executeAndEncodeParsed(
@@ -903,17 +878,6 @@ const Connection = struct {
         }
     }
 
-    fn describeSql(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse {
-        return try self.api_server.handlePublicSqlDescribeRequestResult(.{
-            .sql = sql,
-            .session_id = self.session_id,
-            .database = self.database,
-            .namespace = self.namespace,
-            .read_only = true,
-            .params = params,
-        }, self.authenticated_identity);
-    }
-
     fn describeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse {
         return try self.api_server.handlePublicParsedSqlExternalDescribeRequestResult(.{
             .parsed_sql = parsed_sql,
@@ -921,17 +885,6 @@ const Connection = struct {
             .database = self.database,
             .namespace = self.namespace,
             .read_only = true,
-            .params = params,
-        }, self.authenticated_identity);
-    }
-
-    fn executeSql(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
-        return try self.api_server.executePublicSqlRequestResult(.{
-            .sql = sql,
-            .session_id = self.session_id,
-            .database = self.database,
-            .namespace = self.namespace,
-            .read_only = false,
             .params = params,
         }, self.authenticated_identity);
     }

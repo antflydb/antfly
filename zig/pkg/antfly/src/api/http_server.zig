@@ -10024,7 +10024,46 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        return try self.executeBulkSqlCopyFromStdinParsedSqlWithSessionAndTiming(
+            &parsed_sql,
+            stdin_payload,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    pub fn executeBulkSqlCopyFromStdinParsedSqlWithSession(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        stdin_payload: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return try self.executeBulkSqlCopyFromStdinParsedSqlWithSessionAndTiming(
+            parsed_sql,
+            stdin_payload,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    fn executeBulkSqlCopyFromStdinParsedSqlWithSessionAndTiming(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        stdin_payload: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+        statement_start_ns: u64,
+        statement_timeout_ns: ?u64,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(parsed_sql, session, authenticated_identity);
         defer planned.deinit(self.alloc);
         const execution_plan = planned.execution_plan;
         if (execution_plan.operation != .import_rows or
@@ -10052,7 +10091,46 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        return try self.executeBulkSqlParsedSqlWithSessionAndTiming(
+            &parsed_sql,
+            stdin_payload,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    pub fn executeBulkSqlParsedSqlWithSession(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        stdin_payload: ?[]const u8,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !BulkSqlExecutionResult {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return try self.executeBulkSqlParsedSqlWithSessionAndTiming(
+            parsed_sql,
+            stdin_payload,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    fn executeBulkSqlParsedSqlWithSessionAndTiming(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        stdin_payload: ?[]const u8,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+        statement_start_ns: u64,
+        statement_timeout_ns: ?u64,
+    ) !BulkSqlExecutionResult {
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(parsed_sql, session, authenticated_identity);
         defer planned.deinit(self.alloc);
         const execution_plan = planned.execution_plan;
         var result: BulkSqlExecutionResult = switch (execution_plan.operation) {
@@ -10204,7 +10282,42 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        var planned = try self.planBulkSqlExecutionWithSessionAlloc(&parsed_sql, session, authenticated_identity);
+        return try self.executeBulkSqlCopyToStdoutParsedSqlWithSessionAndTiming(
+            &parsed_sql,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    pub fn executeBulkSqlCopyToStdoutParsedSqlWithSession(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) ![]u8 {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return try self.executeBulkSqlCopyToStdoutParsedSqlWithSessionAndTiming(
+            parsed_sql,
+            session,
+            authenticated_identity,
+            statement_start_ns,
+            statement_timeout_ns,
+        );
+    }
+
+    fn executeBulkSqlCopyToStdoutParsedSqlWithSessionAndTiming(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+        statement_start_ns: u64,
+        statement_timeout_ns: ?u64,
+    ) ![]u8 {
+        var planned = try self.planBulkSqlExecutionWithSessionAlloc(parsed_sql, session, authenticated_identity);
         defer planned.deinit(self.alloc);
         const execution_plan = planned.execution_plan;
         if (execution_plan.operation != .export_rows or
