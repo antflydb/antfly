@@ -2775,6 +2775,8 @@ pub fn build(b: *std.Build) void {
         "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
+        "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
+        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",

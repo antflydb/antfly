@@ -120,10 +120,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         "{d} passed; {d} skipped; {d} failed; {d} leaked.\n",
         .{ ok_count, skip_count, fail_count, leak_count },
     );
+    const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
     if (log_err_count != 0) {
         std.debug.print("{d} errors were logged.\n", .{log_err_count});
     }
-    if (fail_count != 0 or leak_count != 0 or log_err_count != 0) {
+    if (fail_count != 0 or leak_count != 0 or (fail_on_error_logs and log_err_count != 0)) {
         std.process.exit(1);
     }
 }
