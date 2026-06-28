@@ -3115,7 +3115,7 @@ pub const DataServer = struct {
                     const status = raft.host.http_host.host.raftStatus(group_id);
                     local_status_missing = status == null;
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
-                    if (leader_node_id == null and localRaftStatusIsVoter(status, local_node_id)) {
+                    if (leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
                         const now_ns = platform_time.monotonicNs();
                         if (last_local_campaign_ns == 0 or
                             now_ns -| last_local_campaign_ns >= data_raft_campaign_retry_interval_ns)
@@ -3337,6 +3337,13 @@ pub const DataServer = struct {
             if (node_id == local_node_id) return true;
         }
         return false;
+    }
+
+    fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
+        const raft_status = status orelse return false;
+        if (raft_status.soft.leader_id != null) return false;
+        if (raft_status.soft.role != .follower) return false;
+        return localRaftStatusIsVoter(raft_status, local_node_id);
     }
 
     fn sleepDataRaftBatchLeaderRetry() void {
@@ -4615,7 +4622,7 @@ pub const DataServer = struct {
         for (local_intents.items) |intent| {
             if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
-            if (status == null or status.?.soft.leader_id != null or !localRaftStatusIsVoter(status, registration.node_id)) continue;
+            if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
                     intent.record.group_id,
