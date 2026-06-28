@@ -24,7 +24,6 @@ pub const corpus = @import("corpus.zig");
 const ddl_plan = @import("ddl.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const document_plan = @import("document_plan.zig");
-pub const document_runtime = @import("document_runtime.zig");
 pub const durable_plan = @import("durable_plan.zig");
 pub const edge_case_runner = @import("edge_case_runner.zig");
 pub const executor = @import("executor.zig");

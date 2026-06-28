@@ -25,7 +25,7 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const table_reads = @import("table_reads.zig");
 const tables_api = @import("tables.zig");
-const document_sql_runtime = @import("../sql/document_runtime.zig");
+const document_sql_runtime = @import("table_reads/document_sql_runtime.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 

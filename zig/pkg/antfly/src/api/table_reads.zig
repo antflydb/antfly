@@ -15,6 +15,7 @@
 const table_read_core = @import("table_reads/core.zig");
 const table_read_cache = @import("table_reads/cache.zig");
 const table_read_document_sql = @import("table_reads/document_sql.zig");
+pub const document_sql_runtime = @import("table_reads/document_sql_runtime.zig");
 const table_read_relational_rows = @import("table_reads/relational_rows.zig");
 const table_read_external_lake = @import("table_reads/external_lake.zig");
 const table_read_remote_wire = @import("table_reads/remote_wire.zig");

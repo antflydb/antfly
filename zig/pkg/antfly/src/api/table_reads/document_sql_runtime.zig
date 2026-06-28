@@ -5,9 +5,9 @@
 
 const std = @import("std");
 
-const raft_mod = @import("../raft/mod.zig");
-const sql_adapter_runtime = @import("runtime.zig");
-const storage_schema = @import("../storage/schema.zig");
+const raft_mod = @import("../../raft/mod.zig");
+const sql_adapter_runtime = @import("../../sql/runtime.zig");
+const storage_schema = @import("../../storage/schema.zig");
 
 pub const LookupOptions = struct {};
 
