@@ -26164,7 +26164,6 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .executor = .{ .backend = .manual },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer db.close();

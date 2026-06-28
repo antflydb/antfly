@@ -2040,6 +2040,9 @@ fn embedBatchWithOpenAiCompatible(
         headers_buf[1] = .{ .name = "authorization", .value = value };
     }
 
+    const serial_pacer = beginEntryPacedRequest(entry);
+    defer endEntryPacedRequest(serial_pacer);
+
     var request = std.http.Client.request(&client, .POST, uri, .{
         .extra_headers = headers_buf[0..header_count],
     }) catch |err| return err;
@@ -2049,8 +2052,6 @@ fn embedBatchWithOpenAiCompatible(
     var body_writer = try request.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(json_body);
     try body_writer.end();
-    const serial_pacer = beginEntryPacedRequest(entry);
-    defer endEntryPacedRequest(serial_pacer);
     try request.connection.?.flush();
 
     var response = request.receiveHead(&.{}) catch |err| return err;
@@ -3073,7 +3074,7 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
 
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/api/embed"));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ai/v1/embed"));
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"input\":[\"alpha concept\"]") != null);
             return .{
@@ -3108,7 +3109,7 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
 
-    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{base_uri});
+    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/ai/v1", .{base_uri});
     defer std.testing.allocator.free(expected_base_url);
     try std.testing.expectEqualStrings(expected_base_url, managed.entries[0].base_url);
 
