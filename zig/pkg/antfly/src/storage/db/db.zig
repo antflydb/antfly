@@ -3242,6 +3242,15 @@ pub const DB = struct {
                 const target_sequence = self.core.nextEnrichmentSequence();
                 if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
             }
+            if (query_visibility_hook != null) {
+                runtime.runtime.?.setStatusHook(.{
+                    .ptr = self.async_context,
+                    .on_change = notifyAsyncContextVisibilityHook,
+                });
+            }
+            if (self.open_mode.allowsOptionalRuntimes()) {
+                try runtime.runtime.?.start();
+            }
         }
 
         if (self.enrichment_runtime) |runtime| {
@@ -3260,25 +3269,6 @@ pub const DB = struct {
             self.enrichment_runtime = owned.runtime;
         }
         self.setQueryVisibilityHook(query_visibility_hook);
-
-        if (self.enrichment_runtime) |runtime| {
-            if (self.open_mode.allowsOptionalRuntimes()) {
-                runtime.start() catch |err| {
-                    self.setQueryVisibilityHook(null);
-                    if (self.enrichment_runtime) |failed_runtime| {
-                        failed_runtime.deinit();
-                        self.runtime_alloc.destroy(failed_runtime);
-                        self.enrichment_runtime = null;
-                    }
-                    if (self.enrichment_append_context) |ctx| {
-                        self.runtime_alloc.destroy(ctx);
-                        self.enrichment_append_context = null;
-                    }
-                    self.setQueryVisibilityHook(query_visibility_hook);
-                    return err;
-                };
-            }
-        }
     }
 
     fn initResolutionRuntime(self: *DB) !void {
