@@ -19,9 +19,10 @@ const repository_mod = @import("repository.zig");
 const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
+const platform = @import("antfly_platform");
 
 fn openDebugLogsEnabled() bool {
-    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
 fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {

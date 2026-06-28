@@ -33,6 +33,7 @@ const backend_types = @import("backend_types.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
 const lmdb_backend = @import("lmdb_backend.zig");
+const platform = @import("antfly_platform");
 const platform_time = @import("../platform/time.zig");
 const lmdb = @import("lmdb.zig");
 const storage_sim = @import("sim_runtime.zig");
@@ -44,8 +45,7 @@ const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
 
 fn lsmOpenDebugLogsEnabled() bool {
-    if (builtin.os.tag == .freestanding) return false;
-    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
 fn nextWalTmpNonce() u64 {

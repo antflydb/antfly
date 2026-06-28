@@ -2964,7 +2964,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
@@ -3357,7 +3357,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
