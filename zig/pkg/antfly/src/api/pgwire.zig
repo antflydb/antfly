@@ -620,7 +620,7 @@ const Connection = struct {
                 if (statement.parameter_oids.len != 0) {
                     try self.sendNoData();
                 } else {
-                    _ = try self.describeAndEncodeOne(statement.parsed_sql.sql(), &.{}, &.{});
+                    _ = try self.describeAndEncodeParsed(&statement.parsed_sql, &.{}, &.{});
                 }
             },
             'P' => {
@@ -628,7 +628,7 @@ const Connection = struct {
                     try self.sendError("34000", "portal does not exist");
                     return;
                 };
-                if (try self.describeAndEncodeOne(active_portal.parsed_sql.sql(), active_portal.params, active_portal.result_formats)) try self.markPortalDescribed(name);
+                if (try self.describeAndEncodeParsed(&active_portal.parsed_sql, active_portal.params, active_portal.result_formats)) try self.markPortalDescribed(name);
             },
             else => return error.InvalidPgwireMessage,
         }
@@ -643,7 +643,7 @@ const Connection = struct {
             try self.sendError("34000", "portal does not exist");
             return;
         };
-        _ = try self.executeAndEncodeOne(active_portal.parsed_sql.sql(), active_portal.params, active_portal.result_formats, false, !self.portalDescribed(portal_name));
+        _ = try self.executeAndEncodeParsed(&active_portal.parsed_sql, active_portal.params, active_portal.result_formats, false, !self.portalDescribed(portal_name));
     }
 
     fn handleClose(self: *Connection, payload: []const u8) !void {
@@ -767,6 +767,23 @@ const Connection = struct {
             try self.sendError("XX000", "internal sql describe error");
             return false;
         };
+        return try self.encodeDescribeOutcome(&outcome, result_formats);
+    }
+
+    fn describeAndEncodeParsed(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, result_formats: []const i16) !bool {
+        var outcome = self.describeParsedSql(parsed_sql, params) catch |err| {
+            std.log.warn("pgwire parsed sql describe failed err={}", .{err});
+            try self.sendError("XX000", "internal sql describe error");
+            return false;
+        };
+        return try self.encodeDescribeOutcome(&outcome, result_formats);
+    }
+
+    fn encodeDescribeOutcome(
+        self: *Connection,
+        outcome: *http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse,
+        result_formats: []const i16,
+    ) !bool {
         switch (outcome) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
@@ -823,6 +840,52 @@ const Connection = struct {
             if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         }
+        return try self.encodeExecutionOutcome(&outcome, result_formats, send_ready_on_error, include_row_description);
+    }
+
+    fn executeAndEncodeParsed(
+        self: *Connection,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
+        result_formats: []const i16,
+        send_ready_on_error: bool,
+        include_row_description: bool,
+    ) !bool {
+        if (self.consumeCancelRequested()) {
+            self.markTransactionError();
+            try self.sendError("57014", "canceling statement due to user request");
+            if (send_ready_on_error) try self.sendReadyForQuery();
+            return false;
+        }
+        self.active_execution.store(true, .release);
+        var outcome = self.executeParsedSql(parsed_sql, params) catch |err| {
+            self.active_execution.store(false, .release);
+            std.log.warn("pgwire parsed sql execution failed err={}", .{err});
+            try self.sendError("XX000", "internal sql execution error");
+            if (send_ready_on_error) try self.sendReadyForQuery();
+            return false;
+        };
+        self.active_execution.store(false, .release);
+        if (self.consumeCancelRequested()) {
+            switch (outcome) {
+                .response => |*response| response.deinit(self.api_server.alloc),
+                .result => |*result| result.deinit(self.api_server.alloc),
+            }
+            self.markTransactionError();
+            try self.sendError("57014", "canceling statement due to user request");
+            if (send_ready_on_error) try self.sendReadyForQuery();
+            return false;
+        }
+        return try self.encodeExecutionOutcome(&outcome, result_formats, send_ready_on_error, include_row_description);
+    }
+
+    fn encodeExecutionOutcome(
+        self: *Connection,
+        outcome: *http_server.ApiHttpServer.PublicSqlResultOrResponse,
+        result_formats: []const i16,
+        send_ready_on_error: bool,
+        include_row_description: bool,
+    ) !bool {
         switch (outcome) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
@@ -851,9 +914,31 @@ const Connection = struct {
         }, self.authenticated_identity);
     }
 
+    fn describeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse {
+        return try self.api_server.handlePublicParsedSqlExternalDescribeRequestResult(.{
+            .parsed_sql = parsed_sql,
+            .session_id = self.session_id,
+            .database = self.database,
+            .namespace = self.namespace,
+            .read_only = true,
+            .params = params,
+        }, self.authenticated_identity);
+    }
+
     fn executeSql(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
         return try self.api_server.executePublicSqlRequestResult(.{
             .sql = sql,
+            .session_id = self.session_id,
+            .database = self.database,
+            .namespace = self.namespace,
+            .read_only = false,
+            .params = params,
+        }, self.authenticated_identity);
+    }
+
+    fn executeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
+        return try self.api_server.executePublicParsedSqlExternalRequestResult(.{
+            .parsed_sql = parsed_sql,
             .session_id = self.session_id,
             .database = self.database,
             .namespace = self.namespace,

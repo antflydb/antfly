@@ -99,7 +99,9 @@ Each phase has a narrow job:
   for `EXPLAIN`, CTEs, relation population, `INSERT ... SELECT`, and future
   embedded statements. Generated child-read validation and `EXPLAIN` subject
   lowering use owned nested `ParsedSql` values with rebased source spans where
-  the caller can hold the nested source lifetime.
+  the caller can hold the nested source lifetime; relation-population source
+  reads also use owned token-range children for non-contiguous `SELECT ... INTO`
+  source ranges.
 - `BoundSqlStatement` applies SQL session state, `current_database`,
   `search_path`, catalog identity, object versions, schemas, dependency facts,
   and role authorization.

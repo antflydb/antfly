@@ -9111,6 +9111,16 @@ pub const ApiHttpServer = struct {
         stdin_payload: ?[]const u8 = null,
     };
 
+    pub const PublicParsedSqlRequest = struct {
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session_id: ?u64 = null,
+        database: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+        read_only: ?bool = null,
+        params: []const sql_adapter.SqlValue = &.{},
+        stdin_payload: ?[]const u8 = null,
+    };
+
     const PublicSqlPlannedExecutionPlan = union(enum) {
         logical: sql_adapter.LogicalSqlPlan,
         durable: sql_adapter.DurableSqlPlan,
@@ -9616,6 +9626,113 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    pub fn executePublicParsedSqlExternalRequestResult(self: *ApiHttpServer, request: PublicParsedSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(.{
+            .sql = request.parsed_sql.sql(),
+            .session_id = request.session_id,
+            .database = request.database,
+            .namespace = request.namespace,
+            .read_only = request.read_only,
+            .params = request.params,
+            .stdin_payload = request.stdin_payload,
+        }) catch |err| switch (err) {
+            error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+            else => return err,
+        };
+        defer session.deinit(self.alloc);
+
+        var outcome = try self.executePublicParsedSqlRequestResult(.{
+            .parsed_sql = request.parsed_sql,
+            .params = request.params,
+            .session = &session,
+            .authenticated_identity = authenticated_identity,
+            .stdin_payload = request.stdin_payload,
+        });
+        errdefer outcome.deinit(self.alloc);
+        try self.savePublicSqlSession(session);
+        return outcome;
+    }
+
+    pub const PublicParsedSqlDescribeRequest = struct {
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue = &.{},
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity = null,
+    };
+
+    pub fn handlePublicParsedSqlDescribeRequestResult(self: *ApiHttpServer, request: PublicParsedSqlDescribeRequest) !PublicSqlDescribeResultOrResponse {
+        const parsed_sql = request.parsed_sql;
+        const session = request.session;
+        if (try self.describePublicSqlPostgresCompatibilityReadAlloc(parsed_sql, session)) |result_value| {
+            var result = result_value;
+            errdefer result.deinit(self.alloc);
+            result.transaction_status = self.publicSqlTransactionStatus(session);
+            return .{ .result = result };
+        }
+        if (switch (parsed_sql.statement) {
+            .read => true,
+            else => false,
+        }) {
+            var outcome = try self.describePublicSqlReadColumnsAlloc(parsed_sql, request.params, session, request.authenticated_identity);
+            errdefer outcome.deinit(self.alloc);
+            switch (outcome) {
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(session),
+                .response => {},
+            }
+            return outcome;
+        }
+
+        const statement_kind: []const u8 = switch (parsed_sql.statement) {
+            .write => |statement| @tagName(statement.kind),
+            else => blk: {
+                var planned_or_response = try self.planPublicParsedSqlExecutionAlloc(parsed_sql, session, request.authenticated_identity);
+                var planned_or_response_owned = true;
+                defer if (planned_or_response_owned) planned_or_response.deinit(self.alloc);
+                switch (planned_or_response) {
+                    .response => |*response| {
+                        const out = response.*;
+                        planned_or_response_owned = false;
+                        return .{ .response = out };
+                    },
+                    .planned => |planned| break :blk planned.plan.statementKindName(),
+                }
+            },
+        };
+        const session_id = self.ensureSqlProtocolSessionId(session);
+        return .{ .result = .{
+            .session_id = session_id,
+            .statement_kind = statement_kind,
+            .transaction_status = self.publicSqlTransactionStatus(session),
+            .has_row_description = false,
+        } };
+    }
+
+    pub fn handlePublicParsedSqlExternalDescribeRequestResult(self: *ApiHttpServer, request: PublicParsedSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {
+        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(.{
+            .sql = request.parsed_sql.sql(),
+            .session_id = request.session_id,
+            .database = request.database,
+            .namespace = request.namespace,
+            .read_only = request.read_only,
+            .params = request.params,
+            .stdin_payload = request.stdin_payload,
+        }) catch |err| switch (err) {
+            error.InvalidSqlRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
+            else => return err,
+        };
+        defer session.deinit(self.alloc);
+
+        var outcome = try self.handlePublicParsedSqlDescribeRequestResult(.{
+            .parsed_sql = request.parsed_sql,
+            .params = request.params,
+            .session = &session,
+            .authenticated_identity = authenticated_identity,
+        });
+        errdefer outcome.deinit(self.alloc);
+        try self.savePublicSqlSession(session);
+        return outcome;
+    }
+
     pub fn handlePublicSqlDescribeRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {
         if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.parse, .invalid_sql_request)) };
 
@@ -9630,51 +9747,15 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
-        if (try self.describePublicSqlPostgresCompatibilityReadAlloc(&parsed_sql, &session)) |result_value| {
-            var result = result_value;
-            errdefer result.deinit(self.alloc);
-            try self.savePublicSqlSession(session);
-            result.transaction_status = self.publicSqlTransactionStatus(&session);
-            return .{ .result = result };
-        }
-        if (switch (parsed_sql.statement) {
-            .read => true,
-            else => false,
-        }) {
-            var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, request.params, &session, authenticated_identity);
-            errdefer outcome.deinit(self.alloc);
-            try self.savePublicSqlSession(session);
-            switch (outcome) {
-                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
-                .response => {},
-            }
-            return outcome;
-        }
-
-        const statement_kind: []const u8 = switch (parsed_sql.statement) {
-            .write => |statement| @tagName(statement.kind),
-            else => blk: {
-                var planned_or_response = try self.planPublicParsedSqlExecutionAlloc(&parsed_sql, &session, authenticated_identity);
-                var planned_or_response_owned = true;
-                defer if (planned_or_response_owned) planned_or_response.deinit(self.alloc);
-                switch (planned_or_response) {
-                    .response => |*response| {
-                        const out = response.*;
-                        planned_or_response_owned = false;
-                        return .{ .response = out };
-                    },
-                    .planned => |planned| break :blk planned.plan.statementKindName(),
-                }
-            },
-        };
-        const session_id = self.ensureSqlProtocolSessionId(&session);
+        var outcome = try self.handlePublicParsedSqlDescribeRequestResult(.{
+            .parsed_sql = &parsed_sql,
+            .params = request.params,
+            .session = &session,
+            .authenticated_identity = authenticated_identity,
+        });
+        errdefer outcome.deinit(self.alloc);
         try self.savePublicSqlSession(session);
-        return .{ .result = .{
-            .session_id = session_id,
-            .statement_kind = statement_kind,
-            .transaction_status = self.publicSqlTransactionStatus(&session),
-            .has_row_description = false,
-        } };
+        return outcome;
     }
 
     fn applyPreparedTransactionPlan(

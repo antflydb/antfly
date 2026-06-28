@@ -380,6 +380,19 @@ pub const OwnedParsedSql = struct {
         return .{ .parsed = parsed };
     }
 
+    pub fn initChildStatementFromTokenRangesAlloc(
+        alloc: std.mem.Allocator,
+        parent: *const ParsedSql,
+        ranges: []const TokenRange,
+    ) !OwnedParsedSql {
+        const tokens = try flattenTokenRangesAlloc(alloc, parent.items(), ranges);
+        defer alloc.free(tokens);
+        const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
+        errdefer alloc.free(owned_sql);
+        const parsed = try ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, tokens);
+        return .{ .parsed = parsed };
+    }
+
     pub fn deinit(self: *OwnedParsedSql, alloc: std.mem.Allocator) void {
         const owned_sql = self.parsed.sql();
         self.parsed.deinit(alloc);
@@ -5032,6 +5045,29 @@ fn cloneTokenRangesAlloc(
     return try cloneTokenRangesForSourceSqlAlloc(alloc, null, source_tokens, ranges);
 }
 
+fn flattenTokenRangesAlloc(
+    alloc: std.mem.Allocator,
+    source_tokens: []const Token,
+    ranges: []const TokenRange,
+) ![]Token {
+    var total: usize = 0;
+    for (ranges) |range| {
+        if (range.start >= range.end or range.end > source_tokens.len) return error.UnsupportedSqlShape;
+        total += range.end - range.start;
+    }
+    if (total == 0) return error.UnsupportedSqlShape;
+    const out = try alloc.alloc(Token, total);
+    var index: usize = 0;
+    for (ranges) |range| {
+        for (source_tokens[range.start..range.end]) |token| {
+            out[index] = token;
+            out[index].owned = true;
+            index += 1;
+        }
+    }
+    return out;
+}
+
 fn cloneTokenRangesForSourceSqlAlloc(
     alloc: std.mem.Allocator,
     source_sql: ?[]const u8,
@@ -5517,6 +5553,30 @@ test "sql adapter parsed sql builds non-contiguous child statements from parent 
     try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
     try std.testing.expectEqualStrings("FROM", child.items()[4].text);
     try std.testing.expectEqualStrings("usage_records", child.items()[5].text);
+}
+
+test "sql adapter owned parsed sql builds non-contiguous child statements from token ranges" {
+    const alloc = std.testing.allocator;
+
+    var parent = try ParsedSql.initAlloc(
+        alloc,
+        "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10",
+    );
+    defer parent.deinit(alloc);
+
+    const ranges = [_]TokenRange{
+        .{ .start = 0, .end = 4 },
+        .{ .start = 6, .end = parent.items().len },
+    };
+    var child = try OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges);
+    defer child.deinit(alloc);
+
+    try std.testing.expectEqualStrings("SELECT account_id , total FROM usage_records WHERE total > 10", child.parsed.sql());
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, child.parsed.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, child.parsed.readStatementKind().?);
+    try std.testing.expectEqual(@as(usize, 0), child.parsed.items()[0].source_start);
+    try std.testing.expectEqual(@as(usize, child.parsed.sql().len), child.parsed.items()[child.parsed.items().len - 1].source_end);
+    try std.testing.expectEqualStrings("FROM", child.parsed.items()[4].text);
 }
 
 test "sql adapter parsed sql builds owned child statements from existing tokens" {

@@ -2442,7 +2442,7 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     defer parsed.deinit(alloc);
     var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
     defer parsed_source.deinit(alloc);
-    var source = try hooks.lower_read(hooks.ptr, &parsed_source);
+    var source = try hooks.lower_read(hooks.ptr, &parsed_source.parsed);
     errdefer source.deinit(alloc);
     return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
 }
@@ -2451,7 +2451,7 @@ fn relationPopulationSourceParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parent_sql: *const tokenized.ParsedSql,
     parsed: grammar.RelationPopulationSyntax,
-) !tokenized.ParsedSql {
+) !tokenized.OwnedParsedSql {
     if (parsed.source_token_start) |start| {
         const end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
         if (parsed.source_suffix_token_start) |suffix_start| {
@@ -2460,9 +2460,9 @@ fn relationPopulationSourceParsedSqlAlloc(
                 .{ .start = start, .end = end },
                 .{ .start = suffix_start, .end = suffix_end },
             };
-            return try tokenized.ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, parent_sql, &ranges);
+            return try tokenized.OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, parent_sql, &ranges);
         }
-        return try tokenized.ParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
+        return try tokenized.OwnedParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
     }
     return error.UnsupportedSqlShape;
 }

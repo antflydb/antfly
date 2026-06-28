@@ -332,6 +332,9 @@ PostgreSQL-style relation population heads, including `SELECT ... INTO` and
 `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE ... AS SELECT ... [WITH [NO] DATA]`,
 now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
+Relation-population source lowering now builds owned nested `ParsedSql` source
+reads from retained token ranges with rebased source spans, including
+non-contiguous `SELECT ... INTO` source ranges that omit the target clause.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
