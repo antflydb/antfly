@@ -7434,41 +7434,10 @@ pub fn parseCloseCursorPortalPlanTailAlloc(
     return try closeCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
 }
 
-fn sqlTextFromTokenRangeAlloc(alloc: std.mem.Allocator, tokens: []const grammar.Token) ![]const u8 {
-    if (tokens.len == 0) return error.UnsupportedSqlShape;
-    var contiguous = true;
-    const start_addr = @intFromPtr(tokens[0].text.ptr);
-    var prev_end = start_addr + tokens[0].text.len;
-    for (tokens[1..]) |token| {
-        const token_start = @intFromPtr(token.text.ptr);
-        if (token_start < prev_end) {
-            contiguous = false;
-            break;
-        }
-        prev_end = token_start + token.text.len;
-    }
-    if (contiguous) {
-        const end_token = tokens[tokens.len - 1];
-        const end_addr = @intFromPtr(end_token.text.ptr) + end_token.text.len;
-        if (end_addr >= start_addr) {
-            const source = tokens[0].text.ptr[0 .. end_addr - start_addr];
-            return try alloc.dupe(u8, source);
-        }
-    }
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    for (tokens, 0..) |token, index| {
-        if (index != 0) try out.writer.writeByte(' ');
-        try out.writer.writeAll(token.text);
-    }
-    return try out.toOwnedSlice();
-}
-
 fn parsedSqlFromTokenRangeAlloc(alloc: std.mem.Allocator, tokens: []const grammar.Token) !tokenized.ParsedSql {
-    const owned_sql = try sqlTextFromTokenRangeAlloc(alloc, tokens);
+    const owned_sql = try tokenized.sqlTextFromTokenSliceAlloc(alloc, tokens);
     errdefer alloc.free(owned_sql);
-    return try tokenized.ParsedSql.initAlloc(alloc, owned_sql);
+    return try tokenized.ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, tokens);
 }
 
 pub fn parseSavepointTransactionPlanTailAlloc(

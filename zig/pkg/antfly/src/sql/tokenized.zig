@@ -172,6 +172,15 @@ pub const TokenizedSql = struct {
         };
     }
 
+    pub fn initFromOwnedTokenSliceAlloc(alloc: std.mem.Allocator, sql: []const u8, source_tokens: []const Token) !TokenizedSql {
+        var tokens = try cloneTokensForOwnedSourceSqlAlloc(alloc, sql, source_tokens);
+        errdefer lexer.freeTokens(alloc, &tokens);
+        return .{
+            .sql = sql,
+            .tokens = tokens,
+        };
+    }
+
     pub fn initFromTokenRangesAlloc(
         alloc: std.mem.Allocator,
         sql: []const u8,
@@ -225,6 +234,22 @@ pub const ParsedSql = struct {
 
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenSliceAlloc(alloc, source_sql, source_tokens);
+        errdefer tokenized_sql.deinit(alloc);
+        var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        var generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
+        raw_statement.family = rawStatementFamily(tokenized_sql.items(), raw_statement, generated_statement);
+        if (generated_statement) |*generated_raw| generated_raw.raw = raw_statement;
+        const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
+        return .{
+            .tokenized_sql = tokenized_sql,
+            .raw_statement = raw_statement,
+            .generated_statement = generated_statement,
+            .statement = statement,
+        };
+    }
+
+    pub fn initFromOwnedTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
+        var tokenized_sql = try TokenizedSql.initFromOwnedTokenSliceAlloc(alloc, source_sql, source_tokens);
         errdefer tokenized_sql.deinit(alloc);
         var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
         var generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
@@ -4907,6 +4932,73 @@ fn cloneTokensForSourceSqlAlloc(alloc: std.mem.Allocator, source_sql: ?[]const u
     return out;
 }
 
+fn cloneTokensForOwnedSourceSqlAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !std.ArrayListUnmanaged(Token) {
+    if (source_tokens.len == 0) return error.UnsupportedSqlShape;
+    var out = try std.ArrayListUnmanaged(Token).initCapacity(alloc, source_tokens.len);
+    errdefer lexer.freeTokens(alloc, &out);
+
+    if (contiguousTokenTextRange(source_tokens)) |range| {
+        if (range.len == source_sql.len) {
+            for (source_tokens) |token| {
+                const token_start = @intFromPtr(token.text.ptr);
+                if (token_start < range.start or token_start + token.text.len > range.start + range.len) return error.UnsupportedSqlShape;
+                const rebased_start = token_start - range.start;
+                var cloned = token;
+                cloned.text = source_sql[rebased_start .. rebased_start + token.text.len];
+                cloned.source_start = rebased_start;
+                cloned.source_end = rebased_start + token.text.len;
+                cloned.owned = false;
+                out.appendAssumeCapacity(cloned);
+            }
+            return out;
+        }
+    }
+
+    var cursor: usize = 0;
+    for (source_tokens, 0..) |token, index| {
+        if (index != 0) {
+            if (cursor >= source_sql.len or source_sql[cursor] != ' ') return error.UnsupportedSqlShape;
+            cursor += 1;
+        }
+        if (cursor + token.text.len > source_sql.len) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, source_sql[cursor .. cursor + token.text.len], token.text)) return error.UnsupportedSqlShape;
+        var cloned = token;
+        cloned.text = source_sql[cursor .. cursor + token.text.len];
+        cloned.source_start = cursor;
+        cloned.source_end = cursor + token.text.len;
+        cloned.owned = false;
+        out.appendAssumeCapacity(cloned);
+        cursor += token.text.len;
+    }
+    if (cursor != source_sql.len) return error.UnsupportedSqlShape;
+    return out;
+}
+
+const ContiguousTokenTextRange = struct {
+    start: usize,
+    len: usize,
+};
+
+fn contiguousTokenTextRange(tokens: []const Token) ?ContiguousTokenTextRange {
+    if (tokens.len == 0) return null;
+    if (tokens[0].owned) return null;
+    const start = @intFromPtr(tokens[0].text.ptr);
+    const first_source_start = tokens[0].source_start;
+    if (tokens[0].source_end < first_source_start or tokens[0].source_end - first_source_start != tokens[0].text.len) return null;
+    var prev_end = start + tokens[0].text.len;
+    for (tokens[1..]) |token| {
+        if (token.owned) return null;
+        const token_start = @intFromPtr(token.text.ptr);
+        if (token_start < prev_end) return null;
+        if (token.source_start < first_source_start or token.source_end < token.source_start) return null;
+        if (token.source_end - token.source_start != token.text.len) return null;
+        if (token_start - start != token.source_start - first_source_start) return null;
+        prev_end = token_start + token.text.len;
+    }
+    if (prev_end < start) return null;
+    return .{ .start = start, .len = prev_end - start };
+}
+
 fn cloneTokenRangesAlloc(
     alloc: std.mem.Allocator,
     source_tokens: []const Token,
@@ -4935,6 +5027,22 @@ fn cloneTokenRangesForSourceSqlAlloc(
         }
     }
     return out;
+}
+
+pub fn sqlTextFromTokenSliceAlloc(alloc: std.mem.Allocator, tokens: []const Token) ![]const u8 {
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    if (contiguousTokenTextRange(tokens)) |range| {
+        const source = tokens[0].text.ptr[0..range.len];
+        return try alloc.dupe(u8, source);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (tokens, 0..) |token, index| {
+        if (index != 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(token.text);
+    }
+    return try out.toOwnedSlice();
 }
 
 fn cloneTokenForSourceSqlAlloc(alloc: std.mem.Allocator, source_sql: ?[]const u8, token: Token) !Token {
@@ -5384,6 +5492,34 @@ test "sql adapter parsed sql builds non-contiguous child statements from parent 
     try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
     try std.testing.expectEqualStrings("FROM", child.items()[4].text);
     try std.testing.expectEqualStrings("usage_records", child.items()[5].text);
+}
+
+test "sql adapter parsed sql builds owned child statements from existing tokens" {
+    const alloc = std.testing.allocator;
+
+    var parent = try ParsedSql.initAlloc(
+        alloc,
+        "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;",
+    );
+    defer parent.deinit(alloc);
+
+    const subject_tokens = parent.items()[6 .. parent.items().len - 1];
+    const subject_sql = try sqlTextFromTokenSliceAlloc(alloc, subject_tokens);
+    errdefer alloc.free(subject_sql);
+    var child = try ParsedSql.initFromOwnedTokenSliceAlloc(alloc, subject_sql, subject_tokens);
+    defer {
+        const owned_sql = child.sql();
+        child.deinit(alloc);
+        alloc.free(@constCast(owned_sql));
+    }
+
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", child.sql());
+    try std.testing.expectEqual(sql_statement_kind.SqlStatementFamily.select, child.raw_statement.family.?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, child.readStatementKind().?);
+    try std.testing.expectEqual(@as(usize, 0), child.items()[0].source_start);
+    try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
+    try std.testing.expectEqual(@as(usize, child.sql().len), child.items()[child.items().len - 1].source_end);
+    try std.testing.expectEqualStrings("$1", child.items()[child.items().len - 1].text);
 }
 
 test "sql adapter parsed sql owns typed statement variants" {

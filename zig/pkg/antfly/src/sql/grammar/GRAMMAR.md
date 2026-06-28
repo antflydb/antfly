@@ -877,10 +877,11 @@ Suggested migration order:
    statement name span after the optional `PREPARE` keyword. Prepared
    transactions use a separate generated AST family from named prepared
    statements so two-phase-commit GIDs cannot be confused with statement names.
-   Generated prepared-statement planning now reparses the retained nested
-   statement range through the generated parser and maps generated read, DML,
-   DDL, and extension-index DDL ASTs to the typed prepared-statement family
-   instead of consulting the legacy prepared-statement classifier.
+   Generated prepared-statement planning now clones the retained nested
+   statement token range into an owned `ParsedSql` subject with rebased source
+   spans and maps generated read, DML, DDL, and extension-index DDL ASTs to the
+   typed prepared-statement family instead of consulting the legacy
+   prepared-statement classifier or reparsing a reconstructed subject string.
 2. DDL: `CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `ALTER TABLE`,
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,

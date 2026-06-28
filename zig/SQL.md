@@ -1371,6 +1371,9 @@ Current implementation status:
   parsed token predicates for early syntax buckets such as conflict clauses,
   query functions, computed patterns, and common function-name coverage.
   Parsed-only lowering context construction does not require a raw SQL field.
+  Prepared-statement and cursor subject plans now own nested `ParsedSql`
+  subjects built from existing token slices with rebased source spans instead
+  of reconstructing a SQL substring and lexing it again.
   Recursive data-modifying CTEs carry a parsed recursive-write flag, so generic
   write planning no longer reclassifies recursive write kind from the token
   stream. Catalog-aware read/write bind, lower, and resolve APIs expose parsed
@@ -1651,6 +1654,10 @@ Current implementation status:
   plan surfaces. Routine expression execution uses the storage row-expression
   evaluator directly, so routine catalog state no longer depends on API row
   handlers.
+- Prepared-statement and cursor DDL plans now store subject statements as
+  owned nested `ParsedSql` values cloned from retained token slices with rebased
+  source spans, so subject execution no longer carries a parallel raw SQL field
+  or reparses a reconstructed subject string.
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.
