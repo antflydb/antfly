@@ -158,20 +158,29 @@ class _Api:
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
-        timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
-        try:
-            response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
-        except requests.RequestException as exc:
-            # A timed-out write usually means a node wedged in memory without
-            # logging anything; capture native stacks before teardown so the
-            # CI failure is diagnosable.
-            stacks = self._server.native_stack_dumps()
-            raise AssertionError(
-                f"batch insert timed out/failed table={table!r} key={doc_id!r} "
-                f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
-                f"\n[logs]\n{self._server.debug_logs()}"
-            ) from exc
-        return self._check(response)
+        while True:
+            timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
+            try:
+                response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
+            except requests.RequestException as exc:
+                # A timed-out write usually means a node wedged in memory without
+                # logging anything; capture native stacks before teardown so the
+                # CI failure is diagnosable.
+                stacks = self._server.native_stack_dumps()
+                raise AssertionError(
+                    f"batch insert timed out/failed table={table!r} key={doc_id!r} "
+                    f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
+                    f"\n[logs]\n{self._server.debug_logs()}"
+                ) from exc
+            if (
+                deadline is not None
+                and response.status_code == 503
+                and response.text.strip() == "write unavailable"
+                and not deadline.expired()
+            ):
+                deadline.sleep()
+                continue
+            return self._check(response)
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(

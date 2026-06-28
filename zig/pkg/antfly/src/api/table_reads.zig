@@ -5904,63 +5904,15 @@ fn openProvisionedQueryDbForTableWithCache(
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
     });
-    var db_open = true;
-    errdefer if (db_open) db.close();
+    errdefer db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = false,
     });
-    var indexes_added = summary.indexes_added;
-    if (summary.indexManagerCatalogChanged()) {
-        // Query/status paths can be the first readers to observe a newly-added
-        // index or resolver from metadata. Reopen after reconcile so searches
-        // run against the stabilized post-reconcile index-manager state.
-        db.close();
-        db_open = false;
-        enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
-        db = if (enrichments.enabled()) blk: {
-            const enrichment_cfg = enrichments.config();
-            const opened = try db_mod.DB.open(alloc, path, .{
-                .open_mode = .query_readonly,
-                .lsm_cache = lsm_cache,
-                .hbc_cache = hbc_cache,
-                .lsm_root_generation = lsm_root_generation,
-                .resource_manager = resource_manager,
-                .backend_runtime = backend_runtime,
-                .secret_store = secret_store,
-                .remote_content = remote_content,
-                .identity_namespace = identity_namespace,
-                .prefer_existing_identity_namespace = identity_namespace != null,
-                .enrichment = enrichment_cfg,
-            });
-            enrichments.take();
-            break :blk opened;
-        } else try db_mod.DB.open(alloc, path, .{
-            .open_mode = .query_readonly,
-            .lsm_cache = lsm_cache,
-            .hbc_cache = hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = resource_manager,
-            .backend_runtime = backend_runtime,
-            .secret_store = secret_store,
-            .remote_content = remote_content,
-            .identity_namespace = identity_namespace,
-            .prefer_existing_identity_namespace = identity_namespace != null,
-        });
-        db_open = true;
-        try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
-        const reopened_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-            .drain_resolver_backfill = false,
-        });
-        indexes_added += reopened_summary.indexes_added;
-    }
-    if (indexes_added > 0) {
-        if (db.enrichment_runtime != null) {
-            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
-            try db.runUntilIdle();
-        }
-    }
+    // Query opens must never materialize metadata-defined indexes. Writers own
+    // that catalog mutation under the root writer lock.
+    if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
     return db;
 }
 

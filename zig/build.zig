@@ -3032,7 +3032,9 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime live writer source follows raft apply ownership",
         "data runtime local split fallback preserves source identity namespace",
+        "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data runtime resolves extension package store env before local default",
         "data runtime cli accepts ARD identity flags",
@@ -3064,6 +3066,7 @@ pub fn build(b: *std.Build) void {
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db split destination read-only open does not create missing root",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db merge coordinator opt-in applies configured receiver identity namespace",
@@ -3801,8 +3804,13 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
-            "write cache reserves retirement slots when pruning multiple leased generations",
+            "write cache blocks same-root generation replacement while stale lease stays live",
+            "provisioned create index updates cached writer in place",
+            "write cache metadata refresh preserves inactive adoptable seed",
+            "write cache adopts active just-created db across generation bump",
+            "runtime status collection leaves active stale write lease live",
             "primary lookup adopts seeded write cache across visible generation bump",
+            "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
@@ -3812,6 +3820,7 @@ pub fn build(b: *std.Build) void {
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
+            "managed startup catch-up uses provided indexes json without catalog fetch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3834,6 +3843,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
+            "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",

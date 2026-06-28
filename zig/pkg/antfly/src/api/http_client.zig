@@ -1424,6 +1424,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            if (resp.status == 503) return error.LeaderUnavailable;
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2401,6 +2402,10 @@ test "api http client preserves group doc identity conflicts" {
 
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.status = 503;
+    conflict_executor.body = "write unavailable";
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

@@ -1166,7 +1166,7 @@ test "transition service steps real merge coordinator from prepared donor state"
     try std.testing.expectEqual(@as(usize, 0), svc.metrics.queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_merge_transitions);
 
-    var receiver = try data.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);

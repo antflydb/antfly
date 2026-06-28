@@ -2922,6 +2922,7 @@ pub const DB = struct {
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                 opts.external_derived_checkpoints,
+                openModeRequiresReadOnlyBackends(opts.open_mode),
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -3124,8 +3125,39 @@ pub const DB = struct {
         if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
-    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+    const DetachedEnrichmentRuntime = struct {
+        append_ctx: ?*EnrichmentAppendContext = null,
+        runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+                self.runtime = null;
+            }
+            if (self.append_ctx) |ctx| {
+                alloc.destroy(ctx);
+                self.append_ctx = null;
+            }
+        }
+
+        fn take(self: *@This()) struct {
+            append_ctx: *EnrichmentAppendContext,
+            runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+        } {
+            const append_ctx = self.append_ctx.?;
+            const runtime = self.runtime.?;
+            self.append_ctx = null;
+            self.runtime = null;
+            return .{
+                .append_ctx = append_ctx,
+                .runtime = runtime,
+            };
+        }
+    };
+
+    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -3166,8 +3198,94 @@ pub const DB = struct {
             enrichment_cfg,
         );
         errdefer runtime.deinit();
-        self.enrichment_append_context = append_ctx;
-        self.enrichment_runtime = runtime;
+        return .{
+            .append_ctx = append_ctx,
+            .runtime = runtime,
+        };
+    }
+
+    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
+        var detached = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
+        const owned = detached.take();
+        self.enrichment_append_context = owned.append_ctx;
+        self.enrichment_runtime = owned.runtime;
+    }
+
+    fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
+        if (cfg.dense_embedder) |dense_embedder| {
+            dense_embedder.deinit(self.runtime_alloc);
+            cfg.dense_embedder = null;
+        }
+        if (cfg.sparse_embedder) |sparse_embedder| {
+            sparse_embedder.deinit(self.runtime_alloc);
+            cfg.sparse_embedder = null;
+        }
+        if (cfg.asset_producer) |producer| {
+            producer.deinit(self.runtime_alloc);
+            cfg.asset_producer = null;
+        }
+    }
+
+    pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var owned_cfg = cfg;
+        var cfg_owned = true;
+        errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
+
+        const query_visibility_hook = self.async_context.query_visibility_hook;
+        var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
+        cfg_owned = false;
+        errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
+        if (detached) |*runtime| {
+            if (self.core.hasGeneratedEnrichmentTargets()) {
+                const target_sequence = self.core.nextEnrichmentSequence();
+                if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
+            }
+            if (query_visibility_hook != null) {
+                runtime.runtime.?.setStatusHook(.{
+                    .ptr = self.async_context,
+                    .on_change = notifyAsyncContextVisibilityHook,
+                });
+            }
+        }
+
+        const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+        var stopped_existing_runtime = false;
+        if (should_start_replacement) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.stop();
+                stopped_existing_runtime = true;
+            }
+        }
+        errdefer if (stopped_existing_runtime) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.start() catch |err| {
+                    std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
+                };
+            }
+        };
+
+        if (should_start_replacement) {
+            try detached.?.runtime.?.start();
+        }
+
+        if (self.enrichment_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.enrichment_runtime = null;
+        }
+        if (self.enrichment_append_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.enrichment_append_context = null;
+        }
+
+        if (detached) |*runtime| {
+            const owned = runtime.take();
+            self.enrichment_append_context = owned.append_ctx;
+            self.enrichment_runtime = owned.runtime;
+        }
+        self.setQueryVisibilityHook(query_visibility_hook);
     }
 
     fn initResolutionRuntime(self: *DB) !void {
@@ -6977,6 +7095,7 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         var apply_locked = true;
         errdefer if (apply_locked) self.core.unlockApply();
@@ -7003,18 +7122,21 @@ pub const DB = struct {
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7041,6 +7163,7 @@ pub const DB = struct {
         cfg: index_manager_mod.ResolverConfig,
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7099,6 +7222,7 @@ pub const DB = struct {
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
@@ -7686,24 +7810,28 @@ pub const DB = struct {
     }
 
     pub fn compactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.bestEffortForceCompactTextIndexes();
@@ -8001,6 +8129,7 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
@@ -8061,6 +8190,7 @@ pub const DB = struct {
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -24499,6 +24629,7 @@ fn cleanupTempDir(path: [*:0]const u8) void {
 
 const default_test_wait_attempts: usize = 100;
 const slow_test_wait_attempts: usize = 500;
+const graph_replay_test_wait_attempts: usize = 2000;
 
 fn waitForSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     return waitForSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
@@ -24517,6 +24648,64 @@ fn waitForSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchR
         return error.Timeout;
     }
     return last;
+}
+
+fn waitForGraphEdges(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+) ![]graph_mod.Edge {
+    return waitForGraphEdgesWithAttempts(alloc, db, index_name, key, edge_type, direction, min_edges, graph_replay_test_wait_attempts);
+}
+
+fn replayStageHasPendingWork(stats: types.ReplayStageStats) bool {
+    if (stats.blocked or stats.error_count != 0) return false;
+    return stats.catch_up_required or stats.applied_sequence < stats.target_sequence;
+}
+
+fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: *DB, index_name: []const u8) !bool {
+    const graph_applied = try db.core.loadAppliedSequence(alloc, index_name);
+    if (graph_applied < db.core.nextDerivedSequence()) return true;
+    const pending = db.pendingWorkStats();
+    return replayStageHasPendingWork(pending.resolution) or
+        replayStageHasPendingWork(pending.promotion);
+}
+
+fn waitForGraphEdgesWithAttempts(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+    max_attempts: usize,
+) ![]graph_mod.Edge {
+    var drained_without_edges: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+        if (edges.len >= min_edges) return edges;
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try db.runUntilIdle();
+        if (try graphEdgeProducerHasPendingWork(alloc, db, index_name)) {
+            drained_without_edges = 0;
+        } else {
+            drained_without_edges += 1;
+            if (drained_without_edges >= default_test_wait_attempts) return error.Timeout;
+        }
+        sleepPollInterval();
+    }
+    const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+    if (edges.len < min_edges) {
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        return error.Timeout;
+    }
+    return edges;
 }
 
 fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
@@ -26030,6 +26219,33 @@ test "db enrichment enabled requires backend runtime io" {
         .executor = .{ .backend = .manual },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     }));
+}
+
+test "db enrichment reconfigure preserves active runtime when replacement cannot initialize" {
+    const alloc = std.testing.allocator;
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    const original_backend_runtime = db.backend_runtime;
+    defer db.backend_runtime = original_backend_runtime;
+
+    const original_runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    var manual_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer manual_runtime.deinit();
+
+    db.backend_runtime = manual_runtime.ptr();
+    var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.MissingBackendRuntimeIo, db.reconfigureEnrichmentRuntime(.{
+        .dense_embedder = replacement_embedder.interface(),
+    }));
+    try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {
@@ -29687,7 +29903,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    const edges = try waitForGraphEdges(alloc, &db, "relations_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
@@ -30421,7 +30637,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 
     // Outbound: doc:a mentions both canonical entities.
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 2), out.len);
         // Each mention edge records the resolved DocRef target table so the
@@ -30432,7 +30648,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     }
     // Inbound provenance: "which documents mention this entity" == inbound edges.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
         try std.testing.expectEqualStrings("doc:a", inbound[0].source);
@@ -30539,7 +30755,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
     }
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
         var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
@@ -30552,7 +30768,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
     }
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -30668,7 +30884,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
-    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
@@ -30720,7 +30936,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     });
     try db.runUntilIdle();
 
-    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
@@ -30770,7 +30986,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
 
     // The mention edge points at the resolved DocRef from the resolution artifact.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -34243,14 +34459,18 @@ test "db managed dense enrichment remains searchable after transient rate limits
     while (attempts_after_release < 500) : (attempts_after_release += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        if (stats.indexes[0].doc_count == 3 and
-            stats.indexes[0].replay_applied_sequence >= 2 and
-            stats.indexes[0].replay_applied_sequence == stats.indexes[0].replay_target_sequence and
-            !stats.indexes[0].backfill_active)
-        {
-            ready = true;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "semantic_idx")) continue;
+            if (item.doc_count == 3 and
+                item.replay_applied_sequence >= 2 and
+                item.replay_applied_sequence == item.replay_target_sequence and
+                !item.backfill_active)
+            {
+                ready = true;
+            }
             break;
         }
+        if (ready) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
     try std.testing.expect(ready);
@@ -39599,6 +39819,119 @@ test "db query_readonly lsm primary opens physical backend read-only" {
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,
     }));
+}
+
+test "db read-only open modes can share lsm root with live writer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var writer = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try writer.sync(true);
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .query_readonly,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.TestUnexpectedResult;
+        defer result.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    }
+
+    {
+        var status = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .status_only,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer status.close();
+    }
+}
+
+test "db read-only open modes reject catalog mutations before side effects" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer writer.close();
+
+        try writer.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        try writer.sync(true);
+    }
+
+    for ([_]OpenOptions.OpenMode{ .query_readonly, .status_only }) |mode| {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = mode,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing_idx"));
+        try std.testing.expectError(error.ReadOnly, readonly.addEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "readonly_asset_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.addResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.removeResolver("readonly_resolver_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.drainScheduledTextMerges());
+        try std.testing.expectError(error.ReadOnly, readonly.forceCompactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.bestEffortForceCompactTextIndexes());
+    }
 }
 
 test "db query_readonly lmdb primary does not create missing database" {

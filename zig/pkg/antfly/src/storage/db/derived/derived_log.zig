@@ -61,6 +61,7 @@ pub const OpenOptions = struct {
     group_commit_max_requests: usize = 64,
     commit_backend: wal.CommitBackend = .adaptive,
     backend: wal.StorageBackend = .lsm,
+    read_only: bool = false,
     storage: ?lsm_backend.Storage = null,
     lsm_options: lsm_backend.Options = .{},
 };
@@ -188,6 +189,7 @@ pub const DerivedLog = if (!supports_native_derived_log) struct {
                 .group_commit_max_requests = opts.group_commit_max_requests,
                 .commit_backend = opts.commit_backend,
                 .backend = opts.backend,
+                .read_only = opts.read_only,
                 .storage = opts.storage,
                 .lsm_options = opts.lsm_options,
             }),

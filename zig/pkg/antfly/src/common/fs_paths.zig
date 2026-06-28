@@ -14,10 +14,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 
 fn fsPathDebugEnabled() bool {
     if (builtin.os.tag == .freestanding) return false;
-    return std.c.getenv("ANTFLY_FS_PATH_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_FS_PATH_DEBUG") != null;
 }
 
 fn logPathDebug(comptime event: []const u8, path: []const u8) void {

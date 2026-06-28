@@ -19,9 +19,10 @@ const repository_mod = @import("repository.zig");
 const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
+const platform = @import("antfly_platform");
 
 fn openDebugLogsEnabled() bool {
-    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
 fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
@@ -91,6 +92,16 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     }
     errdefer cleanup(BackendType, backend, false);
     errdefer finishOpenFailure(BackendType, backend);
+
+    if (@hasDecl(BackendType, "acquireRootLockState")) {
+        try backend.acquireRootLockState(options.create_if_missing);
+    }
+    if (@hasDecl(BackendType, "acquireRootWriterLock")) {
+        try backend.acquireRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "prepareWalOperationLockFile")) {
+        try backend.prepareWalOperationLockFile();
+    }
 
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
@@ -169,6 +180,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {
     cleanup(BackendType, backend, true);
+}
+
+pub fn abandon(comptime BackendType: type, backend: *BackendType) void {
+    cleanup(BackendType, backend, false);
 }
 
 fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool) void {
@@ -257,6 +272,15 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "manifest_backing")) {
         if (backend.manifest_backing) |raw| backend.allocator.free(raw);
+    }
+    if (@hasDecl(BackendType, "releaseRootWriterLock")) {
+        backend.releaseRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "closeWalOperationLockFile")) {
+        backend.closeWalOperationLockFile();
+    }
+    if (@hasDecl(BackendType, "releaseRootLockState")) {
+        backend.releaseRootLockState();
     }
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {
