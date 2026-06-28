@@ -16,7 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl.zig");
-const relational_rows = @import("../api/relational_rows.zig");
+const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const usermgr = @import("../usermgr/mod.zig");
 

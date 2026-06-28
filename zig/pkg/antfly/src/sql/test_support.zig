@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-const relational_rows = @import("../api/relational_rows.zig");
+const relational_rows = @import("relational_rows.zig");
 
 pub const TestPrimaryResolver = struct {
     row_json: []const u8,

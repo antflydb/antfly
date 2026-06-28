@@ -1637,6 +1637,13 @@ Current implementation status:
 - SQL catalog identity/session helpers now live under `pkg/antfly/src/sql/`
   and are re-exported by the API module, so binder, executor, DDL, and runtime
   code no longer import catalog session types from the API package.
+- Relational row request/plan/result contracts now live under
+  `pkg/antfly/src/sql/`; the API module re-exports the surface for existing
+  HTTP callers, while SQL lowerers and runtimes depend on the SQL-owned module
+  directly.
+- SQL parity, coverage, native-requirement, and adapter-edge fixture manifests
+  now live under `pkg/antfly/src/sql/fixtures/`; API integration tests reference
+  those SQL-owned manifests instead of owning corpus inputs.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

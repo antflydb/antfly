@@ -10,6 +10,11 @@ parity-test details are documented in [SQL.md](SQL.md). This document owns the
 native relational model that SQL, REST, SDK, MCP, A2A, CLI, and internal jobs
 target.
 
+Implementation ownership mirrors that contract: relational row request, plan,
+result, CTE, and expression-evaluation code lives under `pkg/antfly/src/sql/`,
+with API modules acting as callers or re-exporters rather than owning the
+relational row runtime.
+
 **Relational mode** is a second table profile on the same engine. It keeps
 every piece of the existing machinery — shards, Raft, indexes, enrichers, the
 join planner, and the algebraic fold runtime — but changes two things:

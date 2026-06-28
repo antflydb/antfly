@@ -25,6 +25,11 @@ and execution all stay in the binder, planner, and shared service layers.
 SQL catalog identity and session state are owned by the SQL package and
 re-exported for API callers, so generated-parser lowering does not depend on
 API-owned catalog-session types.
+Relational row request, plan, result, CTE, and expression-evaluation contracts
+are also SQL-owned, with API callers using re-exports instead of owning the row
+contract.
+SQL parity and native-requirement fixtures live under `pkg/antfly/src/sql`
+alongside the corpus parser that validates them.
 
 The reusable generator machinery lives under `zig/lib/yacc`, following the same
 library-plus-codegen shape as `zig/lib/openapi`. Antfly SQL owns only the input

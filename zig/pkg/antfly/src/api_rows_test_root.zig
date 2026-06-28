@@ -13,7 +13,7 @@
 // limitations.
 
 const http_server = @import("api/http_server.zig");
-const relational_rows = @import("api/relational_rows.zig");
+const relational_rows = @import("sql/relational_rows.zig");
 const sql_adapter_runtime = @import("sql/runtime.zig");
 const table_reads = @import("api/table_reads.zig");
 

@@ -3006,13 +3006,13 @@ test "postgres sql adapter checks application parity fixture freshness" {
 
 test "postgres sql adapter classifies fixture-backed application parity corpus" {
     const alloc = std.testing.allocator;
-    const fixture_json = @embedFile("fixtures/sql_api_parity_corpus.json");
+    const fixture_json = @embedFile("../sql/fixtures/sql_api_parity_corpus.json");
     var parsed_fixture = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed_fixture.deinit();
 
     const fixture_root = try sql_adapter.parseFixtureRootAlloc(alloc, parsed_fixture.value);
     defer sql_adapter.freeFixtureRoot(alloc, fixture_root);
-    const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
+    const source_json = @embedFile("../sql/fixtures/sql_api_parity_source_corpus.json");
     const source_sha256 = try sql_adapter.sourceCorpusSha256HexAlloc(alloc, source_json);
     defer alloc.free(source_sha256);
     try std.testing.expectEqualStrings(source_sha256, fixture_root.source_sha256);
@@ -6283,7 +6283,7 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
     defer runtime_schema.freeSchema(alloc, schema);
     var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"organization_id\":\"o1\"}", .version = 3 };
 
-    const fixture_json = @embedFile("fixtures/sql_api_adapter_edge_cases.json");
+    const fixture_json = @embedFile("../sql/fixtures/sql_api_adapter_edge_cases.json");
     var parsed_fixture = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed_fixture.deinit();
     const root = try sql_adapter.parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_fixture.value);

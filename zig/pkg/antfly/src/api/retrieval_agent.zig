@@ -22,7 +22,7 @@ const generating = @import("antfly_generating");
 const platform_time = @import("../platform/time.zig");
 const query_api = @import("query.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("../common/json_helpers.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;

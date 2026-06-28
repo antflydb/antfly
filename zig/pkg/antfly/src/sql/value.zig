@@ -17,7 +17,7 @@ const std = @import("std");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../platform/time.zig");
-const relational_rows = @import("../api/relational_rows.zig");
+const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const token_mod = @import("token.zig");
 
