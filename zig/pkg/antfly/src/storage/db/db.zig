@@ -3248,9 +3248,26 @@ pub const DB = struct {
                     .on_change = notifyAsyncContextVisibilityHook,
                 });
             }
-            if (self.open_mode.allowsOptionalRuntimes()) {
-                try runtime.runtime.?.start();
+        }
+
+        const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+        var stopped_existing_runtime = false;
+        if (should_start_replacement) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.stop();
+                stopped_existing_runtime = true;
             }
+        }
+        errdefer if (stopped_existing_runtime) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.start() catch |err| {
+                    std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
+                };
+            }
+        };
+
+        if (should_start_replacement) {
+            try detached.?.runtime.?.start();
         }
 
         if (self.enrichment_runtime) |runtime| {

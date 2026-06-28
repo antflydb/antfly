@@ -1162,16 +1162,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        self.stop();
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -1182,7 +1173,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn stop(self: *EnrichmentRuntime) void {
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            self.shutdown = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+
+            if (self.future) |*future| _ = future.await(io);
+        }
+        self.future = null;
+        self.shutdown = false;
+        self.ownership.release();
+    }
+
     pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
