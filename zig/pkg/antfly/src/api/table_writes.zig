@@ -81,9 +81,15 @@ const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .
     .max_deferred_l0_runs = 64,
     .max_deferred_hbc_leaf_splits_per_publish = auto_bulk_ingest_max_hbc_leaf_splits_per_publish,
 };
+const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
+const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 
 fn isTransientReplayVisibilityError(err: anyerror) bool {
     return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
+}
+
+fn isTransientWriterOpenConflict(err: anyerror) bool {
+    return err == error.LsmRootWriterAlreadyOpen or err == error.WriterLocked;
 }
 
 const TestExecutionHook = struct {
@@ -1449,14 +1455,6 @@ pub const ProvisionedTableWriteCache = struct {
         lsm_root_generation: u64,
         table_name: []const u8,
     ) !void {
-        var leased_retirements: usize = 0;
-        for (self.entries.items) |entry| {
-            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation == lsm_root_generation) continue;
-            if (entry.active_leases > 0) leased_retirements += 1;
-        }
-        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
-
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const entry = self.entries.items[i];
@@ -1472,17 +1470,13 @@ pub const ProvisionedTableWriteCache = struct {
                 i += 1;
                 continue;
             }
-            if (entry.allow_generation_adoption and (entry.active_leases > 0 or entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open)) {
+            if (entry.active_leases > 0 or entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) {
                 i += 1;
                 continue;
             }
             _ = self.entries.orderedRemove(i);
-            if (entry.active_leases == 0) {
-                entry.deinit(self.alloc);
-                self.alloc.destroy(entry);
-            } else {
-                self.retireEntryLocked(entry);
-            }
+            entry.deinit(self.alloc);
+            self.alloc.destroy(entry);
         }
     }
 
@@ -4314,6 +4308,53 @@ pub const ProvisionedTableWriteSource = struct {
         return cached;
     }
 
+    fn getOrOpenCachedDbModeForReplicatedApply(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+    ) !ProvisionedTableWriteCache.CachedDb {
+        const start_ns = platform_time.monotonicNs();
+        const deadline_ns = start_ns +| replicated_apply_writer_open_timeout_ns;
+        var logged_wait = false;
+        while (true) {
+            return self.getOrOpenCachedDbMode(
+                alloc,
+                cache,
+                path,
+                group_id,
+                table_name,
+                .default_async,
+                null,
+                null,
+            ) catch |err| {
+                if (!isTransientWriterOpenConflict(err)) return err;
+                const now_ns = platform_time.monotonicNs();
+                if (now_ns >= deadline_ns) {
+                    std.log.err("raft apply local writer wait timed out table={s} group_id={} wait_ms={} err={s}", .{
+                        table_name,
+                        group_id,
+                        @divTrunc(now_ns -| start_ns, std.time.ns_per_ms),
+                        @errorName(err),
+                    });
+                    return err;
+                }
+                if (!logged_wait) {
+                    logged_wait = true;
+                    std.log.warn("raft apply waiting for local writer table={s} group_id={} err={s}", .{
+                        table_name,
+                        group_id,
+                        @errorName(err),
+                    });
+                }
+                sleepNs(replicated_apply_writer_open_retry_ns);
+                continue;
+            };
+        }
+    }
+
     pub fn setLocalChangeHook(self: *ProvisionedTableWriteSource, hook: ?LocalChangeHook) void {
         self.local_change_hook = hook;
     }
@@ -4554,14 +4595,6 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn pruneStaleWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
         const pruneCache = struct {
             fn run(write_source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
-                var leased_retirements: usize = 0;
-                for (cache.entries.items) |entry| {
-                    const current_generation = write_source.visibleRootGeneration(entry.group_id);
-                    if (entry.lsm_root_generation == current_generation) continue;
-                    if (entry.active_leases > 0) leased_retirements += 1;
-                }
-                cache.retired_entries.ensureUnusedCapacity(cache.alloc, leased_retirements) catch return;
-
                 var i: usize = 0;
                 while (i < cache.entries.items.len) {
                     const entry = cache.entries.items[i];
@@ -4574,8 +4607,13 @@ pub const ProvisionedTableWriteSource = struct {
                         i += 1;
                         continue;
                     }
+                    if (entry.active_leases > 0 or entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) {
+                        i += 1;
+                        continue;
+                    }
                     _ = cache.entries.orderedRemove(i);
-                    cache.retireEntryLocked(entry);
+                    entry.deinit(cache.alloc);
+                    cache.alloc.destroy(entry);
                 }
 
                 var session_index: usize = 0;
@@ -5293,6 +5331,17 @@ pub const ProvisionedTableWriteSource = struct {
         absent,
         unknown,
         leased: ProvisionedTableWriteCache.CachedDb,
+
+        pub fn deinit(self: *ManagedWriterGroupProbe) void {
+            switch (self.*) {
+                .leased => |*cached| {
+                    const release_alloc = if (cached.cache) |cache| cache.alloc else std.heap.page_allocator;
+                    cached.deinit(release_alloc);
+                },
+                .absent, .unknown => {},
+            }
+            self.* = .absent;
+        }
     };
 
     pub fn probeManagedWriterGroupBestEffort(
@@ -7242,15 +7291,12 @@ pub const ProvisionedTableWriteSource = struct {
             self.invalidateWriteCache(table_name);
         }
         if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
+            var cached = try self.getOrOpenCachedDbModeForReplicatedApply(
                 alloc,
                 cache,
                 path,
                 group_id,
                 table_name,
-                .default_async,
-                null,
-                null,
             );
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
@@ -7558,14 +7604,6 @@ pub const ProvisionedTableWriteSource = struct {
             _ = try cache.finishExpiredAutoBulkIngestLocked(platform_time.monotonicNs());
         }
 
-        var leased_retirements: usize = 0;
-        for (cache.entries.items) |entry| {
-            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation == self.visibleRootGeneration(entry.group_id)) continue;
-            if (entry.active_leases > 0) leased_retirements += 1;
-        }
-        try cache.retired_entries.ensureUnusedCapacity(cache.alloc, leased_retirements);
-
         var i: usize = 0;
         while (i < cache.entries.items.len) {
             const entry = cache.entries.items[i];
@@ -7577,8 +7615,17 @@ pub const ProvisionedTableWriteSource = struct {
                 i += 1;
                 continue;
             }
+            if (cache.adoptSeededEntryGenerationLocked(entry, self.visibleRootGeneration(entry.group_id))) {
+                i += 1;
+                continue;
+            }
+            if (entry.active_leases > 0 or entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) {
+                i += 1;
+                continue;
+            }
             _ = cache.entries.orderedRemove(i);
-            cache.retireEntryLocked(entry);
+            entry.deinit(cache.alloc);
+            cache.alloc.destroy(entry);
         }
 
         var matching_entries: usize = 0;
@@ -21999,7 +22046,7 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
-test "write cache blocks same-root generation replacement while stale lease is active" {
+test "write cache blocks same-root generation replacement while stale lease stays live" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -22054,14 +22101,18 @@ test "write cache blocks same-root generation replacement while stale lease is a
         error.LsmRootWriterAlreadyOpen,
         write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs"),
     );
-    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 0), write_cache.entries.items[0].lsm_root_generation);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items[0].active_leases);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 
     gen0.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 
     var gen1 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 
     gen1.deinit(alloc);
@@ -22074,6 +22125,8 @@ test "write cache blocks same-root generation replacement while stale lease is a
         write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 2, "docs"),
     );
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items[0].active_leases);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 
     adoptable_gen1.deinit(alloc);
@@ -23600,6 +23653,81 @@ test "write cache adopts active just-created db across generation bump" {
     try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items[0].active_leases);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+}
+
+test "runtime status collection leaves active stale write lease live" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-active-stale-lease", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var generation: u64 = 1;
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+
+    var held = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    errdefer held.deinit(alloc);
+    var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+    defer leases.deinit(alloc);
+
+    generation = 2;
+    try std.testing.expect(!try source.collectRuntimeStatusLeasesFromWriteCacheLocked(alloc, "docs", &leases));
+    try std.testing.expectEqual(@as(usize, 0), leases.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items[0].active_leases);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+
+    held.deinit(alloc);
+    held.cache = null;
+    held.entry = null;
+    try std.testing.expect(!try source.collectRuntimeStatusLeasesFromWriteCacheLocked(alloc, "docs", &leases));
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
 test "primary lookup adopts seeded write cache across visible generation bump" {

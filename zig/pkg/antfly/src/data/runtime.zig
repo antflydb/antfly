@@ -4283,7 +4283,9 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+                    var writer_probe = self.probeManagedWriterGroupBestEffort(table.name, group_id);
+                    defer writer_probe.deinit();
+                    switch (writer_probe) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                                 try reports.append(alloc, cached);
