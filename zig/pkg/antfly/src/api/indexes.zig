@@ -1572,6 +1572,12 @@ fn appendSingleIndexRuntimeStatus(
             catch_up_phase = dense_catch_up.phase;
             catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
             catch_up_target_sequence = @max(catch_up_target_sequence, dense_catch_up.current_target_sequence);
+        } else if (embeddings_view) |view| {
+            if (!view.backfill_active) {
+                catch_up_active = false;
+                catch_up_phase = .idle;
+                catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
+            }
         }
     }
     if (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence) {
@@ -3593,7 +3599,7 @@ test "embeddings index status reports dense catch-up phase separately from publi
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"replay\"") != null);
 }
 
-test "embeddings index status keeps replay pending when catch-up progress lags replay target" {
+test "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -3642,12 +3648,82 @@ test "embeddings index status keeps replay pending when catch-up progress lags r
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "dense_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":325") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":325") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":325") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
+}
+
+test "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .node_count = 1,
+        .root_node = 1,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
+        .catch_up_active = false,
+        .catch_up_phase = .idle,
+        .catch_up_applied_sequence = 4,
+        .catch_up_target_sequence = 8,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 6,
+                .applied_sequence = 6,
+                .retryable_error_count = 10,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
 }
 
 test "managed embeddings readiness prefers replay completion once docs are indexed" {

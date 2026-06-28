@@ -6,8 +6,8 @@ import (
 )
 
 // WholeFileProcessor processes content by returning it as a single section
-// without any chunking. This is useful when you want Antfly's internal
-// chunking (e.g., Termite) to handle document segmentation.
+// without any chunking. This is useful when you want Antfly inference
+// to handle document segmentation.
 type WholeFileProcessor struct{}
 
 // CanProcess returns true for common text-based file types.

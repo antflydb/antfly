@@ -3972,6 +3972,9 @@ pub const DB = struct {
 
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
+            // This test drives primary maintenance explicitly; keep detached
+            // primary LSM maintenance from racing the precondition checks.
+            .executor = .{ .backend = .manual },
             .primary_backend = .{ .lsm = .{
                 .flush_threshold = 1,
                 .defer_flush_on_commit = true,
@@ -17712,6 +17715,101 @@ fn graphArtifactSourceConsumesRef(
     };
 }
 
+const GraphArtifactRefView = struct {
+    name: []const u8,
+    kind: types.ArtifactKind,
+    unit_id_present: bool = false,
+};
+
+fn graphArtifactSourceConsumesArtifactKey(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_key: []const u8,
+) bool {
+    if (decodeArtifactRefViewForGraphApplicability(artifact_key) catch null) |artifact_ref| {
+        return graphArtifactSourceConsumesRefView(index_manager, source, artifact_ref);
+    }
+
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch return false) orelse return false;
+    defer artifact_ref.deinit(index_manager.alloc);
+    return graphArtifactSourceConsumesRef(index_manager, source, artifact_ref);
+}
+
+fn graphArtifactSourceConsumesRefView(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: GraphArtifactRefView,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRefView(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+fn graphAssetSourceConsumesAssetRefView(index_manager: *const index_manager_mod.IndexManager, artifact_ref: GraphArtifactRefView) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id_present) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
+fn decodeArtifactRefViewForGraphApplicability(key: []const u8) !?GraphArtifactRefView {
+    if (!internal_keys.isInternalUserKey(key)) return null;
+
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) return null;
+    pos += 1;
+
+    const type_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const raw_kind = (try internal_keys.decodeBodyView(key[pos..type_term])) orelse return null;
+    const kind = try artifactKindFromInternalLabel(raw_kind);
+    pos = type_term + 2;
+
+    const name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const name = (try internal_keys.decodeBodyView(key[pos..name_term])) orelse return null;
+    pos = name_term + 2;
+
+    var unit_id_present = false;
+    if (kind == .asset and pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+        pos += 1;
+        const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+        if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+        pos = unit_term + 2;
+        if (pos == key.len) return .{ .name = name, .kind = .asset, .unit_id_present = true };
+    } else if (kind == .chunk) {
+        if (pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+            pos += 1;
+            const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+            if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+            pos = unit_term + 2;
+            unit_id_present = true;
+        }
+        if (pos + 1 + @sizeOf(u32) > key.len or key[pos] != internal_keys.chunk_record_kind) return error.InvalidInternalUserKey;
+        pos += 1 + @sizeOf(u32);
+        if (pos == key.len) return .{ .name = name, .kind = .chunk, .unit_id_present = unit_id_present };
+    }
+
+    if (pos == key.len) return .{ .name = name, .kind = kind, .unit_id_present = unit_id_present };
+    if (key[pos] != internal_keys.derived_embedding_kind) return error.InvalidInternalUserKey;
+    pos += 1;
+    const derived_name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const derived_name = (try internal_keys.decodeBodyView(key[pos..derived_name_term])) orelse return null;
+    if (derived_name_term + 2 != key.len) return error.InvalidInternalUserKey;
+    return .{ .name = derived_name, .kind = .embedding };
+}
+
+fn artifactKindFromInternalLabel(raw_kind: []const u8) !types.ArtifactKind {
+    if (std.mem.eql(u8, raw_kind, "chunk")) return .chunk;
+    if (std.mem.eql(u8, raw_kind, "asset")) return .asset;
+    if (std.mem.eql(u8, raw_kind, "embedding")) return .embedding;
+    return error.InvalidInternalUserKey;
+}
+
 fn graphAssetSourceConsumesAssetRef(index_manager: *const index_manager_mod.IndexManager, artifact_ref: types.ArtifactRef) bool {
     if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
     if (artifact_ref.unit_id != null) return true;
@@ -18736,6 +18834,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    ctx.apply_mutex.lockExclusive();
+    defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
@@ -20339,10 +20439,8 @@ fn managedIndexBatchApplicability(
             }
             for (batch.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
-                    defer artifact_ref.deinit(index_manager.alloc);
                     const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) return .relevant;
+                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
@@ -29616,7 +29714,10 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
     defer db.close();
 
     try db.addIndex(.{

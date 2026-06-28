@@ -694,8 +694,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_idx", timeout_s=30.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_idx", timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -760,8 +759,7 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -842,8 +840,7 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, 
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -925,8 +922,7 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
 
 
 @pytest.mark.real_model
@@ -974,8 +970,7 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_cl
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
