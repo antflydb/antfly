@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const ddl_plan = @import("ddl.zig");
+const ddl_plan = @import("../../sql/ddl.zig");
 
 const sql_adapter = struct {
     const NotificationChannelPlan = ddl_plan.NotificationChannelPlan;

@@ -14,9 +14,9 @@
 
 const std = @import("std");
 
-const catalog_apply = @import("catalog_apply.zig");
-const catalog_resources = @import("catalog_resources.zig");
-const ddl_plan = @import("ddl.zig");
+const catalog_apply = @import("../../sql/catalog_apply.zig");
+const catalog_resources = @import("../../sql/catalog_resources.zig");
+const ddl_plan = @import("../../sql/ddl.zig");
 
 const sql_adapter = struct {
     const OwnedSqlCatalogSession = catalog_apply.OwnedSqlCatalogSession;

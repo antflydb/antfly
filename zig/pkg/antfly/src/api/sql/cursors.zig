@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const ddl_plan = @import("ddl.zig");
-const runtime_schema = @import("../storage/schema.zig");
+const ddl_plan = @import("../../sql/ddl.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 
 const sql_adapter = struct {
     const CloseCursorPortalPlan = ddl_plan.CloseCursorPortalPlan;
