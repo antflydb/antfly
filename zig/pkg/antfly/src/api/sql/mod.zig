@@ -18,3 +18,4 @@ pub const prepared_statements = @import("prepared_statements.zig");
 pub const routines = @import("routines.zig");
 pub const savepoints = @import("savepoints.zig");
 pub const sessions = @import("sessions.zig");
+pub const transactions = @import("transactions.zig");

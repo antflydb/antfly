@@ -38,6 +38,7 @@ const sql_prepared_statements = api_sql.prepared_statements;
 const sql_routines = api_sql.routines;
 const sql_savepoints = api_sql.savepoints;
 const sql_sessions = api_sql.sessions;
+const sql_transactions = api_sql.transactions;
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -4484,25 +4485,25 @@ pub const ApiHttpServer = struct {
     }
 
     fn parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
-        return sql_sessions.parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql);
+        return sql_transactions.parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql);
     }
 
     fn parsedSqlTransactionBoundaryStartsSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
-        return sql_sessions.parsedSqlTransactionBoundaryStartsSession(parsed_sql);
+        return sql_transactions.parsedSqlTransactionBoundaryStartsSession(parsed_sql);
     }
 
     fn publicSqlTransactionStatus(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) PublicSqlTransactionStatus {
         if (session.sql_transaction_failed) return .failed_transaction;
-        if (sql_sessions.transactionIsActive(session)) return .in_transaction;
+        if (sql_transactions.transactionIsActive(session)) return .in_transaction;
         return .idle;
     }
 
     fn markPublicSqlTransactionFailedIfActive(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession) void {
-        sql_sessions.markTransactionFailedIfActive(session);
+        sql_transactions.markTransactionFailedIfActive(session);
     }
 
     fn publicSqlReadOnlyActive(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) !bool {
-        return try sql_sessions.readOnlyActive(session);
+        return try sql_transactions.readOnlyActive(session);
     }
 
     fn sessionCatalogPlanAllowedInReadOnly(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.SessionCatalogPlan) !bool {
@@ -4510,11 +4511,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn transactionControlPlanAllowedInReadOnly(_: *ApiHttpServer, plan: sql_adapter.TransactionControlPlan) !bool {
-        return try sql_sessions.transactionControlPlanAllowedInReadOnly(plan);
+        return try sql_transactions.transactionControlPlanAllowedInReadOnly(plan);
     }
 
     fn applyTransactionModePlanToSession(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.TransactionModePlan) !bool {
-        return try sql_sessions.applyTransactionModePlanToSession(self.alloc, session, plan);
+        return try sql_transactions.applyTransactionModePlanToSession(self.alloc, session, plan);
     }
 
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
