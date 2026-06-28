@@ -200,6 +200,13 @@ jobs:
 
           dump_stacks() {
             local root_pid="$1"
+            echo "::group::antfly unit watchdog ptrace settings"
+            if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
+              cat /proc/sys/kernel/yama/ptrace_scope || true
+            fi
+            sysctl kernel.yama.ptrace_scope 2>/dev/null || true
+            echo "::endgroup::"
+
             echo "::group::antfly unit watchdog process tree"
             ps -eo pid,ppid,stat,etime,cmd | grep -E "PID|zig build|zig-local|/test|make zig-unit-test|make -C ./zig unit-test" || true
             echo "::endgroup::"
@@ -214,6 +221,20 @@ jobs:
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
                 *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                  echo "::group::proc snapshot pid=$pid cmd=$cmdline"
+                  if [ -r "/proc/$pid/status" ]; then
+                    grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
+                  fi
+                  if [ -r "/proc/$pid/wchan" ]; then
+                    printf "wchan="
+                    cat "/proc/$pid/wchan" || true
+                    printf "\n"
+                  fi
+                  if [ -r "/proc/$pid/stack" ]; then
+                    cat "/proc/$pid/stack" || true
+                  fi
+                  echo "::endgroup::"
+
                   echo "::group::gdb thread dump pid=$pid cmd=$cmdline"
                   timeout 45s gdb -batch -p "$pid" \
                     -ex "set pagination off" \
@@ -245,6 +266,14 @@ jobs:
               fi
             done
           }
+
+          if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
+            echo "::group::configure ptrace for unit watchdog"
+            echo "ptrace_scope before: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
+            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+            echo "ptrace_scope after: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
+            echo "::endgroup::"
+          fi
 
           make zig-unit-test &
           unit_pid="$!"
