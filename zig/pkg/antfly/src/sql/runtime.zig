@@ -968,7 +968,7 @@ pub fn lowerRecursiveCtePlanAlloc(
     return try lowerRecursiveCtePlanParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
 }
 
-fn lowerRecursiveCtePlanParsedSqlAlloc(
+pub fn lowerRecursiveCtePlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -997,6 +997,15 @@ pub fn lowerSetOperationPlanAlloc(
     return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, .{});
 }
 
+pub fn lowerSetOperationPlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, parsed_sql, schema, null, params, .{});
+}
+
 pub fn lowerSetOperationPlanWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -1005,6 +1014,16 @@ pub fn lowerSetOperationPlanWithFunctionBindingsAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredSetOperationPlan {
     return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, function_bindings);
+}
+
+pub fn lowerSetOperationPlanWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, parsed_sql, schema, null, params, function_bindings);
 }
 
 pub fn lowerSetOperationPlanWithSchemasAlloc(
@@ -1017,6 +1036,16 @@ pub fn lowerSetOperationPlanWithSchemasAlloc(
     return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, .{});
 }
 
+pub fn lowerSetOperationPlanWithSchemasParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, parsed_sql, schema, source_schema, params, .{});
+}
+
 pub fn lowerSetOperationPlanWithSchemasAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -1026,6 +1055,17 @@ pub fn lowerSetOperationPlanWithSchemasAndFunctionBindingsAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredSetOperationPlan {
     return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, function_bindings);
+}
+
+pub fn lowerSetOperationPlanWithSchemasAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, parsed_sql, schema, source_schema, params, function_bindings);
 }
 
 fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
@@ -1745,7 +1785,7 @@ pub fn lowerWindowPlanAlloc(
     return try lowerWindowPlanParsedSqlAlloc(alloc, &parsed_sql, schema, params);
 }
 
-fn lowerWindowPlanParsedSqlAlloc(
+pub fn lowerWindowPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -2928,7 +2968,7 @@ pub fn lowerAggregateAlloc(
     return try lowerAggregateParsedSqlAlloc(alloc, &parsed_sql, schema, params);
 }
 
-fn lowerAggregateParsedSqlAlloc(
+pub fn lowerAggregateParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -2966,7 +3006,7 @@ pub fn lowerAggregatePlanAlloc(
     return try lowerAggregatePlanParsedSqlAlloc(alloc, &parsed_sql, schema, params);
 }
 
-fn lowerAggregatePlanParsedSqlAlloc(
+pub fn lowerAggregatePlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -3016,6 +3056,15 @@ pub fn lowerJoinAlloc(
     return try lowerJoinWithSchemasAlloc(alloc, sql, schema, schema, params);
 }
 
+pub fn lowerJoinParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredJoin {
+    return try lowerJoinWithSchemasParsedSqlAlloc(alloc, parsed_sql, schema, schema, params);
+}
+
 pub fn lowerJoinWithSchemasAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -3028,7 +3077,7 @@ pub fn lowerJoinWithSchemasAlloc(
     return try lowerJoinWithSchemasParsedSqlAlloc(alloc, &parsed_sql, schema, source_schema, params);
 }
 
-fn lowerJoinWithSchemasParsedSqlAlloc(
+pub fn lowerJoinWithSchemasParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -3081,6 +3130,15 @@ pub fn lowerLateralPlanAlloc(
     return try lowerLateralPlanWithSchemasAlloc(alloc, sql, schema, schema, params);
 }
 
+pub fn lowerLateralPlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredLateralPlan {
+    return try lowerLateralPlanWithSchemasParsedSqlAlloc(alloc, parsed_sql, schema, schema, params);
+}
+
 pub fn lowerLateralPlanWithSchemasAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -3093,7 +3151,7 @@ pub fn lowerLateralPlanWithSchemasAlloc(
     return try lowerLateralPlanWithSchemasParsedSqlAlloc(alloc, &parsed_sql, schema, source_schema, params);
 }
 
-fn lowerLateralPlanWithSchemasParsedSqlAlloc(
+pub fn lowerLateralPlanWithSchemasParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
