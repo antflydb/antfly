@@ -909,12 +909,6 @@ const TriggerParser = struct {
     }
 };
 
-fn parseTriggerDdlAlloc(alloc: std.mem.Allocator, sql: []const u8) !TriggerDdlPlan {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try parseTriggerDdlParsedSqlAlloc(alloc, &parsed_sql);
-}
-
 fn parseTriggerDdlParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !TriggerDdlPlan {
     var parser = TriggerParser{ .alloc = alloc, .tokens = parsed_sql.items() };
     return try parser.parse();
