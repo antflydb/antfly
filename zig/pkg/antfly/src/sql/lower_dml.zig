@@ -2364,19 +2364,30 @@ pub fn classifyDeleteSelectorParsedSqlAlloc(
     return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
 }
 
-fn parseGeneratedDmlTargetAliasAlloc(
+fn tableAliasFromGeneratedDmlTargetAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     target_range: generated_parser.GeneratedSqlTokenRange,
     target_alias_end: usize,
+    target_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
 ) !plan_mod.TableAlias {
     if (target_range.start >= target_range.end or target_range.end > target_alias_end or target_alias_end > tokens.len) return error.UnsupportedSqlShape;
-    var pos: usize = 0;
-    const target_tokens = tokens[target_range.start..target_alias_end];
-    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, target_tokens, &pos);
-    errdefer plan_mod.freeTableAlias(alloc, target_table);
-    if (pos != target_tokens.len) return error.UnsupportedSqlShape;
-    return target_table;
+    if (tokens[target_range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    const name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_range.start].text);
+    errdefer alloc.free(name);
+
+    const alias = if (target_alias_name_tokens) |alias_range| blk: {
+        if (alias_range.start >= alias_range.end or alias_range.end > target_alias_end) return error.UnsupportedSqlShape;
+        if (alias_range.end != target_alias_end or alias_range.end != alias_range.start + 1) return error.UnsupportedSqlShape;
+        if (tokens[alias_range.start].kind != .identifier) return error.UnsupportedSqlShape;
+        break :blk try alloc.dupe(u8, tokens[alias_range.start].text);
+    } else blk: {
+        if (target_alias_end != target_range.end) return error.UnsupportedSqlShape;
+        break :blk try alloc.dupe(u8, name);
+    };
+    errdefer alloc.free(alias);
+
+    return .{ .name = name, .alias = alias };
 }
 
 fn generatedDmlTargetAliasEnd(
@@ -2481,7 +2492,7 @@ fn classifyGeneratedUpdateSelectorFromDmlAstAlloc(
     const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const target_alias_end = try generatedUpdateTargetAliasEnd(tokens, ast, target_range, end);
-    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, target_alias_end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
     const where_range = ast.where_tokens orelse return .source;
@@ -2513,7 +2524,7 @@ fn classifyGeneratedDeleteSelectorFromDmlAstAlloc(
     const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const target_alias_end = try generatedDeleteTargetAliasEnd(tokens, ast, target_range, end);
-    const target_table = try parseGeneratedDmlTargetAliasAlloc(alloc, tokens, target_range, target_alias_end);
+    const target_table = try tableAliasFromGeneratedDmlTargetAlloc(alloc, tokens, target_range, target_alias_end, ast.target_alias_name_tokens);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
     const where_range = ast.where_tokens orelse return .source;
@@ -15405,13 +15416,13 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         const update_target_start = try generatedUpdateTargetTableStart(update_tokens, update_start, update_end);
         const update_target_range = try requireGeneratedDmlTokenRangeAt(generated_update_ast.target_table_tokens, update_target_start, update_end);
         const update_target_alias_end = try generatedUpdateTargetAliasEnd(update_tokens, generated_update_ast, update_target_range, update_end);
-        const update_target = try parseGeneratedDmlTargetAliasAlloc(alloc, update_tokens, update_target_range, update_target_alias_end);
+        const update_target = try tableAliasFromGeneratedDmlTargetAlloc(alloc, update_tokens, update_target_range, update_target_alias_end, generated_update_ast.target_alias_name_tokens);
         defer plan_mod.freeTableAlias(alloc, update_target);
         try std.testing.expectEqualStrings("usage_records", update_target.name);
         try std.testing.expectEqualStrings("usage_records", update_target.alias);
         try std.testing.expectError(
             error.UnsupportedSqlShape,
-            parseGeneratedDmlTargetAliasAlloc(alloc, update_tokens, update_target_range, update_target_alias_end + 1),
+            tableAliasFromGeneratedDmlTargetAlloc(alloc, update_tokens, update_target_range, update_target_alias_end + 1, generated_update_ast.target_alias_name_tokens),
         );
 
         const delete_tokens = parsed_generated_delete.items();
@@ -15420,13 +15431,37 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         const delete_target_start = try generatedDeleteTargetTableStart(delete_tokens, delete_start, delete_end);
         const delete_target_range = try requireGeneratedDmlTokenRangeAt(generated_delete_ast.target_table_tokens, delete_target_start, delete_end);
         const delete_target_alias_end = try generatedDeleteTargetAliasEnd(delete_tokens, generated_delete_ast, delete_target_range, delete_end);
-        const delete_target = try parseGeneratedDmlTargetAliasAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end);
+        const delete_target = try tableAliasFromGeneratedDmlTargetAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end, generated_delete_ast.target_alias_name_tokens);
         defer plan_mod.freeTableAlias(alloc, delete_target);
         try std.testing.expectEqualStrings("usage_records", delete_target.name);
         try std.testing.expectEqualStrings("usage_records", delete_target.alias);
         try std.testing.expectError(
             error.UnsupportedSqlShape,
-            parseGeneratedDmlTargetAliasAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end + 1),
+            tableAliasFromGeneratedDmlTargetAlloc(alloc, delete_tokens, delete_target_range, delete_target_alias_end + 1, generated_delete_ast.target_alias_name_tokens),
+        );
+
+        var parsed_aliased_update = try tokenized.ParsedSql.initAlloc(
+            alloc,
+            "UPDATE usage_records AS u SET status = 'done' WHERE u.id = 'u1'",
+        );
+        defer parsed_aliased_update.deinit(alloc);
+        const aliased_update_ast = switch ((parsed_aliased_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+            .dml => |ast| ast,
+            else => return error.TestUnexpectedResult,
+        };
+        const aliased_update_tokens = parsed_aliased_update.items();
+        const aliased_update_end = generatedDmlStatementEnd(aliased_update_tokens, aliased_update_ast.statement_span) orelse return error.TestUnexpectedResult;
+        const aliased_update_start = try generatedDmlCommandStart(aliased_update_tokens, aliased_update_ast, aliased_update_end);
+        const aliased_update_target_start = try generatedUpdateTargetTableStart(aliased_update_tokens, aliased_update_start, aliased_update_end);
+        const aliased_update_target_range = try requireGeneratedDmlTokenRangeAt(aliased_update_ast.target_table_tokens, aliased_update_target_start, aliased_update_end);
+        const aliased_update_target_alias_end = try generatedUpdateTargetAliasEnd(aliased_update_tokens, aliased_update_ast, aliased_update_target_range, aliased_update_end);
+        const aliased_update_target = try tableAliasFromGeneratedDmlTargetAlloc(alloc, aliased_update_tokens, aliased_update_target_range, aliased_update_target_alias_end, aliased_update_ast.target_alias_name_tokens);
+        defer plan_mod.freeTableAlias(alloc, aliased_update_target);
+        try std.testing.expectEqualStrings("usage_records", aliased_update_target.name);
+        try std.testing.expectEqualStrings("u", aliased_update_target.alias);
+        try std.testing.expectError(
+            error.UnsupportedSqlShape,
+            tableAliasFromGeneratedDmlTargetAlloc(alloc, aliased_update_tokens, aliased_update_target_range, aliased_update_target_alias_end - 1, aliased_update_ast.target_alias_name_tokens),
         );
     }
 

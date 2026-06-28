@@ -446,6 +446,9 @@ the legacy token scanner. Write-target binding for generated `INSERT`,
 `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements now consumes retained
 generated target-table metadata and validates that the target range sits at the
 generated command's target position before schema binding can continue. Direct
+generated selector classification for `UPDATE` and `DELETE` constructs target
+table aliases from retained generated target/alias ranges instead of reparsing
+the target through the legacy DML alias parser. Direct
 joined-source prebinding for generated `UPDATE ... FROM`, `DELETE ... USING`,
 and `MERGE ... USING` consumes retained relation-source wrapper metadata and
 fails closed when source table metadata is stale instead of reopening the

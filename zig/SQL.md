@@ -1637,6 +1637,10 @@ Current implementation status:
   metadata for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE`, and fails
   closed when the retained target range no longer matches the generated command
   layout instead of falling back to a legacy token scan.
+- Generated point-vs-source selector classification for direct `UPDATE` and
+  `DELETE` now constructs target table aliases from retained generated
+  target/alias ranges instead of reparsing the target through the legacy DML
+  alias parser.
 - Joined-source catalog prebinding for generated direct `UPDATE ... FROM`,
   `DELETE ... USING`, and `MERGE ... USING` now consumes retained generated
   relation-source metadata, and fails closed when source-table metadata drifts
