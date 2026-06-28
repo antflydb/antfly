@@ -30,6 +30,8 @@ are also SQL-owned, with API callers using re-exports instead of owning the row
 contract.
 SQL parity and native-requirement fixtures live under `pkg/antfly/src/sql`
 alongside the corpus parser that validates them.
+Query-function lowering consumes the neutral query contract under
+`pkg/antfly/src/query` rather than API-owned query helpers.
 
 The reusable generator machinery lives under `zig/lib/yacc`, following the same
 library-plus-codegen shape as `zig/lib/openapi`. Antfly SQL owns only the input
@@ -1450,7 +1452,10 @@ boundaries, `name AS (...)` layout, partition/order list payloads, and frame
 expression spans before publishing a generated read family. Simple generated
 read sources now retain source table and alias/name token ranges, and read
 classification rejects missing simple-source table metadata unless the source is
-a generated table function or join. Join classification
+a generated table function or join. Catalog prebinding for generated simple
+read sources now consumes the retained generated source-table range directly
+and fails closed when that range drifts into alias or non-source tokens instead
+of rediscovering the table through the legacy source scanner. Join classification
 now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete

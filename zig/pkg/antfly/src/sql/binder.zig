@@ -23,6 +23,7 @@ const ddl_plan = @import("ddl.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("catalog_resources.zig");
+const generated_parser = @import("generated_parser.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
@@ -2848,7 +2849,62 @@ pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
         .read => {},
         else => return error.UnsupportedSqlShape,
     }
+    if (generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
+        if (try readSourceTableNamesFromGeneratedReadAstAlloc(alloc, parsed_sql.items(), read_ast)) |resolved| return resolved;
+    }
     return try readSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
+}
+
+fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |read| read,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
+fn readSourceTableNamesFromGeneratedReadAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+) !?ReadSourceTableNames {
+    if (read_ast.cte_tokens != null or
+        read_ast.join_items.len != 0 or
+        read_ast.source_antfly_function_items.len != 0 or
+        read_ast.source_graph_function_items.len != 0 or
+        read_ast.set_operation_tokens != null)
+    {
+        return null;
+    }
+    const source_tokens = read_ast.source_tokens orelse return null;
+    const table_tokens = read_ast.source_table_tokens orelse return null;
+    try validateGeneratedSimpleReadSourceTableTokens(tokens, source_tokens, table_tokens);
+    const table = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[table_tokens.start].text);
+    errdefer alloc.free(table);
+    return .{
+        .left = table,
+        .source = try alloc.dupe(u8, table),
+    };
+}
+
+fn validateGeneratedSimpleReadSourceTableTokens(
+    tokens: []const Token,
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    table_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (table_tokens.start >= table_tokens.end or table_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+    if (table_tokens.end != table_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (table_tokens.start != source_tokens.start) {
+        if (table_tokens.start != source_tokens.start + 1 or !tokens[source_tokens.start].matchesKeywordTag(.only)) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    if (tokens[table_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
 }
 
 fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
@@ -3263,6 +3319,25 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     defer single_table.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", single_table.left);
     try std.testing.expectEqualStrings("usage_records", single_table.source);
+
+    var alias_source_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT u.id FROM usage_records AS u WHERE u.status = 'open'",
+    );
+    defer alias_source_sql.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, alias_source_sql.generatedStatementKind().?);
+    var alias_source = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &alias_source_sql)).?;
+    defer alias_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", alias_source.left);
+    try std.testing.expectEqualStrings("usage_records", alias_source.source);
+
+    if (alias_source_sql.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .read => |*read| read.source_table_tokens = read.source_alias_name_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &alias_source_sql));
 
     var joined_sql = try tokenized.ParsedSql.initAlloc(
         alloc,

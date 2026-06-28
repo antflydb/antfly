@@ -12,12 +12,16 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const public_query_string = @import("../query/public_query_string.zig");
+pub const contract = @import("contract.zig");
+pub const public_embedding_query = @import("public_embedding_query.zig");
+pub const public_query_string = @import("public_query_string.zig");
+pub const public_search_request = @import("public_search_request.zig");
+pub const public_text_query = @import("public_text_query.zig");
 
-pub const OwnedFilter = public_query_string.OwnedFilter;
-pub const ParseOptions = public_query_string.ParseOptions;
-
-pub const parseFilterAlloc = public_query_string.parseFilterAlloc;
-pub const parseFilterAllocWithOptions = public_query_string.parseFilterAllocWithOptions;
-pub const filterToStatefulTextQueryAlloc = public_query_string.filterToStatefulTextQueryAlloc;
-pub const joinTermsWithSpacesAlloc = public_query_string.joinTermsWithSpacesAlloc;
+test {
+    _ = contract;
+    _ = public_embedding_query;
+    _ = public_query_string;
+    _ = public_search_request;
+    _ = public_text_query;
+}

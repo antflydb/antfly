@@ -33,7 +33,7 @@ pub const transaction_runtime = @import("storage/db/maintenance/transaction_runt
 pub const schema = @import("storage/schema.zig");
 pub const batch = @import("api/batch.zig");
 pub const query = @import("api/query.zig");
-pub const query_contract = @import("api/query_contract.zig");
+pub const query_contract = @import("query/contract.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
 

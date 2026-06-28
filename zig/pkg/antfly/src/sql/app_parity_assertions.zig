@@ -20,7 +20,7 @@ const diagnostics = @import("diagnostics.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
-const query_contract = @import("../api/query_contract.zig");
+const query_contract = @import("../query/contract.zig");
 const query_function = @import("query_function.zig");
 const tokenized = @import("tokenized.zig");
 

@@ -17,8 +17,8 @@ const Allocator = std.mem.Allocator;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const request = @import("request.zig");
 const search_sources = @import("../search_sources.zig");
-const public_embedding_query_mod = @import("../../api/public_embedding_query.zig");
-const public_search_request_mod = @import("../../api/public_search_request.zig");
+const public_embedding_query_mod = @import("../../query/public_embedding_query.zig");
+const public_search_request_mod = @import("../../query/public_search_request.zig");
 
 pub const SearchPlan = struct {
     request: request.QueryRequest,

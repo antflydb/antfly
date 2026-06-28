@@ -16,7 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
-const query_contract = @import("../api/query_contract.zig");
+const query_contract = @import("../query/contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");

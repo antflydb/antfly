@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const foreign_mod = @import("../../foreign/mod.zig");
 const foreign_sources_api = @import("../../api/foreign_sources.zig");
-const public_text_query = @import("../../api/public_text_query.zig");
+const public_text_query = @import("../../query/public_text_query.zig");
 const json_helpers = @import("../../common/json_helpers.zig");
 const join_model = @import("../../api/join_model.zig");
 

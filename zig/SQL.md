@@ -1644,6 +1644,12 @@ Current implementation status:
 - SQL parity, coverage, native-requirement, and adapter-edge fixture manifests
   now live under `pkg/antfly/src/sql/fixtures/`; API integration tests reference
   those SQL-owned manifests instead of owning corpus inputs.
+- Catalog prebinding for generated simple read sources now consumes retained
+  generated source-table token metadata and fails closed when that metadata is
+  inconsistent, instead of always rediscovering the source table from tokens.
+- Query request contracts and public query parser helpers now live under
+  `pkg/antfly/src/query/`; SQL query-function lowering uses that neutral
+  contract directly instead of importing the API package.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
