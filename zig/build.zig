@@ -3806,6 +3806,8 @@ pub fn build(b: *std.Build) void {
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease is active",
             "provisioned create index updates cached writer in place",
+            "write cache metadata refresh preserves inactive adoptable seed",
+            "write cache adopts active just-created db across generation bump",
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
