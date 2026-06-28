@@ -3125,8 +3125,39 @@ pub const DB = struct {
         if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
-    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+    const DetachedEnrichmentRuntime = struct {
+        append_ctx: ?*EnrichmentAppendContext = null,
+        runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+                self.runtime = null;
+            }
+            if (self.append_ctx) |ctx| {
+                alloc.destroy(ctx);
+                self.append_ctx = null;
+            }
+        }
+
+        fn take(self: *@This()) struct {
+            append_ctx: *EnrichmentAppendContext,
+            runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+        } {
+            const append_ctx = self.append_ctx.?;
+            const runtime = self.runtime.?;
+            self.append_ctx = null;
+            self.runtime = null;
+            return .{
+                .append_ctx = append_ctx,
+                .runtime = runtime,
+            };
+        }
+    };
+
+    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -3167,8 +3198,17 @@ pub const DB = struct {
             enrichment_cfg,
         );
         errdefer runtime.deinit();
-        self.enrichment_append_context = append_ctx;
-        self.enrichment_runtime = runtime;
+        return .{
+            .append_ctx = append_ctx,
+            .runtime = runtime,
+        };
+    }
+
+    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
+        var detached = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
+        const owned = detached.take();
+        self.enrichment_append_context = owned.append_ctx;
+        self.enrichment_runtime = owned.runtime;
     }
 
     fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
@@ -3194,7 +3234,15 @@ pub const DB = struct {
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
 
         const query_visibility_hook = self.async_context.query_visibility_hook;
-        self.setQueryVisibilityHook(null);
+        var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
+        cfg_owned = false;
+        errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
+        if (detached) |*runtime| {
+            if (self.core.hasGeneratedEnrichmentTargets()) {
+                const target_sequence = self.core.nextEnrichmentSequence();
+                if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
+            }
+        }
 
         if (self.enrichment_runtime) |runtime| {
             runtime.deinit();
@@ -3206,13 +3254,30 @@ pub const DB = struct {
             self.enrichment_append_context = null;
         }
 
-        try self.initOptionalEnrichmentRuntime(owned_cfg);
-        cfg_owned = false;
-        if (query_visibility_hook) |hook| self.setQueryVisibilityHook(hook);
+        if (detached) |*runtime| {
+            const owned = runtime.take();
+            self.enrichment_append_context = owned.append_ctx;
+            self.enrichment_runtime = owned.runtime;
+        }
+        self.setQueryVisibilityHook(query_visibility_hook);
 
         if (self.enrichment_runtime) |runtime| {
-            try self.resumeGeneratedReplayFromJournalIfNeeded();
-            if (self.open_mode.allowsOptionalRuntimes()) try runtime.start();
+            if (self.open_mode.allowsOptionalRuntimes()) {
+                runtime.start() catch |err| {
+                    self.setQueryVisibilityHook(null);
+                    if (self.enrichment_runtime) |failed_runtime| {
+                        failed_runtime.deinit();
+                        self.runtime_alloc.destroy(failed_runtime);
+                        self.enrichment_runtime = null;
+                    }
+                    if (self.enrichment_append_context) |ctx| {
+                        self.runtime_alloc.destroy(ctx);
+                        self.enrichment_append_context = null;
+                    }
+                    self.setQueryVisibilityHook(query_visibility_hook);
+                    return err;
+                };
+            }
         }
     }
 
@@ -25921,6 +25986,34 @@ test "db enrichment enabled requires backend runtime io" {
         .executor = .{ .backend = .manual },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     }));
+}
+
+test "db enrichment reconfigure preserves active runtime when replacement cannot initialize" {
+    const alloc = std.testing.allocator;
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    const original_backend_runtime = db.backend_runtime;
+    defer db.backend_runtime = original_backend_runtime;
+
+    const original_runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    var manual_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer manual_runtime.deinit();
+
+    db.backend_runtime = manual_runtime.ptr();
+    var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.MissingBackendRuntimeIo, db.reconfigureEnrichmentRuntime(.{
+        .dense_embedder = replacement_embedder.interface(),
+    }));
+    try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {

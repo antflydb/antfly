@@ -642,6 +642,35 @@ pub const ProvisionedTableWriteCache = struct {
         cached.deinit(self.alloc);
     }
 
+    fn retireCachedLeaseAfterMutationFailureLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
+        const entry = cached.entry orelse {
+            cached.deinit(self.alloc);
+            return;
+        };
+
+        var track_retirement = true;
+        if (!entry.retired) self.reserveRetiredEntriesCapacityLocked(1) catch |err| {
+            std.log.err("failed to reserve retired writer-cache entry after structural mutation failure: {}", .{err});
+            track_retirement = false;
+        };
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (self.entries.items[i] != entry) continue;
+            _ = self.entries.orderedRemove(i);
+            break;
+        }
+
+        if (!entry.retired) {
+            if (track_retirement) {
+                self.retireEntryLocked(entry);
+            } else {
+                self.markEntryRetiredUntrackedLocked(entry);
+            }
+        }
+        cached.deinit(self.alloc);
+    }
+
     fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
         for (self.entries.items) |entry| {
             self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
@@ -2086,16 +2115,28 @@ pub const ProvisionedTableWriteCache = struct {
         self.retired_entries.appendAssumeCapacity(entry);
     }
 
+    fn reserveRetiredEntriesCapacityLocked(self: *ProvisionedTableWriteCache, count: usize) !void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, count);
+    }
+
+    fn markEntryRetiredUntrackedLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        if (entry.retired) return;
+        entry.retired = true;
+    }
+
     fn destroyRetiredEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         var i: usize = 0;
         while (i < self.retired_entries.items.len) : (i += 1) {
             if (self.retired_entries.items[i] != entry) continue;
             _ = self.retired_entries.orderedRemove(i);
-            entry.deinit(self.alloc);
-            self.alloc.destroy(entry);
-            return;
+            break;
         }
-        unreachable;
+        entry.deinit(self.alloc);
+        self.alloc.destroy(entry);
     }
 };
 
@@ -9507,7 +9548,7 @@ fn applyIndexCreateToCachedDb(
     const owned_name = try alloc.dupe(u8, index_name);
     defer alloc.free(owned_name);
     var enrichments = try createManagedDbEnrichments(db.runtime_alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
-    errdefer enrichments.deinit(alloc);
+    errdefer enrichments.deinit(db.runtime_alloc);
     if (enrichments.enabled()) {
         try db.reconfigureEnrichmentRuntime(enrichments.config());
         enrichments.forgetTransferred();
@@ -9552,10 +9593,15 @@ fn reconcileCachedLocalTableIndexCreate(
         defer alloc.free(path);
 
         var cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, self.visibleRootGeneration(group_id), table_name, .default_async);
-        defer cached.deinit(alloc);
+        var cached_active = true;
+        defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
-        try applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content);
+        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
         try catchUpManagedIndexCreate(alloc, cached.db, index_name);
         try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
         managed_visibility_changed = true;
