@@ -31,6 +31,7 @@ const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -90,10 +91,16 @@ const TestExecutionHook = struct {
     run: *const fn (ptr: *anyopaque) void,
 };
 
+const TestStartupCatchUpReplayPassHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque, db: *db_mod.DB) anyerror!void,
+};
+
 var test_before_batch_execution_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
+var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
@@ -167,6 +174,12 @@ fn runTestBeforeDropIndexWorkHook() void {
 fn runTestBeforeRestoreWorkHook() void {
     if (comptime builtin.is_test) {
         if (test_before_restore_work_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestAfterStartupCatchUpReplayPassHook(db: *db_mod.DB) !void {
+    if (comptime builtin.is_test) {
+        if (test_after_startup_catch_up_replay_pass_hook) |hook| try hook.run(hook.ptr, db);
     }
 }
 
@@ -11033,6 +11046,7 @@ fn catchUpManagedDb(
                 }
                 return err;
             };
+            try runTestAfterStartupCatchUpReplayPassHook(db);
 
             const next_debt_signature = try startupReplayDebtSignature(alloc, db);
             if (next_debt_signature.remaining == 0) break;
@@ -20542,6 +20556,175 @@ test "managed startup catch-up invalidates stale cached writer status after repl
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqual(@as(u64, statuses.items[0].stats.indexes[0].replay_target_sequence), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+}
+
+test "managed startup catch-up repeats replay while dense debt progresses" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-repeat-replay", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        const indexes_json = "{\"indexes\":[{\"name\":\"dense_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}}]}";
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ReplaySeed = struct {
+        fn appendDenseReplay(
+            seed_alloc: std.mem.Allocator,
+            db: *db_mod.DB,
+            doc_id: []const u8,
+            value: []const u8,
+            vector: []const f32,
+        ) !u64 {
+            const stored_key = try db_mod.internal_keys.documentKeyAlloc(seed_alloc, doc_id);
+            defer seed_alloc.free(stored_key);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = value },
+            }, &.{});
+
+            var dense_embeddings = try seed_alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
+            var batch = db_mod.derived_types.DerivedBatch{
+                .dense_embeddings = dense_embeddings,
+            };
+            defer db_mod.derived_types.deinitDerivedBatch(seed_alloc, &batch);
+            dense_embeddings[0] = .{
+                .index_name = try seed_alloc.dupe(u8, "dense_idx"),
+                .doc_key = try seed_alloc.dupe(u8, doc_id),
+                .artifact_key = null,
+                .vector = try seed_alloc.dupe(f32, vector),
+            };
+
+            const sequence = db.core.store.reserveNextReplaySequence(1);
+            var record = try change_journal_mod.recordFromDerivedBatch(seed_alloc, batch, sequence);
+            defer change_journal_mod.deinitRecord(seed_alloc, &record);
+            const encoded = try change_journal_mod.encodeRecord(seed_alloc, record);
+            defer seed_alloc.free(encoded);
+            try db_mod.replay_stream.appendOpaque(seed_alloc, db.core.store, sequence, encoded);
+            return sequence;
+        }
+    };
+
+    {
+        var seeded = try db_mod.DB.open(alloc, path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer seeded.close();
+        try seeded.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+        _ = try ReplaySeed.appendDenseReplay(alloc, &seeded, "doc:a", "{\"title\":\"alpha\"}", &[_]f32{ 1, 0 });
+    }
+    {
+        var seeded_check = try db_mod.DB.open(alloc, path, .{
+            .open_mode = .writer_no_replay,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer seeded_check.close();
+        const before = try seeded_check.stats(alloc);
+        defer db_mod.types.freeDBStats(alloc, before);
+        try std.testing.expectEqual(@as(usize, 1), before.indexes.len);
+        try std.testing.expect(before.indexes[0].replay_catch_up_required);
+    }
+
+    const ReplayPassHook = struct {
+        alloc: std.mem.Allocator,
+        passes: usize = 0,
+        inserted: bool = false,
+
+        fn run(ptr: *anyopaque, db: *db_mod.DB) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.passes += 1;
+            if (self.inserted) return;
+            self.inserted = true;
+            _ = try ReplaySeed.appendDenseReplay(self.alloc, db, "doc:b", "{\"title\":\"beta\"}", &[_]f32{ 0, 1 });
+        }
+    };
+
+    var hook_ctx = ReplayPassHook{ .alloc = alloc };
+    const previous_hook = test_after_startup_catch_up_replay_pass_hook;
+    test_after_startup_catch_up_replay_pass_hook = .{
+        .ptr = &hook_ctx,
+        .run = ReplayPassHook.run,
+    };
+    defer test_after_startup_catch_up_replay_pass_hook = previous_hook;
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    var startup_db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .writer_no_replay,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .prefer_existing_identity_namespace = true,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .transaction_recovery = .{ .enabled = false },
+        .text_merge = .{ .enabled = false },
+    });
+    defer startup_db.close();
+
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db);
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(result.had_debt);
+    try std.testing.expect(result.cleared_debt);
+    try std.testing.expect(hook_ctx.inserted);
+    try std.testing.expect(hook_ctx.passes >= 2);
+
+    const after = try startup_db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, after);
+    try std.testing.expectEqual(@as(usize, 1), after.indexes.len);
+    try std.testing.expectEqual(@as(u64, after.indexes[0].replay_target_sequence), after.indexes[0].replay_applied_sequence);
+    try std.testing.expect(after.indexes[0].replay_target_sequence >= 2);
+    try std.testing.expect(!after.indexes[0].replay_catch_up_required);
 }
 
 test "managed startup catch-up defers while shared writer cache owns the table" {

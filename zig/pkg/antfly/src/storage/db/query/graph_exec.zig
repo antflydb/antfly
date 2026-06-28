@@ -721,17 +721,25 @@ pub fn fuseNamedSets(
         else
             null;
         const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
-        const stored_data = if (req.include_stored)
-            try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
-        else
-            null;
-        hits[i] = .{
-            .id = try alloc.dupe(u8, output_doc_id),
-            .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
-            .score = @floatCast(hit.score),
-            .index_scores = try types.cloneIndexScores(alloc, hit.index_scores),
-            .stored_data = stored_data,
+        const materialized = blk: {
+            const owned_id = try alloc.dupe(u8, output_doc_id);
+            errdefer alloc.free(owned_id);
+            const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            errdefer types.freeIndexScores(alloc, owned_index_scores);
+            const stored_data = if (req.include_stored)
+                try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
+            else
+                null;
+            errdefer if (stored_data) |value| alloc.free(value);
+            break :blk types.SearchHit{
+                .id = owned_id,
+                .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
+                .score = @floatCast(hit.score),
+                .index_scores = owned_index_scores,
+                .stored_data = stored_data,
+            };
         };
+        hits[i] = materialized;
         initialized += 1;
     }
 

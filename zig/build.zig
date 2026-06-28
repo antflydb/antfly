@@ -3803,6 +3803,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "managed startup catch-up repeats replay while dense debt progresses",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3869,6 +3870,8 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
+    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
