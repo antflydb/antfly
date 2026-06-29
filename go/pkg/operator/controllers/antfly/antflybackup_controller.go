@@ -16,7 +16,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 )
@@ -387,5 +389,41 @@ func (r *AntflyBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyBackup{}).
 		Owns(&batchv1.CronJob{}).
+		Watches(&antflyv1.AntflyCluster{}, handler.EnqueueRequestsFromMapFunc(r.requestsForCluster)).
 		Complete(r)
+}
+
+func (r *AntflyBackupReconciler) requestsForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	cluster, ok := obj.(*antflyv1.AntflyCluster)
+	if !ok {
+		return nil
+	}
+
+	backupList := &antflyv1.AntflyBackupList{}
+	if err := r.List(ctx, backupList); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list AntflyBackups for AntflyCluster watch",
+			"cluster", cluster.Name,
+			"namespace", cluster.Namespace,
+		)
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(backupList.Items))
+	for i := range backupList.Items {
+		backup := &backupList.Items[i]
+		clusterNamespace := backup.Spec.ClusterRef.Namespace
+		if clusterNamespace == "" {
+			clusterNamespace = backup.Namespace
+		}
+		if backup.Spec.ClusterRef.Name != cluster.Name || clusterNamespace != cluster.Namespace {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      backup.Name,
+				Namespace: backup.Namespace,
+			},
+		})
+	}
+	return requests
 }

@@ -496,8 +496,13 @@ pub const Host = struct {
         max_tick_groups: usize,
         max_ready_groups: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
+        const inbound_start_ns = platform_time.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
-        return try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
+        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
+        round.elapsed_ns += round.inbound_drain_elapsed_ns;
+        return round;
     }
 
     pub fn step(self: *Host, group_id: u64, msg: raft_engine.core.Message) !void {

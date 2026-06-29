@@ -1,12 +1,15 @@
 package controllers
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestShellQuote(t *testing.T) {
@@ -254,6 +257,61 @@ func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
 	}
 	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
 		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %q", got)
+	}
+}
+
+func TestRequestsForClusterEnqueuesReferencingBackups(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "cluster-ns"},
+	}
+	sameNamespaceBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "same-ns", Namespace: "cluster-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "cluster"},
+		},
+	}
+	crossNamespaceBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-ns", Namespace: "backup-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "cluster", Namespace: "cluster-ns"},
+		},
+	}
+	otherBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "cluster-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "other-cluster"},
+		},
+	}
+
+	r := &AntflyBackupReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(sameNamespaceBackup, crossNamespaceBackup, otherBackup).
+			Build(),
+	}
+
+	requests := r.requestsForCluster(context.Background(), cluster)
+	got := make(map[string]bool, len(requests))
+	for _, req := range requests {
+		got[req.NamespacedName.String()] = true
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 requests, got %d: %#v", len(got), got)
+	}
+	if !got["cluster-ns/same-ns"] {
+		t.Fatalf("expected same-namespace backup request, got %#v", got)
+	}
+	if !got["backup-ns/cross-ns"] {
+		t.Fatalf("expected cross-namespace backup request, got %#v", got)
+	}
+	if got["cluster-ns/other"] {
+		t.Fatalf("did not expect unrelated backup request, got %#v", got)
 	}
 }
 

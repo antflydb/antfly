@@ -67,6 +67,63 @@ fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     }
 }
 
+fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRound) void {
+    if (round.elapsed_ns <= metadata_run_round_slow_phase_threshold_ns) return;
+    const ready = round.slowest_ready_group;
+    std.log.warn(
+        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d} ready_messages={d} ready_message_bytes={d} ready_committed_entries={d} ready_committed_bytes={d} ready_unstable_entries={d} ready_unstable_bytes={d} ready_read_states={d} ready_has_snapshot={} ready_snapshot_bytes={d} ready_async_storage={} ready_processed={} ready_denied_backpressure={} ready_denied_transport_capacity={} ready_denied_apply_capacity={} ready_denied_snapshot_throttle={} ready_has_more={}",
+        .{
+            @divTrunc(round.elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.tick_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.drain_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.persist_batch_begin_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.persist_batch_finish_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.outbox_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.apply_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.transport_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.transport_advance_elapsed_ns, std.time.ns_per_ms),
+            round.ticked_groups,
+            round.processed_groups,
+            round.virtual_round,
+            round.virtual_time_ms,
+            ready.group_id,
+            @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.snapshot_throttle_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.persist_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.async_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.clone_messages_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.enqueue_apply_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.async_message_loop_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.outbox_append_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.raft_advance_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+            ready.message_count,
+            ready.message_bytes,
+            ready.committed_entries,
+            ready.committed_entry_bytes,
+            ready.unstable_entries,
+            ready.unstable_entry_bytes,
+            ready.read_states,
+            ready.has_snapshot,
+            ready.snapshot_bytes,
+            ready.async_storage_writes,
+            ready.processed,
+            ready.denied_by_backpressure,
+            ready.denied_by_transport_capacity,
+            ready.denied_by_apply_capacity,
+            ready.denied_by_snapshot_throttle,
+            ready.has_more_ready,
+        },
+    );
+}
+
 const MetadataRunRoundTrace = struct {
     const Phase = struct {
         name: []const u8,
@@ -2730,6 +2787,7 @@ pub const MetadataHttpService = struct {
         }
         self.refreshProbeReady();
         run_round_trace.recordSince("raft_round", phase_start_ns);
+        if (self.raft.lastRuntimeRound()) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -3045,6 +3103,10 @@ pub const MetadataHttpService = struct {
 
         const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
         var next_request_ns: u64 = 0;
+        var request_attempts: usize = 0;
+        var not_leader_count: usize = 0;
+        var raft_rounds: usize = 0;
+        var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
@@ -3052,12 +3114,15 @@ pub const MetadataHttpService = struct {
                 self.lockRuntime();
                 {
                     defer self.unlockRuntime();
+                    request_attempts += 1;
                     self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
                         // A follower may not know the leader yet during elections,
                         // restarts, or after endpoint-level load balancing. Keep
                         // driving raft below and retry the same read context until
                         // the barrier completes or the caller's timeout expires.
-                        error.NotLeader => {},
+                        error.NotLeader => {
+                            not_leader_count += 1;
+                        },
                         else => return err,
                     };
                 }
@@ -3072,11 +3137,96 @@ pub const MetadataHttpService = struct {
                     try self.raft.runRaftRoundOnly();
                 }
             }
+            raft_rounds += 1;
+            if (self.raft.lastRuntimeRound()) |round| {
+                if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
+                logMetadataRaftRoundDiagnostics(round);
+            }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             platform_clock.Clock.real().sleepMs(1);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
+        self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round);
         return error.MetadataLinearizableReadTimeout;
+    }
+
+    fn logLinearizableReadTimeout(
+        self: *MetadataHttpService,
+        request_id: u64,
+        request_attempts: usize,
+        not_leader_count: usize,
+        raft_rounds: usize,
+        slowest_round: raft_engine.runtime.multi_raft.HostRound,
+    ) void {
+        const raft_status = self.raft.raftStatus(self.metadata_group_id);
+        const node_id = if (raft_status) |s| s.id else 0;
+        const role = if (raft_status) |s| @tagName(s.soft.role) else "unknown";
+        const leader_id = if (raft_status) |s| if (s.soft.leader_id) |leader| leader else 0 else 0;
+        const has_leader = if (raft_status) |s| s.soft.leader_id != null else false;
+        const term = if (raft_status) |s| s.hard.current_term else 0;
+        const commit_index = if (raft_status) |s| s.hard.commit_index else 0;
+        const applied_index = if (raft_status) |s| s.applied_index else 0;
+        const last_index = if (raft_status) |s| s.last_index else 0;
+        const election_elapsed = if (raft_status) |s| s.election_elapsed else 0;
+        const ready = slowest_round.slowest_ready_group;
+        std.log.warn(
+            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_ready_group_id={d} slowest_ready_group_ms={d} slowest_ready_build_ms={d} slowest_ready_backpressure_ms={d} slowest_ready_capacity_ms={d} slowest_ready_snapshot_throttle_ms={d} slowest_ready_persist_ms={d} slowest_ready_async_ms={d} slowest_ready_clone_messages_ms={d} slowest_ready_enqueue_apply_ms={d} slowest_ready_async_loop_ms={d} slowest_ready_outbox_append_ms={d} slowest_ready_advance_ms={d} slowest_ready_inline_apply_flush_ms={d} slowest_ready_inline_outbox_drain_ms={d} slowest_ready_inline_transport_flush_ms={d} slowest_ready_messages={d} slowest_ready_committed_entries={d} slowest_ready_unstable_entries={d} slowest_ready_read_states={d} slowest_ready_has_snapshot={} slowest_ready_async_storage={} slowest_ready_processed={} slowest_ready_denied_backpressure={} slowest_ready_denied_transport_capacity={} slowest_ready_denied_apply_capacity={} slowest_ready_denied_snapshot_throttle={} slowest_ready_has_more={}",
+            .{
+                request_id,
+                self.metadata_group_id,
+                request_attempts,
+                not_leader_count,
+                raft_rounds,
+                self.raft.pending_updates.items.len,
+                node_id,
+                role,
+                has_leader,
+                leader_id,
+                term,
+                commit_index,
+                applied_index,
+                last_index,
+                election_elapsed,
+                @divTrunc(slowest_round.elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.tick_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.drain_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.apply_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.transport_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.transport_advance_elapsed_ns, std.time.ns_per_ms),
+                slowest_round.ticked_groups,
+                slowest_round.processed_groups,
+                ready.group_id,
+                @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.snapshot_throttle_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.persist_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.async_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.clone_messages_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.enqueue_apply_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.async_message_loop_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.outbox_append_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.raft_advance_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+                ready.message_count,
+                ready.committed_entries,
+                ready.unstable_entries,
+                ready.read_states,
+                ready.has_snapshot,
+                ready.async_storage_writes,
+                ready.processed,
+                ready.denied_by_backpressure,
+                ready.denied_by_transport_capacity,
+                ready.denied_by_apply_capacity,
+                ready.denied_by_snapshot_throttle,
+                ready.has_more_ready,
+            },
+        );
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
