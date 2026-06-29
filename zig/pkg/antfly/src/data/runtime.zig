@@ -3342,7 +3342,7 @@ pub const DataServer = struct {
     fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
         const raft_status = status orelse return false;
         if (raft_status.soft.leader_id != null) return false;
-        if (raft_status.soft.role != .follower) return false;
+        if (raft_status.soft.role == .leader) return false;
         return localRaftStatusIsVoter(raft_status, local_node_id);
     }
 
@@ -8962,6 +8962,36 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
+}
+
+test "data raft bootstrap campaign retries leaderless voter elections" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = 7001,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
 }
 
 test "data runtime live writer source follows raft apply ownership" {
