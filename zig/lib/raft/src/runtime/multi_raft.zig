@@ -62,6 +62,7 @@ pub const ReadyGroupDiagnostics = struct {
     capacity_check_elapsed_ns: u64 = 0,
     snapshot_throttle_elapsed_ns: u64 = 0,
     persist_ready_elapsed_ns: u64 = 0,
+    persist_ready_detail: storage_iface.ReadyPersistenceDiagnostics = .{},
     async_ready_elapsed_ns: u64 = 0,
     clone_messages_elapsed_ns: u64 = 0,
     enqueue_apply_elapsed_ns: u64 = 0,
@@ -646,9 +647,17 @@ pub const MultiRaft = struct {
 
         const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (persist_batch) |batch| {
-            try batch.persistReady(group_id, ready);
+            try batch.persistReadyWithDiagnostics(
+                group_id,
+                ready,
+                if (diagnostics) |diag| &diag.persist_ready_detail else null,
+            );
         } else if (self.hooks.group_storage) |storage| {
-            try storage.persistReady(group_id, ready);
+            try storage.persistReadyWithDiagnostics(
+                group_id,
+                ready,
+                if (diagnostics) |diag| &diag.persist_ready_detail else null,
+            );
         }
         if (diagnostics) |diag| diag.persist_ready_elapsed_ns = clock.elapsedSinceNs(persist_ready_start_ns);
 

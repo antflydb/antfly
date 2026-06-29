@@ -14,6 +14,21 @@
 
 const core = @import("../core/mod.zig");
 
+pub const ReadyPersistenceDiagnostics = struct {
+    storage_apply_elapsed_ns: u64 = 0,
+    encode_elapsed_ns: u64 = 0,
+    wal_append_elapsed_ns: u64 = 0,
+    wal_wait_elapsed_ns: u64 = 0,
+    wal_coalesce_elapsed_ns: u64 = 0,
+    wal_txn_open_elapsed_ns: u64 = 0,
+    wal_put_elapsed_ns: u64 = 0,
+    wal_commit_elapsed_ns: u64 = 0,
+    wal_physical_commits: u64 = 0,
+    encoded_bytes: u64 = 0,
+    delta_records_since_checkpoint: u64 = 0,
+    delta_bytes_since_checkpoint: u64 = 0,
+};
+
 // GroupStorage owns raft-log durability for one hosted group.
 // Implementations must consume the passed slices synchronously and must not retain them.
 pub const GroupStorage = struct {
@@ -22,10 +37,30 @@ pub const GroupStorage = struct {
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
+        persist_ready_diagnostics: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            ready: core.Ready,
+            diagnostics: *ReadyPersistenceDiagnostics,
+        ) anyerror!void = null,
     };
 
     pub fn persistReady(self: GroupStorage, group_id: core.types.GroupId, ready: core.Ready) !void {
         return try self.vtable.persist_ready(self.ptr, group_id, ready);
+    }
+
+    pub fn persistReadyWithDiagnostics(
+        self: GroupStorage,
+        group_id: core.types.GroupId,
+        ready: core.Ready,
+        diagnostics: ?*ReadyPersistenceDiagnostics,
+    ) !void {
+        if (diagnostics) |diag| {
+            if (self.vtable.persist_ready_diagnostics) |persist_ready_diagnostics| {
+                return try persist_ready_diagnostics(self.ptr, group_id, ready, diag);
+            }
+        }
+        return try self.persistReady(group_id, ready);
     }
 };
 
@@ -37,11 +72,31 @@ pub const PersistBatch = struct {
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
+        persist_ready_diagnostics: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            ready: core.Ready,
+            diagnostics: *ReadyPersistenceDiagnostics,
+        ) anyerror!void = null,
         finish: *const fn (ptr: *anyopaque) anyerror!void,
     };
 
     pub fn persistReady(self: PersistBatch, group_id: core.types.GroupId, ready: core.Ready) !void {
         return try self.vtable.persist_ready(self.ptr, group_id, ready);
+    }
+
+    pub fn persistReadyWithDiagnostics(
+        self: PersistBatch,
+        group_id: core.types.GroupId,
+        ready: core.Ready,
+        diagnostics: ?*ReadyPersistenceDiagnostics,
+    ) !void {
+        if (diagnostics) |diag| {
+            if (self.vtable.persist_ready_diagnostics) |persist_ready_diagnostics| {
+                return try persist_ready_diagnostics(self.ptr, group_id, ready, diag);
+            }
+        }
+        return try self.persistReady(group_id, ready);
     }
 
     pub fn finish(self: PersistBatch) !void {
