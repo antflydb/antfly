@@ -388,6 +388,7 @@ pub const LoweredQueryPlan = struct {
 
 pub const LoweredSetOperationPlan = struct {
     operation: SelectSetOperation,
+    ctes: []const db_mod.types.RelationalRowsCte = &.{},
     left: LoweredQueryPlan,
     right: LoweredQueryPlan,
     output_columns: []const runtime_schema.RelationalColumn = &.{},
@@ -399,6 +400,7 @@ pub const LoweredSetOperationPlan = struct {
     spill_after_bytes: ?u64 = db_mod.types.default_relational_rows_cte_spill_after_bytes,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freePlanCtes(alloc, self.ctes);
         self.left.deinit(alloc);
         self.right.deinit(alloc);
         freeSetOperationOutputColumns(alloc, self.output_columns);
@@ -585,6 +587,7 @@ pub const LoweredJoinedMutationSource = struct {
 
 pub const LowerWritePlanOptions = struct {
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
+    default_context: relational_rows.DefaultValueContext = .{},
     row_claim: ?db_mod.types.RowClaimRequest = null,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     insert_source_schema: ?runtime_schema.TableSchema = null,
@@ -1100,6 +1103,7 @@ pub fn findCteByName(ctes: []const db_mod.types.RelationalRowsCte, name: []const
 
 pub const CteSelectParserHooks = struct {
     ptr: *anyopaque,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     parse_select: *const fn (
         *anyopaque,
         []const Token,
@@ -1195,6 +1199,7 @@ pub const RecursiveCteMemberProjectionExpression = struct {
 
 pub const SetOperationParserHooks = struct {
     ptr: *anyopaque,
+    cte_hooks: CteSelectParserHooks,
     context_hooks: ReadPlanParserContextHooks,
     parse_select: *const fn (*anyopaque) anyerror!LoweredSelect,
     select_output_columns: *const fn (
@@ -1370,19 +1375,34 @@ pub fn parseCtesForPlanAlloc(
         try parser.consumeCteMaterializationHint(tokens, pos);
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
-        if (lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
-            pos.* = close_index + 1;
-            try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
-            try ctes.append(alloc, .{
-                .name = cte_name,
-                .table_function = table_function,
-            });
-            cte_name_transferred = true;
-            if (cursor.matchToken(.comma) == null) break;
-            continue;
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => {},
-            else => return err,
+        if (hooks.generated_read_ast) |generated_read_ast| {
+            const generated_cte = generatedReadCteForBodyRange(generated_read_ast, pos.*, close_index) orelse return error.UnsupportedSqlShape;
+            if (try lowerGeneratedReadGraphTableFunctionCteAlloc(alloc, tokens, generated_cte)) |table_function| {
+                pos.* = close_index + 1;
+                try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
+                try ctes.append(alloc, .{
+                    .name = cte_name,
+                    .table_function = table_function,
+                });
+                cte_name_transferred = true;
+                if (cursor.matchToken(.comma) == null) break;
+                continue;
+            }
+        } else {
+            if (lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
+                pos.* = close_index + 1;
+                try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
+                try ctes.append(alloc, .{
+                    .name = cte_name,
+                    .table_function = table_function,
+                });
+                cte_name_transferred = true;
+                if (cursor.matchToken(.comma) == null) break;
+                continue;
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
         }
         var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items);
         errdefer lowered.deinit(alloc);
@@ -1402,6 +1422,37 @@ pub fn parseCtesForPlanAlloc(
     }
 
     return try ctes.toOwnedSlice(alloc);
+}
+
+fn generatedReadCteForBodyRange(
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+    body_start: usize,
+    body_end: usize,
+) ?generated_parser.GeneratedSqlCteAst {
+    for (read_ast.cte_items) |cte| {
+        const body = cte.body_tokens orelse continue;
+        if (body.start == body_start and body.end == body_end) return cte;
+    }
+    return null;
+}
+
+fn lowerGeneratedReadGraphTableFunctionCteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+) !?db_mod.types.RelationalRowsTableFunction {
+    if (cte.body_source_antfly_function_items.len != cte.body_source_antfly_function_count) return error.UnsupportedSqlShape;
+    if (cte.body_source_graph_function_items.len != cte.body_source_graph_function_count) return error.UnsupportedSqlShape;
+    if (cte.body_source_graph_function_items.len == 0) return null;
+    if (cte.body_source_graph_function_items.len != 1) return error.UnsupportedSqlShape;
+    const graph_item = cte.body_source_graph_function_items[0];
+    for (cte.body_source_antfly_function_items) |antfly_item| {
+        if (!std.meta.eql(antfly_item.tokens, graph_item.tokens)) continue;
+        if (!std.meta.eql(antfly_item.name_tokens, graph_item.name_tokens)) continue;
+        if (!std.meta.eql(antfly_item.argument_tokens, graph_item.argument_tokens)) continue;
+        return try query_function.lowerAntflyGraphTableFunctionGeneratedAstAlloc(alloc, tokens, antfly_item, graph_item);
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerAntflyGraphTableFunctionCteAlloc(
@@ -1778,10 +1829,59 @@ pub fn parseSetOperationPlanAlloc(
     allow_distinct_table_names: bool,
     hooks: SetOperationParserHooks,
 ) !LoweredSetOperationPlan {
-    if (parser.peekKeywordTag(tokens, pos.*, .with)) return error.UnsupportedSqlShape;
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) {
+        return try parseSetOperationPlanWithCtesAlloc(
+            alloc,
+            tokens,
+            pos,
+            right_schema,
+            allow_distinct_table_names,
+            hooks,
+            &.{},
+            null,
+        );
+    }
 
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, hooks.cte_hooks);
+    errdefer freePlanCtes(alloc, ctes);
+
+    var final = try parseSetOperationPlanWithCtesAlloc(
+        alloc,
+        tokens,
+        pos,
+        right_schema,
+        allow_distinct_table_names,
+        hooks,
+        ctes,
+        &base_table_name,
+    );
+    errdefer final.deinit(alloc);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    _ = base_table_name orelse return error.UnsupportedSqlShape;
+
+    final.ctes = ctes;
+    ctes = &.{};
+    return final;
+}
+
+fn parseSetOperationPlanWithCtesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    right_schema: runtime_schema.TableSchema,
+    allow_distinct_table_names: bool,
+    hooks: SetOperationParserHooks,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: ?*?[]const u8,
+) !LoweredSetOperationPlan {
+    const previous_context = setReadPlanAvailableCtes(hooks.context_hooks, ctes);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
     var left = try parseSetOperationSelectWithContext(hooks, null, true, null);
     errdefer left.deinit(alloc);
+    if (base_table_name) |base| try resolveSetOperationSelectSourceForPlanAlloc(alloc, &left, ctes, base);
     const left_columns = try hooks.select_output_columns(hooks.ptr, left);
     var left_columns_transferred = false;
     errdefer if (!left_columns_transferred) freeSetOperationOutputColumns(alloc, left_columns);
@@ -1790,6 +1890,7 @@ pub fn parseSetOperationPlanAlloc(
     const op = try grammar.parseSelectSetOperation(tokens, pos);
     var right = try parseSetOperationSelectWithContext(hooks, right_schema, null, true);
     errdefer right.deinit(alloc);
+    if (base_table_name) |base| try resolveSetOperationSelectSourceForPlanAlloc(alloc, &right, ctes, base);
     const right_columns = try hooks.select_output_columns(hooks.ptr, right);
     defer freeSetOperationOutputColumns(alloc, right_columns);
 
@@ -1827,6 +1928,7 @@ pub fn parseSetOperationPlanAlloc(
     tail_transferred = true;
     return .{
         .operation = op,
+        .ctes = &.{},
         .left = left_plan,
         .right = right_plan,
         .output_columns = left_columns,
@@ -1837,6 +1939,20 @@ pub fn parseSetOperationPlanAlloc(
         .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
         .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
     };
+}
+
+fn resolveSetOperationSelectSourceForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredSelect,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    try resolveSelectSourceForPlanAlloc(alloc, lowered, ctes, base_table_name);
+    if (lowered.query.source_cte.len == 0) return;
+    const base = base_table_name.* orelse return error.UnsupportedSqlShape;
+    const physical_table_name = try alloc.dupe(u8, base);
+    alloc.free(lowered.table_name);
+    lowered.table_name = physical_table_name;
 }
 
 fn parseSetOperationSelectWithContext(

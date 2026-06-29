@@ -23,8 +23,10 @@ const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
 const platform = @import("antfly_platform");
-const catalog_resources = @import("../api/catalog_resources.zig");
-const relational_sql_ddl = @import("../api/relational_sql_ddl.zig");
+const catalog_resources = @import("../metadata/catalog/resources.zig");
+const catalog_source = @import("../metadata/catalog/source.zig");
+const catalog_table_ddl = @import("../metadata/catalog/table_ddl.zig");
+const relational_sql_ddl = @import("../metadata/catalog/relational_ddl.zig");
 const sql_adapter = @import("../sql/mod.zig");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
@@ -179,6 +181,7 @@ const LocalSwarmMetadata = struct {
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
+        sequences: []const antfly.metadata.SequenceRecord = &.{},
         extension_packages: []const antfly.extensions.PackageManifest = &.{},
         installed_extensions: []const antfly.extensions.InstalledExtension = &.{},
         extension_members: []const antfly.extensions.ExtensionMember = &.{},
@@ -226,12 +229,15 @@ const LocalSwarmMetadata = struct {
         self.* = undefined;
     }
 
-    fn catalogSource(self: *LocalSwarmMetadata) antfly.public_api.table_catalog.CatalogSource {
+    fn catalogSource(self: *LocalSwarmMetadata) catalog_source.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
             },
         };
     }
@@ -252,6 +258,8 @@ const LocalSwarmMetadata = struct {
                 .drop_index = dropIndex,
                 .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
@@ -309,6 +317,8 @@ const LocalSwarmMetadata = struct {
         errdefer self.manager.freeNamespaces(self.alloc, namespaces);
         const tablespaces = try self.manager.listTablespaces(self.alloc);
         errdefer self.manager.freeTablespaces(self.alloc, tablespaces);
+        const sequences = try self.manager.listSequences(self.alloc);
+        errdefer self.manager.freeSequences(self.alloc, sequences);
         const ranges = try self.manager.listRanges(self.alloc);
         errdefer self.manager.freeRanges(self.alloc, ranges);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
@@ -366,6 +376,7 @@ const LocalSwarmMetadata = struct {
             .databases = databases,
             .namespaces = namespaces,
             .tablespaces = tablespaces,
+            .sequences = sequences,
             .tables = tables,
             .ranges = ranges,
             .stores = stores,
@@ -384,6 +395,7 @@ const LocalSwarmMetadata = struct {
         self.manager.freeDatabases(self.alloc, snapshot.databases);
         self.manager.freeNamespaces(self.alloc, snapshot.namespaces);
         self.manager.freeTablespaces(self.alloc, snapshot.tablespaces);
+        self.manager.freeSequences(self.alloc, snapshot.sequences);
         self.manager.freeTables(self.alloc, snapshot.tables);
         self.manager.freeRanges(self.alloc, snapshot.ranges);
         for (snapshot.stores) |store| antfly.metadata.table_manager.freeStore(self.alloc, store);
@@ -427,12 +439,67 @@ const LocalSwarmMetadata = struct {
         try self.persistLocked();
     }
 
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogDropWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn upsertSequence(self: *LocalSwarmMetadata, record: antfly.metadata.SequenceRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertSequence(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn removeSequence(self: *LocalSwarmMetadata, sequence_id: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const removed = try self.manager.removeSequence(sequence_id);
+        antfly.metadata.table_manager.freeSequence(self.alloc, removed);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
     fn statusApplyTableCatalogUpdateWithSchemaRewriteJobs(
         ptr: *anyopaque,
         request: antfly.metadata.TableCatalogUpdateWithSchemaRewriteJobsRequest,
     ) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         return try self.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn statusApplyTableCatalogDropWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.applyTableCatalogDropWithSchemaRewriteJobs(request);
     }
 
     pub fn promoteTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingBarrierPromotionRequest) !void {
@@ -609,15 +676,15 @@ const LocalSwarmMetadata = struct {
 
     pub fn proposeTransitionCommand(_: *LocalSwarmMetadata, _: anytype) !void {}
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
+    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         var normalized_req = req;
-        const indexes_json = req.indexes_json orelse antfly.public_api.tables.default_indexes_json;
-        const prepared_indexes_json = try antfly.public_api.tables.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, antfly.public_api.tables.effectiveSchemaJson(req.schema_json));
+        const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+        const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
-        const table = antfly.public_api.tables.deriveTableRecord(table_name, normalized_req);
-        const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
+        const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+        const ranges = try catalog_table_ddl.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
@@ -675,7 +742,7 @@ const LocalSwarmMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
-        const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
+        const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
         try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
@@ -714,7 +781,7 @@ const LocalSwarmMetadata = struct {
         alloc: std.mem.Allocator,
         plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
-    ) !antfly.public_api.tables.AppliedRelationalSqlDdlRecord {
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, self, plan, session);
     }
@@ -995,7 +1062,7 @@ const LocalSwarmMetadata = struct {
     ) ?*const antfly.metadata.TableRecord {
         var it = self.manager.tables.valueIterator();
         while (it.next()) |table| {
-            if (antfly.public_api.tables.tableCatalogIdentityMatches(table.*, database_name, namespace_name, table_name)) return table;
+            if (catalog_table_ddl.tableCatalogIdentityMatches(table.*, database_name, namespace_name, table_name)) return table;
         }
         return null;
     }
@@ -1014,6 +1081,7 @@ const LocalSwarmMetadata = struct {
         defer parsed.deinit();
 
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
+        for (parsed.value.sequences) |record| try self.manager.upsertSequence(record);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,
             parsed.value.installed_extensions,
@@ -1028,6 +1096,8 @@ const LocalSwarmMetadata = struct {
         defer self.manager.freeTables(self.alloc, tables);
         const ranges = try self.manager.listRanges(self.alloc);
         defer self.manager.freeRanges(self.alloc, ranges);
+        const sequences = try self.manager.listSequences(self.alloc);
+        defer self.manager.freeSequences(self.alloc, sequences);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
         defer self.extension_catalog.freePackages(self.alloc, extension_packages);
         const installed_extensions = try self.extension_catalog.listInstalled(self.alloc);
@@ -1041,6 +1111,7 @@ const LocalSwarmMetadata = struct {
             .epoch = self.epoch,
             .tables = tables,
             .ranges = ranges,
+            .sequences = sequences,
             .extension_packages = extension_packages,
             .installed_extensions = installed_extensions,
             .extension_members = extension_members,
@@ -1084,7 +1155,7 @@ fn dropFullTextIndexForVersion(
 
     var versioned_name_buf: [64]u8 = undefined;
     const stale_name = if (version == 0)
-        antfly.public_api.tables.default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&versioned_name_buf, "full_text_index_v{d}", .{version});
     _ = object.swapRemove(stale_name);
@@ -1323,15 +1394,15 @@ pub fn runFromIterator(
     };
 
     const api_server = &data_server.http_server.?;
-    var pgwire_server = try antfly.public_api.pgwire_runtime.startOptional(alloc, .{
+    var public_api_surface = antfly.public_api.public_runtime.PublicApiSurface.initForBorrowedApiServer(alloc, api_server);
+    defer public_api_surface.deinit();
+    try public_api_surface.startPgwireOptional(.{
         .bind_host = cli.pgwire_host,
         .default_bind_host = public_listener.bind_host,
         .bind_port = cli.pgwire_port,
         .auth_enabled = auth_enabled,
         .auth_error_message = "swarm pgwire listener does not support auth yet; disable --auth or omit --pgwire-port",
-        .api_server = api_server,
     });
-    defer if (pgwire_server) |*server| server.deinit();
 
     // ---------------------------------------------------------------
     // Unified httpx.Server — all routes on a single port
@@ -4570,8 +4641,59 @@ test "swarm local metadata drop table cascade removes child foreign keys" {
             ,
             .placement_role = "data",
         },
+        .{
+            .table_id = 10,
+            .name = "invoices",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
     };
     for (tables) |table| try metadata.manager.upsertTable(table);
+
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE invoices_id_seq AS bigint START WITH 10 OWNED BY public.invoices.id");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+
+        var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+        defer applied.deinit(alloc);
+        try std.testing.expect(applied.created_sequence);
+    }
+    {
+        const sequences = try metadata.manager.listSequences(alloc);
+        defer metadata.manager.freeSequences(alloc, sequences);
+        try std.testing.expectEqual(@as(usize, 1), sequences.len);
+        try std.testing.expectEqualStrings("invoices_id_seq", sequences[0].name);
+    }
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE invoices");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+        try std.testing.expectError(
+            error.TableReferencedBySequence,
+            LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default()),
+        );
+    }
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE invoices CASCADE");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+
+        var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+        defer applied.deinit(alloc);
+        try std.testing.expect(applied.dropped_table);
+    }
+    try std.testing.expect(metadata.findTableByNameLocked("invoices") == null);
+    {
+        const sequences = try metadata.manager.listSequences(alloc);
+        defer metadata.manager.freeSequences(alloc, sequences);
+        try std.testing.expectEqual(@as(usize, 0), sequences.len);
+    }
 
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE customers CASCADE");
     defer parsed_sql.deinit(alloc);

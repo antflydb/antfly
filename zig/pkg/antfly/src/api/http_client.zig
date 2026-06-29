@@ -3166,7 +3166,7 @@ test "api http client round-trips public table management routes" {
     const std_http_listener = @import("../raft/transport/std_http_listener.zig");
     const metadata_api = @import("../metadata/api.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
-    const tables_api = @import("tables.zig");
+    const tables_api = @import("../metadata/catalog/table_ddl.zig");
 
     const FakeSource = struct {
         created: bool = false,
@@ -3241,7 +3241,7 @@ test "api http client round-trips public table management routes" {
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("../metadata/catalog/table_ddl.zig").CreateTableRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.created = true;
             _ = table_name;

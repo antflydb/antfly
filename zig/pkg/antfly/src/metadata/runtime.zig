@@ -863,15 +863,13 @@ pub fn runFromIterator(
     if (synced_extension_packages > 0) {
         std.log.info("metadata synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
-    var pgwire_server = try antfly.public_api.pgwire_runtime.startOptional(alloc, .{
+    try server.server.public_api_surface.startPgwireOptional(.{
         .bind_host = cli.pgwire_host,
         .default_bind_host = admin_listener.bind_host,
         .bind_port = cli.pgwire_port,
         .auth_enabled = effective_auth_enabled,
         .auth_error_message = "metadata pgwire listener does not support auth yet; disable public API auth/trusted principal or omit --pgwire-port",
-        .api_server = server.server.owned_public_http_server,
     });
-    defer if (pgwire_server) |*pgwire| pgwire.deinit();
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -1863,7 +1861,7 @@ test "metadata runtime preserves projected tables across restart" {
             .table_id = 77,
             .name = "docs",
         };
-        const ranges = try antfly.public_api.tables.deriveInitialRanges(std.testing.allocator, table);
+        const ranges = try antfly.metadata.catalog.table_ddl.deriveInitialRanges(std.testing.allocator, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
             std.testing.allocator.free(ranges);

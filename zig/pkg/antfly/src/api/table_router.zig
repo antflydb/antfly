@@ -21,7 +21,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
 
 pub const HostedGroupRouter = struct {
     ptr: *anyopaque,

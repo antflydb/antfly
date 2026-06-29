@@ -27,9 +27,8 @@ const public_table_http = @import("public_table_http.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
-const relational_sql_ddl = @import("relational_sql_ddl.zig");
-const sql_adapter_runtime = @import("../sql/runtime.zig");
-const catalog_jobs = @import("catalog_jobs.zig");
+const relational_sql_ddl = @import("../metadata/catalog/relational_ddl.zig");
+const catalog_jobs = @import("../metadata/catalog/jobs.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const sql_routines = sql_adapter.routines;
 const sql_sessions = sql_adapter.sessions;
@@ -52,8 +51,8 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const table_catalog = @import("table_catalog.zig");
-const tables_api = @import("tables.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
@@ -491,6 +490,29 @@ const RowsUniqueSelectorResolverContext = struct {
     }
 };
 
+const RowsSequenceDefaultResolverContext = struct {
+    source: StatusSource,
+
+    fn resolver(self: *@This()) relational_rows_api.SequenceDefaultResolver {
+        return .{
+            .ptr = self,
+            .next_value_json_alloc = nextValueJsonAlloc,
+        };
+    }
+
+    fn nextValueJsonAlloc(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: relational_rows_api.SequenceDefaultRequest,
+    ) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const database_name = if (request.database.len != 0) request.database else tables_api.default_database_name;
+        const namespace_name = if (request.schema.len != 0) request.schema else tables_api.default_namespace_name;
+        const value = try self.source.allocateSequenceValue(alloc, database_name, namespace_name, request.sequence);
+        return try std.fmt.allocPrint(alloc, "{d}", .{value});
+    }
+};
+
 pub const RequestForwarder = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -611,7 +633,12 @@ pub const StatusSource = struct {
         compare_and_swap_table_schema: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) anyerror!void = null,
         upsert_table_emptying_job: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) anyerror!void = null,
         upsert_table: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.TableRecord) anyerror!void = null,
+        upsert_sequence: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.SequenceRecord) anyerror!void = null,
+        remove_sequence: ?*const fn (ptr: *anyopaque, sequence_id: u64) anyerror!void = null,
+        allocate_sequence_value: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, database_name: []const u8, namespace_name: []const u8, sequence_name: []const u8) anyerror!i64 = null,
         apply_table_catalog_update_with_schema_rewrite_jobs: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) anyerror!void = null,
+        apply_table_catalog_batch_update_with_schema_rewrite_jobs: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) anyerror!void = null,
+        apply_table_catalog_drop_with_schema_rewrite_jobs: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest) anyerror!void = null,
         promote_table_emptying_barrier: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) anyerror!void = null,
         reset_identity_allocators_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) anyerror!void = null,
         supports_identity_allocator_reset_for_table_emptying_barrier: ?*const fn (ptr: *anyopaque) bool = null,
@@ -744,11 +771,54 @@ pub const StatusSource = struct {
         return try fn_ptr(self.ptr, record);
     }
 
+    pub fn upsertSequence(
+        self: StatusSource,
+        record: metadata_table_manager.SequenceRecord,
+    ) !void {
+        const fn_ptr = self.vtable.upsert_sequence orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, record);
+    }
+
+    pub fn removeSequence(
+        self: StatusSource,
+        sequence_id: u64,
+    ) !void {
+        const fn_ptr = self.vtable.remove_sequence orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, sequence_id);
+    }
+
+    pub fn allocateSequenceValue(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        const fn_ptr = self.vtable.allocate_sequence_value orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, database_name, namespace_name, sequence_name);
+    }
+
     pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
         self: StatusSource,
         request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
     ) !void {
         const fn_ptr = self.vtable.apply_table_catalog_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: StatusSource,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const fn_ptr = self.vtable.apply_table_catalog_batch_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: StatusSource,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        const fn_ptr = self.vtable.apply_table_catalog_drop_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 
@@ -1015,6 +1085,36 @@ pub const StatusSource = struct {
                 return error.UnsupportedOperation;
             }
 
+            fn upsertSequence(ptr: *anyopaque, record: metadata_table_manager.SequenceRecord) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "upsertSequence")) {
+                    return try svc.upsertSequence(record);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn removeSequence(ptr: *anyopaque, sequence_id: u64) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "removeSequence")) {
+                    return try svc.removeSequence(sequence_id);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn allocateSequenceValue(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                database_name: []const u8,
+                namespace_name: []const u8,
+                sequence_name: []const u8,
+            ) anyerror!i64 {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "allocateSequenceValue")) {
+                    return try svc.allocateSequenceValue(alloc, database_name, namespace_name, sequence_name);
+                }
+                return error.UnsupportedOperation;
+            }
+
             fn applyTableCatalogUpdateWithSchemaRewriteJobs(
                 ptr: *anyopaque,
                 request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
@@ -1022,6 +1122,28 @@ pub const StatusSource = struct {
                 const svc = cast(ptr);
                 if (comptime @hasDecl(T, "applyTableCatalogUpdateWithSchemaRewriteJobs")) {
                     return try svc.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+                ptr: *anyopaque,
+                request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+            ) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) {
+                    return try svc.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+                }
+                return error.UnsupportedOperation;
+            }
+
+            fn applyTableCatalogDropWithSchemaRewriteJobs(
+                ptr: *anyopaque,
+                request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+            ) anyerror!void {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "applyTableCatalogDropWithSchemaRewriteJobs")) {
+                    return try svc.applyTableCatalogDropWithSchemaRewriteJobs(request);
                 }
                 return error.UnsupportedOperation;
             }
@@ -1183,7 +1305,12 @@ pub const StatusSource = struct {
             .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
             .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
             .upsert_table = Gen.upsertTable,
+            .upsert_sequence = Gen.upsertSequence,
+            .remove_sequence = Gen.removeSequence,
+            .allocate_sequence_value = Gen.allocateSequenceValue,
             .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
+            .apply_table_catalog_batch_update_with_schema_rewrite_jobs = if (comptime @hasDecl(T, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) Gen.applyTableCatalogBatchUpdateWithSchemaRewriteJobs else null,
+            .apply_table_catalog_drop_with_schema_rewrite_jobs = if (comptime @hasDecl(T, "applyTableCatalogDropWithSchemaRewriteJobs")) Gen.applyTableCatalogDropWithSchemaRewriteJobs else null,
             .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
             .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(T, "resetIdentityAllocatorsForTableEmptyingBarrier")) Gen.resetIdentityAllocatorsForTableEmptyingBarrier else null,
             .supports_identity_allocator_reset_for_table_emptying_barrier = Gen.supportsIdentityAllocatorResetForTableEmptyingBarrier,
@@ -1766,6 +1893,15 @@ fn schemaRewriteJobNeedsCatalogCatchup(job: metadata_table_manager.SchemaRewrite
     return std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_declared) or
         std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_running) or
         std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_ready);
+}
+
+fn tableEmptyingJobNeedsCatalogCatchup(job: metadata_table_manager.TableEmptyingJobRecord) bool {
+    if (std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_invalid)) {
+        return std.mem.eql(u8, job.last_error, @errorName(error.TopologyChanged));
+    }
+    return std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_declared) or
+        std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_running) or
+        std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_ready);
 }
 
 fn schemaRewriteGenerationHasInvalidJob(
@@ -2841,8 +2977,168 @@ test "api session maintenance runs schema rewrite catalog catch-up" {
 
     try server.runSessionMaintenanceOnce();
 
-    try std.testing.expectEqual(@as(usize, 1), source.snapshot_count);
+    try std.testing.expectEqual(@as(usize, 2), source.snapshot_count);
     try std.testing.expectEqual(@as(usize, 1), source.compare_count);
+    try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
+}
+
+test "api session maintenance repairs table emptying topology jobs and wakes table" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        snapshot_count: usize = 0,
+        upsert_count: usize = 0,
+        tables: [1]metadata_table_manager.TableRecord = .{
+            .{
+                .table_id = 88,
+                .name = "audit_log",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .indexes_json = "{}",
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            },
+        },
+        old_ranges: [1]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 100, .range_id = 101, .table_id = 88, .start_key = "", .end_key = null },
+        },
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 102, .range_id = 103, .table_id = 88, .start_key = "", .end_key = "m" },
+            .{ .group_id = 104, .range_id = 105, .table_id = 88, .start_key = "m", .end_key = null },
+        },
+        affected: [1]u64 = .{88},
+        jobs: [4]metadata_table_manager.TableEmptyingJobRecord = undefined,
+        job_count: usize = 1,
+
+        fn seed(self: *@This()) !void {
+            const barrier_snapshot = metadata_api.AdminSnapshot{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.old_ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            const barrier_id = try catalog_jobs.tableEmptyingBarrierIdForSnapshot(&barrier_snapshot, self.affected[0..], false, false);
+            self.jobs[0] = catalog_jobs.tableEmptyingJobForRangeWithBarrierId(self.tables[0], self.old_ranges[0], self.affected[0..], false, false, barrier_id);
+            self.jobs[0].state = metadata_table_manager.table_emptying_invalid;
+            self.jobs[0].last_error = @errorName(error.TopologyChanged);
+        }
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .upsert_table_emptying_job = upsertTableEmptyingJob,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_count += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .table_emptying_jobs = self.jobs[0..self.job_count],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.jobs[0..self.job_count]) |*existing| {
+                if (existing.job_id != record.job_id) continue;
+                existing.* = record;
+                return;
+            }
+            if (self.job_count == self.jobs.len) return error.TestUnexpectedResult;
+            self.jobs[self.job_count] = record;
+            self.job_count += 1;
+            self.upsert_count += 1;
+        }
+    };
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .table_emptying_worker_pass_for_table_id = tableEmptyingWorkerPassForTableId,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn tableEmptyingWorkerPassForTableId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_id: u64,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.TableEmptyingWorkerPassResult {
+            try std.testing.expectEqual(@as(u64, 88), table_id);
+            try std.testing.expectEqualStrings("audit_log", table_name);
+            try std.testing.expectEqualStrings("api-table-emptying", worker_id);
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            return .{
+                .complete = false,
+                .jobs_scanned = 2,
+                .jobs_busy = 2,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    try source.seed();
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    const scheduled = try server.runTableEmptyingCatalogCatchupOnce();
+
+    try std.testing.expectEqual(@as(usize, 1), scheduled);
+    try std.testing.expectEqual(@as(usize, 2), source.upsert_count);
+    try std.testing.expectEqual(@as(usize, 3), source.job_count);
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
 
@@ -3910,6 +4206,7 @@ pub const ApiHttpServer = struct {
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
         _ = try self.runSchemaRewriteCatalogCatchupOnce();
+        _ = try self.runTableEmptyingCatalogCatchupOnce();
     }
 
     pub fn runSchemaRewriteCatalogCatchupOnce(self: *ApiHttpServer) !usize {
@@ -3928,6 +4225,34 @@ pub const ApiHttpServer = struct {
             if (schemaRewriteCatchupAlreadyScheduled(scheduled_table_ids.items, job.table_id)) continue;
             const table = schemaRewriteSnapshotTableById(&snapshot, job.table_id) orelse continue;
             if (!try self.submitSchemaRewriteWakeForTable(runtime, write_source, table)) continue;
+            try scheduled_table_ids.append(self.alloc, job.table_id);
+            scheduled += 1;
+        }
+        return scheduled;
+    }
+
+    pub fn runTableEmptyingCatalogCatchupOnce(self: *ApiHttpServer) !usize {
+        const runtime = self.cfg.backend_runtime orelse return 0;
+        const write_source = self.table_writes orelse return 0;
+        var snapshot = (try self.source.adminSnapshot()) orelse return 0;
+        defer self.source.freeAdminSnapshot(&snapshot);
+
+        var scheduled_table_ids = std.ArrayListUnmanaged(u64).empty;
+        defer scheduled_table_ids.deinit(self.alloc);
+
+        const catalog = self.catalogSource();
+        var scheduled: usize = 0;
+        for (snapshot.table_emptying_jobs) |job| {
+            if (!tableEmptyingJobNeedsCatalogCatchup(job)) continue;
+            if (schemaRewriteCatchupAlreadyScheduled(scheduled_table_ids.items, job.table_id)) continue;
+            const table = schemaRewriteSnapshotTableById(&snapshot, job.table_id) orelse continue;
+            const repaired = catalog_jobs.repairMissingTableEmptyingBarrierJobsForTableIdAlloc(self.alloc, catalog, job.table_id) catch |err| switch (err) {
+                error.UnsupportedOperation => 0,
+                error.TableNotFound => 0,
+                else => return err,
+            };
+            if (std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_invalid) and repaired == 0) continue;
+            if (!try self.submitTableEmptyingWakeForTable(runtime, write_source, table)) continue;
             try scheduled_table_ids.append(self.alloc, job.table_id);
             scheduled += 1;
         }
@@ -4357,6 +4682,8 @@ pub const ApiHttpServer = struct {
                 .upsert_table_emptying_job = apiHttpServerCatalogUpsertTableEmptyingJob,
                 .upsert_table = apiHttpServerCatalogUpsertTable,
                 .apply_table_catalog_update_with_schema_rewrite_jobs = apiHttpServerCatalogApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_batch_update_with_schema_rewrite_jobs = apiHttpServerCatalogApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_drop_with_schema_rewrite_jobs = apiHttpServerCatalogApplyTableCatalogDropWithSchemaRewriteJobs,
                 .promote_table_emptying_barrier = apiHttpServerCatalogPromoteTableEmptyingBarrier,
                 .reset_identity_allocators_for_table_emptying_barrier = apiHttpServerCatalogResetIdentityAllocatorsForTableEmptyingBarrier,
                 .supports_identity_allocator_reset_for_table_emptying_barrier = apiHttpServerCatalogSupportsIdentityAllocatorResetForTableEmptyingBarrier,
@@ -4814,6 +5141,12 @@ pub const ApiHttpServer = struct {
         context: RelationalDdlPlanExecutionContext,
         timing: SqlStatementExecutionTiming,
     ) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (plan.* == .trigger_catalog) {
+            var applied = try self.applyTriggerCatalogPlanWithUpdatePolicyFallback(plan.trigger_catalog, session, context, timing);
+            errdefer applied.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+            return applied;
+        }
         var applied = relational_sql_ddl.applyRoutineLogicalPlanWithSessionAlloc(self.alloc, self, plan, session.session()) catch |err| switch (err) {
             error.TriggerNotFound => switch (plan.*) {
                 .trigger_catalog => |trigger_plan| switch (trigger_plan) {
@@ -4913,6 +5246,16 @@ pub const ApiHttpServer = struct {
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         try self.rejectUnsupportedDocumentSqlViewMappingForDurablePlan(durable_plan.*, session.session());
         switch (durable_plan.*) {
+            .table_ddl => |*table_plan| {
+                if (try self.applyRoutineTriggerDropBeforeUpdatePolicyFallback(table_plan, timing)) |applied| {
+                    return applied;
+                }
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, durable_plan, session.session(), context.function_bindings);
+                errdefer applied.deinit(self.alloc);
+                try self.scheduleSchemaRewriteRuntimeHintForAppliedDdl(applied);
+                try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+                return applied;
+            },
             .auth => |auth_plan| {
                 var applied = try relational_sql_ddl.applyAuthorizationLogicalPlanWithSessionAlloc(self.alloc, self, auth_plan, session.session());
                 errdefer applied.deinit(self.alloc);
@@ -4942,6 +5285,41 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
         }
+    }
+
+    fn applyRoutineTriggerDropBeforeUpdatePolicyFallback(
+        self: *ApiHttpServer,
+        plan: *const sql_adapter.TableDdlLogicalPlan,
+        timing: SqlStatementExecutionTiming,
+    ) !?tables_api.AppliedRelationalSqlDdlRecord {
+        const drop_update_policy = switch (plan.*) {
+            .alter_table => |alter| blk: {
+                if (alter.operations.len != 1) return null;
+                break :blk switch (alter.operations[0]) {
+                    .drop_update_policy => |drop| .{
+                        .table_name = alter.table_name,
+                        .drop = drop,
+                    },
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+        const trigger_plan = sql_adapter.TriggerCatalogPlan{ .drop = .{
+            .trigger_name = drop_update_policy.drop.trigger_name,
+            .table_name = drop_update_policy.table_name,
+            .if_exists = drop_update_policy.drop.if_exists,
+            .cascade = false,
+        } };
+        self.sql_routine_runtime.applyTriggerCatalogPlan(trigger_plan) catch |err| switch (err) {
+            error.TriggerNotFound => return null,
+            else => return err,
+        };
+        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+        errdefer applied.deinit(self.alloc);
+        applied.noop = true;
+        try self.enforceSqlStatementTimeout(timing.timeout_ns, timing.start_ns);
+        return applied;
     }
 
     fn applyTriggerCatalogPlanWithUpdatePolicyFallback(
@@ -5767,7 +6145,8 @@ pub const ApiHttpServer = struct {
         const effective_source_schema = relational_rows_api.rowsPlannedQuerySourceSchema(source_schema, planned_ctes, lowered.insert_source.req.source) orelse return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
 
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
-        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
             self.alloc,
             target_table_name,
             target_schema,
@@ -5775,11 +6154,12 @@ pub const ApiHttpServer = struct {
             lowered.insert_source.req,
             source_result.rows,
             unique_resolver_ctx.resolver(),
+            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
         ) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return .{ .failure = try textResponse(self.alloc, 400, "unsupported rows selector") },
             error.RowSelectorNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
-            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             else => {
                 std.log.err("public sql insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
@@ -5841,7 +6221,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn publicSqlTableEmptyingRequiresCatalogBarrier(truncate_source: sql_adapter.LoweredMutationSource) bool {
-        return truncate_source.additional_table_names.len != 0 or truncate_source.restart_identity or truncate_source.truncate_cascade;
+        _ = truncate_source;
+        return true;
     }
 
     fn schedulePublicSqlTableEmptyingJobsWithSession(
@@ -5949,18 +6330,26 @@ pub const ApiHttpServer = struct {
     fn publicSqlGeneratedReadRowClaimMissingNativeModel(
         parsed_sql: *const sql_adapter.ParsedSql,
     ) ?[]const u8 {
-        const generated_statement = parsed_sql.generated_statement orelse return null;
-        const generated_ast = generated_statement.ast orelse return null;
+        const tokens = parsed_sql.items();
+        const token_fallback = publicSqlTokenReadRowClaimMissingNativeModel(tokens);
+        const generated_statement = parsed_sql.generated_statement orelse return token_fallback;
+        const generated_ast = generated_statement.ast orelse {
+            if (generated_statement.kind() == .read) return null;
+            return token_fallback;
+        };
         const read = switch (generated_ast) {
             .read => |read| read,
-            else => return null,
+            else => if (generated_statement.kind() == .read) return null else return token_fallback,
         };
         for (read.cte_items) |cte| {
             if (cte.body_row_lock_tokens != null) return "lockable base-row source for materialized CTE row claim";
         }
-        if (read.row_lock_tokens == null and !publicSqlTokensContainRowClaim(parsed_sql.items())) return null;
-        return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse publicSqlGeneratedReadKindForRowClaimDiagnostic(parsed_sql.items(), read)) {
-            .query => null,
+        if (read.row_lock_tokens == null and token_fallback == null) return null;
+        const inferred_kind = publicSqlGeneratedReadKindForRowClaimDiagnostic(tokens, read);
+        const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
+        const diagnostic_kind = if (parsed_kind == .query and inferred_kind != .query) inferred_kind else parsed_kind;
+        return switch (diagnostic_kind) {
+            .query => token_fallback,
             .aggregate => "lockable base-row source for aggregate row claim",
             .join => "lockable base-row source for join row claim",
             .lateral => "lockable base-row source for lateral row claim",
@@ -5968,6 +6357,46 @@ pub const ApiHttpServer = struct {
             .set_operation => "lockable base-row source for set-operation row claim",
             .recursive_cte => "lockable base-row source for recursive CTE row claim",
         };
+    }
+
+    fn publicSqlTokenReadRowClaimMissingNativeModel(tokens: []const sql_adapter.Token) ?[]const u8 {
+        if (!publicSqlTokensContainRowClaim(tokens)) return null;
+        if (tokens.len > 0 and tokens[0].matchesKeywordTag(.with)) {
+            return "lockable base-row source for materialized CTE row claim";
+        }
+        if (publicSqlTokensContainKeyword(tokens, .over) or publicSqlTokensContainKeyword(tokens, .window)) {
+            return "lockable base-row source for window row claim";
+        }
+        if (publicSqlTokensContainKeyword(tokens, .lateral)) return "lockable base-row source for lateral row claim";
+        if (publicSqlTokensContainKeyword(tokens, .join)) return "lockable base-row source for join row claim";
+        if (publicSqlTokensContainKeyword(tokens, .group) or
+            publicSqlTokensContainKeyword(tokens, .having) or
+            publicSqlTokensContainAggregateFunction(tokens))
+        {
+            return "lockable base-row source for aggregate row claim";
+        }
+        return null;
+    }
+
+    fn publicSqlTokensContainKeyword(tokens: []const sql_adapter.Token, keyword: sql_adapter.TokenKeyword) bool {
+        for (tokens) |token| {
+            if (token.matchesKeywordTag(keyword)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlTokensContainAggregateFunction(tokens: []const sql_adapter.Token) bool {
+        for (tokens) |token| {
+            if (token.matchesKeywordTag(.count) or
+                token.matchesKeywordTag(.sum) or
+                token.matchesKeywordTag(.avg) or
+                token.matchesKeywordTag(.min) or
+                token.matchesKeywordTag(.max))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn publicSqlTokensContainRowClaim(tokens: []const sql_adapter.Token) bool {
@@ -6052,9 +6481,9 @@ pub const ApiHttpServer = struct {
     fn publicSqlReadStatementKindForCatalogRead(
         read_catalog: *const sql_adapter.CatalogLogicalReadPlan,
         parsed_sql: *const sql_adapter.ParsedSql,
-    ) ?sql_adapter.SqlReadStatementKind {
+    ) !?sql_adapter.SqlReadStatementKind {
         const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
-        if (parsed_sql.generatedStatementKind() == .read) return parsed_kind;
+        if (parsed_sql.generatedStatementKind() == .read) return parsed_kind orelse error.UnsupportedSqlShape;
         if (read_catalog.statement.readKind()) |kind| return kind;
         const target_binding = read_catalog.target_binding orelse return null;
         switch (target_binding) {
@@ -6067,9 +6496,9 @@ pub const ApiHttpServer = struct {
     fn publicSqlWriteStatementKindForCatalogWrite(
         write_catalog: *const sql_adapter.CatalogLogicalWritePlan,
         parsed_sql: *const sql_adapter.ParsedSql,
-    ) ?sql_adapter.SqlWriteStatementKind {
+    ) !?sql_adapter.SqlWriteStatementKind {
         const parsed_kind = parsed_sql.writeStatementKindIncludingGeneratedAst();
-        if (parsed_sql.generatedStatementKind() == .dml) return parsed_kind;
+        if (parsed_sql.generatedStatementKind() == .dml) return parsed_kind orelse error.UnsupportedSqlShape;
         return write_catalog.statement.writeKind() orelse parsed_kind;
     }
 
@@ -6492,7 +6921,8 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
             self.alloc,
             read_source,
             target_table_name,
@@ -6505,8 +6935,9 @@ pub const ApiHttpServer = struct {
             lowered.source,
             &.{},
             .read_index,
+            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
         ) catch |err| switch (err) {
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
@@ -6543,7 +6974,8 @@ pub const ApiHttpServer = struct {
         defer if (target_filter) |*value| value.deinit(self.alloc);
         if (target_filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
 
-        var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc(
             self.alloc,
             read_source,
             self.catalogSource(),
@@ -6556,8 +6988,9 @@ pub const ApiHttpServer = struct {
             .{ .select_all = true },
             &.{},
             .read_index,
+            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
         ) catch |err| switch (err) {
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
@@ -6592,7 +7025,7 @@ pub const ApiHttpServer = struct {
             .catalog_write => |*catalog_write| catalog_write,
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
-        const statement_kind = publicSqlWriteStatementKindForCatalogWrite(write_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        const statement_kind = (publicSqlWriteStatementKindForCatalogWrite(write_catalog, parsed_sql) catch return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) }) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
         switch (statement_kind) {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
@@ -6609,7 +7042,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             logical_plan,
@@ -6907,7 +7340,15 @@ pub const ApiHttpServer = struct {
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
         };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
-        const statement_kind = publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        const statement_kind = (publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) catch return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) }) orelse {
+            if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+            }
+            if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+            }
+            return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        };
         if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
         const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
 
@@ -7367,7 +7808,15 @@ pub const ApiHttpServer = struct {
             else => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) },
         };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
-        const statement_kind = publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        const statement_kind = (publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) catch return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) }) orelse {
+            if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+            }
+            if (publicSqlUnsupportedGeneratedSubqueryPredicateDiagnostic(parsed_sql, .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
+            }
+            return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) };
+        };
         const target = target_binding.target();
         const target_table_name = try self.alloc.dupe(u8, target.table_name);
         defer self.alloc.free(target_table_name);
@@ -7443,7 +7892,7 @@ pub const ApiHttpServer = struct {
 
     fn applyPublicSqlDocumentReadRowFilter(
         self: *ApiHttpServer,
-        lowered: *sql_adapter_runtime.LoweredReadPlan,
+        lowered: *sql_adapter.LoweredReadPlan,
         session: catalog_resources.SqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
@@ -7493,7 +7942,7 @@ pub const ApiHttpServer = struct {
         default_table_name: []const u8,
         default_schema: runtime_schema_mod.TableSchema,
         source_table_name: []const u8,
-        lowered: sql_adapter_runtime.LoweredReadPlan,
+        lowered: sql_adapter.LoweredReadPlan,
         session: catalog_resources.SqlCatalogSession,
     ) ![]const runtime_schema_mod.RelationalColumn {
         switch (lowered) {
@@ -7636,7 +8085,7 @@ pub const ApiHttpServer = struct {
         statement_kind: sql_adapter.SqlReadStatementKind,
     ) !?PublicSqlResultOrResponse {
         const query_table_name = sql_adapter.antflyQueryFunctionReadTableNameAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return null,
+            error.UnsupportedSqlShape => if (sql_adapter.parsedSqlHasGeneratedAntflyReadSource(parsed_sql)) return err else return null,
             else => return err,
         };
         defer self.alloc.free(query_table_name);
@@ -7655,7 +8104,7 @@ pub const ApiHttpServer = struct {
             .inference_api_key = self.cfg.inference_api_key,
         };
         var lowered = sql_adapter.lowerAntflyQueryFunctionReadParsedSqlAlloc(self.alloc, self.semanticResolver(&semantic_resolver), parsed_sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return null,
+            error.UnsupportedSqlShape => if (sql_adapter.parsedSqlHasGeneratedAntflyReadSource(parsed_sql)) return err else return null,
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
             else => return err,
@@ -8057,6 +8506,25 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const PostgresCompatibilitySequenceFunction = enum {
+        nextval,
+        currval,
+        setval,
+    };
+
+    const PostgresCompatibilitySequenceCall = struct {
+        function: PostgresCompatibilitySequenceFunction,
+        sequence_name: []const u8,
+        value: ?i64 = null,
+        is_called: bool = true,
+        column_name: []const u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(@constCast(self.sequence_name));
+            self.* = undefined;
+        }
+    };
+
     const PostgresCompatibilitySetting = struct {
         name: []const u8,
         value: []u8,
@@ -8138,8 +8606,12 @@ pub const ApiHttpServer = struct {
         session: *sql_adapter.OwnedSqlCatalogSession,
         params: []const sql_adapter.SqlValue,
     ) !?PublicSqlResultOrResponse {
-        const maybe_scalar = self.postgresCompatibilityScalarAlloc(parsed_sql, session.session(), params) catch |err| switch (err) {
+        const maybe_scalar = self.postgresCompatibilityScalarAlloc(parsed_sql, session, params, true) catch |err| switch (err) {
             error.MissingSqlParameter => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) },
+            error.SqlReadOnlyTransaction => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .read_only_transaction)) },
+            error.SequenceNotFound, error.InvalidSqlCatalog => return .{ .response = try self.publicSqlParsedDiagnosticResponse(404, parsed_sql, .init(.bind, .invalid_sql_catalog)) },
+            error.InvalidSqlRequest, error.InvalidRoleSetting, error.InvalidSequenceCatalog => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.bind, .invalid_sql_request)) },
+            error.SequenceExhausted => return .{ .response = try self.publicSqlParsedDiagnosticResponse(400, parsed_sql, .init(.execute, .invalid_sql_request)) },
             else => return err,
         };
         if (maybe_scalar) |scalar_value| {
@@ -8178,7 +8650,7 @@ pub const ApiHttpServer = struct {
         parsed_sql: *const sql_adapter.ParsedSql,
         session: *sql_adapter.OwnedSqlCatalogSession,
     ) !?PublicSqlDescribeResult {
-        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session(), &.{})) |scalar_value| {
+        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session, &.{}, false)) |scalar_value| {
             var scalar = scalar_value;
             defer scalar.deinit(self.alloc);
             return .{
@@ -8492,8 +8964,9 @@ pub const ApiHttpServer = struct {
     fn postgresCompatibilityScalarAlloc(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
-        session: catalog_resources.SqlCatalogSession,
+        session: *sql_adapter.OwnedSqlCatalogSession,
         params: []const sql_adapter.SqlValue,
+        execute_sequence_side_effects: bool,
     ) !?PostgresCompatibilityScalar {
         if (self.postgresCompatibilitySelectFunction(parsed_sql, "version")) {
             return .{
@@ -8504,19 +8977,30 @@ pub const ApiHttpServer = struct {
         if (self.postgresCompatibilitySelectFunction(parsed_sql, "current_database")) {
             return .{
                 .column_name = "current_database",
-                .value = try self.alloc.dupe(u8, session.currentDatabase()),
+                .value = try self.alloc.dupe(u8, session.session().currentDatabase()),
             };
         }
         if (self.postgresCompatibilitySelectFunction(parsed_sql, "current_schema")) {
             return .{
                 .column_name = "current_schema",
-                .value = try self.alloc.dupe(u8, session.primarySearchPathNamespace()),
+                .value = try self.alloc.dupe(u8, session.session().primarySearchPathNamespace()),
             };
         }
         if (self.postgresCompatibilitySelectCurrentSetting(parsed_sql)) |setting_name| {
             return .{
                 .column_name = "current_setting",
-                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
+                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session.session()),
+            };
+        }
+        if (try self.postgresCompatibilitySelectSequenceCallAlloc(parsed_sql, params)) |call_value| {
+            var call = call_value;
+            defer call.deinit(self.alloc);
+            return .{
+                .column_name = call.column_name,
+                .value = if (execute_sequence_side_effects)
+                    try self.executePostgresCompatibilitySequenceCallAlloc(call, session)
+                else
+                    try self.alloc.dupe(u8, "0"),
             };
         }
         if (try self.postgresCompatibilitySelectLiteralAlloc(parsed_sql, params)) |literal| {
@@ -8525,10 +9009,161 @@ pub const ApiHttpServer = struct {
         if (self.postgresCompatibilityShowSettingName(parsed_sql)) |setting_name| {
             return .{
                 .column_name = setting_name,
-                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
+                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session.session()),
             };
         }
         return null;
+    }
+
+    fn postgresCompatibilitySelectSequenceCallAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
+    ) !?PostgresCompatibilitySequenceCall {
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return null;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len < 5 or !tokens[0].matchesKeywordTag(.select)) return null;
+        const function: PostgresCompatibilitySequenceFunction = if (postgresCompatibilityTokenTextMatches(tokens[1], "nextval"))
+            .nextval
+        else if (postgresCompatibilityTokenTextMatches(tokens[1], "currval"))
+            .currval
+        else if (postgresCompatibilityTokenTextMatches(tokens[1], "setval"))
+            .setval
+        else
+            return null;
+        if (tokens[2].kind != .lparen) return null;
+
+        const sequence_name = try self.postgresCompatibilitySequenceNameArgAlloc(tokens[3], params);
+        errdefer self.alloc.free(@constCast(sequence_name));
+        switch (function) {
+            .nextval, .currval => {
+                if (tokens.len < 5 or tokens[4].kind != .rparen) return null;
+                if (!postgresCompatibilityOptionalAliasOnly(tokens[5..])) return null;
+                return .{
+                    .function = function,
+                    .sequence_name = sequence_name,
+                    .column_name = @tagName(function),
+                };
+            },
+            .setval => {
+                if (tokens.len < 7 or tokens[4].kind != .comma) return null;
+                const value = try self.postgresCompatibilityIntArg(tokens[5], params);
+                var is_called = true;
+                var close_index: usize = 6;
+                if (tokens[close_index].kind == .comma) {
+                    if (tokens.len <= close_index + 2) return null;
+                    is_called = try self.postgresCompatibilityBoolArg(tokens[close_index + 1], params);
+                    close_index += 2;
+                }
+                if (tokens[close_index].kind != .rparen) return null;
+                if (!postgresCompatibilityOptionalAliasOnly(tokens[close_index + 1 ..])) return null;
+                return .{
+                    .function = .setval,
+                    .sequence_name = sequence_name,
+                    .value = value,
+                    .is_called = is_called,
+                    .column_name = "setval",
+                };
+            },
+        }
+    }
+
+    fn postgresCompatibilitySequenceNameArgAlloc(
+        self: *ApiHttpServer,
+        token: sql_adapter.Token,
+        params: []const sql_adapter.SqlValue,
+    ) ![]const u8 {
+        return switch (token.kind) {
+            .string => try self.alloc.dupe(u8, token.text),
+            .placeholder => switch (try sql_adapter.boundSqlValue(token, params)) {
+                .string => |value| try self.alloc.dupe(u8, value),
+                else => error.InvalidSqlRequest,
+            },
+            else => error.InvalidSqlRequest,
+        };
+    }
+
+    fn postgresCompatibilityIntArg(
+        self: *ApiHttpServer,
+        token: sql_adapter.Token,
+        params: []const sql_adapter.SqlValue,
+    ) !i64 {
+        _ = self;
+        return switch (token.kind) {
+            .number => std.fmt.parseInt(i64, token.text, 10) catch return error.InvalidSqlRequest,
+            .placeholder => switch (try sql_adapter.boundSqlValue(token, params)) {
+                .integer => |value| value,
+                else => error.InvalidSqlRequest,
+            },
+            else => error.InvalidSqlRequest,
+        };
+    }
+
+    fn postgresCompatibilityBoolArg(
+        self: *ApiHttpServer,
+        token: sql_adapter.Token,
+        params: []const sql_adapter.SqlValue,
+    ) !bool {
+        _ = self;
+        return switch (token.kind) {
+            .placeholder => switch (try sql_adapter.boundSqlValue(token, params)) {
+                .bool => |value| value,
+                else => error.InvalidSqlRequest,
+            },
+            else => if (token.matchesKeywordTag(.true))
+                true
+            else if (token.matchesKeywordTag(.false))
+                false
+            else
+                error.InvalidSqlRequest,
+        };
+    }
+
+    fn executePostgresCompatibilitySequenceCallAlloc(
+        self: *ApiHttpServer,
+        call: PostgresCompatibilitySequenceCall,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+    ) ![]u8 {
+        const target = try session.session().tableTargetFromObjectName(call.sequence_name);
+        switch (call.function) {
+            .nextval => {
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                const value = try self.source.allocateSequenceValue(self.alloc, target.database_name, target.namespace_name, target.table_name);
+                try session.setSequenceCurrvalAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name, value);
+                return try std.fmt.allocPrint(self.alloc, "{d}", .{value});
+            },
+            .currval => {
+                const value = session.sequenceCurrval(target.database_name, target.namespace_name, target.table_name) orelse return error.SequenceNotFound;
+                return try std.fmt.allocPrint(self.alloc, "{d}", .{value});
+            },
+            .setval => {
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
+                const requested = call.value orelse return error.InvalidSqlRequest;
+                var snapshot = try self.catalogSource().adminSnapshot();
+                defer self.catalogSource().freeAdminSnapshot(&snapshot);
+                const sequence_id = metadata_table_manager.deriveSequenceId(target.database_name, target.namespace_name, target.table_name);
+                var record: ?metadata_table_manager.SequenceRecord = null;
+                for (snapshot.sequences) |candidate| {
+                    if (candidate.sequence_id == sequence_id) {
+                        record = candidate;
+                        break;
+                    }
+                }
+                var updated = record orelse return error.SequenceNotFound;
+                updated.last_value = if (call.is_called)
+                    requested
+                else blk: {
+                    const increment = try metadata_table_manager.sequenceIncrementFromOptionsJson(self.alloc, updated.options_json);
+                    break :blk std.math.sub(i64, requested, increment) catch return error.InvalidSequenceCatalog;
+                };
+                updated.last_allocation_id = 0;
+                try self.source.upsertSequence(updated);
+                try session.setSequenceCurrvalAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name, requested);
+                return try std.fmt.allocPrint(self.alloc, "{d}", .{requested});
+            },
+        }
     }
 
     fn postgresCompatibilitySelectLiteralAlloc(
@@ -9298,7 +9933,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
         const query_table_name = sql_adapter.antflyQueryFunctionReadTableNameAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return,
+            error.UnsupportedSqlShape => if (sql_adapter.parsedSqlHasGeneratedAntflyReadSource(parsed_sql)) return err else return,
             else => return err,
         };
         defer self.alloc.free(query_table_name);
@@ -9359,6 +9994,7 @@ pub const ApiHttpServer = struct {
             try self.enforceAntflyQueryFunctionReadPermissionBeforeCatalogPlanning(parsed_sql, session.session(), authenticated_identity);
         }
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
         var write_options: sql_adapter.LowerWritePlanOptions = .{};
         var row_claim_owner_id: ?[]const u8 = null;
         defer if (row_claim_owner_id) |owner_id| self.alloc.free(@constCast(owner_id));
@@ -9380,6 +10016,7 @@ pub const ApiHttpServer = struct {
             row_claim_owner_id = if (row_claim) |claim| claim.owner_id else null;
             write_options = .{
                 .unique_resolver = unique_resolver_ctx.resolver(),
+                .default_context = .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
                 .row_claim = row_claim,
                 .sync_level = sync_level,
             };
@@ -9517,7 +10154,14 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        if (parsed_sql.readStatementKindIncludingGeneratedAst()) |read_kind| {
+        const maybe_read_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse blk: {
+            if (parsed_sql.generatedStatementKind() == .read) {
+                self.markPublicSqlTransactionFailedIfActive(session);
+                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
+            }
+            break :blk null;
+        };
+        if (maybe_read_kind) |read_kind| {
             if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, read_kind)) |outcome_value| {
                 var outcome = outcome_value;
                 errdefer outcome.deinit(self.alloc);
@@ -10361,7 +11005,10 @@ pub const ApiHttpServer = struct {
         const schema = try self.runtimeSchemaForCatalogRows(target);
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var rows_req = try sql_adapter.bulkSqlIoImportRowsBatchFromStdinAlloc(self.alloc, schema, execution_plan, payload);
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var rows_req = try sql_adapter.bulkSqlIoImportRowsBatchFromStdinWithDefaultContextAlloc(self.alloc, schema, execution_plan, payload, .{
+            .sequence_resolver = sequence_resolver_ctx.resolver(),
+        });
         errdefer rows_req.deinit(self.alloc);
         try self.applyRowsBatchBeforeInsertTriggersForBulkImport(target.table_name, schema, &rows_req);
         try self.requireSqlBulkIoRowsSatisfyEffectiveFilter(execution_plan, target, schema, rows_req.req, authenticated_identity);
@@ -15275,6 +15922,22 @@ pub const ApiHttpServer = struct {
         return try self.source.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
     }
 
+    fn apiHttpServerCatalogApplyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn apiHttpServerCatalogApplyTableCatalogDropWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.applyTableCatalogDropWithSchemaRewriteJobs(request);
+    }
+
     fn apiHttpServerCatalogPromoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.source.promoteTableEmptyingBarrier(request);
@@ -17464,9 +18127,13 @@ pub const ApiHttpServer = struct {
         const triggered_body = (try self.rowsBatchBodyAfterBeforeTriggersAlloc(table_name, body, schema, unique_resolver)) orelse body;
         defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
 
-        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, table_name, triggered_body, schema, unique_resolver) catch |err| switch (err) {
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(self.alloc, table_name, triggered_body, schema, unique_resolver, .{
+            .sequence_resolver = sequence_resolver_ctx.resolver(),
+        }) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.SequenceNotFound => return try textResponse(self.alloc, 400, "invalid rows request"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return try textResponse(self.alloc, 400, "invalid rows request"),
         };
@@ -17555,9 +18222,13 @@ pub const ApiHttpServer = struct {
         const triggered_body = (try self.rowsBatchBodyAfterBeforeTriggersAlloc(target.table_name, body, schema, unique_resolver)) orelse body;
         defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
 
-        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, target.table_name, triggered_body, schema, unique_resolver) catch |err| switch (err) {
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolverAndDefaultContext(self.alloc, target.table_name, triggered_body, schema, unique_resolver, .{
+            .sequence_resolver = sequence_resolver_ctx.resolver(),
+        }) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.SequenceNotFound => return try textResponse(self.alloc, 400, "invalid rows request"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return try textResponse(self.alloc, 400, "invalid rows request"),
         };
@@ -17900,7 +18571,8 @@ pub const ApiHttpServer = struct {
         defer source_result.deinit(self.alloc);
 
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
-        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
             self.alloc,
             table_name,
             target_schema,
@@ -17908,11 +18580,12 @@ pub const ApiHttpServer = struct {
             rows_req.req,
             source_result.rows,
             unique_resolver_ctx.resolver(),
+            .{ .sequence_resolver = sequence_resolver_ctx.resolver() },
         ) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
-            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.SequenceNotFound => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
             else => {
                 std.log.err("public table rows insert source plan failed table={s} source={s} err={}", .{ table_name, source_table_name, err });
                 return try textResponse(self.alloc, 500, "rows mutation source failed");
@@ -29882,8 +30555,11 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer rollback_missing_param_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), rollback_missing_param_resp.status);
-    const stored_after_missing_param_rollback = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(!stored_after_missing_param_rollback.sql_transaction_failed);
+    try std.testing.expect(server.sql_catalog_session_runtime.sessions.getPtr(session_id) == null);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        server.sql_prepared_statement_runtime.statementCountForTest(session_id),
+    );
 
     const request_readonly_set_readwrite_body = try std.fmt.allocPrint(
         alloc,
@@ -30275,6 +30951,192 @@ test "api http server exposes psql-style SQL session endpoint" {
     try std.testing.expectEqual(@as(u16, 400), readonly_trigger_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, readonly_trigger_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
     try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
+}
+
+test "api http server executes PostgreSQL sequence compatibility functions through metadata source" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        sequence: metadata_table_manager.SequenceRecord = .{
+            .sequence_id = metadata_table_manager.deriveSequenceId("default", "public", "usage_id_seq"),
+            .name = "usage_id_seq",
+            .database_name = "default",
+            .namespace_name = "public",
+            .options_json = "{\"start_with\":10,\"increment_by\":5}",
+            .last_value = 5,
+        },
+        snapshot_sequences: [1]metadata_table_manager.SequenceRecord = undefined,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .upsert_sequence = upsertSequence,
+                    .allocate_sequence_value = allocateSequenceValue,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_sequences[0] = self.sequence;
+            return .{
+                .status = try status(ptr),
+                .sequences = self.snapshot_sequences[0..],
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertSequence(ptr: *anyopaque, record: metadata_table_manager.SequenceRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (record.sequence_id != self.sequence.sequence_id) return error.SequenceNotFound;
+            self.sequence.last_value = record.last_value;
+            self.sequence.last_allocation_id = record.last_allocation_id;
+        }
+
+        fn allocateSequenceValue(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            sequence_name: []const u8,
+        ) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, database_name, self.sequence.database_name) or
+                !std.mem.eql(u8, namespace_name, self.sequence.namespace_name) or
+                !std.mem.eql(u8, sequence_name, self.sequence.name))
+            {
+                return error.SequenceNotFound;
+            }
+            const value = try metadata_table_manager.sequenceNextValueFromRecord(alloc_arg, self.sequence);
+            self.sequence.last_value = value;
+            return value;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var describe_session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer describe_session.deinit(alloc);
+    var describe_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "SELECT nextval('usage_id_seq')");
+    defer describe_sql.deinit(alloc);
+    var described = try server.handlePublicParsedSqlDescribeRequestResult(.{
+        .parsed_sql = &describe_sql,
+        .session = &describe_session,
+    });
+    defer described.deinit(alloc);
+    switch (described) {
+        .result => |result| {
+            try std.testing.expectEqualStrings("query", result.statement_kind);
+            try std.testing.expect(result.has_row_description);
+        },
+        .response => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(i64, 5), source.sequence.last_value);
+
+    var currval_before_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT currval('usage_id_seq');\"}",
+    });
+    defer currval_before_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), currval_before_resp.status);
+
+    var nextval_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT nextval('usage_id_seq');\"}",
+    });
+    defer nextval_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), nextval_resp.status);
+    var parsed_nextval = try std.json.parseFromSlice(std.json.Value, alloc, nextval_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_nextval.deinit();
+    const session_id = @as(u64, @intCast(parsed_nextval.value.object.get("session_id").?.integer));
+    const nextval_rows = parsed_nextval.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("10", nextval_rows[0].object.get("nextval").?.string);
+    try std.testing.expectEqual(@as(i64, 10), source.sequence.last_value);
+
+    const set_path_body = try std.fmt.allocPrint(alloc, "{{\"session_id\":{d},\"sql\":\"SET search_path TO public;\"}}", .{session_id});
+    defer alloc.free(set_path_body);
+    var set_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_path_body,
+    });
+    defer set_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_path_resp.status);
+
+    const currval_body = try std.fmt.allocPrint(alloc, "{{\"session_id\":{d},\"sql\":\"SELECT currval('usage_id_seq');\"}}", .{session_id});
+    defer alloc.free(currval_body);
+    var currval_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = currval_body,
+    });
+    defer currval_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), currval_resp.status);
+    var parsed_currval = try std.json.parseFromSlice(std.json.Value, alloc, currval_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_currval.deinit();
+    const currval_rows = parsed_currval.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("10", currval_rows[0].object.get("currval").?.string);
+
+    const setval_body = try std.fmt.allocPrint(alloc, "{{\"session_id\":{d},\"sql\":\"SELECT setval('usage_id_seq', 100, false);\"}}", .{session_id});
+    defer alloc.free(setval_body);
+    var setval_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = setval_body,
+    });
+    defer setval_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), setval_resp.status);
+    try std.testing.expectEqual(@as(i64, 95), source.sequence.last_value);
+
+    const next_after_setval_body = try std.fmt.allocPrint(alloc, "{{\"session_id\":{d},\"sql\":\"SELECT nextval('usage_id_seq');\"}}", .{session_id});
+    defer alloc.free(next_after_setval_body);
+    var next_after_setval_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = next_after_setval_body,
+    });
+    defer next_after_setval_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), next_after_setval_resp.status);
+    var parsed_next_after_setval = try std.json.parseFromSlice(std.json.Value, alloc, next_after_setval_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_next_after_setval.deinit();
+    const next_after_setval_rows = parsed_next_after_setval.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("100", next_after_setval_rows[0].object.get("nextval").?.string);
+
+    const readonly_body = try std.fmt.allocPrint(alloc, "{{\"read_only\":true,\"session_id\":{d},\"sql\":\"SELECT nextval('usage_id_seq');\"}}", .{session_id});
+    defer alloc.free(readonly_body);
+    var readonly_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = readonly_body,
+    });
+    defer readonly_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, readonly_resp.body, "execute", "read_only_transaction", "cannot execute statement in a read-only transaction", null, null);
 }
 
 test "api http server executes Antfly SQL query functions through native query path" {
@@ -32210,23 +33072,15 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqual(@as(u16, 200), truncate_resp.status);
     var parsed_truncate = try std.json.parseFromSlice(std.json.Value, alloc, truncate_resp.body, .{ .allocate = .alloc_always });
     defer parsed_truncate.deinit();
-    try std.testing.expectEqualStrings("write", parsed_truncate.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("ddl", parsed_truncate.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
-    const truncate_result = parsed_truncate.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 17), truncate_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 17), truncate_result.get("staged").?.integer);
-
-    var truncated_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records;\"}",
-    });
-    defer truncated_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncated_query_resp.status);
-    var parsed_truncated_query = try std.json.parseFromSlice(std.json.Value, alloc, truncated_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncated_query.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_truncated_query.value.object.get("result").?.object.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[0].group_id);
+    try std.testing.expect(!source.table_emptying_jobs.items[0].restart_identity);
+    try std.testing.expect(!source.table_emptying_jobs.items[0].cascade);
+    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[0].affected_table_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].affected_table_ids[0]);
 
     var truncate_continue_seed_resp = try server.handle(.{
         .method = .POST,
@@ -32247,11 +33101,14 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqual(@as(u16, 200), truncate_continue_resp.status);
     var parsed_truncate_continue = try std.json.parseFromSlice(std.json.Value, alloc, truncate_continue_resp.body, .{ .allocate = .alloc_always });
     defer parsed_truncate_continue.deinit();
-    try std.testing.expectEqualStrings("write", parsed_truncate_continue.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("ddl", parsed_truncate_continue.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate_continue.value.object.get("statement_kind").?.string);
-    const truncate_continue_result = parsed_truncate_continue.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), truncate_continue_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), truncate_continue_result.get("staged").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
+    try std.testing.expect(!source.table_emptying_jobs.items[0].restart_identity);
+    try std.testing.expect(!source.table_emptying_jobs.items[0].cascade);
+    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[0].affected_table_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].affected_table_ids[0]);
 
     var truncate_cascade_resp = try server.handle(.{
         .method = .POST,
@@ -32265,12 +33122,12 @@ test "api http server executes SQL point writes through typed row batch ingress"
     defer parsed_truncate_cascade.deinit();
     try std.testing.expectEqualStrings("ddl", parsed_truncate_cascade.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate_cascade.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 2), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 3), source.table_emptying_jobs.items[1].table_id);
-    try std.testing.expectEqual(@as(u64, 13), source.table_emptying_jobs.items[1].group_id);
-    for (source.table_emptying_jobs.items[0..2]) |job| {
+    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[1].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[1].group_id);
+    try std.testing.expectEqual(@as(u64, 3), source.table_emptying_jobs.items[2].table_id);
+    try std.testing.expectEqual(@as(u64, 13), source.table_emptying_jobs.items[2].group_id);
+    for (source.table_emptying_jobs.items[1..3]) |job| {
         try std.testing.expect(!job.restart_identity);
         try std.testing.expect(job.cascade);
         try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
@@ -32286,7 +33143,7 @@ test "api http server executes SQL point writes through typed row batch ingress"
     });
     defer truncate_restart_identity_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), truncate_restart_identity_resp.status);
-    try std.testing.expectEqual(@as(usize, 2), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
 
     var truncate_multi_table_resp = try server.handle(.{
         .method = .POST,
@@ -32300,12 +33157,12 @@ test "api http server executes SQL point writes through typed row batch ingress"
     defer parsed_truncate_multi_table.deinit();
     try std.testing.expectEqualStrings("ddl", parsed_truncate_multi_table.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate_multi_table.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 4), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[2].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[2].group_id);
-    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[3].table_id);
-    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[3].group_id);
-    for (source.table_emptying_jobs.items[2..4]) |job| {
+    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[3].table_id);
+    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[3].group_id);
+    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[4].table_id);
+    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[4].group_id);
+    for (source.table_emptying_jobs.items[3..5]) |job| {
         try std.testing.expect(!job.restart_identity);
         try std.testing.expect(!job.cascade);
         try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
@@ -32321,7 +33178,7 @@ test "api http server executes SQL point writes through typed row batch ingress"
     });
     defer tenant_truncate_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), tenant_truncate_resp.status);
-    try std.testing.expectEqual(@as(usize, 4), source.table_emptying_jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {

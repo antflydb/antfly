@@ -192,6 +192,7 @@ pub const UniqueConstraintOwnerRange = struct {
     start_encoded_value: []u8,
     end_encoded_value: ?[]u8 = null,
     group_id: u64,
+    range_id: u64 = 0,
     topology_epoch: u64 = 0,
     state: []u8,
     active: bool,

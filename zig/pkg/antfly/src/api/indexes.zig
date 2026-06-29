@@ -19,7 +19,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_mod = @import("../graph/graph.zig");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const runtime_status = @import("runtime_status.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 

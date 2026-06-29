@@ -25,8 +25,8 @@ const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
-const table_catalog = @import("../api/table_catalog.zig");
-const tables_api = @import("../api/tables.zig");
+const catalog_source = @import("catalog/source.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
@@ -864,7 +864,7 @@ fn localRangeHasSchemaVersionIndex(
 
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
     const target_index = findDbIndexStats(stats.indexes, target_name) orelse return false;
@@ -873,7 +873,7 @@ fn localRangeHasSchemaVersionIndex(
 
     var read_name_buf: [64]u8 = undefined;
     const read_name = if (read_schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version});
     const read_index = findDbIndexStats(stats.indexes, read_name) orelse return true;
@@ -921,7 +921,7 @@ fn runtimeHasReadySchemaVersionIndex(
 ) bool {
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
@@ -929,7 +929,7 @@ fn runtimeHasReadySchemaVersionIndex(
 
     var read_name_buf: [64]u8 = undefined;
     const read_name = if (read_schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, read_name) orelse return true;
@@ -1193,9 +1193,9 @@ test "table provisioner applies schema-derived algebraic reloads to hosted group
         \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
     ;
     const seed_indexes = "{\"alg\":{\"type\":\"algebraic\",\"derive_from_schema\":true}}";
-    const indexes_v1 = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, "docs", seed_indexes, schema_v1);
+    const indexes_v1 = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, "docs", seed_indexes, schema_v1);
     defer alloc.free(indexes_v1);
-    const indexes_v2 = try tables_api.regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "docs", indexes_v1, schema_v2);
+    const indexes_v2 = try catalog_table_ddl.regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "docs", indexes_v1, schema_v2);
     defer alloc.free(indexes_v2);
 
     const range = table_manager.RangeRecord{
@@ -2136,7 +2136,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     const FakeCatalog = struct {
         restore_location: []const u8,
 
-        fn iface(self: *@This()) table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -2248,7 +2248,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .table_id = 7,
             .name = "docs",
             .description = "docs table",
-            .indexes_json = tables_api.default_indexes_json,
+            .indexes_json = catalog_table_ddl.default_indexes_json,
             .placement_role = "data",
         },
         &.{.{
@@ -2272,7 +2272,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         &.{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = tables_api.default_indexes_json,
+            .indexes_json = catalog_table_ddl.default_indexes_json,
             .restore_backup_id = "snap1",
             .restore_location = restore_location,
             .placement_role = "data",

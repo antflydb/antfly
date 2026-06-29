@@ -23,7 +23,7 @@ const relational_row_runtime = @import("../storage/db/relational_rows.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_value = @import("value.zig");
-const table_catalog = if (builtin.is_test) @import("../metadata/catalog_source.zig") else struct {};
+const table_catalog = if (builtin.is_test) @import("../metadata/catalog/source.zig") else struct {};
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 

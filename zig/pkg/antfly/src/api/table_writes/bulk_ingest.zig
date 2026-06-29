@@ -16,7 +16,7 @@ const std = @import("std");
 
 const backend_types = @import("../../storage/backend_types.zig");
 const db_mod = @import("../../storage/db/mod.zig");
-const table_catalog = @import("../table_catalog.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
 const table_write_core = @import("core.zig");
 const table_write_managed_db = @import("managed_db.zig");
 

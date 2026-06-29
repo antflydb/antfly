@@ -292,6 +292,16 @@ pub fn importRowsBatchFromStdinAlloc(
     plan: BulkSqlIoExecutionPlan,
     stdin_payload: []const u8,
 ) !relational_rows.OwnedRowsBatchRequest {
+    return try importRowsBatchFromStdinWithDefaultContextAlloc(alloc, schema, plan, stdin_payload, .{});
+}
+
+pub fn importRowsBatchFromStdinWithDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    stdin_payload: []const u8,
+    default_context: relational_rows.DefaultValueContext,
+) !relational_rows.OwnedRowsBatchRequest {
     if (plan.operation != .import_rows or plan.native_route != .rows_batch or (plan.endpoint_kind != .stream and plan.endpoint_kind != .file and plan.endpoint_kind != .program)) return error.UnsupportedSqlShape;
     if (plan.endpoint_kind == .stream and plan.stream != .stdin) return error.UnsupportedSqlShape;
     if (plan.endpoint_kind == .file and plan.stream != .file) return error.UnsupportedSqlShape;
@@ -304,7 +314,7 @@ pub fn importRowsBatchFromStdinAlloc(
             return error.UnsupportedSqlShape;
         }
     }
-    if (plan.codec == .postgres_binary) return try importRowsBatchFromPostgresBinaryAlloc(alloc, schema, plan, stdin_payload);
+    if (plan.codec == .postgres_binary) return try importRowsBatchFromPostgresBinaryWithDefaultContextAlloc(alloc, schema, plan, stdin_payload, default_context);
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(alloc);
@@ -341,7 +351,7 @@ pub fn importRowsBatchFromStdinAlloc(
         appended += 1;
     }
     try body.appendSlice(alloc, "]}");
-    return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
+    return try relational_rows.parseRowsBatchRequestWithResolverAndDefaultContext(alloc, plan.table_name, body.items, schema, null, default_context);
 }
 
 const postgres_binary_copy_signature = "PGCOPY\n\xff\r\n\x00";
@@ -351,6 +361,16 @@ fn importRowsBatchFromPostgresBinaryAlloc(
     schema: runtime_schema.TableSchema,
     plan: BulkSqlIoExecutionPlan,
     payload: []const u8,
+) !relational_rows.OwnedRowsBatchRequest {
+    return try importRowsBatchFromPostgresBinaryWithDefaultContextAlloc(alloc, schema, plan, payload, .{});
+}
+
+fn importRowsBatchFromPostgresBinaryWithDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    payload: []const u8,
+    default_context: relational_rows.DefaultValueContext,
 ) !relational_rows.OwnedRowsBatchRequest {
     if (payload.len < postgres_binary_copy_signature.len + 8) return error.InvalidRowsRequest;
     if (!std.mem.eql(u8, payload[0..postgres_binary_copy_signature.len], postgres_binary_copy_signature)) return error.InvalidRowsRequest;
@@ -384,7 +404,7 @@ fn importRowsBatchFromPostgresBinaryAlloc(
     }
     if (pos != payload.len) return error.InvalidRowsRequest;
     try body.appendSlice(alloc, "]}");
-    return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
+    return try relational_rows.parseRowsBatchRequestWithResolverAndDefaultContext(alloc, plan.table_name, body.items, schema, null, default_context);
 }
 
 fn rowJsonFromPostgresBinaryFieldsAlloc(
@@ -1367,6 +1387,79 @@ test "sql adapter bulk io imports COPY rows into row batches" {
     generated_plan.columns = generated_columns[0..];
     generated_plan.header = false;
     try std.testing.expectError(error.InvalidRowsRequest, importRowsBatchFromStdinAlloc(alloc, schema, generated_plan, "u5,ready\n"));
+}
+
+test "sql adapter bulk io materializes sequence defaults through explicit resolver" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{
+            .name = "id",
+            .path = "id",
+            .field_type = .numeric,
+            .nullable = false,
+            .default_value = .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}" },
+        },
+        .{ .name = "status", .path = "status", .field_type = .text, .nullable = false },
+    };
+    const primary_columns = [_][]const u8{"id"};
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .primary_key = .{ .columns = primary_columns[0..] },
+    };
+    const import_columns = [_][]const u8{"status"};
+    const plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .csv,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
+        .table_name = "usage_records",
+        .columns = import_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+    };
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        importRowsBatchFromStdinAlloc(alloc, schema, plan, "pending\n"),
+    );
+
+    const Resolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) relational_rows.SequenceDefaultResolver {
+            return .{
+                .ptr = self,
+                .next_value_json_alloc = nextValueJsonAlloc,
+            };
+        }
+
+        fn nextValueJsonAlloc(ptr: *anyopaque, inner_alloc: std.mem.Allocator, request: relational_rows.SequenceDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("usage_id_seq", request.sequence);
+            try std.testing.expectEqualStrings("tenant", request.database);
+            try std.testing.expectEqualStrings("billing", request.schema);
+            self.calls += 1;
+            return try std.fmt.allocPrint(inner_alloc, "{d}", .{@as(i64, 700) + @as(i64, @intCast(self.calls))});
+        }
+    };
+
+    var resolver = Resolver{};
+    var batch = try importRowsBatchFromStdinWithDefaultContextAlloc(
+        alloc,
+        schema,
+        plan,
+        "pending\nclosed\n",
+        .{ .sequence_resolver = resolver.iface() },
+    );
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 2), batch.writes.len);
+    try std.testing.expectEqualStrings("{\"status\":\"pending\",\"id\":701}", batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"status\":\"closed\",\"id\":702}", batch.writes[1].value);
 }
 
 test "sql adapter bulk io imports and exports COPY text csv and binary codecs" {

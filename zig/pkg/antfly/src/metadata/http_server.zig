@@ -26,13 +26,13 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const storage_schema = @import("../storage/schema.zig");
 const backups_api = @import("../api/backups.zig");
-const catalog_resources = @import("../api/catalog_resources.zig");
+const catalog_resources = @import("catalog/resources.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
-const relational_sql_ddl = @import("../api/relational_sql_ddl.zig");
-const table_catalog = @import("../api/table_catalog.zig");
-const tables_api = @import("../api/tables.zig");
-const catalog_jobs = @import("../api/catalog_jobs.zig");
+const relational_sql_ddl = @import("catalog/relational_ddl.zig");
+const catalog_source = @import("catalog/source.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
+const catalog_jobs = @import("catalog/jobs.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 const platform_time = @import("../platform/time.zig");
 const sql_adapter = @import("../sql/mod.zig");
@@ -146,11 +146,11 @@ pub const AdminSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
-        create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
+        create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) anyerror!void = null,
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
-        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.DurableSqlPlan, session: catalog_resources.SqlCatalogSession) anyerror!catalog_table_ddl.AppliedRelationalSqlDdlRecord = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -204,7 +204,7 @@ pub const AdminSource = struct {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
     }
 
-    pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+    pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const fn_ptr = self.vtable.create_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
@@ -224,7 +224,7 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
     }
 
-    pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+    pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
         return try self.applyRelationalParsedSqlDdl(alloc, &parsed_sql, catalog_resources.SqlCatalogSession.default());
@@ -235,7 +235,7 @@ pub const AdminSource = struct {
         alloc: std.mem.Allocator,
         parsed_sql: *const sql_adapter.ParsedSql,
         session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
         var source = self;
         var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
@@ -254,7 +254,7 @@ pub const AdminSource = struct {
         alloc: std.mem.Allocator,
         plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, plan, session);
     }
@@ -556,20 +556,20 @@ pub const AdminSource = struct {
         _ = svc;
     }
 
-    fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+    fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         var normalized_req = req;
-        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+        const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+        const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
-        const table = tables_api.deriveTableRecord(table_name, normalized_req);
-        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
-        const ranges = try tables_api.deriveInitialRanges(alloc, table);
+        const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+        try catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
+        const ranges = try catalog_table_ddl.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(ranges);
@@ -589,7 +589,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        try catalog_table_ddl.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
         if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -605,9 +605,9 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+        const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
+        try catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -617,7 +617,7 @@ pub const AdminSource = struct {
         alloc: std.mem.Allocator,
         plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var applied = try applyDurableSqlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
@@ -911,20 +911,20 @@ pub const AdminSource = struct {
         return try svc.forwardMetadataLeaderRequest(alloc, req);
     }
 
-    fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+    fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         var normalized_req = req;
-        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+        const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+        const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
-        const table = tables_api.deriveTableRecord(table_name, normalized_req);
-        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
-        const ranges = try tables_api.deriveInitialRanges(alloc, table);
+        const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+        try catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
+        const ranges = try catalog_table_ddl.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(ranges);
@@ -947,7 +947,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        try catalog_table_ddl.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
         if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -963,9 +963,9 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+        const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
+        try catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try applyTableCatalogUpdateWithoutSchemaRewriteJobs(svc, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -975,7 +975,7 @@ pub const AdminSource = struct {
         alloc: std.mem.Allocator,
         plan: *sql_adapter.DurableSqlPlan,
         session: catalog_resources.SqlCatalogSession,
-    ) !tables_api.AppliedRelationalSqlDdlRecord {
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var applied = try applyDurableSqlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
@@ -1241,7 +1241,7 @@ pub const AdminSource = struct {
     }
 };
 
-fn adminSourceCatalogSource(source: *AdminSource) table_catalog.CatalogSource {
+fn adminSourceCatalogSource(source: *AdminSource) catalog_source.CatalogSource {
     const Adapter = struct {
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const admin_source: *AdminSource = @ptrCast(@alignCast(ptr));
@@ -2206,8 +2206,8 @@ fn parseForeignKeyReferenceRangeMergeRequest(alloc: std.mem.Allocator, body: []c
     };
 }
 
-fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
-    return try tables_api.parseCreateTableRequest(alloc, body);
+fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !catalog_table_ddl.CreateTableRequest {
+    return try catalog_table_ddl.parseCreateTableRequest(alloc, body);
 }
 
 const RestoreMetadataSpec = struct {
@@ -2276,7 +2276,7 @@ fn applyRelationalSqlDdlPlanOnMetadataServiceWithSession(
     alloc: std.mem.Allocator,
     plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
+) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
     return try applyDurableSqlPlanOnMetadataServiceWithSession(service_impl, alloc, plan, session);
 }
 
@@ -2285,7 +2285,7 @@ fn applyDurableSqlPlanOnMetadataServiceWithSession(
     alloc: std.mem.Allocator,
     plan: *sql_adapter.DurableSqlPlan,
     session: catalog_resources.SqlCatalogSession,
-) !tables_api.AppliedRelationalSqlDdlRecord {
+) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
     return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, service_impl, plan, session);
 }
 
@@ -3118,7 +3118,7 @@ fn sanitizePostgresIdentifierAlloc(
 }
 
 fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
-    return tables_api.findTableByName(snapshot, table_name);
+    return catalog_table_ddl.findTableByName(snapshot, table_name);
 }
 
 fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
@@ -3285,7 +3285,7 @@ test "metadata catalog validation requires cross-table foreign keys to reference
     };
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
-        tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &missing_unique_snapshot, orders),
+        catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &missing_unique_snapshot, orders),
     );
 
     var valid_parent_tables = [_]metadata_table_manager.TableRecord{customers_with_unique};
@@ -3298,7 +3298,7 @@ test "metadata catalog validation requires cross-table foreign keys to reference
         .split_transitions = &.{},
         .merge_transitions = &.{},
     };
-    try tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &valid_parent_snapshot, orders);
+    try catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &valid_parent_snapshot, orders);
 
     var type_mismatch_tables = [_]metadata_table_manager.TableRecord{customers_type_mismatch};
     var type_mismatch_snapshot = metadata_api.AdminSnapshot{
@@ -3312,7 +3312,7 @@ test "metadata catalog validation requires cross-table foreign keys to reference
     };
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
-        tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &type_mismatch_snapshot, orders),
+        catalog_table_ddl.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &type_mismatch_snapshot, orders),
     );
 }
 
@@ -3346,9 +3346,9 @@ test "metadata catalog validation rejects relational parent table drop while ref
 
     try std.testing.expectError(
         error.TableReferencedByForeignKey,
-        tables_api.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, customers),
+        catalog_table_ddl.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, customers),
     );
-    try tables_api.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, orders);
+    try catalog_table_ddl.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, orders);
 }
 
 test "metadata catalog validation applies sql drop table cascade through child schema updates" {
@@ -3397,6 +3397,22 @@ test "metadata catalog validation applies sql drop table cascade through child s
         ) !void {
             self.apply_table_update_count += 1;
             try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+        }
+
+        pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            self.apply_table_update_count += request.tables.len;
+            try self.manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+        }
+
+        pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+        ) !void {
+            self.apply_table_update_count += request.table_updates.len;
+            try self.manager.applyTableCatalogDropWithSchemaRewriteJobs(request);
         }
 
         pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -3510,7 +3526,7 @@ test "metadata catalog validation applies sql drop table cascade through child s
 }
 
 test "metadata catalog validation treats missing drop table if exists as ddl noop" {
-    var applied = try tables_api.missingDropTableIfExistsNoopAlloc(std.testing.allocator, "missing_usage");
+    var applied = try catalog_table_ddl.missingDropTableIfExistsNoopAlloc(std.testing.allocator, "missing_usage");
     defer applied.deinit(std.testing.allocator);
     try std.testing.expect(applied.noop);
     try std.testing.expect(!applied.created_table);
@@ -3573,6 +3589,31 @@ test "metadata catalog applies untargeted graph metric SQL DDL through shared de
             if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
             self.table = cloned;
             self.table_owned = true;
+            self.apply_table_update_count += 1;
+        }
+
+        pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            try std.testing.expectEqual(@as(usize, 1), request.tables.len);
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, request.tables[0]);
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = cloned;
+            self.table_owned = true;
+            self.apply_table_update_count += 1;
+        }
+
+        pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            try std.testing.expectEqual(@as(usize, 0), request.table_updates.len);
+            try std.testing.expectEqual(self.table.table_id, request.table_id);
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table_owned = false;
             self.apply_table_update_count += 1;
         }
 
@@ -3735,6 +3776,25 @@ test "metadata catalog applies SQL ALTER COLUMN USING through typed schema rewri
         ) !void {
             try self.upsertTable(request.table);
             for (request.schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+        }
+
+        pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            for (request.tables) |record| try self.upsertTable(record);
+            for (request.schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+        }
+
+        pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+        ) !void {
+            for (request.table_updates) |record| try self.upsertTable(record);
+            for (request.schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+            if (self.table.table_id != request.table_id) return error.UnknownTable;
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table_owned = false;
         }
 
         pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -4222,7 +4282,7 @@ test "metadata admin source advances foreign key validation state through schema
                         .table_id = 1,
                         .name = "orders",
                         .schema_json = self.schema_json,
-                        .indexes_json = tables_api.default_indexes_json,
+                        .indexes_json = catalog_table_ddl.default_indexes_json,
                         .replication_sources_json = "[]",
                         .placement_role = "data",
                     },

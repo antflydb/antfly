@@ -5,9 +5,9 @@
 
 const std = @import("std");
 
-const raft_mod = @import("../../raft/mod.zig");
-const sql_adapter_runtime = @import("../../sql/runtime.zig");
-const storage_schema = @import("../../storage/schema.zig");
+const raft_mod = @import("../raft/mod.zig");
+const sql_adapter = @import("document_plan.zig");
+const storage_schema = @import("../storage/schema.zig");
 
 pub const LookupOptions = struct {};
 
@@ -70,8 +70,8 @@ pub const QueryResponse = struct {
 pub const AlgebraicAggregateRequest = struct {
     index_name: []const u8,
     materialization_name: []const u8,
-    aggregate_op: sql_adapter_runtime.DocumentAggregateOp,
-    group_by: ?sql_adapter_runtime.DocumentAggregateGroupBy = null,
+    aggregate_op: sql_adapter.DocumentAggregateOp,
+    group_by: ?sql_adapter.DocumentAggregateGroupBy = null,
     limit: ?u32 = null,
 };
 
@@ -257,7 +257,7 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
 pub fn executeReadPlanAlloc(
     alloc: std.mem.Allocator,
     source: Source,
-    lowered: sql_adapter_runtime.DocumentReadPlan,
+    lowered: sql_adapter.DocumentReadPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsQueryResult {
     const native_table_name = source.native_table_name;
@@ -348,7 +348,7 @@ pub fn executeReadPlanAlloc(
 }
 
 fn documentSqlAdmitBoundedScanPayload(
-    scan_plan: sql_adapter_runtime.BoundedDocumentScan,
+    scan_plan: sql_adapter.BoundedDocumentScan,
     payload: []const u8,
 ) !void {
     const max_bytes = scan_plan.max_bytes orelse return;
@@ -363,7 +363,7 @@ fn documentSqlBoundedScanProbeLimit(max_rows: u32) u32 {
 pub fn executeAggregatePlanAlloc(
     alloc: std.mem.Allocator,
     source: Source,
-    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    lowered: sql_adapter.DocumentAlgebraicAggregatePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsAggregateResult {
     const native_table_name = source.native_table_name;
@@ -486,7 +486,7 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
     alloc: std.mem.Allocator,
     source: Source,
     native_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    lowered: sql_adapter.DocumentAlgebraicAggregatePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsAggregateResult {
     const index_name = lowered.index_name orelse return error.DocumentSqlIndexUnavailable;
@@ -537,7 +537,7 @@ fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    lowered: sql_adapter.DocumentAlgebraicAggregatePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsAggregateResult {
     const input = lowered.aggregate.input orelse return error.UnsupportedSqlShape;
@@ -645,8 +645,8 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
-    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
+    lowered: sql_adapter.DocumentAlgebraicAggregatePlan,
+    group_by: sql_adapter.DocumentAggregateGroupBy,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsAggregateResult {
     if (lowered.candidate_producer == null) return error.UnsupportedSqlShape;
@@ -727,8 +727,8 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
-    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
+    lowered: sql_adapter.DocumentAlgebraicAggregatePlan,
+    group_by: sql_adapter.DocumentAggregateGroupBy,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsAggregateResult {
     const input = lowered.aggregate.input orelse return error.UnsupportedSqlShape;
@@ -817,7 +817,7 @@ const DocumentSqlCountGroup = struct {
 fn appendDocumentSqlCountGroupFromDocJsonAlloc(
     alloc: std.mem.Allocator,
     groups: *std.ArrayListUnmanaged(DocumentSqlCountGroup),
-    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
+    group_by: sql_adapter.DocumentAggregateGroupBy,
     doc_json: []const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
@@ -852,9 +852,9 @@ const DocumentSqlNumericAggregateGroup = struct {
 fn appendDocumentSqlNumericAggregateGroupFromDocJsonAlloc(
     alloc: std.mem.Allocator,
     groups: *std.ArrayListUnmanaged(DocumentSqlNumericAggregateGroup),
-    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
-    input: sql_adapter_runtime.DocumentAggregateInput,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    group_by: sql_adapter.DocumentAggregateGroupBy,
+    input: sql_adapter.DocumentAggregateInput,
+    op: sql_adapter.DocumentAggregateOp,
     doc_json: []const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
@@ -923,7 +923,7 @@ const OrderedDocumentSqlUnnestCandidate = struct {
 };
 
 const DocumentSqlSortContext = struct {
-    direction: sql_adapter_runtime.DocumentOrderDirection,
+    direction: sql_adapter.DocumentOrderDirection,
 };
 
 fn documentSqlCandidateLessThan(ctx: DocumentSqlSortContext, lhs: OrderedDocumentSqlCandidate, rhs: OrderedDocumentSqlCandidate) bool {
@@ -988,8 +988,8 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentReadPlan,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    lowered: sql_adapter.DocumentReadPlan,
+    order_by: sql_adapter.DocumentOrderBy,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsQueryResult {
     var candidates = std.ArrayListUnmanaged(OrderedDocumentSqlCandidate).empty;
@@ -1088,7 +1088,7 @@ fn appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
     public_table_name: []const u8,
     response_json: []const u8,
     residual_filter_json: ?[]const u8,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    order_by: sql_adapter.DocumentOrderBy,
     consistency: raft_mod.ReadConsistency,
     candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlCandidate),
 ) !void {
@@ -1135,7 +1135,7 @@ fn appendOrderedDocumentSqlCandidateAlloc(
     candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlCandidate),
     id: []const u8,
     doc_json: []const u8,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    order_by: sql_adapter.DocumentOrderBy,
 ) !void {
     const owned_id = try alloc.dupe(u8, id);
     errdefer alloc.free(owned_id);
@@ -1154,7 +1154,7 @@ fn documentSqlSortKeyAlloc(
     alloc: std.mem.Allocator,
     id: []const u8,
     doc_json: []const u8,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    order_by: sql_adapter.DocumentOrderBy,
 ) !DocumentSqlSortKey {
     if (std.mem.eql(u8, order_by.field, "_id")) return .{ .string = try alloc.dupe(u8, id) };
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
@@ -1202,7 +1202,7 @@ fn documentSqlSortNumber(value: std.json.Value) !f64 {
 
 fn documentSqlIndexQueryRequestAlloc(
     alloc: std.mem.Allocator,
-    query: sql_adapter_runtime.DocumentIndexQuery,
+    query: sql_adapter.DocumentIndexQuery,
     limit: ?u32,
     include_documents: bool,
     count_only: bool,
@@ -1526,7 +1526,7 @@ fn documentSqlIndexQueryAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    query: sql_adapter_runtime.DocumentIndexQuery,
+    query: sql_adapter.DocumentIndexQuery,
     limit: ?u32,
     include_documents: bool,
     count_only: bool,
@@ -1586,7 +1586,7 @@ fn documentSqlCountAggregateResultAlloc(
 fn documentSqlNumericAggregateResultAlloc(
     alloc: std.mem.Allocator,
     output: []const u8,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    op: sql_adapter.DocumentAggregateOp,
     aggregate: DocumentSqlNumericAggregate,
 ) !RowsAggregateResult {
     var row: std.Io.Writer.Allocating = .init(alloc);
@@ -1699,7 +1699,7 @@ fn documentSqlGroupedNumericAggregateResultAlloc(
     alloc: std.mem.Allocator,
     group_output: []const u8,
     aggregate_output: []const u8,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    op: sql_adapter.DocumentAggregateOp,
     groups: []const DocumentSqlNumericAggregateGroup,
     limit: ?u32,
 ) !RowsAggregateResult {
@@ -1737,7 +1737,7 @@ fn documentSqlGroupedNumericAggregateResultAlloc(
 fn appendDocumentSqlNumericAggregateFromDocJsonAlloc(
     alloc: std.mem.Allocator,
     aggregate: *DocumentSqlNumericAggregate,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    op: sql_adapter.DocumentAggregateOp,
     field: []const u8,
     doc_json: []const u8,
 ) !void {
@@ -1750,7 +1750,7 @@ fn appendDocumentSqlNumericAggregateFromDocJsonAlloc(
 
 fn appendDocumentSqlNumericAggregateValue(
     aggregate: *DocumentSqlNumericAggregate,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    op: sql_adapter.DocumentAggregateOp,
     value: std.json.Value,
 ) !void {
     if (value == .null) return;
@@ -1772,7 +1772,7 @@ fn appendDocumentSqlNumericAggregateValue(
 
 fn documentSqlNumericAggregateResultValue(
     aggregate: DocumentSqlNumericAggregate,
-    op: sql_adapter_runtime.DocumentAggregateOp,
+    op: sql_adapter.DocumentAggregateOp,
 ) f64 {
     return switch (op) {
         .avg => aggregate.value / @as(f64, @floatFromInt(aggregate.count)),
@@ -1795,9 +1795,9 @@ fn executeOrderedLoweredDocumentSqlUnnestReadPlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentReadPlan,
-    unnest: sql_adapter_runtime.DocumentUnnest,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    lowered: sql_adapter.DocumentReadPlan,
+    unnest: sql_adapter.DocumentUnnest,
+    order_by: sql_adapter.DocumentOrderBy,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsQueryResult {
     var candidates = std.ArrayListUnmanaged(OrderedDocumentSqlUnnestCandidate).empty;
@@ -1896,8 +1896,8 @@ fn executeLoweredDocumentSqlUnnestReadPlanAlloc(
     source: Source,
     native_table_name: []const u8,
     public_table_name: []const u8,
-    lowered: sql_adapter_runtime.DocumentReadPlan,
-    unnest: sql_adapter_runtime.DocumentUnnest,
+    lowered: sql_adapter.DocumentReadPlan,
+    unnest: sql_adapter.DocumentUnnest,
     consistency: raft_mod.ReadConsistency,
 ) !?RowsQueryResult {
     var rows = std.ArrayListUnmanaged([]const u8).empty;
@@ -1990,7 +1990,7 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
     native_table_name: []const u8,
     public_table_name: []const u8,
     response_json: []const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
+    projection: []const sql_adapter.DocumentProjection,
     residual_filter_json: ?[]const u8,
     row_limit: ?u32,
     consistency: raft_mod.ReadConsistency,
@@ -2098,7 +2098,7 @@ fn documentSqlProjectedRowJsonAlloc(
     alloc: std.mem.Allocator,
     key: []const u8,
     doc_json: []const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
+    projection: []const sql_adapter.DocumentProjection,
 ) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
@@ -2111,7 +2111,7 @@ fn documentSqlProjectedParsedRowJsonAlloc(
     key: []const u8,
     row: std.json.Value,
     full_doc_json: ?[]const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
+    projection: []const sql_adapter.DocumentProjection,
 ) ![]const u8 {
     return try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, row, full_doc_json, projection, null);
 }
@@ -2121,7 +2121,7 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
     key: []const u8,
     row: std.json.Value,
     full_doc_json: ?[]const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
+    projection: []const sql_adapter.DocumentProjection,
     unnest_value: ?std.json.Value,
 ) ![]const u8 {
     if (row != .object) return error.InvalidRowsRequest;
@@ -2164,9 +2164,9 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
     candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlUnnestCandidate),
     key: []const u8,
     doc_json: []const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
-    unnest: sql_adapter_runtime.DocumentUnnest,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    projection: []const sql_adapter.DocumentProjection,
+    unnest: sql_adapter.DocumentUnnest,
+    order_by: sql_adapter.DocumentOrderBy,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
@@ -2205,9 +2205,9 @@ fn appendOrderedDocumentSqlUnnestCandidatesFromQueryResponseAlloc(
     public_table_name: []const u8,
     response_json: []const u8,
     residual_filter_json: ?[]const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
-    unnest: sql_adapter_runtime.DocumentUnnest,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    projection: []const sql_adapter.DocumentProjection,
+    unnest: sql_adapter.DocumentUnnest,
+    order_by: sql_adapter.DocumentOrderBy,
     consistency: raft_mod.ReadConsistency,
     candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlUnnestCandidate),
 ) !void {
@@ -2254,8 +2254,8 @@ fn documentSqlUnnestSortKeyAlloc(
     key: []const u8,
     doc_json: []const u8,
     item: std.json.Value,
-    unnest: sql_adapter_runtime.DocumentUnnest,
-    order_by: sql_adapter_runtime.DocumentOrderBy,
+    unnest: sql_adapter.DocumentUnnest,
+    order_by: sql_adapter.DocumentOrderBy,
 ) !DocumentSqlSortKey {
     if (std.ascii.eqlIgnoreCase(order_by.field, unnest.alias)) {
         return try documentSqlSortKeyFromValueAlloc(alloc, item, unnest.item_type);
@@ -2270,8 +2270,8 @@ fn appendDocumentSqlUnnestRowsFromQueryResponseAlloc(
     public_table_name: []const u8,
     response_json: []const u8,
     residual_filter_json: ?[]const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
-    unnest: sql_adapter_runtime.DocumentUnnest,
+    projection: []const sql_adapter.DocumentProjection,
+    unnest: sql_adapter.DocumentUnnest,
     row_limit: ?u32,
     consistency: raft_mod.ReadConsistency,
     rows: *std.ArrayListUnmanaged([]const u8),
@@ -2324,8 +2324,8 @@ fn appendDocumentSqlUnnestRowsAlloc(
     alloc: std.mem.Allocator,
     key: []const u8,
     doc_json: []const u8,
-    projection: []const sql_adapter_runtime.DocumentProjection,
-    unnest: sql_adapter_runtime.DocumentUnnest,
+    projection: []const sql_adapter.DocumentProjection,
+    unnest: sql_adapter.DocumentUnnest,
     row_limit: ?u32,
     rows: *std.ArrayListUnmanaged([]const u8),
 ) !void {
@@ -2784,7 +2784,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         }
     };
 
-    const plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2800,7 +2800,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqual(@as(u32, 1), result.total_groups);
     try std.testing.expectEqualStrings("{\"total_amount\":30}", result.rows[0]);
 
-    const min_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const min_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2815,7 +2815,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqual(@as(u32, 1), min_result.total_groups);
     try std.testing.expectEqualStrings("{\"min_amount\":10}", min_result.rows[0]);
 
-    const avg_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const avg_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2830,7 +2830,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqual(@as(u32, 1), avg_result.total_groups);
     try std.testing.expectEqualStrings("{\"avg_amount\":15}", avg_result.rows[0]);
 
-    const max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const max_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2845,7 +2845,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqual(@as(u32, 1), max_result.total_groups);
     try std.testing.expectEqualStrings("{\"max_amount\":20}", max_result.rows[0]);
 
-    const grouped_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const grouped_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2866,7 +2866,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqualStrings("{\"status\":\"active\",\"row_count\":1}", grouped.rows[0]);
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"row_count\":1}", grouped.rows[1]);
 
-    const grouped_sum_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const grouped_sum_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2888,7 +2888,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqualStrings("{\"status\":\"active\",\"total_amount\":10}", grouped_sum.rows[0]);
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":20}", grouped_sum.rows[1]);
 
-    const grouped_max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const grouped_max_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2910,7 +2910,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqualStrings("{\"status\":\"active\",\"max_amount\":10}", grouped_max.rows[0]);
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"max_amount\":20}", grouped_max.rows[1]);
 
-    const grouped_avg_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const grouped_avg_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
         .aggregate = .{
@@ -2933,7 +2933,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"avg_amount\":20}", grouped_avg.rows[1]);
 
     var overflow_source = MockSource{ .overflow = true };
-    const overflow_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const overflow_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
         .aggregate = .{
@@ -2947,7 +2947,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_plan, .stale),
     );
 
-    const overflow_grouped_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const overflow_grouped_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
         .aggregate = .{
@@ -2966,7 +2966,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_plan, .stale),
     );
 
-    const overflow_grouped_sum_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const overflow_grouped_sum_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
         .aggregate = .{
@@ -2986,7 +2986,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_sum_plan, .stale),
     );
 
-    const overflow_max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const overflow_max_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
         .aggregate = .{
@@ -3062,7 +3062,7 @@ test "document SQL executes algebraic materialized aggregate rows" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("alg", req.index_name);
             try std.testing.expectEqualStrings("sum_by_status", req.materialization_name);
-            try std.testing.expectEqual(sql_adapter_runtime.DocumentAggregateOp.sum, req.aggregate_op);
+            try std.testing.expectEqual(sql_adapter.DocumentAggregateOp.sum, req.aggregate_op);
             try std.testing.expect(req.group_by != null);
             const rows = try aggregate_alloc.alloc(AlgebraicAggregateRow, 2);
             rows[0] = .{
@@ -3080,7 +3080,7 @@ test "document SQL executes algebraic materialized aggregate rows" {
         }
     };
 
-    const plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+    const plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .index_name = "alg",
         .materialization_name = "sum_by_status",

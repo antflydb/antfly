@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const metadata_api = @import("api.zig");
-const metadata_table_manager = @import("table_manager.zig");
+const metadata_api = @import("snapshot.zig");
+const metadata_table_manager = @import("../table_manager.zig");
 
 pub const default_database_name = metadata_table_manager.default_database_name;
 pub const default_namespace_name = metadata_table_manager.default_namespace_name;
@@ -97,6 +97,25 @@ pub fn findTablespaceByName(snapshot: *const metadata_api.AdminSnapshot, tablesp
     const tablespace_id = metadata_table_manager.deriveTablespaceId(tablespace_name);
     for (snapshot.tablespaces) |*record| {
         if (record.tablespace_id == tablespace_id and std.mem.eql(u8, record.name, tablespace_name)) return record;
+    }
+    return null;
+}
+
+pub fn findSequenceByQualifiedName(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    sequence_name: []const u8,
+) ?*const metadata_table_manager.SequenceRecord {
+    const sequence_id = metadata_table_manager.deriveSequenceId(database_name, namespace_name, sequence_name);
+    for (snapshot.sequences) |*record| {
+        if (record.sequence_id == sequence_id and
+            std.mem.eql(u8, record.database_name, database_name) and
+            std.mem.eql(u8, record.namespace_name, namespace_name) and
+            std.mem.eql(u8, record.name, sequence_name))
+        {
+            return record;
+        }
     }
     return null;
 }

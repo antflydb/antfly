@@ -68,6 +68,25 @@ pub const OwnedRowsBatchRequest = struct {
     }
 };
 
+pub const SequenceDefaultRequest = struct {
+    sequence: []const u8,
+    database: []const u8 = "",
+    schema: []const u8 = "",
+};
+
+pub const SequenceDefaultResolver = struct {
+    ptr: *anyopaque,
+    next_value_json_alloc: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: SequenceDefaultRequest) anyerror![]u8,
+
+    pub fn nextValueJsonAlloc(self: @This(), alloc: std.mem.Allocator, request: SequenceDefaultRequest) ![]u8 {
+        return try self.next_value_json_alloc(self.ptr, alloc, request);
+    }
+};
+
+pub const DefaultValueContext = struct {
+    sequence_resolver: ?SequenceDefaultResolver = null,
+};
+
 pub const OwnedRowsGetRequest = struct {
     keys: []?[]const u8 = &.{},
     identities_json: [][]const u8 = &.{},
@@ -256,7 +275,7 @@ pub fn buildRowsInsertSourceBatchAlloc(
     source_rows: []const []const u8,
     conflict_resolver: ?UniqueSelectorResolver,
 ) !OwnedRowsBatchRequest {
-    return try buildRowsInsertSourceBatchWithSchemasAlloc(alloc, table_name, schema, schema, req, source_rows, conflict_resolver);
+    return try buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(alloc, table_name, schema, schema, req, source_rows, conflict_resolver, .{});
 }
 
 pub fn buildRowsInsertSourceBatchWithSchemasAlloc(
@@ -267,6 +286,19 @@ pub fn buildRowsInsertSourceBatchWithSchemasAlloc(
     req: db_mod.types.RelationalRowsInsertSourceRequest,
     source_rows: []const []const u8,
     conflict_resolver: ?UniqueSelectorResolver,
+) !OwnedRowsBatchRequest {
+    return try buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(alloc, table_name, target_schema, source_schema, req, source_rows, conflict_resolver, .{});
+}
+
+pub fn buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    source_rows: []const []const u8,
+    conflict_resolver: ?UniqueSelectorResolver,
+    default_context: DefaultValueContext,
 ) !OwnedRowsBatchRequest {
     const schema = target_schema;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
@@ -309,7 +341,7 @@ pub fn buildRowsInsertSourceBatchWithSchemasAlloc(
         if (parsed.value != .object) return error.InvalidRowsRequest;
 
         if (req.on_conflict) |conflict| {
-            const planned = try plannedRelationalRowJsonAlloc(alloc, schema, parsed.value);
+            const planned = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, parsed.value, default_context);
             defer alloc.free(planned);
             const duplicate_key = try typedConflictTargetDuplicateKeyAlloc(alloc, schema, planned, conflict.target);
             var duplicate_key_transferred = false;
@@ -348,7 +380,7 @@ pub fn buildRowsInsertSourceBatchWithSchemasAlloc(
             }
             try appendPlannedInsertAlloc(alloc, schema, planned, true, &writes, &predicates);
         } else {
-            const planned = try plannedRelationalRowJsonAlloc(alloc, schema, parsed.value);
+            const planned = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, parsed.value, default_context);
             defer alloc.free(planned);
             try appendPlannedInsertAlloc(alloc, schema, planned, true, &writes, &predicates);
         }
@@ -1157,7 +1189,7 @@ pub fn parseRowsBatchRequest(
     body: []const u8,
     schema: runtime_schema.TableSchema,
 ) !OwnedRowsBatchRequest {
-    return try parseRowsBatchRequestWithResolver(alloc, "", body, schema, null);
+    return try parseRowsBatchRequestWithResolverAndDefaultContext(alloc, "", body, schema, null, .{});
 }
 
 pub fn parseRowsBatchRequestWithResolver(
@@ -1166,6 +1198,17 @@ pub fn parseRowsBatchRequestWithResolver(
     body: []const u8,
     schema: runtime_schema.TableSchema,
     unique_resolver: ?UniqueSelectorResolver,
+) !OwnedRowsBatchRequest {
+    return try parseRowsBatchRequestWithResolverAndDefaultContext(alloc, table_name, body, schema, unique_resolver, .{});
+}
+
+pub fn parseRowsBatchRequestWithResolverAndDefaultContext(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+    unique_resolver: ?UniqueSelectorResolver,
+    default_context: DefaultValueContext,
 ) !OwnedRowsBatchRequest {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
     if (body.len == 0) return error.InvalidRowsRequest;
@@ -1251,6 +1294,7 @@ pub fn parseRowsBatchRequestWithResolver(
                     &proposed_conflict_targets,
                     &inserted,
                     &transformed,
+                    default_context,
                 );
             } else {
                 try appendInsertAlloc(
@@ -1260,6 +1304,7 @@ pub fn parseRowsBatchRequestWithResolver(
                     std.mem.eql(u8, op_text, "insert"),
                     &writes,
                     &predicates,
+                    default_context,
                 );
                 try appendReturningProjectionAlloc(alloc, schema, &returning_rows, op_value, writes.items[writes.items.len - 1].value);
                 inserted += 1;
@@ -15594,7 +15639,16 @@ fn plannedRelationalRowJsonAlloc(
     schema: runtime_schema.TableSchema,
     row_value: std.json.Value,
 ) ![]u8 {
-    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, row_value, true);
+    return try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, row_value, .{});
+}
+
+fn plannedRelationalRowJsonWithDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    default_context: DefaultValueContext,
+) ![]u8 {
+    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, row_value, true, default_context);
 }
 
 fn plannedExistingRelationalRowJsonAlloc(
@@ -15604,7 +15658,7 @@ fn plannedExistingRelationalRowJsonAlloc(
 ) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, parsed.value, false);
+    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, parsed.value, false, .{});
 }
 
 fn insertSourceAssignedRowJsonAlloc(
@@ -15680,6 +15734,7 @@ fn plannedRelationalRowJsonWithOptionsAlloc(
     schema: runtime_schema.TableSchema,
     row_value: std.json.Value,
     reject_generated_input: bool,
+    default_context: DefaultValueContext,
 ) ![]u8 {
     if (row_value != .object) return error.InvalidRowsRequest;
     const resolved_defaults = try alloc.alloc(?[]u8, schema.relational_columns.len);
@@ -15708,7 +15763,7 @@ fn plannedRelationalRowJsonWithOptionsAlloc(
     for (schema.relational_columns, 0..) |column, column_index| {
         if (row_value.object.get(column.path) != null) continue;
         if (column.default_value) |default_value| {
-            const value_json = try relationalDefaultValueJsonAlloc(alloc, default_value);
+            const value_json = try relationalDefaultValueJsonWithContextAlloc(alloc, default_value, default_context);
             resolved_defaults[column_index] = value_json;
             try appendRawJsonFieldValue(alloc, writer, &first, column.path, value_json);
         }
@@ -15729,15 +15784,62 @@ fn plannedRelationalRowJsonWithOptionsAlloc(
 }
 
 pub fn relationalDefaultValueJsonAlloc(alloc: std.mem.Allocator, default_value: runtime_schema.RelationalDefaultValue) ![]u8 {
+    return try relationalDefaultValueJsonWithContextAlloc(alloc, default_value, .{});
+}
+
+pub fn relationalDefaultValueJsonWithContextAlloc(
+    alloc: std.mem.Allocator,
+    default_value: runtime_schema.RelationalDefaultValue,
+    default_context: DefaultValueContext,
+) ![]u8 {
     return switch (default_value.kind) {
         .literal => try alloc.dupe(u8, default_value.value_json),
         .now_ns => try std.fmt.allocPrint(alloc, "{d}", .{platform_time.realtimeNs()}),
         .current_date_ns => try std.fmt.allocPrint(alloc, "{d}", .{currentUtcDateStartNs()}),
+        .sequence_next => try sequenceDefaultValueJsonAlloc(alloc, default_value.value_json, default_context.sequence_resolver orelse return error.UnsupportedSqlShape),
         .uuid_v4 => blk: {
             const uuid = try randomUuidV4String();
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(uuid[0..], .{})});
         },
     };
+}
+
+fn sequenceDefaultValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+    resolver: SequenceDefaultResolver,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "sequence", "database", "schema" });
+    const sequence_value = parsed.value.object.get("sequence") orelse return error.InvalidRowsRequest;
+    if (sequence_value != .string or sequence_value.string.len == 0) return error.InvalidRowsRequest;
+    const database = if (parsed.value.object.get("database")) |database_value| blk: {
+        if (database_value != .string or database_value.string.len == 0) return error.InvalidRowsRequest;
+        break :blk database_value.string;
+    } else "";
+    const schema = if (parsed.value.object.get("schema")) |schema_value| blk: {
+        if (schema_value != .string or schema_value.string.len == 0) return error.InvalidRowsRequest;
+        break :blk schema_value.string;
+    } else "";
+    const value = try resolver.nextValueJsonAlloc(alloc, .{
+        .sequence = sequence_value.string,
+        .database = database,
+        .schema = schema,
+    });
+    errdefer alloc.free(value);
+    try validateSequenceDefaultJsonValue(alloc, value);
+    return value;
+}
+
+fn validateSequenceDefaultJsonValue(alloc: std.mem.Allocator, value_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .integer, .float => {},
+        else => return error.InvalidRowsRequest,
+    }
 }
 
 fn currentUtcDateStartNs() u64 {
@@ -16317,8 +16419,9 @@ fn appendInsertAlloc(
     require_absent: bool,
     writes: *std.ArrayListUnmanaged(db_mod.types.BatchWrite),
     predicates: *std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate),
+    default_context: DefaultValueContext,
 ) !void {
-    const row_json = try plannedRelationalRowJsonAlloc(alloc, schema, row_value);
+    const row_json = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, row_value, default_context);
     var row_json_transferred = false;
     errdefer if (!row_json_transferred) alloc.free(row_json);
     const key = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
@@ -16377,6 +16480,7 @@ fn appendInsertWithConflictAlloc(
     proposed_conflict_targets: *std.StringHashMapUnmanaged(void),
     inserted: *u32,
     transformed: *u32,
+    default_context: DefaultValueContext,
 ) !void {
     if (conflict_value != .object) return error.InvalidRowsRequest;
     try requireJsonObjectOnlyKeys(conflict_value.object, &.{ "target", "action", "patch", "patch_expr", "increment", "increment_expr", "json_set", "array_update", "where_expression", "where_expressions", "where_any", "where_not" });
@@ -16384,7 +16488,7 @@ fn appendInsertWithConflictAlloc(
     const target_value = conflict_value.object.get("target") orelse return error.InvalidRowsRequest;
     if (target_value != .object) return error.InvalidRowsRequest;
 
-    const row_json = try plannedRelationalRowJsonAlloc(alloc, schema, row_value);
+    const row_json = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, row_value, default_context);
     defer alloc.free(row_json);
 
     const duplicate_key = try conflictTargetDuplicateKeyAlloc(alloc, schema, row_json, target_value);
@@ -16476,7 +16580,7 @@ fn appendInsertWithConflictAlloc(
         }
     }
 
-    try appendInsertAlloc(alloc, schema, row_value, true, writes, predicates);
+    try appendInsertAlloc(alloc, schema, row_value, true, writes, predicates, default_context);
     try appendReturningProjectionAlloc(alloc, schema, returning_rows, op_value, row_json);
     inserted.* += 1;
 }
@@ -21072,6 +21176,63 @@ test "relational rows materializes server defaults once per planned row" {
     try std.testing.expectEqualStrings(committed_request_id_lc.string, returned.value.object.get("request_id_lc").?.string);
     try std.testing.expectEqual(committed_created_at.integer, returned.value.object.get("created_at_ns").?.integer);
     try std.testing.expectEqual(committed_created_day.integer, returned.value.object.get("created_day_ns").?.integer);
+}
+
+test "relational rows materializes sequence defaults through explicit resolver" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"status":{"type":"keyword","default":"pending"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        parseRowsBatchRequest(
+            std.testing.allocator,
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{},\"returning\":[\"id\",\"status\"]}]}",
+            schema,
+        ),
+    );
+
+    const Resolver = struct {
+        next: i64 = 41,
+        calls: usize = 0,
+
+        fn iface(self: *@This()) SequenceDefaultResolver {
+            return .{
+                .ptr = self,
+                .next_value_json_alloc = nextValueJsonAlloc,
+            };
+        }
+
+        fn nextValueJsonAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, request: SequenceDefaultRequest) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("usage_id_seq", request.sequence);
+            try std.testing.expectEqualStrings("tenant", request.database);
+            try std.testing.expectEqualStrings("billing", request.schema);
+            self.calls += 1;
+            self.next += 1;
+            return try std.fmt.allocPrint(alloc, "{d}", .{self.next});
+        }
+    };
+
+    var resolver = Resolver{};
+    var batch = try parseRowsBatchRequestWithResolverAndDefaultContext(
+        std.testing.allocator,
+        "usage",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{},\"returning\":[\"id\",\"status\"]}]}",
+        schema,
+        null,
+        .{ .sequence_resolver = resolver.iface() },
+    );
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":42,\"status\":\"pending\"}", batch.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":42,\"status\":\"pending\"}", batch.returning_rows[0]);
 }
 
 test "relational rows applies server on update policies" {

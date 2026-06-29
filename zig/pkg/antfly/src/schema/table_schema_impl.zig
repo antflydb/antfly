@@ -441,6 +441,7 @@ pub const RelationalDefaultKind = enum {
     now_ns,
     current_date_ns,
     uuid_v4,
+    sequence_next,
 };
 
 pub const RelationalDefaultValue = struct {
@@ -4673,6 +4674,23 @@ fn parseRelationalDefaultValue(alloc: std.mem.Allocator, value: std.json.Value) 
     }
     if (enumTokenEql(op_text, "uuid_v4")) {
         return .{ .kind = .uuid_v4, .value_json = try alloc.dupe(u8, "") };
+    }
+    if (enumTokenEql(op_text, "sequence_next")) {
+        const sequence_value = object.get("sequence") orelse return error.InvalidSchemaUpdateRequest;
+        if (sequence_value != .string or sequence_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const database_value = object.get("database");
+        if (database_value) |actual| if (actual != .string or actual.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const schema_value = object.get("schema");
+        if (schema_value) |actual| if (actual != .string or actual.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        try writer.print("\"sequence\":{f}", .{std.json.fmt(sequence_value.string, .{})});
+        if (database_value) |actual| try writer.print(",\"database\":{f}", .{std.json.fmt(actual.string, .{})});
+        if (schema_value) |actual| try writer.print(",\"schema\":{f}", .{std.json.fmt(actual.string, .{})});
+        try writer.writeByte('}');
+        return .{ .kind = .sequence_next, .value_json = try out.toOwnedSlice() };
     }
     return error.InvalidSchemaUpdateRequest;
 }

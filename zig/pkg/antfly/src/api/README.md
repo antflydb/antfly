@@ -33,6 +33,8 @@ Read implementation lives under [table_reads/](table_reads/):
 table_reads/core.zig
   -> cache.zig
   -> document_sql.zig
+      -> ../../sql/document_runtime.zig
+      -> ../../sql/document.zig
   -> relational_rows.zig
       -> external_lake.zig
   -> remote_wire.zig
@@ -56,10 +58,10 @@ Ownership:
   - identity namespace and visible-root cache-key validation
   - read-cache lifecycle diagnostics and focused cache tests
 - `document_sql.zig`
-  - `DocumentSqlRuntimeSourceAdapter`
-  - catalog-aware document SQL lookup, scan, and query glue
-  - document algebraic aggregate execution and fan-in merge helpers
-  - document SQL-specific tests
+  - catalog-aware document SQL lookup, scan, query, and provisioned routing glue
+  - adapts `TableReadSource` to `sql/document_runtime.zig`
+  - delegates document algebraic aggregate execution and fan-in merge helpers to
+    `sql/document.zig`
 - `relational_rows.zig`
   - lowered SQL read-plan execution
   - routed relational row materialization helpers

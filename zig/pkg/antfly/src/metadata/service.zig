@@ -42,10 +42,10 @@ const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const sql_schema_mutation = @import("../sql/schema_mutation.zig");
-const api_tables = @import("../api/tables.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const catalog_source = @import("catalog/source.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
@@ -58,6 +58,11 @@ pub const default_unique_schema_controller_worker_id = "metadata-unique-schema-c
 pub const metadata_run_round_slow_threshold_ns: u64 = std.time.ns_per_s;
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
 const metadata_run_round_trace_max_phases: usize = 32;
+const sequence_allocation_max_attempts: usize = 32;
+const sequence_allocation_retry_wait_ns: u64 = 50 * std.time.ns_per_ms;
+const sequence_reset_max_attempts: usize = 32;
+const sequence_reset_retry_wait_ns: u64 = 50 * std.time.ns_per_ms;
+var sequence_allocation_id_counter: std.atomic.Value(u64) = .init(1);
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
@@ -69,6 +74,100 @@ fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
             @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
     }
+}
+
+fn freshSequenceAllocationId() u128 {
+    const counter = sequence_allocation_id_counter.fetchAdd(1, .monotonic) | 1;
+    const timestamp = platform_time.monotonicNs();
+    return (@as(u128, timestamp) << 64) | @as(u128, counter);
+}
+
+fn findSequenceRecord(
+    records: []const metadata_table_manager.SequenceRecord,
+    sequence_id: u64,
+) ?metadata_table_manager.SequenceRecord {
+    for (records) |record| {
+        if (record.sequence_id == sequence_id) return record;
+    }
+    return null;
+}
+
+fn resetIdentityAllocatorsForTableEmptyingBarrierWithCas(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) !void {
+    for (0..sequence_reset_max_attempts) |_| {
+        var snapshot = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&snapshot);
+
+        const targets = try tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(alloc, snapshot, request);
+        defer alloc.free(targets);
+        if (targets.len == 0) return;
+
+        var needs_reset = false;
+        const observed = service.captureLifecycleSignal(null);
+        for (targets) |target| {
+            const record = findSequenceRecord(snapshot.sequences, target.sequence_id) orelse return error.SequenceNotFound;
+            if (record.last_value == target.reset_last_value) continue;
+            needs_reset = true;
+            try service.proposeTransitionCommand(.{ .compare_and_swap_sequence = .{
+                .sequence_id = target.sequence_id,
+                .expected_last_value = record.last_value,
+                .next_last_value = target.reset_last_value,
+                .allocation_id = freshSequenceAllocationId(),
+            } });
+        }
+        if (!needs_reset) return;
+        service.waitForLifecycleSignal(observed, sequence_reset_retry_wait_ns);
+
+        var after = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&after);
+        const after_targets = try tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(alloc, after, request);
+        defer alloc.free(after_targets);
+        var all_reset = true;
+        for (after_targets) |target| {
+            const record = findSequenceRecord(after.sequences, target.sequence_id) orelse return error.SequenceNotFound;
+            if (record.last_value != target.reset_last_value) {
+                all_reset = false;
+                break;
+            }
+        }
+        if (all_reset) return;
+    }
+    return error.SequenceAllocationConflict;
+}
+
+fn allocateSequenceValueWithCas(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    sequence_name: []const u8,
+) !i64 {
+    const sequence_id = metadata_table_manager.deriveSequenceId(database_name, namespace_name, sequence_name);
+    const allocation_id = freshSequenceAllocationId();
+    for (0..sequence_allocation_max_attempts) |_| {
+        var snapshot = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&snapshot);
+        const record = findSequenceRecord(snapshot.sequences, sequence_id) orelse return error.SequenceNotFound;
+        const expected_last_value = record.last_value;
+        const next_value = try metadata_table_manager.sequenceNextValueFromRecord(alloc, record);
+        const observed = service.captureLifecycleSignal(null);
+        try service.proposeTransitionCommand(.{ .compare_and_swap_sequence = .{
+            .sequence_id = sequence_id,
+            .expected_last_value = expected_last_value,
+            .next_last_value = next_value,
+            .allocation_id = allocation_id,
+        } });
+        service.waitForLifecycleSignal(observed, sequence_allocation_retry_wait_ns);
+
+        var after = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&after);
+        const after_record = findSequenceRecord(after.sequences, sequence_id) orelse return error.SequenceNotFound;
+        if (after_record.last_value == next_value and after_record.last_allocation_id == allocation_id) return next_value;
+    }
+    return error.SequenceAllocationConflict;
 }
 
 const MetadataRunRoundTrace = struct {
@@ -905,6 +1004,7 @@ const ProjectedCoreSnapshot = struct {
     databases: []metadata_table_manager.DatabaseRecord = &.{},
     namespaces: []metadata_table_manager.NamespaceRecord = &.{},
     tablespaces: []metadata_table_manager.TablespaceRecord = &.{},
+    sequences: []metadata_table_manager.SequenceRecord = &.{},
     tables: []metadata_table_manager.TableRecord = &.{},
     ranges: []metadata_table_manager.RangeRecord = &.{},
     foreign_key_ref_ranges: []metadata_table_manager.ForeignKeyReferenceRangeRecord = &.{},
@@ -928,6 +1028,8 @@ const ProjectedCoreSnapshot = struct {
         if (self.namespaces.len > 0) alloc.free(self.namespaces);
         for (self.tablespaces) |record| metadata_table_manager.freeTablespace(alloc, record);
         if (self.tablespaces.len > 0) alloc.free(self.tablespaces);
+        for (self.sequences) |record| metadata_table_manager.freeSequence(alloc, record);
+        if (self.sequences.len > 0) alloc.free(self.sequences);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -1256,6 +1358,23 @@ fn cloneProjectedTablespacesOwned(
     return out;
 }
 
+fn cloneProjectedSequencesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.SequenceRecord,
+) ![]metadata_table_manager.SequenceRecord {
+    const out = try alloc.alloc(metadata_table_manager.SequenceRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeSequence(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneSequence(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
 fn cloneProjectedRangesOwned(
     alloc: std.mem.Allocator,
     records: []const metadata_table_manager.RangeRecord,
@@ -1373,6 +1492,26 @@ fn cloneProjectedStoresOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.AdminSnapshot,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) ![]metadata_table_manager.SequenceIdentityAllocatorReset {
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    _ = try manager.replaceProjectedTopologyWithDerivedWork(
+        snapshot.tables,
+        snapshot.ranges,
+        snapshot.foreign_key_ref_ranges,
+        snapshot.unique_constraint_ranges,
+        snapshot.secondary_index_rebuild_ranges,
+        snapshot.schema_rewrite_jobs,
+        snapshot.table_emptying_jobs,
+    );
+    for (snapshot.sequences) |record| try manager.upsertSequence(record);
+    return try manager.tableEmptyingIdentityAllocatorResetTargetsAlloc(alloc, request);
 }
 
 fn cloneProjectedShuffleJoinLeasesOwned(
@@ -1611,6 +1750,10 @@ pub const MetadataService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     raft: raft_service.ManagedHostService,
+
+    pub fn catalogSource(self: *MetadataService) catalog_source.CatalogSource {
+        return catalogSourceForMetadataService(MetadataService, self);
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -1879,6 +2022,20 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
     }
 
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_batch_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_drop_with_schema_rewrite_jobs = request });
+    }
+
     pub fn upsertDatabase(self: *MetadataService, record: metadata_table_manager.DatabaseRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_database = record });
     }
@@ -1901,6 +2058,24 @@ pub const MetadataService = struct {
 
     pub fn removeTablespace(self: *MetadataService, tablespace_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_tablespace = .{ .tablespace_id = tablespace_id } });
+    }
+
+    pub fn upsertSequence(self: *MetadataService, record: metadata_table_manager.SequenceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_sequence = record });
+    }
+
+    pub fn removeSequence(self: *MetadataService, sequence_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_sequence = .{ .sequence_id = sequence_id } });
+    }
+
+    pub fn allocateSequenceValue(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        return try allocateSequenceValueWithCas(self, alloc, database_name, namespace_name, sequence_name);
     }
 
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
@@ -2106,6 +2281,10 @@ pub const MetadataService = struct {
 
     pub fn promoteTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
         try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(self, self.alloc, request);
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
@@ -2428,6 +2607,16 @@ pub const MetadataService = struct {
     pub fn freeProjectedTablespaces(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TablespaceRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeTablespaces(alloc, records);
+    }
+
+    pub fn listProjectedSequences(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.SequenceRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listSequences(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedSequences(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.SequenceRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSequences(alloc, records);
     }
 
     pub fn freeProjectedTables(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
@@ -2981,7 +3170,7 @@ pub const MetadataService = struct {
 
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.catalogSourceFromMetadataService(self),
+            self.catalogSource(),
         );
         write_source.backend_runtime = try self.ensureBackendRuntime();
         _ = write_source.withSecretStore(self.secret_store);
@@ -3089,7 +3278,7 @@ pub const MetadataService = struct {
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.catalogSourceFromMetadataService(self),
+            self.catalogSource(),
         );
         defer write_source.deinit();
         write_source.backend_runtime = try self.ensureBackendRuntime();
@@ -3107,7 +3296,7 @@ pub const MetadataService = struct {
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.catalogSourceFromMetadataService(self),
+            self.catalogSource(),
         );
         defer write_source.deinit();
         write_source.backend_runtime = try self.ensureBackendRuntime();
@@ -3182,6 +3371,10 @@ pub const MetadataHttpService = struct {
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     raft: raft_service.ManagedHttpHostService,
+
+    pub fn catalogSource(self: *MetadataHttpService) catalog_source.CatalogSource {
+        return catalogSourceForMetadataService(MetadataHttpService, self);
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -3544,6 +3737,20 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
     }
 
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_batch_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_drop_with_schema_rewrite_jobs = request });
+    }
+
     pub fn upsertDatabase(self: *MetadataHttpService, record: metadata_table_manager.DatabaseRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_database = record });
     }
@@ -3566,6 +3773,24 @@ pub const MetadataHttpService = struct {
 
     pub fn removeTablespace(self: *MetadataHttpService, tablespace_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_tablespace = .{ .tablespace_id = tablespace_id } });
+    }
+
+    pub fn upsertSequence(self: *MetadataHttpService, record: metadata_table_manager.SequenceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_sequence = record });
+    }
+
+    pub fn removeSequence(self: *MetadataHttpService, sequence_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_sequence = .{ .sequence_id = sequence_id } });
+    }
+
+    pub fn allocateSequenceValue(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        return try allocateSequenceValueWithCas(self, alloc, database_name, namespace_name, sequence_name);
     }
 
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
@@ -3771,6 +3996,10 @@ pub const MetadataHttpService = struct {
 
     pub fn promoteTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
         try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(self, self.alloc, request);
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
@@ -4289,6 +4518,7 @@ pub const MetadataHttpService = struct {
         snapshot.databases = try cloneProjectedDatabasesOwned(self.alloc, core.databases);
         snapshot.namespaces = try cloneProjectedNamespacesOwned(self.alloc, core.namespaces);
         snapshot.tablespaces = try cloneProjectedTablespacesOwned(self.alloc, core.tablespaces);
+        snapshot.sequences = try cloneProjectedSequencesOwned(self.alloc, core.sequences);
         snapshot.tables = try cloneProjectedTablesOwned(self.alloc, core.tables);
         snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, core.ranges);
         snapshot.foreign_key_ref_ranges = try cloneProjectedForeignKeyReferenceRangesOwned(self.alloc, core.foreign_key_ref_ranges);
@@ -4371,6 +4601,7 @@ pub const MetadataHttpService = struct {
         snapshot.databases = try store.listDatabases(self.alloc, self.metadata_group_id);
         snapshot.namespaces = try store.listNamespaces(self.alloc, self.metadata_group_id);
         snapshot.tablespaces = try store.listTablespaces(self.alloc, self.metadata_group_id);
+        snapshot.sequences = try store.listSequences(self.alloc, self.metadata_group_id);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
         snapshot.foreign_key_ref_ranges = try store.listForeignKeyReferenceRanges(self.alloc, self.metadata_group_id);
@@ -4472,6 +4703,18 @@ pub const MetadataHttpService = struct {
 
     pub fn freeProjectedTablespaces(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TablespaceRecord) void {
         for (records) |record| metadata_table_manager.freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listProjectedSequences(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.SequenceRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedSequencesOwned(alloc, snapshot.sequences);
+    }
+
+    pub fn freeProjectedSequences(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.SequenceRecord) void {
+        for (records) |record| metadata_table_manager.freeSequence(alloc, record);
         alloc.free(records);
     }
 
@@ -5114,7 +5357,7 @@ pub const MetadataHttpService = struct {
         if (now_ms < self.cdc_next_round_at_ms) return;
         self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
 
-        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
+        const catalog = self.catalogSource();
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
             // CDC is metadata-owned but data-applied; force the routed API path even
@@ -5235,7 +5478,7 @@ pub const MetadataHttpService = struct {
         if (!self.foreign_key_schema_controller.enabled) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
+        const catalog = self.catalogSource();
         var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
         var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -5256,7 +5499,7 @@ pub const MetadataHttpService = struct {
         if (!self.unique_constraint_schema_controller.enabled) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        const catalog = api_table_catalog.catalogSourceFromMetadataHttpService(self);
+        const catalog = self.catalogSource();
         var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
         var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -5338,6 +5581,184 @@ fn isTerminalInvalidForeignKeySchemaControllerResult(result: api_table_writes.Fo
         .validate, .repair => result.complete and !result.valid,
         else => false,
     };
+}
+
+fn catalogSourceForMetadataService(comptime Service: type, svc: *Service) catalog_source.CatalogSource {
+    return .{
+        .ptr = svc,
+        .vtable = &comptime catalogSourceVTable(Service),
+    };
+}
+
+fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTable {
+    const Gen = struct {
+        fn service(ptr: *anyopaque) *Service {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return try service(ptr).adminSnapshot();
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            service(ptr).freeAdminSnapshot(snapshot);
+        }
+
+        fn beginSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+            return try service(ptr).beginSecondaryIndexRebuildRange(request);
+        }
+
+        fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+            return try service(ptr).finishSecondaryIndexRebuildRange(request);
+        }
+
+        fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+            return try service(ptr).invalidateSecondaryIndexRebuildRange(request);
+        }
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            return try service(ptr).beginSchemaRewriteJob(request);
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            return try service(ptr).finishSchemaRewriteJob(request);
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            return try service(ptr).invalidateSchemaRewriteJob(request);
+        }
+
+        fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            return try service(ptr).upsertTableEmptyingJob(record);
+        }
+
+        fn upsertTable(ptr: *anyopaque, record: metadata_table_manager.TableRecord) !void {
+            return try service(ptr).upsertTable(record);
+        }
+
+        fn applyTableCatalogUpdateWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) !void {
+            return try service(ptr).applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+        }
+
+        fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) !void {
+            if (comptime @hasDecl(Service, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) {
+                return try service(ptr).applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn applyTableCatalogDropWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest) !void {
+            if (comptime @hasDecl(Service, "applyTableCatalogDropWithSchemaRewriteJobs")) {
+                return try service(ptr).applyTableCatalogDropWithSchemaRewriteJobs(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn removeTableEmptyingJob(ptr: *anyopaque, job_id: u64) !void {
+            return try service(ptr).removeTableEmptyingJob(job_id);
+        }
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            return try service(ptr).beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            return try service(ptr).finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            return try service(ptr).invalidateTableEmptyingJob(request);
+        }
+
+        fn promoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+            return try service(ptr).promoteTableEmptyingBarrier(request);
+        }
+
+        fn resetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+            if (comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
+                return try service(ptr).resetIdentityAllocatorsForTableEmptyingBarrier(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn supportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+            return comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier");
+        }
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            return try promoteSecondaryIndexReadyOnMetadataService(service(ptr), alloc, table_name, index_name, expected_generation);
+        }
+
+        fn compareAndSwapTableSchema(ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+            return try service(ptr).compareAndSwapTableSchema(request);
+        }
+    };
+
+    return .{
+        .admin_snapshot = Gen.adminSnapshot,
+        .free_admin_snapshot = Gen.freeAdminSnapshot,
+        .begin_secondary_index_rebuild_range = Gen.beginSecondaryIndexRebuildRange,
+        .finish_secondary_index_rebuild_range = Gen.finishSecondaryIndexRebuildRange,
+        .invalidate_secondary_index_rebuild_range = Gen.invalidateSecondaryIndexRebuildRange,
+        .begin_schema_rewrite_job = Gen.beginSchemaRewriteJob,
+        .finish_schema_rewrite_job = Gen.finishSchemaRewriteJob,
+        .invalidate_schema_rewrite_job = Gen.invalidateSchemaRewriteJob,
+        .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
+        .upsert_table = Gen.upsertTable,
+        .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs = if (comptime @hasDecl(Service, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) Gen.applyTableCatalogBatchUpdateWithSchemaRewriteJobs else null,
+        .apply_table_catalog_drop_with_schema_rewrite_jobs = if (comptime @hasDecl(Service, "applyTableCatalogDropWithSchemaRewriteJobs")) Gen.applyTableCatalogDropWithSchemaRewriteJobs else null,
+        .remove_table_emptying_job = Gen.removeTableEmptyingJob,
+        .begin_table_emptying_job = Gen.beginTableEmptyingJob,
+        .finish_table_emptying_job = Gen.finishTableEmptyingJob,
+        .invalidate_table_emptying_job = Gen.invalidateTableEmptyingJob,
+        .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
+        .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier")) Gen.resetIdentityAllocatorsForTableEmptyingBarrier else null,
+        .supports_identity_allocator_reset_for_table_emptying_barrier = Gen.supportsIdentityAllocatorResetForTableEmptyingBarrier,
+        .promote_secondary_index_ready = Gen.promoteSecondaryIndexReady,
+        .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
+    };
+}
+
+fn promoteSecondaryIndexReadyOnMetadataService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) !bool {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
+        alloc,
+        table.schema_json,
+        index_name,
+        expected_generation,
+    ) catch |err| switch (err) {
+        error.SecondaryIndexNotBuilding,
+        error.SecondaryIndexGenerationMismatch,
+        error.SecondaryIndexNotFound,
+        => return false,
+        else => return err,
+    };
+    defer alloc.free(schema_json);
+    const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try service.promoteSecondaryIndexReady(.{
+        .table_id = table.table_id,
+        .index_name = index_name,
+        .expected_index_generation = expected_generation,
+        .expected_schema_json = table.schema_json,
+        .promoted_table = updated,
+    });
+    return true;
 }
 
 fn findTableRecordByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
@@ -5512,7 +5933,7 @@ fn promoteForeignKeySchemaControllerResult(
         .enforced,
     );
     defer service.alloc.free(schema_json);
-    const schema_updated = try api_tables.applySchemaUpdateRecord(service.alloc, table, schema_json);
+    const schema_updated = try catalog_table_ddl.applySchemaUpdateRecord(service.alloc, table, schema_json);
     defer metadata_table_manager.freeTable(service.alloc, schema_updated);
     const metadata_updated = try tableWithForeignKeyValidationMetadataAlloc(service.alloc, schema_updated, constraint_name, null);
     defer metadata_table_manager.freeTable(service.alloc, metadata_updated);
@@ -5565,7 +5986,7 @@ fn promoteUniqueConstraintSchemaControllerResult(
         .enforced,
     );
     defer service.alloc.free(schema_json);
-    const schema_updated = try api_tables.applySchemaUpdateRecord(service.alloc, table, schema_json);
+    const schema_updated = try catalog_table_ddl.applySchemaUpdateRecord(service.alloc, table, schema_json);
     defer metadata_table_manager.freeTable(service.alloc, schema_updated);
     try service.upsertTable(schema_updated);
 }

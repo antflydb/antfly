@@ -110,6 +110,7 @@ fn sessionHasPersistentCatalogState(session: sql_adapter.OwnedSqlCatalogSession)
     if (session.in_sql_transaction) return true;
     if (session.sql_transaction_failed) return true;
     if (session.settings.len > 0) return true;
+    if (session.sequence_currvals.len > 0) return true;
     if (session.transaction_local_settings_base != null) return true;
     if (session.transaction_local_search_path_base != null) return true;
     if (!std.ascii.eqlIgnoreCase(session.current_database_name, catalog_resources.default_database_name)) return true;

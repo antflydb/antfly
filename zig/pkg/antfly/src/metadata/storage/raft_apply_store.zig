@@ -92,6 +92,11 @@ pub const TransitionCommand = union(enum) {
     remove_tablespace: struct {
         tablespace_id: u64,
     },
+    upsert_sequence: metadata.SequenceRecord,
+    remove_sequence: struct {
+        sequence_id: u64,
+    },
+    compare_and_swap_sequence: metadata_table_manager.SequenceCompareAndSwapRequest,
     upsert_table: metadata.TableRecord,
     remove_table: struct {
         table_id: u64,
@@ -148,6 +153,8 @@ pub const TransitionCommand = union(enum) {
     invalidate_secondary_index_rebuild_range: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
     upsert_schema_rewrite_job: metadata.SchemaRewriteJobRecord,
     apply_table_catalog_update_with_schema_rewrite_jobs: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    apply_table_catalog_batch_update_with_schema_rewrite_jobs: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    apply_table_catalog_drop_with_schema_rewrite_jobs: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
     remove_schema_rewrite_job: struct {
         job_id: u64,
     },
@@ -225,6 +232,9 @@ pub const TransitionCommand = union(enum) {
             .upsert_tablespace => |*record| {
                 metadata_table_manager.freeTablespace(alloc, record.*);
             },
+            .upsert_sequence => |*record| {
+                metadata_table_manager.freeSequence(alloc, record.*);
+            },
             .upsert_table => |*record| {
                 metadata_table_manager.freeTable(alloc, record.*);
             },
@@ -277,6 +287,12 @@ pub const TransitionCommand = union(enum) {
             },
             .apply_table_catalog_update_with_schema_rewrite_jobs => |*request| {
                 freeTableCatalogUpdateWithSchemaRewriteJobsRequest(alloc, request.*);
+            },
+            .apply_table_catalog_batch_update_with_schema_rewrite_jobs => |*request| {
+                freeTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(alloc, request.*);
+            },
+            .apply_table_catalog_drop_with_schema_rewrite_jobs => |*request| {
+                freeTableCatalogDropWithSchemaRewriteJobsRequest(alloc, request.*);
             },
             .remove_secondary_index_rebuild_range => |*selector| {
                 freeSecondaryIndexRebuildRangeSelector(alloc, selector.*);
@@ -380,6 +396,16 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(request.merged_group_id);
         },
         .upsert_secondary_index_rebuild_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .apply_table_catalog_update_with_schema_rewrite_jobs => |request| {
+            for (request.schema_rewrite_jobs) |record| try group_ids.requireDataGroupId(record.group_id);
+        },
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs => |request| {
+            for (request.schema_rewrite_jobs) |record| try group_ids.requireDataGroupId(record.group_id);
+        },
+        .apply_table_catalog_drop_with_schema_rewrite_jobs => |request| {
+            for (request.range_group_ids) |range_group_id| try group_ids.requireDataGroupId(range_group_id);
+            for (request.schema_rewrite_jobs) |record| try group_ids.requireDataGroupId(record.group_id);
+        },
         .upsert_table_emptying_job => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_split_transition => |record| {
             try group_ids.requireDataGroupId(record.source_group_id);
@@ -929,6 +955,35 @@ pub const RaftApplyStore = struct {
 
     pub fn freeTablespaces(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.TablespaceRecord) void {
         for (records) |record| metadata_table_manager.freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSequences(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SequenceRecord {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try sequencePrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+        const out = try alloc.alloc(metadata.SequenceRecord, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |record| metadata_table_manager.freeSequence(alloc, record);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeSequenceRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeSequences(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.SequenceRecord) void {
+        for (records) |record| metadata_table_manager.freeSequence(alloc, record);
         alloc.free(records);
     }
 
@@ -1597,6 +1652,20 @@ pub const RaftApplyStore = struct {
                 };
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
+            .upsert_sequence => |record| {
+                var key_buf: [160]u8 = undefined;
+                const key = try sequenceKeyForGroup(&key_buf, group_id, record.sequence_id);
+                const value = try encodeSequenceRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_sequence => |record| {
+                try self.deleteSequenceRecordTxn(txn, group_id, record.sequence_id);
+            },
+            .compare_and_swap_sequence => |request| {
+                try self.compareAndSwapSequenceTxn(txn, group_id, request);
+            },
             .upsert_table => |record| {
                 try self.putTableRecordTxn(txn, group_id, record);
             },
@@ -1925,6 +1994,12 @@ pub const RaftApplyStore = struct {
             .apply_table_catalog_update_with_schema_rewrite_jobs => |request| {
                 try self.applyTableCatalogUpdateWithSchemaRewriteJobsTxn(txn, group_id, request);
             },
+            .apply_table_catalog_batch_update_with_schema_rewrite_jobs => |request| {
+                try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobsTxn(txn, group_id, request);
+            },
+            .apply_table_catalog_drop_with_schema_rewrite_jobs => |request| {
+                try self.applyTableCatalogDropWithSchemaRewriteJobsTxn(txn, group_id, request);
+            },
             .remove_schema_rewrite_job => |record| {
                 try self.deleteSchemaRewriteJobTxn(txn, group_id, record.job_id);
             },
@@ -2175,30 +2250,252 @@ pub const RaftApplyStore = struct {
         });
     }
 
+    fn loadTableRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+    ) !?metadata.TableRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, table_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodeTableRecord(self.alloc, encoded);
+    }
+
+    fn deleteTableRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        table_name: ?[]const u8,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, table_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .table,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = table_id,
+        });
+    }
+
+    fn loadRangeRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        range_group_id: u64,
+    ) !?metadata.RangeRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try rangeKeyForGroup(&key_buf, group_id, range_group_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodeRangeRecord(self.alloc, encoded);
+    }
+
+    fn deleteRangeRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        range_group_id: u64,
+    ) !void {
+        const existing = try self.loadRangeRecordTxn(txn, group_id, range_group_id);
+        defer if (existing) |record_existing| metadata_table_manager.freeRange(self.alloc, record_existing);
+        const existing_table_id = if (existing) |record_existing| record_existing.table_id else 0;
+        const table_name = if (existing) |record_existing|
+            try self.lookupTableNameTxn(txn, group_id, record_existing.table_id)
+        else
+            null;
+        defer if (table_name) |name| self.alloc.free(name);
+        var key_buf: [160]u8 = undefined;
+        const key = try rangeKeyForGroup(&key_buf, group_id, range_group_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = existing_table_id,
+            .group_id = range_group_id,
+        });
+    }
+
+    fn sequenceExistsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        sequence_id: u64,
+    ) !bool {
+        _ = self;
+        var key_buf: [160]u8 = undefined;
+        const key = try sequenceKeyForGroup(&key_buf, group_id, sequence_id);
+        _ = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn deleteSequenceRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        sequence_id: u64,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try sequenceKeyForGroup(&key_buf, group_id, sequence_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
     fn applyTableCatalogUpdateWithSchemaRewriteJobsTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
     ) !void {
-        if (request.table.table_id == 0) return error.UnknownTable;
-        const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(request.table.schema_json);
-        if (schema_generation == 0) return error.InvalidSchemaRewriteGeneration;
+        return try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobsTxn(txn, group_id, .{
+            .tables = &[_]metadata.TableRecord{request.table},
+            .schema_rewrite_jobs = request.schema_rewrite_jobs,
+        });
+    }
 
+    fn applyTableCatalogBatchUpdateWithSchemaRewriteJobsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        if (request.tables.len == 0) return error.UnknownTable;
+        for (request.tables, 0..) |table, i| {
+            if (table.table_id == 0) return error.UnknownTable;
+            if (metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json) == 0) return error.InvalidSchemaRewriteGeneration;
+            for (request.tables[0..i]) |previous| {
+                if (previous.table_id == table.table_id) return error.UnknownTable;
+            }
+        }
         for (request.schema_rewrite_jobs, 0..) |job, i| {
-            if (job.table_id != request.table.table_id) return error.InvalidSchemaRewriteJob;
-            if (job.schema_generation != schema_generation) return error.InvalidSchemaRewriteGeneration;
-            if (job.job_id == 0) return error.InvalidSchemaRewriteJob;
+            try validateSchemaRewriteJobForBatchUpdate(request.tables, job);
             try group_ids.requireDataGroupId(job.group_id);
             for (request.schema_rewrite_jobs[0..i]) |previous| {
                 if (previous.job_id == job.job_id) return error.InvalidSchemaRewriteJob;
             }
         }
 
-        try self.putTableRecordTxn(txn, group_id, request.table);
-        for (request.schema_rewrite_jobs) |job| {
-            try self.putSchemaRewriteJobTxn(txn, group_id, job);
+        for (request.tables) |table| try self.putTableRecordTxn(txn, group_id, table);
+        for (request.schema_rewrite_jobs) |job| try self.putSchemaRewriteJobTxn(txn, group_id, job);
+    }
+
+    fn applyTableCatalogDropWithSchemaRewriteJobsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        if (request.table_id == 0) return error.UnknownTable;
+        const existing_table_name = try self.lookupTableNameTxn(txn, group_id, request.table_id);
+        if (existing_table_name == null) return error.UnknownTable;
+        defer self.alloc.free(existing_table_name.?);
+
+        if (request.table_updates.len > 0 or request.schema_rewrite_jobs.len > 0) {
+            try self.validateTableCatalogBatchUpdateWithSchemaRewriteJobsTxn(.{
+                .tables = request.table_updates,
+                .schema_rewrite_jobs = request.schema_rewrite_jobs,
+            });
         }
+        for (request.table_updates) |table| {
+            if (table.table_id == request.table_id) return error.UnknownTable;
+        }
+        for (request.sequence_ids, 0..) |sequence_id, i| {
+            if (!try self.sequenceExistsTxn(txn, group_id, sequence_id)) return error.SequenceNotFound;
+            for (request.sequence_ids[0..i]) |previous| {
+                if (previous == sequence_id) return error.SequenceNotFound;
+            }
+        }
+        for (request.range_group_ids, 0..) |range_group_id, i| {
+            const range = try self.loadRangeRecordTxn(txn, group_id, range_group_id);
+            defer if (range) |record| metadata_table_manager.freeRange(self.alloc, record);
+            if (range == null or range.?.table_id != request.table_id) return error.UnknownRange;
+            for (request.range_group_ids[0..i]) |previous| {
+                if (previous == range_group_id) return error.UnknownRange;
+            }
+        }
+        try self.validateTableCatalogDropRangeSetTxn(txn, group_id, request.table_id, request.range_group_ids);
+
+        for (request.table_updates) |table| try self.putTableRecordTxn(txn, group_id, table);
+        for (request.schema_rewrite_jobs) |job| try self.putSchemaRewriteJobTxn(txn, group_id, job);
+        for (request.range_group_ids) |range_group_id| try self.deleteRangeRecordTxn(txn, group_id, range_group_id);
+        for (request.sequence_ids) |sequence_id| try self.deleteSequenceRecordTxn(txn, group_id, sequence_id);
+        try self.deleteTableRecordTxn(txn, group_id, request.table_id, existing_table_name.?);
+    }
+
+    fn validateTableCatalogDropRangeSetTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        range_group_ids: []const u64,
+    ) !void {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const range = try decodeRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (range.table_id != table_id) continue;
+            if (std.mem.indexOfScalar(u64, range_group_ids, range.group_id) == null) return error.UnknownRange;
+        }
+    }
+
+    fn validateTableCatalogBatchUpdateWithSchemaRewriteJobsTxn(
+        self: *RaftApplyStore,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        _ = self;
+        if (request.tables.len == 0) return error.UnknownTable;
+        for (request.tables, 0..) |table, i| {
+            if (table.table_id == 0) return error.UnknownTable;
+            if (metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json) == 0) return error.InvalidSchemaRewriteGeneration;
+            for (request.tables[0..i]) |previous| {
+                if (previous.table_id == table.table_id) return error.UnknownTable;
+            }
+        }
+        for (request.schema_rewrite_jobs, 0..) |job, i| {
+            try validateSchemaRewriteJobForBatchUpdate(request.tables, job);
+            try group_ids.requireDataGroupId(job.group_id);
+            for (request.schema_rewrite_jobs[0..i]) |previous| {
+                if (previous.job_id == job.job_id) return error.InvalidSchemaRewriteJob;
+            }
+        }
+    }
+
+    fn validateSchemaRewriteJobForBatchUpdate(tables: []const metadata.TableRecord, job: metadata.SchemaRewriteJobRecord) !void {
+        if (job.job_id == 0) return error.InvalidSchemaRewriteJob;
+        for (tables) |table| {
+            if (job.table_id != table.table_id) continue;
+            const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            if (job.schema_generation != schema_generation) return error.InvalidSchemaRewriteGeneration;
+            return;
+        }
+        return error.InvalidSchemaRewriteJob;
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
@@ -3277,6 +3574,94 @@ pub const RaftApplyStore = struct {
         });
     }
 
+    fn tableEmptyingPromotionJobIdsContain(job_ids: []const u64, needle: u64) bool {
+        for (job_ids) |job_id| {
+            if (job_id == needle) return true;
+        }
+        return false;
+    }
+
+    fn tableEmptyingPromotionAffectedTablesContain(table_ids: []const u64, needle: u64) bool {
+        for (table_ids) |table_id| {
+            if (table_id == needle) return true;
+        }
+        return false;
+    }
+
+    fn tableEmptyingPromotionU64SlicesEqual(a: []const u64, b: []const u64) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (left != right) return false;
+        }
+        return true;
+    }
+
+    fn tableEmptyingPromotionOptionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn tableEmptyingPromotionHasReadyRangeJobTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        barrier: metadata.TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table: metadata.TableRecord,
+        range: metadata.RangeRecord,
+    ) !bool {
+        const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+        for (job_ids) |job_id| {
+            const maybe_record = try self.loadTableEmptyingJobTxn(txn, group_id, job_id);
+            const record = maybe_record orelse continue;
+            defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+            if (!std.mem.eql(u8, record.state, metadata_table_manager.table_emptying_ready)) continue;
+            if (record.barrier_id != barrier.barrier_id) continue;
+            if (record.table_id != table.table_id) continue;
+            if (record.group_id != range.group_id) continue;
+            if (record.schema_generation != schema_generation) continue;
+            if (record.data_generation != table.data_generation) continue;
+            if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
+            if (!tableEmptyingPromotionOptionalStringsEqual(record.end_row_key, range.end_key)) continue;
+            if (!tableEmptyingPromotionU64SlicesEqual(record.affected_table_ids, barrier.affected_table_ids)) continue;
+            if (record.restart_identity != barrier.restart_identity) continue;
+            if (record.cascade != barrier.cascade) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn validateCompleteTableEmptyingBarrierTableTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        barrier: metadata.TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table_id: u64,
+    ) !void {
+        const table = (try self.loadTableRecordTxn(txn, group_id, table_id)) orelse return error.UnknownTable;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+
+        var range_count: usize = 0;
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const range = try decodeRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (range.table_id != table_id) continue;
+            range_count += 1;
+            if (!try self.tableEmptyingPromotionHasReadyRangeJobTxn(txn, group_id, barrier, job_ids, table, range)) {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
+        }
+        if (range_count == 0) return error.InvalidTableEmptyingBarrierPromotion;
+    }
+
     fn applyTableEmptyingBarrierPromotionTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3284,6 +3669,11 @@ pub const RaftApplyStore = struct {
         request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
     ) !void {
         if (request.job_ids.len == 0 or request.promotions.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+
+        const first_record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_ids[0])) orelse return error.UnknownTableEmptyingJob;
+        defer metadata_table_manager.freeTableEmptyingJob(self.alloc, first_record);
+        if (first_record.barrier_id == 0 or first_record.affected_table_ids.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+        if (request.promotions.len != first_record.affected_table_ids.len) return error.InvalidTableEmptyingBarrierPromotion;
 
         for (request.job_ids, 0..) |job_id, i| {
             if (job_id == 0) return error.InvalidTableEmptyingBarrierPromotion;
@@ -3293,21 +3683,36 @@ pub const RaftApplyStore = struct {
             const job = (try self.loadTableEmptyingJobTxn(txn, group_id, job_id)) orelse return error.UnknownTableEmptyingJob;
             defer metadata_table_manager.freeTableEmptyingJob(self.alloc, job);
             if (!std.mem.eql(u8, job.state, metadata_table_manager.table_emptying_ready)) return error.TableEmptyingJobNotReady;
+            if (job.barrier_id != first_record.barrier_id or
+                job.restart_identity != first_record.restart_identity or
+                job.cascade != first_record.cascade or
+                !tableEmptyingPromotionU64SlicesEqual(job.affected_table_ids, first_record.affected_table_ids) or
+                !tableEmptyingPromotionAffectedTablesContain(first_record.affected_table_ids, job.table_id))
+            {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
         }
 
         for (request.promotions, 0..) |promotion, i| {
             if (promotion.table_id == 0 or promotion.target_generation == 0) return error.InvalidTableEmptyingBarrierPromotion;
+            if (!tableEmptyingPromotionAffectedTablesContain(first_record.affected_table_ids, promotion.table_id)) return error.InvalidTableEmptyingBarrierPromotion;
             for (request.promotions[0..i]) |previous| {
-                if (previous.table_id == promotion.table_id and previous.target_generation != promotion.target_generation) {
-                    return error.InvalidTableEmptyingBarrierPromotion;
+                if (previous.table_id == promotion.table_id) return error.InvalidTableEmptyingBarrierPromotion;
+            }
+            const table = (try self.loadTableRecordTxn(txn, group_id, promotion.table_id)) orelse return error.UnknownTable;
+            defer metadata_table_manager.freeTable(self.alloc, table);
+            if (promotion.target_generation != table.data_generation +| 1) return error.InvalidTableEmptyingBarrierPromotion;
+        }
+        for (first_record.affected_table_ids) |table_id| {
+            var has_promotion = false;
+            for (request.promotions) |promotion| {
+                if (promotion.table_id == table_id) {
+                    has_promotion = true;
+                    break;
                 }
             }
-            var key_buf: [160]u8 = undefined;
-            const key = try tableKeyForGroup(&key_buf, group_id, promotion.table_id);
-            _ = txn.get(key) catch |err| switch (err) {
-                error.NotFound => return error.UnknownTable,
-                else => return err,
-            };
+            if (!has_promotion) return error.InvalidTableEmptyingBarrierPromotion;
+            try self.validateCompleteTableEmptyingBarrierTableTxn(txn, group_id, first_record, request.job_ids, table_id);
         }
 
         for (request.promotions) |promotion| {
@@ -3437,6 +3842,30 @@ pub const RaftApplyStore = struct {
             .table_name = request.promoted_table.name,
             .table_id = request.table_id,
         });
+    }
+
+    fn compareAndSwapSequenceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SequenceCompareAndSwapRequest,
+    ) !void {
+        if (request.sequence_id == 0) return error.InvalidSequenceCatalog;
+        var key_buf: [160]u8 = undefined;
+        const key = try sequenceKeyForGroup(&key_buf, group_id, request.sequence_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.SequenceNotFound,
+            else => return err,
+        };
+        var current = try decodeSequenceRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeSequence(self.alloc, current);
+        if (current.last_value != request.expected_last_value) return;
+        current.last_value = request.next_last_value;
+        current.last_allocation_id = request.allocation_id;
+        const value = try encodeSequenceRecord(self.alloc, current);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
     }
 
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
@@ -3586,6 +4015,22 @@ fn freeTableCatalogUpdateWithSchemaRewriteJobsRequest(alloc: std.mem.Allocator, 
     if (request.schema_rewrite_jobs.len > 0) alloc.free(request.schema_rewrite_jobs);
 }
 
+fn freeTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) void {
+    for (request.tables) |record| metadata_table_manager.freeTable(alloc, record);
+    if (request.tables.len > 0) alloc.free(request.tables);
+    for (request.schema_rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+    if (request.schema_rewrite_jobs.len > 0) alloc.free(request.schema_rewrite_jobs);
+}
+
+fn freeTableCatalogDropWithSchemaRewriteJobsRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest) void {
+    if (request.sequence_ids.len > 0) alloc.free(request.sequence_ids);
+    if (request.range_group_ids.len > 0) alloc.free(request.range_group_ids);
+    for (request.table_updates) |record| metadata_table_manager.freeTable(alloc, record);
+    if (request.table_updates.len > 0) alloc.free(request.table_updates);
+    for (request.schema_rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+    if (request.schema_rewrite_jobs.len > 0) alloc.free(request.schema_rewrite_jobs);
+}
+
 fn freeTableEmptyingJobBeginRequest(alloc: std.mem.Allocator, request: metadata_table_manager.TableEmptyingJobBeginRequest) void {
     alloc.free(request.lease_owner);
 }
@@ -3731,6 +4176,11 @@ const TransitionTag = enum(u8) {
     invalidate_table_emptying_job = 79,
     promote_table_emptying_barrier = 80,
     apply_table_catalog_update_with_schema_rewrite_jobs = 81,
+    upsert_sequence = 82,
+    remove_sequence = 83,
+    compare_and_swap_sequence = 84,
+    apply_table_catalog_batch_update_with_schema_rewrite_jobs = 85,
+    apply_table_catalog_drop_with_schema_rewrite_jobs = 86,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -3807,6 +4257,21 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_tablespace => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_tablespace));
             try appendInt(alloc, &out, u64, record.tablespace_id);
+        },
+        .upsert_sequence => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_sequence));
+            try appendSequenceRecord(alloc, &out, record);
+        },
+        .remove_sequence => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_sequence));
+            try appendInt(alloc, &out, u64, record.sequence_id);
+        },
+        .compare_and_swap_sequence => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.compare_and_swap_sequence));
+            try appendInt(alloc, &out, u64, request.sequence_id);
+            try appendInt(alloc, &out, i64, request.expected_last_value);
+            try appendInt(alloc, &out, i64, request.next_last_value);
+            try appendInt(alloc, &out, u128, request.allocation_id);
         },
         .upsert_table => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_table));
@@ -3952,6 +4417,14 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_table_catalog_update_with_schema_rewrite_jobs => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.apply_table_catalog_update_with_schema_rewrite_jobs));
             try appendTableCatalogUpdateWithSchemaRewriteJobsRequest(alloc, &out, request);
+        },
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_table_catalog_batch_update_with_schema_rewrite_jobs));
+            try appendTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(alloc, &out, request);
+        },
+        .apply_table_catalog_drop_with_schema_rewrite_jobs => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_table_catalog_drop_with_schema_rewrite_jobs));
+            try appendTableCatalogDropWithSchemaRewriteJobsRequest(alloc, &out, request);
         },
         .remove_schema_rewrite_job => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_schema_rewrite_job));
@@ -4147,6 +4620,20 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .remove_tablespace => .{
             .remove_tablespace = .{ .tablespace_id = try readInt(encoded, &pos, u64) },
         },
+        .upsert_sequence => .{
+            .upsert_sequence = try readSequenceRecord(alloc, encoded, &pos),
+        },
+        .remove_sequence => .{
+            .remove_sequence = .{ .sequence_id = try readInt(encoded, &pos, u64) },
+        },
+        .compare_and_swap_sequence => .{
+            .compare_and_swap_sequence = .{
+                .sequence_id = try readInt(encoded, &pos, u64),
+                .expected_last_value = try readInt(encoded, &pos, i64),
+                .next_last_value = try readInt(encoded, &pos, i64),
+                .allocation_id = try readInt(encoded, &pos, u128),
+            },
+        },
         .upsert_table => .{
             .upsert_table = try readTableRecord(alloc, encoded, &pos),
         },
@@ -4264,6 +4751,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .apply_table_catalog_update_with_schema_rewrite_jobs => .{
             .apply_table_catalog_update_with_schema_rewrite_jobs = try readTableCatalogUpdateWithSchemaRewriteJobsRequest(alloc, encoded, &pos),
+        },
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs => .{
+            .apply_table_catalog_batch_update_with_schema_rewrite_jobs = try readTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(alloc, encoded, &pos),
+        },
+        .apply_table_catalog_drop_with_schema_rewrite_jobs => .{
+            .apply_table_catalog_drop_with_schema_rewrite_jobs = try readTableCatalogDropWithSchemaRewriteJobsRequest(alloc, encoded, &pos),
         },
         .remove_schema_rewrite_job => .{
             .remove_schema_rewrite_job = .{ .job_id = try readInt(encoded, &pos, u64) },
@@ -4451,6 +4944,23 @@ fn decodeTablespaceRecord(alloc: std.mem.Allocator, encoded: []const u8) !metada
     const record = try readTablespaceRecord(alloc, encoded, &pos);
     if (pos != encoded.len) {
         metadata_table_manager.freeTablespace(alloc, record);
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    return record;
+}
+
+fn encodeSequenceRecord(alloc: std.mem.Allocator, record: metadata.SequenceRecord) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendSequenceRecord(alloc, &out, record);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeSequenceRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.SequenceRecord {
+    var pos: usize = 0;
+    const record = try readSequenceRecord(alloc, encoded, &pos);
+    if (pos != encoded.len) {
+        metadata_table_manager.freeSequence(alloc, record);
         return error.InvalidMetadataTransitionEncoding;
     }
     return record;
@@ -5385,6 +5895,53 @@ fn readTablespaceRecord(
     };
 }
 
+fn appendSequenceRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.SequenceRecord,
+) !void {
+    try appendInt(alloc, out, u64, record.sequence_id);
+    try appendRequiredString(alloc, out, record.name);
+    try appendRequiredString(alloc, out, record.database_name);
+    try appendRequiredString(alloc, out, record.namespace_name);
+    try appendRequiredString(alloc, out, record.options_json);
+    try appendInt(alloc, out, i64, record.last_value);
+    try appendInt(alloc, out, u128, record.last_allocation_id);
+}
+
+fn readSequenceRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.SequenceRecord {
+    const sequence_id = try readInt(encoded, pos, u64);
+    const name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(name);
+    const database_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(database_name);
+    const namespace_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(namespace_name);
+    const options_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(options_json);
+    const last_value = if (pos.* < encoded.len)
+        try readInt(encoded, pos, i64)
+    else
+        try metadata.sequenceInitialLastValueFromOptionsJson(alloc, options_json);
+    const last_allocation_id = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u128)
+    else
+        0;
+    return .{
+        .sequence_id = sequence_id,
+        .name = name,
+        .database_name = database_name,
+        .namespace_name = namespace_name,
+        .options_json = options_json,
+        .last_value = last_value,
+        .last_allocation_id = last_allocation_id,
+    };
+}
+
 fn appendTableRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -5538,6 +6095,7 @@ fn appendForeignKeyReferenceRangeRecord(
         try out.append(alloc, 0);
     }
     try appendInt(alloc, out, u64, record.group_id);
+    try appendInt(alloc, out, u64, record.range_id);
     try appendInt(alloc, out, u64, record.topology_epoch);
     try appendInt(alloc, out, u32, @intCast(record.state.len));
     try out.appendSlice(alloc, record.state);
@@ -5554,6 +6112,7 @@ fn appendForeignKeyReferenceRangeSelector(
     try appendInt(alloc, out, u64, selector.parent_table_id);
     try appendInt(alloc, out, u32, @intCast(selector.start_parent_key.len));
     try out.appendSlice(alloc, selector.start_parent_key);
+    try appendInt(alloc, out, u64, selector.range_id);
 }
 
 fn appendForeignKeyReferenceRangeSplitRequest(
@@ -5597,6 +6156,7 @@ fn appendUniqueConstraintRangeRecord(
         try out.append(alloc, 0);
     }
     try appendInt(alloc, out, u64, record.group_id);
+    try appendInt(alloc, out, u64, record.range_id);
     try appendInt(alloc, out, u64, record.topology_epoch);
     try appendInt(alloc, out, u32, @intCast(record.state.len));
     try out.appendSlice(alloc, record.state);
@@ -5612,6 +6172,7 @@ fn appendUniqueConstraintRangeSelector(
     try out.appendSlice(alloc, selector.constraint_name);
     try appendInt(alloc, out, u32, @intCast(selector.start_encoded_value.len));
     try out.appendSlice(alloc, selector.start_encoded_value);
+    try appendInt(alloc, out, u64, selector.range_id);
 }
 
 fn appendUniqueConstraintRangeSplitRequest(
@@ -5661,6 +6222,7 @@ fn appendSecondaryIndexRebuildRangeRecord(
     try appendInt(alloc, out, u64, record.completed_row_count);
     try appendRequiredString(alloc, out, record.progress_row_key);
     try appendRequiredString(alloc, out, record.last_error);
+    try appendInt(alloc, out, u64, record.range_id);
 }
 
 fn appendSecondaryIndexRebuildRangeSelector(
@@ -5757,6 +6319,7 @@ fn appendSchemaRewriteJobRecord(
     try appendInt(alloc, out, u64, record.completed_row_count);
     try appendRequiredString(alloc, out, record.progress_row_key);
     try appendRequiredString(alloc, out, record.last_error);
+    try appendInt(alloc, out, u64, record.range_id);
 }
 
 fn appendTableCatalogUpdateWithSchemaRewriteJobsRequest(
@@ -5765,6 +6328,33 @@ fn appendTableCatalogUpdateWithSchemaRewriteJobsRequest(
     request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
 ) !void {
     try appendTableRecord(alloc, out, request.table);
+    try appendInt(alloc, out, u64, @intCast(request.schema_rewrite_jobs.len));
+    for (request.schema_rewrite_jobs) |record| try appendSchemaRewriteJobRecord(alloc, out, record);
+}
+
+fn appendTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+) !void {
+    try appendInt(alloc, out, u64, @intCast(request.tables.len));
+    for (request.tables) |record| try appendTableRecord(alloc, out, record);
+    try appendInt(alloc, out, u64, @intCast(request.schema_rewrite_jobs.len));
+    for (request.schema_rewrite_jobs) |record| try appendSchemaRewriteJobRecord(alloc, out, record);
+}
+
+fn appendTableCatalogDropWithSchemaRewriteJobsRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.table_id);
+    try appendInt(alloc, out, u64, @intCast(request.sequence_ids.len));
+    for (request.sequence_ids) |sequence_id| try appendInt(alloc, out, u64, sequence_id);
+    try appendInt(alloc, out, u64, @intCast(request.range_group_ids.len));
+    for (request.range_group_ids) |range_group_id| try appendInt(alloc, out, u64, range_group_id);
+    try appendInt(alloc, out, u64, @intCast(request.table_updates.len));
+    for (request.table_updates) |record| try appendTableRecord(alloc, out, record);
     try appendInt(alloc, out, u64, @intCast(request.schema_rewrite_jobs.len));
     for (request.schema_rewrite_jobs) |record| try appendSchemaRewriteJobRecord(alloc, out, record);
 }
@@ -5825,6 +6415,7 @@ fn appendTableEmptyingJobRecord(
     try appendRequiredString(alloc, out, record.last_error);
     try appendInt(alloc, out, u64, record.data_generation);
     try appendInt(alloc, out, u64, record.barrier_id);
+    try appendInt(alloc, out, u64, record.range_id);
 }
 
 fn appendTableEmptyingJobBeginRequest(
@@ -6465,6 +7056,7 @@ fn readForeignKeyReferenceRangeRecord(
     const end_parent_key = try readOptionalString(alloc, encoded, pos);
     errdefer if (end_parent_key) |end| alloc.free(end);
     const group_id = try readInt(encoded, pos, u64);
+    const range_id = try readInt(encoded, pos, u64);
     const topology_epoch = try readInt(encoded, pos, u64);
     const state = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(state);
@@ -6475,6 +7067,7 @@ fn readForeignKeyReferenceRangeRecord(
         .start_parent_key = start_parent_key,
         .end_parent_key = end_parent_key,
         .group_id = group_id,
+        .range_id = range_id,
         .topology_epoch = topology_epoch,
         .state = state,
     };
@@ -6491,11 +7084,13 @@ fn readForeignKeyReferenceRangeSelector(
     const parent_table_id = try readInt(encoded, pos, u64);
     const start_parent_key = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(start_parent_key);
+    const range_id = try readInt(encoded, pos, u64);
     return .{
         .child_table_id = child_table_id,
         .constraint_name = constraint_name,
         .parent_table_id = parent_table_id,
         .start_parent_key = start_parent_key,
+        .range_id = range_id,
     };
 }
 
@@ -6545,6 +7140,7 @@ fn readUniqueConstraintRangeRecord(
     const end_encoded_value = try readOptionalString(alloc, encoded, pos);
     errdefer if (end_encoded_value) |end| alloc.free(end);
     const group_id = try readInt(encoded, pos, u64);
+    const range_id = try readInt(encoded, pos, u64);
     const topology_epoch = try readInt(encoded, pos, u64);
     const state = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(state);
@@ -6554,6 +7150,7 @@ fn readUniqueConstraintRangeRecord(
         .start_encoded_value = start_encoded_value,
         .end_encoded_value = end_encoded_value,
         .group_id = group_id,
+        .range_id = range_id,
         .topology_epoch = topology_epoch,
         .state = state,
     };
@@ -6569,10 +7166,12 @@ fn readUniqueConstraintRangeSelector(
     errdefer alloc.free(constraint_name);
     const start_encoded_value = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(start_encoded_value);
+    const range_id = try readInt(encoded, pos, u64);
     return .{
         .table_id = table_id,
         .constraint_name = constraint_name,
         .start_encoded_value = start_encoded_value,
+        .range_id = range_id,
     };
 }
 
@@ -6635,6 +7234,7 @@ fn readSecondaryIndexRebuildRangeRecord(
     errdefer alloc.free(progress_row_key);
     const last_error = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(last_error);
+    const range_id = if (pos.* < encoded.len) try readInt(encoded, pos, u64) else 0;
     return .{
         .table_id = table_id,
         .index_name = index_name,
@@ -6642,6 +7242,7 @@ fn readSecondaryIndexRebuildRangeRecord(
         .start_row_key = start_row_key,
         .end_row_key = end_row_key,
         .group_id = group_id,
+        .range_id = range_id,
         .topology_epoch = topology_epoch,
         .state = state,
         .lease_owner = lease_owner,
@@ -6793,10 +7394,12 @@ fn readSchemaRewriteJobRecord(
     errdefer alloc.free(progress_row_key);
     const last_error = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(last_error);
+    const range_id = if (pos.* < encoded.len) try readInt(encoded, pos, u64) else 0;
     return .{
         .job_id = job_id,
         .table_id = table_id,
         .group_id = group_id,
+        .range_id = range_id,
         .schema_generation = schema_generation,
         .action = action,
         .reason = reason,
@@ -6838,6 +7441,94 @@ fn readTableCatalogUpdateWithSchemaRewriteJobsRequest(
     }
     return .{
         .table = table,
+        .schema_rewrite_jobs = jobs,
+    };
+}
+
+fn readTableCatalogBatchUpdateWithSchemaRewriteJobsRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest {
+    const tables_len = try readInt(encoded, pos, u64);
+    if (tables_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const tables = try alloc.alloc(metadata.TableRecord, @intCast(tables_len));
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (tables[0..initialized_tables]) |record| metadata_table_manager.freeTable(alloc, record);
+        alloc.free(tables);
+    }
+    for (tables, 0..) |*table, i| {
+        table.* = try readTableRecordWithDataGeneration(alloc, encoded, pos);
+        initialized_tables = i + 1;
+    }
+
+    const jobs_len = try readInt(encoded, pos, u64);
+    if (jobs_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const jobs = try alloc.alloc(metadata_table_manager.SchemaRewriteJobRecord, @intCast(jobs_len));
+    var initialized_jobs: usize = 0;
+    errdefer {
+        for (jobs[0..initialized_jobs]) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        alloc.free(jobs);
+    }
+    for (jobs, 0..) |*job, i| {
+        job.* = try readSchemaRewriteJobRecord(alloc, encoded, pos);
+        initialized_jobs = i + 1;
+    }
+    return .{
+        .tables = tables,
+        .schema_rewrite_jobs = jobs,
+    };
+}
+
+fn readTableCatalogDropWithSchemaRewriteJobsRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest {
+    const table_id = try readInt(encoded, pos, u64);
+    const sequence_ids_len = try readInt(encoded, pos, u64);
+    if (sequence_ids_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const sequence_ids = try alloc.alloc(u64, @intCast(sequence_ids_len));
+    errdefer alloc.free(sequence_ids);
+    for (sequence_ids) |*sequence_id| sequence_id.* = try readInt(encoded, pos, u64);
+
+    const range_group_ids_len = try readInt(encoded, pos, u64);
+    if (range_group_ids_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const range_group_ids = try alloc.alloc(u64, @intCast(range_group_ids_len));
+    errdefer alloc.free(range_group_ids);
+    for (range_group_ids) |*range_group_id| range_group_id.* = try readInt(encoded, pos, u64);
+
+    const table_updates_len = try readInt(encoded, pos, u64);
+    if (table_updates_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const table_updates = try alloc.alloc(metadata.TableRecord, @intCast(table_updates_len));
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (table_updates[0..initialized_tables]) |record| metadata_table_manager.freeTable(alloc, record);
+        alloc.free(table_updates);
+    }
+    for (table_updates, 0..) |*table, i| {
+        table.* = try readTableRecordWithDataGeneration(alloc, encoded, pos);
+        initialized_tables = i + 1;
+    }
+
+    const jobs_len = try readInt(encoded, pos, u64);
+    if (jobs_len > std.math.maxInt(usize)) return error.InvalidMetadataTransitionEncoding;
+    const jobs = try alloc.alloc(metadata_table_manager.SchemaRewriteJobRecord, @intCast(jobs_len));
+    var initialized_jobs: usize = 0;
+    errdefer {
+        for (jobs[0..initialized_jobs]) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        alloc.free(jobs);
+    }
+    for (jobs, 0..) |*job, i| {
+        job.* = try readSchemaRewriteJobRecord(alloc, encoded, pos);
+        initialized_jobs = i + 1;
+    }
+    return .{
+        .table_id = table_id,
+        .sequence_ids = sequence_ids,
+        .range_group_ids = range_group_ids,
+        .table_updates = table_updates,
         .schema_rewrite_jobs = jobs,
     };
 }
@@ -6931,10 +7622,12 @@ fn readTableEmptyingJobRecord(
     errdefer alloc.free(last_error);
     const data_generation = if (pos.* < encoded.len) try readInt(encoded, pos, u64) else 0;
     const barrier_id = if (pos.* < encoded.len) try readInt(encoded, pos, u64) else 0;
+    const range_id = if (pos.* < encoded.len) try readInt(encoded, pos, u64) else 0;
     return .{
         .job_id = job_id,
         .table_id = table_id,
         .group_id = group_id,
+        .range_id = range_id,
         .schema_generation = schema_generation,
         .data_generation = data_generation,
         .barrier_id = barrier_id,
@@ -7406,6 +8099,10 @@ pub fn tablespacePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_tablespace:{d}:", .{group_id});
 }
 
+pub fn sequencePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_sequence:{d}:", .{group_id});
+}
+
 pub fn schemaProgressPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_schema_progress:{d}:", .{group_id});
 }
@@ -7500,6 +8197,10 @@ fn namespaceKeyForGroup(buf: []u8, group_id: u64, namespace_id: u64) ![]const u8
 
 fn tablespaceKeyForGroup(buf: []u8, group_id: u64, tablespace_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_tablespace:{d}:{d}", .{ group_id, tablespace_id });
+}
+
+fn sequenceKeyForGroup(buf: []u8, group_id: u64, sequence_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_sequence:{d}:{d}", .{ group_id, sequence_id });
 }
 
 fn schemaProgressKeyForGroup(buf: []u8, group_id: u64, table_id: u64, node_id: u64) ![]const u8 {
@@ -8099,6 +8800,114 @@ test "metadata raft apply store projects table and range records from committed 
     try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
 }
 
+test "metadata raft apply store projects sequence records across reopen and removal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sequence-catalog", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_id_seq");
+    const upsert_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_sequence = .{
+            .sequence_id = sequence_id,
+            .name = "usage_id_seq",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .options_json = "{\"as_type\":\"bigint\",\"start_with\":10}",
+            .last_value = 12,
+        },
+    });
+    defer std.testing.allocator.free(upsert_cmd);
+    const upsert_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = upsert_cmd },
+    });
+    defer std.testing.allocator.free(upsert_entries);
+
+    const allocate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .compare_and_swap_sequence = .{
+            .sequence_id = sequence_id,
+            .expected_last_value = 12,
+            .next_last_value = 13,
+            .allocation_id = 9001,
+        },
+    });
+    defer std.testing.allocator.free(allocate_cmd);
+    const stale_allocate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .compare_and_swap_sequence = .{
+            .sequence_id = sequence_id,
+            .expected_last_value = 12,
+            .next_last_value = 99,
+            .allocation_id = 9002,
+        },
+    });
+    defer std.testing.allocator.free(stale_allocate_cmd);
+    const allocate_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = allocate_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = stale_allocate_cmd },
+    });
+    defer std.testing.allocator.free(allocate_entries);
+
+    const remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_sequence = .{ .sequence_id = sequence_id },
+    });
+    defer std.testing.allocator.free(remove_cmd);
+    const remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = remove_cmd },
+    });
+    defer std.testing.allocator.free(remove_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 1,
+            .entries_bytes = upsert_entries,
+        });
+
+        const sequences = try store.listSequences(std.testing.allocator, 41);
+        defer store.freeSequences(std.testing.allocator, sequences);
+        try std.testing.expectEqual(@as(usize, 1), sequences.len);
+        try std.testing.expectEqual(sequence_id, sequences[0].sequence_id);
+        try std.testing.expectEqualStrings("usage_id_seq", sequences[0].name);
+        try std.testing.expectEqualStrings("tenant", sequences[0].database_name);
+        try std.testing.expectEqualStrings("billing", sequences[0].namespace_name);
+        try std.testing.expectEqualStrings("{\"as_type\":\"bigint\",\"start_with\":10}", sequences[0].options_json);
+        try std.testing.expectEqual(@as(i64, 12), sequences[0].last_value);
+
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 3,
+            .entries_bytes = allocate_entries,
+        });
+        const allocated = try store.listSequences(std.testing.allocator, 41);
+        defer store.freeSequences(std.testing.allocator, allocated);
+        try std.testing.expectEqual(@as(usize, 1), allocated.len);
+        try std.testing.expectEqual(@as(i64, 13), allocated[0].last_value);
+        try std.testing.expectEqual(@as(u128, 9001), allocated[0].last_allocation_id);
+    }
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        const sequences = try store.listSequences(std.testing.allocator, 41);
+        defer store.freeSequences(std.testing.allocator, sequences);
+        try std.testing.expectEqual(@as(usize, 1), sequences.len);
+        try std.testing.expectEqual(@as(i64, 13), sequences[0].last_value);
+        try std.testing.expectEqual(@as(u128, 9001), sequences[0].last_allocation_id);
+
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 4,
+            .entries_bytes = remove_entries,
+        });
+        const removed = try store.listSequences(std.testing.allocator, 41);
+        defer store.freeSequences(std.testing.allocator, removed);
+        try std.testing.expectEqual(@as(usize, 0), removed.len);
+    }
+}
+
 test "metadata raft apply store persists secondary index rebuild work ranges across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8509,6 +9318,245 @@ test "metadata raft apply store applies table updates with schema rewrite jobs a
     try std.testing.expectEqual(@as(u64, generation), jobs[0].schema_generation);
 }
 
+test "metadata raft apply store applies table catalog batch updates with schema rewrite jobs atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-batch-update-schema-rewrite", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const orders_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const invoices_schema_json =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const update_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs = .{
+            .tables = &.{
+                .{ .table_id = 51, .name = "orders", .schema_json = orders_schema_json },
+                .{ .table_id = 52, .name = "invoices", .schema_json = invoices_schema_json },
+            },
+            .schema_rewrite_jobs = &.{
+                .{
+                    .job_id = 9501,
+                    .table_id = 51,
+                    .group_id = 9001,
+                    .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(orders_schema_json),
+                    .action = "validate",
+                    .reason = "constraints",
+                    .start_row_key = "",
+                },
+                .{
+                    .job_id = 9502,
+                    .table_id = 52,
+                    .group_id = 9002,
+                    .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(invoices_schema_json),
+                    .action = "rewrite",
+                    .reason = "row_images",
+                    .start_row_key = "",
+                    .full_row_rewrite = true,
+                },
+            },
+        },
+    });
+    defer std.testing.allocator.free(update_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = update_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 51,
+            .commit_index = 1,
+            .entries_bytes = encoded_entries,
+        });
+    }
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer reopened.deinit();
+    const tables = try reopened.listTables(std.testing.allocator, 51);
+    defer reopened.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+
+    const jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 51);
+    defer reopened.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+}
+
+test "metadata raft apply store applies table catalog drop with child updates atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-drop-schema-rewrite", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const child_schema_json =
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const parent_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 51, .name = "parents", .schema_json = "{\"version\":1}" },
+    });
+    defer std.testing.allocator.free(parent_table_cmd);
+    const child_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 52, .name = "children", .schema_json = "{\"version\":1}" },
+    });
+    defer std.testing.allocator.free(child_table_cmd);
+    const sequence_id = metadata_table_manager.deriveSequenceId(metadata_table_manager.default_database_name, metadata_table_manager.default_namespace_name, "parents_id_seq");
+    const parent_sequence_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_sequence = .{ .sequence_id = sequence_id, .name = "parents_id_seq" },
+    });
+    defer std.testing.allocator.free(parent_sequence_cmd);
+    const parent_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9001, .table_id = 51, .start_key = "", .end_key = null },
+    });
+    defer std.testing.allocator.free(parent_range_cmd);
+    const child_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9002, .table_id = 52, .start_key = "", .end_key = null },
+    });
+    defer std.testing.allocator.free(child_range_cmd);
+    const drop_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_catalog_drop_with_schema_rewrite_jobs = .{
+            .table_id = 51,
+            .sequence_ids = &.{sequence_id},
+            .range_group_ids = &.{9001},
+            .table_updates = &.{.{ .table_id = 52, .name = "children", .schema_json = child_schema_json }},
+            .schema_rewrite_jobs = &.{
+                .{
+                    .job_id = 9501,
+                    .table_id = 52,
+                    .group_id = 9002,
+                    .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(child_schema_json),
+                    .action = "rewrite",
+                    .reason = "drop_fk_parent",
+                    .start_row_key = "",
+                    .full_row_rewrite = true,
+                },
+            },
+        },
+    });
+    defer std.testing.allocator.free(drop_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = parent_table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = child_table_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = parent_sequence_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = parent_range_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = child_range_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = drop_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 51,
+            .commit_index = 6,
+            .entries_bytes = encoded_entries,
+        });
+    }
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer reopened.deinit();
+    const tables = try reopened.listTables(std.testing.allocator, 51);
+    defer reopened.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqual(@as(u64, 52), tables[0].table_id);
+    try std.testing.expectEqualStrings(child_schema_json, tables[0].schema_json);
+
+    const ranges = try reopened.listRanges(std.testing.allocator, 51);
+    defer reopened.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 9002), ranges[0].group_id);
+    try std.testing.expectEqual(@as(u64, 52), ranges[0].table_id);
+
+    const sequences = try reopened.listSequences(std.testing.allocator, 51);
+    defer reopened.freeSequences(std.testing.allocator, sequences);
+    try std.testing.expectEqual(@as(usize, 0), sequences.len);
+
+    const jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 51);
+    defer reopened.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(u64, 9501), jobs[0].job_id);
+    try std.testing.expectEqual(@as(u64, 52), jobs[0].table_id);
+}
+
+test "metadata raft apply store rejects table catalog drop with omitted table ranges" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-drop-omitted-range", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const parent_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 51, .name = "parents", .schema_json = "{\"version\":1}" },
+    });
+    defer std.testing.allocator.free(parent_table_cmd);
+    const child_table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 52, .name = "children", .schema_json = "{\"version\":1}" },
+    });
+    defer std.testing.allocator.free(child_table_cmd);
+    const parent_left_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9001, .table_id = 51, .start_key = "", .end_key = "m" },
+    });
+    defer std.testing.allocator.free(parent_left_range_cmd);
+    const parent_right_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{ .group_id = 9003, .table_id = 51, .start_key = "m", .end_key = null },
+    });
+    defer std.testing.allocator.free(parent_right_range_cmd);
+    const setup_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = parent_table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = child_table_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = parent_left_range_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = parent_right_range_cmd },
+    });
+    defer std.testing.allocator.free(setup_entries);
+
+    const child_schema_json =
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const bad_drop_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_catalog_drop_with_schema_rewrite_jobs = .{
+            .table_id = 51,
+            .range_group_ids = &.{9001},
+            .table_updates = &.{.{ .table_id = 52, .name = "children", .schema_json = child_schema_json }},
+        },
+    });
+    defer std.testing.allocator.free(bad_drop_cmd);
+    const bad_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = bad_drop_cmd },
+    });
+    defer std.testing.allocator.free(bad_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 51,
+        .commit_index = 4,
+        .entries_bytes = setup_entries,
+    });
+    try std.testing.expectError(error.UnknownRange, store.snapshotBuilder().applyBatch(.{
+        .group_id = 51,
+        .commit_index = 5,
+        .entries_bytes = bad_entries,
+    }));
+
+    const tables = try store.listTables(std.testing.allocator, 51);
+    defer store.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+    var saw_parent = false;
+    var saw_original_child = false;
+    for (tables) |table| {
+        if (table.table_id == 51) saw_parent = true;
+        if (table.table_id == 52 and std.mem.eql(u8, table.schema_json, "{\"version\":1}")) saw_original_child = true;
+    }
+    try std.testing.expect(saw_parent and saw_original_child);
+
+    const ranges = try store.listRanges(std.testing.allocator, 51);
+    defer store.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 2), ranges.len);
+}
+
 test "metadata raft apply store persists table emptying jobs across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8678,23 +9726,37 @@ test "metadata raft apply store promotes table emptying barriers atomically" {
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-promotion", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const schema_json = "{\"type\":\"object\"}";
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
     const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_table = .{
             .table_id = 41,
             .name = "orders",
-            .schema_json = "{\"type\":\"object\"}",
+            .schema_json = schema_json,
             .data_generation = 3,
         },
     });
     defer std.testing.allocator.free(table_cmd);
+    const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 41,
+            .start_key = "",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(range_cmd);
     const empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_table_emptying_job = .{
             .job_id = 9201,
             .table_id = 41,
             .group_id = 9001,
-            .schema_generation = 42,
+            .schema_generation = schema_generation,
             .data_generation = 3,
             .barrier_id = 7007,
+            .start_row_key = "",
+            .end_row_key = null,
             .affected_table_ids = &.{41},
             .state = metadata_table_manager.table_emptying_ready,
         },
@@ -8709,8 +9771,9 @@ test "metadata raft apply store promotes table emptying barriers atomically" {
     defer std.testing.allocator.free(promote_cmd);
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = empty_cmd },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = promote_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = empty_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = promote_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -8719,7 +9782,7 @@ test "metadata raft apply store promotes table emptying barriers atomically" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 3,
+            .commit_index = 4,
             .entries_bytes = encoded_entries,
         });
     }
@@ -8734,6 +9797,84 @@ test "metadata raft apply store promotes table emptying barriers atomically" {
     const jobs = try reopened.listTableEmptyingJobs(std.testing.allocator, 41);
     defer reopened.freeTableEmptyingJobs(std.testing.allocator, jobs);
     try std.testing.expectEqual(@as(usize, 0), jobs.len);
+}
+
+test "metadata raft apply store rejects incomplete table emptying barrier promotion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-incomplete-promotion", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const schema_json = "{\"type\":\"object\"}";
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = schema_json,
+            .data_generation = 3,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const left_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 41,
+            .start_key = "",
+            .end_key = "m",
+        },
+    });
+    defer std.testing.allocator.free(left_range_cmd);
+    const right_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9002,
+            .range_id = 9102,
+            .table_id = 41,
+            .start_key = "m",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(right_range_cmd);
+    const left_empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9201,
+            .table_id = 41,
+            .group_id = 9001,
+            .schema_generation = schema_generation,
+            .data_generation = 3,
+            .barrier_id = 7007,
+            .start_row_key = "",
+            .end_row_key = "m",
+            .affected_table_ids = &.{41},
+            .state = metadata_table_manager.table_emptying_ready,
+        },
+    });
+    defer std.testing.allocator.free(left_empty_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .promote_table_emptying_barrier = .{
+            .job_ids = &.{9201},
+            .promotions = &.{.{ .table_id = 41, .target_generation = 4 }},
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = left_range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = right_range_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = left_empty_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidTableEmptyingBarrierPromotion, store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 5,
+        .entries_bytes = encoded_entries,
+    }));
 }
 
 test "metadata raft apply store rejects stale schema rewrite lease owners" {

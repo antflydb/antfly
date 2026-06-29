@@ -15,11 +15,11 @@
 const std = @import("std");
 
 const catalog_resources = @import("catalog_resources.zig");
-const table_catalog = @import("../metadata/catalog_source.zig");
+const table_catalog = @import("../metadata/catalog/source.zig");
 const binder = @import("binder.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const executor = @import("executor.zig");
-const logical_ddl_plan = @import("logical_ddl_plan.zig");
+const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -115,7 +115,7 @@ pub fn planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(
     bound: *binder.BoundSqlStatement,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !DurableSqlPlan {
-    var logical_plan = try logical_ddl_plan.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
+    var logical_plan = try lower_ddl.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
     errdefer logical_plan.deinit(alloc);
     return try DurableSqlPlan.fromLogical(&logical_plan);
 }

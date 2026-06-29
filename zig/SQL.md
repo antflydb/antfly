@@ -173,7 +173,16 @@ rows APIs. Non-recursive `INSERT ... SELECT` executes through the typed
 insert-source path by reading the source side through the row-plan executor,
 building a typed row batch from insert assignments and conflict policy, applying
 target row filters, and returning the mutation-source `matched`/`staged` counts
-plus `RETURNING` rows. Safe `BEFORE INSERT` SQL trigger hooks run before the
+plus `RETURNING` rows. SQL point writes, insert-source writes, `MERGE`, and
+`COPY FROM` materialize schema-owned `sequence_next` defaults through the same
+explicit server-side resolver as REST row writes. The resolver reserves values
+with a raft-applied compare-and-swap cursor command carrying a durable
+allocation token. PostgreSQL-shaped sequence runtime functions (`nextval`,
+`currval`, and `setval`) route through the same metadata-owned sequence catalog
+and session state instead of raw SQL text. Range/block allocation,
+owned-by dependencies, and identity reset semantics remain native work below
+that resolver boundary. Safe `BEFORE INSERT`
+SQL trigger hooks run before the
 SQL-lowered row batch reaches row filters or commit; SQL update/delete
 statements fail closed when table update/delete triggers are present until
 their executor can share the preimage trigger path. Claimed single-table
@@ -185,12 +194,13 @@ update/delete sources (`UPDATE ... FROM` and `DELETE ... USING`) use the same
 typed path: SQL executes the side-table read as a row plan, feeds the materialized
 source rows into the joined mutation-source planner/stager, and autocommits or
 aborts the SQL-owned row-claim transaction before returning mutation-source
-counts and `RETURNING` rows. Plain single-table `TRUNCATE` and explicit
-`TRUNCATE ... CONTINUE IDENTITY RESTRICT` use the typed table-emptying
-mutation-source path with the SQL-owned row claim; multi-table truncate,
-`CASCADE`, and `RESTART IDENTITY` remain fail-closed until their executor
-wiring can share the native cross-table catalog barrier, identity allocator,
-and 2PC paths. Recursive CTE-backed claimed update/delete statements
+counts and `RETURNING` rows. Plain single-table `TRUNCATE`, explicit
+`TRUNCATE ... CONTINUE IDENTITY RESTRICT`, multi-table truncate, and
+`TRUNCATE ... CASCADE` all admit through catalog-owned table-emptying barriers
+instead of synchronous SQL-owned deletes. `TRUNCATE ... RESTART IDENTITY`
+preserves allocator-reset intent on that same barrier family and remains gated
+on the native identity-allocator reset owner before promotion can advance table
+generations. Recursive CTE-backed claimed update/delete statements
 execute by materializing the bounded recursive producer through the typed read
 planner, filtering the referenced CTE output, and feeding those rows into the
 same joined mutation-source autocommit path. Direct table-source MERGE,

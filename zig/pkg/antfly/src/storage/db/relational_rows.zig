@@ -3927,6 +3927,12 @@ pub fn validateQueryPlanCteReferences(plan: types.RelationalRowsQueryPlan) !void
     try validateFinalCteReference(plan.ctes, plan.query.source_cte);
 }
 
+pub fn validateSetOperationPlanCteReferences(plan: types.RelationalRowsSetOperationPlan) !void {
+    try validateMaterializedCtes(plan.ctes, &.{});
+    try validateFinalCteReference(plan.ctes, plan.left.query.source_cte);
+    try validateFinalCteReference(plan.ctes, plan.right.query.source_cte);
+}
+
 pub fn validateQueryPlanRequest(plan: types.RelationalRowsQueryPlan) !void {
     if (plan.query.row_claim != null or plan.query.doc_key_range != null) return error.UnsupportedQueryRequest;
 }
@@ -12239,10 +12245,24 @@ pub fn Impl(comptime DB: type) type {
             plan: types.RelationalRowsSetOperationPlan,
         ) !types.RelationalRowsQueryResult {
             if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+            if (plan.left.ctes.len != 0 or plan.right.ctes.len != 0) return error.InvalidQueryRequest;
+            try validateSetOperationPlanCteReferences(plan);
+            const planned_ctes = try planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+            defer deinitPlannedCtes(alloc, planned_ctes);
+            try validateQueryAgainstPlannedCteOutput(planned_ctes, plan.left.query);
+            try validateQueryAgainstPlannedCteOutput(planned_ctes, plan.right.query);
 
-            var left = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.left);
+            var materialized_ctes = std.ArrayListUnmanaged(MaterializedCte).empty;
+            defer {
+                for (materialized_ctes.items) |*cte| cte.deinit(alloc);
+                materialized_ctes.deinit(alloc);
+            }
+
+            try @This().appendRelationalRowsMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, plan.ctes, &materialized_ctes);
+
+            var left = try @This().queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, plan.left.ranges, plan.left.query);
             defer left.deinit(alloc);
-            var right = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.right);
+            var right = try @This().queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, plan.right.ranges, plan.right.query);
             defer right.deinit(alloc);
 
             const combined = try relationalRowsSetOperationRowsAllocFn(alloc, plan.operation, left.rows, right.rows);

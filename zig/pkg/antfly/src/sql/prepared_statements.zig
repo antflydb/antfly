@@ -152,7 +152,7 @@ pub const Runtime = struct {
         errdefer self.alloc.free(owned_subject_source);
         var subject_parsed_sql = try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_subject_source, source_subject.items());
         errdefer subject_parsed_sql.deinit(self.alloc);
-        const subject_family = preparedStatementFamilyFromParsedSql(&subject_parsed_sql) orelse return error.UnsupportedSqlShape;
+        const subject_family = (try preparedStatementFamilyFromParsedSql(&subject_parsed_sql)) orelse return error.UnsupportedSqlShape;
         if (subject_family != plan.statement_family or preparedStatementSubjectKindFromFamily(subject_family) != plan.statement_kind) {
             return error.UnsupportedSqlShape;
         }
@@ -207,10 +207,13 @@ pub const Runtime = struct {
     }
 };
 
-fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql) ?sql_adapter.PreparedStatementStatementKind {
+fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql) !?sql_adapter.PreparedStatementStatementKind {
     return switch (parsed_sql.statement) {
-        .read => if (parsed_sql.readStatementKindIncludingGeneratedAst() != null) .read else null,
-        .write => switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return null) {
+        .read => if (parsed_sql.readStatementKindIncludingGeneratedAst() != null) .read else if (parsed_sql.generatedStatementKind() == .read) error.UnsupportedSqlShape else null,
+        .write => switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse {
+            if (parsed_sql.generatedStatementKind() == .dml) return error.UnsupportedSqlShape;
+            return null;
+        }) {
             .insert => .insert,
             .insert_source => .insert_source,
             .update, .update_source, .update_joined_source => .update,
@@ -387,7 +390,7 @@ test "sql prepared statement runtime rejects mismatched subject metadata" {
         };
     }
     try std.testing.expect(malformed_generated_read.readStatementKindIncludingGeneratedAst() == null);
-    try std.testing.expect(preparedStatementFamilyFromParsedSql(&malformed_generated_read) == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, preparedStatementFamilyFromParsedSql(&malformed_generated_read));
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 
     var malformed_generated_write = try sql_adapter.ParsedSql.initAlloc(
@@ -407,6 +410,6 @@ test "sql prepared statement runtime rejects mismatched subject metadata" {
         };
     }
     try std.testing.expect(malformed_generated_write.writeStatementKindIncludingGeneratedAst() == null);
-    try std.testing.expect(preparedStatementFamilyFromParsedSql(&malformed_generated_write) == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, preparedStatementFamilyFromParsedSql(&malformed_generated_write));
     try std.testing.expectEqual(@as(usize, 0), runtime.statementCountForTest(303));
 }

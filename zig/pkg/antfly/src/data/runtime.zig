@@ -240,7 +240,7 @@ const RaftTableApplyStateMachine = struct {
     fn init(
         alloc: std.mem.Allocator,
         replica_root_dir: []const u8,
-        catalog: antfly.public_api.table_catalog.CatalogSource,
+        catalog: antfly.metadata.catalog_source.CatalogSource,
         backend_runtime: ?*backend_runtime_mod.BackendRuntime,
     ) RaftTableApplyStateMachine {
         var write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, catalog);
@@ -2103,7 +2103,7 @@ pub const DataServer = struct {
     pub fn initFromLocalMetadataSources(
         alloc: std.mem.Allocator,
         cfg: DataServerConfig,
-        catalog: antfly.public_api.table_catalog.CatalogSource,
+        catalog: antfly.metadata.catalog_source.CatalogSource,
         status_source: antfly.public_api.http_server.StatusSource,
     ) DataServer {
         return .{
@@ -2146,12 +2146,12 @@ pub const DataServer = struct {
             .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.catalogSourceFromMetadataService(svc),
+                svc.catalogSource(),
                 antfly.raft.read_gate.noopReadableLeaseRequester(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.catalogSourceFromMetadataService(svc),
+                svc.catalogSource(),
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
@@ -2178,12 +2178,12 @@ pub const DataServer = struct {
             .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.catalogSourceFromMetadataHttpService(svc),
+                svc.catalogSource(),
                 antfly.raft.read_gate.noopReadableLeaseRequester(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
-                antfly.public_api.table_catalog.catalogSourceFromMetadataHttpService(svc),
+                svc.catalogSource(),
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
@@ -6544,7 +6544,7 @@ const RemoteMetadataSource = struct {
         return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
     }
 
-    fn catalogSource(self: *RemoteMetadataSource) antfly.public_api.table_catalog.CatalogSource {
+    fn catalogSource(self: *RemoteMetadataSource) antfly.metadata.catalog_source.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -6686,7 +6686,7 @@ const RemoteMetadataSource = struct {
         freeAdminSnapshotOwned(self.alloc, snapshot);
     }
 
-    fn remoteCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
+    fn remoteCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.metadata.catalog.table_ddl.CreateTableRequest) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const body = try antfly.public_api.table_contract.encodeCreateTableRequest(alloc, req);
         defer alloc.free(body);
@@ -9443,7 +9443,7 @@ test "data runtime local group status provider collects and caches group statuse
     defer db.close();
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -9596,7 +9596,7 @@ test "data runtime local split fallback preserves source identity namespace" {
     }
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -9749,7 +9749,7 @@ test "data runtime local merge fallback derives receiver identity namespace from
     }
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -9888,12 +9888,12 @@ test "data runtime store status reuses stale cache while refreshing local group 
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -9990,12 +9990,12 @@ test "data runtime store status keeps stale cache and skips local group refresh 
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -10103,12 +10103,12 @@ test "data runtime live local group status skips the active startup group on a c
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -10178,12 +10178,12 @@ test "data runtime store status cold miss schedules refresh and returns empty im
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -10258,12 +10258,12 @@ test "data runtime metadata local group status provider does not cold-open inlin
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -10333,12 +10333,12 @@ test "data runtime local group refresh prefers runtime status snapshot over DB o
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -10484,7 +10484,7 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -10613,7 +10613,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -10763,7 +10763,7 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -10904,7 +10904,7 @@ test "data runtime status refresh preserves only the active catch-up group while
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11099,7 +11099,7 @@ test "data runtime status refresh skips opening the active startup group when no
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11215,7 +11215,7 @@ test "data runtime status refresh publishes synthetic missing status for absent 
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11335,7 +11335,7 @@ test "data runtime status refresh budget reuses cached group status instead of o
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11476,7 +11476,7 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11617,7 +11617,7 @@ test "data runtime status refresh falls back to live managed writer status when 
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11748,7 +11748,7 @@ test "data runtime status refresh publishes placeholder when live managed writer
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -11845,12 +11845,12 @@ test "data local group status refresh skips active group when cache entry is mis
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -11971,7 +11971,7 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -12172,7 +12172,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -12352,7 +12352,7 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
         };
 
         const FakeCatalog = struct {
-            fn iface() antfly.public_api.table_catalog.CatalogSource {
+            fn iface() antfly.metadata.catalog_source.CatalogSource {
                 return .{
                     .ptr = undefined,
                     .vtable = &.{
@@ -12558,7 +12558,7 @@ test "data runtime startup catch-up retries unresolved leadership and later clea
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -12697,7 +12697,7 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
     defer alloc.free(replica_root_dir);
 
     const EmptyCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -12958,12 +12958,12 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = snapshot_source.iface(),
         .api_server_cfg = undefined,
@@ -13004,12 +13004,12 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -13053,12 +13053,12 @@ test "data runtime provisioned root refresh spawn failure preserves retry bookke
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -13149,7 +13149,7 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -13282,7 +13282,7 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -13365,12 +13365,12 @@ test "data runtime startup catch-up spawn failure preserves retry bookkeeping" {
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.metadata.catalog_source.emptyCatalogSource(),
         ),
         .status_source = undefined,
         .api_server_cfg = undefined,
@@ -14109,7 +14109,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -14396,7 +14396,7 @@ test "data server wires configured HA executors into API server" {
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -14542,7 +14542,7 @@ test "data server mirrors managed primary writes into HA replication log" {
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -14676,7 +14676,7 @@ test "data server fail-closed sync policy rejects primary writes before local co
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -14799,7 +14799,7 @@ test "data server block sync policy waits for standby acknowledgement before com
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -14939,7 +14939,7 @@ test "data server propagates standby HA write gate into provisioned write source
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15072,7 +15072,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15211,7 +15211,7 @@ test "data server applies routed HA replication records through standby write ga
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15346,7 +15346,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15525,7 +15525,7 @@ test "data server resumes HA standby replication from durable progress after res
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15745,7 +15745,7 @@ test "data runtime records HA standby replication round failures" {
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15884,7 +15884,7 @@ test "data runtime records HA standby apply failures without stopping run round"
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -15998,7 +15998,7 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     const alloc = std.testing.allocator;
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -16043,7 +16043,7 @@ test "data runtime background maintenance is due for dense posting cadence witho
     const alloc = std.testing.allocator;
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        fn iface() antfly.metadata.catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{

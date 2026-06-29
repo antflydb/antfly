@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const sql_adapter = @import("../sql/mod.zig");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -22,7 +22,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 

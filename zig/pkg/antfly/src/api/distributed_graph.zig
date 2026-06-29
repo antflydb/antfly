@@ -23,7 +23,7 @@ const doc_set = @import("../storage/db/doc_set.zig");
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -32,7 +32,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const platform_time = @import("../platform/time.zig");
 const indexes_api = @import("indexes.zig");
 const query_contract = @import("query_contract.zig");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 
 pub const Worker = struct {
     ptr: *anyopaque,

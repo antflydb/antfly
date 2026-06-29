@@ -301,6 +301,7 @@ pub const AdminSnapshot = struct {
     databases: []table_manager.DatabaseRecord = &.{},
     namespaces: []table_manager.NamespaceRecord = &.{},
     tablespaces: []table_manager.TablespaceRecord = &.{},
+    sequences: []table_manager.SequenceRecord = &.{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
     foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
@@ -351,6 +352,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedTablespaces")) {
         snapshot.tablespaces = try source.listProjectedTablespaces(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSequences")) {
+        snapshot.sequences = try source.listProjectedSequences(alloc);
     }
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
@@ -440,6 +444,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedTablespaces") and snapshot.tablespaces.len > 0) {
         source.freeProjectedTablespaces(alloc, snapshot.tablespaces);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSequences") and snapshot.sequences.len > 0) {
+        source.freeProjectedSequences(alloc, snapshot.sequences);
     }
     source.freeProjectedTables(alloc, snapshot.tables);
     source.freeProjectedRanges(alloc, snapshot.ranges);

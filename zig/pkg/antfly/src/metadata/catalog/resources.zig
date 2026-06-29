@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const sql_catalog_resources = @import("../metadata/catalog/resources.zig");
+const sql_catalog_resources = @import("../../sql/catalog_resources.zig");
 
 pub const default_database_name = sql_catalog_resources.default_database_name;
 pub const default_namespace_name = sql_catalog_resources.default_namespace_name;

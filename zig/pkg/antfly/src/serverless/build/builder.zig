@@ -38,7 +38,7 @@ const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const shared_vector = @import("antfly_vector").vector;
 
 const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;

@@ -18,7 +18,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const raft_mod = @import("../../raft/mod.zig");
 const catalog_resources = @import("../catalog_resources.zig");
-const document_sql_runtime = @import("document_sql_runtime.zig");
+const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const distributed_graph = @import("../distributed_graph.zig");
 const runtime_status = @import("../runtime_status.zig");
 const query_api = @import("../query.zig");
@@ -1245,6 +1245,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn rowsSetOperationPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlan(alloc, table_name, runtime_schema, plan, consistency);
+        if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
 
@@ -1258,6 +1259,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn rowsSetOperationPlanCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlanCatalog(alloc, target, runtime_schema, plan, consistency);
+        if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
 
@@ -1517,6 +1519,7 @@ pub fn rowsSetOperationPlanFromLakeScanAlloc(
     plan: db_mod.types.RelationalRowsSetOperationPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
+    if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
     var left = (try rowsQueryPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
     defer left.deinit(alloc);
     var right = (try rowsQueryPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;

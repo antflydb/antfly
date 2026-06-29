@@ -13,29 +13,29 @@
 // limitations.
 
 const std = @import("std");
-const group_ids = @import("../common/group_ids.zig");
-const metadata_api = @import("../metadata/api.zig");
-const metadata_admin = @import("../metadata/admin.zig");
-const metadata_catalog_lookup = @import("../metadata/catalog_lookup.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_transition_state = @import("../metadata/transition_state.zig");
-const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const group_ids = @import("../../common/group_ids.zig");
+const metadata_api = @import("snapshot.zig");
+const metadata_admin = @import("../admin.zig");
+const metadata_catalog_lookup = @import("lookup.zig");
+const metadata_table_manager = @import("../table_manager.zig");
+const metadata_transition_state = @import("../transition_state.zig");
+const raft_reconciler = @import("../../raft/reconciler.zig");
+const db_mod = @import("../../storage/db/mod.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
-const schema_mod = @import("../schema/mod.zig");
-const runtime_schema_mod = @import("../storage/schema.zig");
-const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const table_catalog = @import("table_catalog.zig");
-const full_text_indexes = @import("full_text_indexes.zig");
-const indexes_api = @import("indexes.zig");
-const json_helpers = @import("../common/json_helpers.zig");
-const catalog_resources = @import("catalog_resources.zig");
-const sql_adapter = @import("../sql/mod.zig");
-const sql_schema_mutation = @import("../sql/schema_mutation.zig");
-const table_reads = @import("table_reads.zig");
+const schema_mod = @import("../../schema/mod.zig");
+const runtime_schema_mod = @import("../../storage/schema.zig");
+const algebraic_mod = @import("../../storage/db/algebraic/mod.zig");
+const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
+const table_catalog = @import("source.zig");
+const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const indexes_api = @import("../../api/indexes.zig");
+const json_helpers = @import("../../common/json_helpers.zig");
+const catalog_resources = @import("resources.zig");
+const sql_adapter = @import("../../sql/mod.zig");
+const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
+const table_reads = @import("../../api/table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
@@ -66,6 +66,9 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     created_tablespace: bool = false,
     renamed_tablespace: bool = false,
     dropped_tablespace: bool = false,
+    created_sequence: bool = false,
+    altered_sequence: bool = false,
+    dropped_sequence: bool = false,
     noop: bool = false,
     requires_rebuild: bool = false,
     validation_required: bool = false,
@@ -1471,7 +1474,7 @@ pub fn validateWritesAgainstTableSchema(
     try schema_mod.validateWritesAgainstTableSchema(alloc, schema, writes);
 }
 
-pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !@import("../storage/schema.zig").TableSchema {
+pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !@import("../../storage/schema.zig").TableSchema {
     return try schema_mod.deriveRuntimeTableSchema(alloc, schema);
 }
 
@@ -1638,7 +1641,7 @@ fn durableRelationalSqlDdlPlanFromParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !sql_adapter.DurableSqlPlan {
-    var logical_plan = try sql_adapter.logical_ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    var logical_plan = try sql_adapter.lower_ddl.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
     errdefer logical_plan.deinit(alloc);
     return try sql_adapter.takeDurableSqlPlanFromLogical(&logical_plan);
 }
@@ -3825,6 +3828,15 @@ pub fn findTablespaceByName(snapshot: *const metadata_api.AdminSnapshot, tablesp
     return metadata_catalog_lookup.findTablespaceByName(snapshot, tablespace_name);
 }
 
+pub fn findSequenceByQualifiedName(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    sequence_name: []const u8,
+) ?*const metadata_table_manager.SequenceRecord {
+    return metadata_catalog_lookup.findSequenceByQualifiedName(snapshot, database_name, namespace_name, sequence_name);
+}
+
 pub fn effectiveTablespaceForTarget(
     snapshot: *const metadata_api.AdminSnapshot,
     database_name: []const u8,
@@ -4070,20 +4082,42 @@ pub fn applyCatalogDdlPlanOnServiceWithSessionAlloc(
         .pointer => |pointer| pointer.child,
         else => ServiceType,
     };
-    if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
-        @hasDecl(ServiceDeclType, "removeDatabase") and
-        @hasDecl(ServiceDeclType, "upsertNamespace") and
-        @hasDecl(ServiceDeclType, "removeNamespace") and
-        @hasDecl(ServiceDeclType, "upsertTablespace") and
-        @hasDecl(ServiceDeclType, "removeTablespace")))
-    {
-        return null;
-    }
-
     switch (plan) {
-        .database_catalog => |database_plan| return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan),
-        .schema_namespace_catalog => |namespace_plan| return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan, session),
-        .tablespace_catalog => |tablespace_plan| return try applyTablespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, tablespace_plan),
+        .database_catalog => |database_plan| {
+            if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+                @hasDecl(ServiceDeclType, "removeDatabase") and
+                @hasDecl(ServiceDeclType, "upsertNamespace") and
+                @hasDecl(ServiceDeclType, "removeNamespace")))
+            {
+                return null;
+            }
+            return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan);
+        },
+        .schema_namespace_catalog => |namespace_plan| {
+            if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+                @hasDecl(ServiceDeclType, "upsertNamespace") and
+                @hasDecl(ServiceDeclType, "removeNamespace")))
+            {
+                return null;
+            }
+            return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan, session);
+        },
+        .tablespace_catalog => |tablespace_plan| {
+            if (comptime !(@hasDecl(ServiceDeclType, "upsertTablespace") and
+                @hasDecl(ServiceDeclType, "removeTablespace")))
+            {
+                return null;
+            }
+            return try applyTablespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, tablespace_plan);
+        },
+        .sequence_catalog => |sequence_plan| {
+            if (comptime !(@hasDecl(ServiceDeclType, "upsertSequence") and
+                @hasDecl(ServiceDeclType, "removeSequence")))
+            {
+                return null;
+            }
+            return try applySequenceCatalogPlanOnServiceWithSessionAlloc(alloc, svc, snapshot, sequence_plan, session);
+        },
         else => return null,
     }
 }
@@ -4265,6 +4299,220 @@ pub fn applyTablespaceCatalogPlanOnServiceAlloc(
     return applied;
 }
 
+pub fn applySequenceCatalogPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: sql_adapter.SequenceCatalogPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !(@hasDecl(ServiceDeclType, "upsertSequence") and @hasDecl(ServiceDeclType, "removeSequence"))) {
+        return error.UnsupportedSqlShape;
+    }
+
+    var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    switch (plan) {
+        .create => |create| {
+            const target = try session.tableTargetFromObjectName(create.sequence_name);
+            const existing = findSequenceByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name);
+            if (existing != null) {
+                if (create.if_not_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.SequenceAlreadyExists;
+            }
+            if (findNamespaceByName(snapshot, target.database_name, target.namespace_name) == null) return error.NamespaceNotFound;
+            try validateSequenceOwnedByOptionsAlloc(alloc, snapshot, target, create.options);
+            const options_json = try sequenceOptionsJsonFromCreateAlloc(alloc, create.options);
+            defer alloc.free(options_json);
+            const last_value = try metadata_table_manager.sequenceInitialLastValueFromOptionsJson(alloc, options_json);
+            try svc.upsertSequence(.{
+                .sequence_id = metadata_table_manager.deriveSequenceId(target.database_name, target.namespace_name, target.table_name),
+                .name = target.table_name,
+                .database_name = target.database_name,
+                .namespace_name = target.namespace_name,
+                .options_json = options_json,
+                .last_value = last_value,
+            });
+            applied.created_sequence = true;
+        },
+        .alter => |alter| {
+            const target = try session.tableTargetFromObjectName(alter.sequence_name);
+            const existing = findSequenceByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
+                if (alter.if_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.SequenceNotFound;
+            };
+            try validateSequenceOwnedByAlterOperationsAlloc(alloc, snapshot, target, alter.operations);
+            const options_json = try sequenceOptionsJsonAfterAlterAlloc(alloc, existing.options_json, alter.operations);
+            defer alloc.free(options_json);
+            const last_value = try sequenceLastValueAfterAlterAlloc(alloc, existing.last_value, options_json, alter.operations);
+            try svc.upsertSequence(.{
+                .sequence_id = existing.sequence_id,
+                .name = existing.name,
+                .database_name = existing.database_name,
+                .namespace_name = existing.namespace_name,
+                .options_json = options_json,
+                .last_value = last_value,
+            });
+            applied.altered_sequence = true;
+        },
+        .drop => |drop| {
+            const target = try session.tableTargetFromObjectName(drop.sequence_name);
+            const existing = findSequenceByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
+                if (drop.if_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.SequenceNotFound;
+            };
+            _ = drop.cascade;
+            try svc.removeSequence(existing.sequence_id);
+            applied.dropped_sequence = true;
+        },
+    }
+    return applied;
+}
+
+fn validateSequenceOwnedByOptionsAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sequence_target: catalog_resources.TableTarget,
+    options: sql_adapter.SequenceOptions,
+) !void {
+    if (options.owned_by) |owned_by| try validateSequenceOwnedByAlloc(alloc, snapshot, sequence_target, owned_by);
+}
+
+fn validateSequenceOwnedByAlterOperationsAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sequence_target: catalog_resources.TableTarget,
+    operations: []const sql_adapter.SequenceAlterOperation,
+) !void {
+    for (operations) |operation| {
+        switch (operation) {
+            .set_owned_by => |owned_by| try validateSequenceOwnedByAlloc(alloc, snapshot, sequence_target, owned_by),
+            else => {},
+        }
+    }
+}
+
+fn validateSequenceOwnedByAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sequence_target: catalog_resources.TableTarget,
+    owned_by: sql_adapter.SequenceOwnedBy,
+) !void {
+    if (owned_by.table_name.len == 0 and owned_by.column_name.len == 0) return;
+    if (owned_by.table_name.len == 0 or owned_by.column_name.len == 0) return error.InvalidSequenceCatalog;
+
+    const table = findTableByQualifiedName(snapshot, sequence_target.database_name, sequence_target.namespace_name, owned_by.table_name) orelse return error.TableNotFound;
+    var parsed = try parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    if (runtime.storage_mode != .relational) return error.InvalidSequenceCatalog;
+    if (findRelationalColumn(runtime.relational_columns, owned_by.column_name) == null) return error.InvalidSqlCatalog;
+}
+
+fn sequenceLastValueAfterAlterAlloc(
+    alloc: std.mem.Allocator,
+    existing_last_value: i64,
+    options_json: []const u8,
+    operations: []const sql_adapter.SequenceAlterOperation,
+) !i64 {
+    for (operations) |operation| switch (operation) {
+        .restart => return try metadata_table_manager.sequenceInitialLastValueFromOptionsJson(alloc, options_json),
+        else => {},
+    };
+    return existing_last_value;
+}
+
+fn sequenceOptionsJsonFromCreateAlloc(alloc: std.mem.Allocator, options: sql_adapter.SequenceOptions) ![]u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var object = std.json.ObjectMap.empty;
+    try putSequenceOptionsJson(arena, &object, options);
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = object }, .{});
+}
+
+fn sequenceOptionsJsonAfterAlterAlloc(
+    alloc: std.mem.Allocator,
+    options_json: []const u8,
+    operations: []const sql_adapter.SequenceAlterOperation,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, options_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSequenceCatalog;
+    const arena = parsed.arena.allocator();
+    for (operations) |operation| {
+        switch (operation) {
+            .set_type => |type_name| try putJsonString(arena, &parsed.value.object, "as_type", type_name),
+            .restart => |value| try putJsonOptionalInteger(arena, &parsed.value.object, "restart_with", value),
+            .set_start => |value| try putJsonInteger(arena, &parsed.value.object, "start_with", value),
+            .set_increment => |value| try putJsonInteger(arena, &parsed.value.object, "increment_by", value),
+            .set_min => |value| try putJsonOptionalInteger(arena, &parsed.value.object, "min_value", value),
+            .set_max => |value| try putJsonOptionalInteger(arena, &parsed.value.object, "max_value", value),
+            .set_cache => |value| try putJsonInteger(arena, &parsed.value.object, "cache", value),
+            .set_cycle => |value| try putJsonBool(arena, &parsed.value.object, "cycle", value),
+            .set_owned_by => |owned_by| try putSequenceOwnedByJson(arena, &parsed.value.object, owned_by),
+        }
+    }
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn putSequenceOptionsJson(arena: std.mem.Allocator, object: *std.json.ObjectMap, options: sql_adapter.SequenceOptions) !void {
+    if (options.as_type) |value| try putJsonString(arena, object, "as_type", value);
+    if (options.start_with) |value| try putJsonInteger(arena, object, "start_with", value);
+    if (options.increment_by) |value| try putJsonInteger(arena, object, "increment_by", value);
+    if (options.min_value_specified) try putJsonOptionalInteger(arena, object, "min_value", options.min_value);
+    if (options.max_value_specified) try putJsonOptionalInteger(arena, object, "max_value", options.max_value);
+    if (options.cache) |value| try putJsonInteger(arena, object, "cache", value);
+    if (options.cycle) |value| try putJsonBool(arena, object, "cycle", value);
+    if (options.owned_by) |owned_by| try putSequenceOwnedByJson(arena, object, owned_by);
+}
+
+fn putSequenceOwnedByJson(arena: std.mem.Allocator, object: *std.json.ObjectMap, owned_by: sql_adapter.SequenceOwnedBy) !void {
+    if (owned_by.table_name.len == 0 and owned_by.column_name.len == 0) {
+        try object.put(arena, try arena.dupe(u8, "owned_by"), .null);
+        return;
+    }
+    var owned = std.json.ObjectMap.empty;
+    try putJsonString(arena, &owned, "table_name", owned_by.table_name);
+    try putJsonString(arena, &owned, "column_name", owned_by.column_name);
+    try object.put(arena, try arena.dupe(u8, "owned_by"), .{ .object = owned });
+}
+
+fn putJsonString(arena: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try object.put(arena, try arena.dupe(u8, key), .{ .string = try arena.dupe(u8, value) });
+}
+
+fn putJsonInteger(arena: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: i64) !void {
+    try object.put(arena, try arena.dupe(u8, key), .{ .integer = value });
+}
+
+fn putJsonOptionalInteger(arena: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: ?i64) !void {
+    if (value) |number| {
+        try putJsonInteger(arena, object, key, number);
+    } else {
+        try object.put(arena, try arena.dupe(u8, key), .null);
+    }
+}
+
+fn putJsonBool(arena: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
+    try object.put(arena, try arena.dupe(u8, key), .{ .bool = value });
+}
+
 fn tablespaceHasReferences(snapshot: *const metadata_api.AdminSnapshot, tablespace_name: []const u8) bool {
     for (snapshot.databases) |database| {
         if (std.mem.eql(u8, database.tablespace_name, tablespace_name)) return true;
@@ -4334,6 +4582,9 @@ fn databaseHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: u
     for (snapshot.tables) |table| {
         if (metadata_table_manager.deriveDatabaseId(table.database_name) == database_id) return true;
     }
+    for (snapshot.sequences) |sequence| {
+        if (metadata_table_manager.deriveDatabaseId(sequence.database_name) == database_id) return true;
+    }
     return false;
 }
 
@@ -4341,6 +4592,10 @@ fn namespaceHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: 
     for (snapshot.tables) |table| {
         if (metadata_table_manager.deriveDatabaseId(table.database_name) != database_id) continue;
         if (std.mem.eql(u8, table.namespace_name, namespace_name)) return true;
+    }
+    for (snapshot.sequences) |sequence| {
+        if (metadata_table_manager.deriveDatabaseId(sequence.database_name) != database_id) continue;
+        if (std.mem.eql(u8, sequence.namespace_name, namespace_name)) return true;
     }
     return false;
 }
@@ -4395,6 +4650,82 @@ pub fn validateRelationalTableDropAllowed(
             if (std.mem.eql(u8, foreign_key.parent_table, target_table.name)) return error.TableReferencedByForeignKey;
         }
     }
+    try validateRelationalTableOwnedSequenceDropAllowed(alloc, snapshot, target_table);
+}
+
+pub fn validateRelationalTableOwnedSequenceDropAllowed(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.sequences) |sequence| {
+        if (try sequenceOwnedByTableColumnAlloc(alloc, sequence, target_table)) return error.TableReferencedBySequence;
+    }
+}
+
+pub fn ownedSequenceIdsForTableAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) ![]u64 {
+    var out = std.ArrayListUnmanaged(u64).empty;
+    errdefer out.deinit(alloc);
+    for (snapshot.sequences) |sequence| {
+        if (try sequenceOwnedByTableColumnAlloc(alloc, sequence, target_table)) {
+            try out.append(alloc, sequence.sequence_id);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn removeOwnedSequencesForTableOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) !usize {
+    const owned_sequence_ids = try ownedSequenceIdsForTableAlloc(alloc, snapshot, target_table);
+    defer alloc.free(owned_sequence_ids);
+    if (owned_sequence_ids.len == 0) return 0;
+
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !@hasDecl(ServiceDeclType, "removeSequence")) return error.UnsupportedOperation;
+
+    for (owned_sequence_ids) |sequence_id| try svc.removeSequence(sequence_id);
+    return owned_sequence_ids.len;
+}
+
+fn sequenceOwnedByTableColumnAlloc(
+    alloc: std.mem.Allocator,
+    sequence: metadata_table_manager.SequenceRecord,
+    target_table: metadata_table_manager.TableRecord,
+) !bool {
+    if (!std.mem.eql(u8, sequence.database_name, target_table.database_name)) return false;
+    if (!std.mem.eql(u8, sequence.namespace_name, target_table.namespace_name)) return false;
+
+    var parsed_options = try std.json.parseFromSlice(std.json.Value, alloc, sequence.options_json, .{});
+    defer parsed_options.deinit();
+    if (parsed_options.value != .object) return error.InvalidSequenceCatalog;
+    const owned_by = parsed_options.value.object.get("owned_by") orelse return false;
+    if (owned_by == .null) return false;
+    if (owned_by != .object) return error.InvalidSequenceCatalog;
+    const table_name = owned_by.object.get("table_name") orelse return error.InvalidSequenceCatalog;
+    const column_name = owned_by.object.get("column_name") orelse return error.InvalidSequenceCatalog;
+    if (table_name != .string or column_name != .string) return error.InvalidSequenceCatalog;
+    if (table_name.string.len == 0 or column_name.string.len == 0) return error.InvalidSequenceCatalog;
+    if (!std.mem.eql(u8, table_name.string, target_table.name)) return false;
+
+    var parsed_table_schema = try parseValidatedTableSchema(alloc, target_table.schema_json);
+    defer parsed_table_schema.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed_table_schema);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    if (runtime.storage_mode != .relational) return error.InvalidSequenceCatalog;
+    if (findRelationalColumn(runtime.relational_columns, column_name.string) == null) return error.InvalidSequenceCatalog;
+    return true;
 }
 
 pub fn schemaWithoutForeignKeysReferencingTableAlloc(
@@ -5284,6 +5615,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
                 .databases = try self.manager.listDatabases(alloc),
                 .namespaces = try self.manager.listNamespaces(alloc),
                 .tablespaces = try self.manager.listTablespaces(alloc),
+                .sequences = try self.manager.listSequences(alloc),
                 .tables = try self.manager.listTables(alloc),
                 .ranges = &.{},
                 .stores = &.{},
@@ -5297,6 +5629,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
             self.manager.freeDatabases(alloc, snapshot_value.databases);
             self.manager.freeNamespaces(alloc, snapshot_value.namespaces);
             self.manager.freeTablespaces(alloc, snapshot_value.tablespaces);
+            self.manager.freeSequences(alloc, snapshot_value.sequences);
             self.manager.freeTables(alloc, snapshot_value.tables);
             snapshot_value.* = undefined;
         }
@@ -5330,12 +5663,39 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
             try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
         }
 
+        pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            self.apply_table_update_count += request.tables.len;
+            try self.manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+        }
+
+        pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+            self: *@This(),
+            request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+        ) !void {
+            try std.testing.expectEqual(@as(usize, 0), request.schema_rewrite_jobs.len);
+            self.apply_table_update_count += request.table_updates.len;
+            try self.manager.applyTableCatalogDropWithSchemaRewriteJobs(request);
+        }
+
         pub fn upsertTablespace(self: *@This(), record: metadata_table_manager.TablespaceRecord) !void {
             try self.manager.upsertTablespace(record);
         }
 
         pub fn removeTablespace(self: *@This(), tablespace_id: u64) !void {
             _ = try self.manager.removeTablespace(tablespace_id);
+        }
+
+        pub fn upsertSequence(self: *@This(), record: metadata_table_manager.SequenceRecord) !void {
+            try self.manager.upsertSequence(record);
+        }
+
+        pub fn removeSequence(self: *@This(), sequence_id: u64) !void {
+            const removed = try self.manager.removeSequence(sequence_id);
+            metadata_table_manager.freeSequence(self.manager.alloc, removed);
         }
 
         fn apply(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !AppliedRelationalSqlDdlRecord {
@@ -5410,6 +5770,105 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var dropped_tablespace = try service.apply(std.testing.allocator, "DROP TABLESPACE archive_space;");
     defer dropped_tablespace.deinit(std.testing.allocator);
     try std.testing.expect(dropped_tablespace.dropped_tablespace);
+
+    const tenant_session = catalog_resources.SqlCatalogSession{ .current_database_name = "tenant_ops" };
+    const sequence_owner_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const sequence_owner_table_id = deriveQualifiedTableId("tenant_ops", default_namespace_name, "usage_records");
+    try service.manager.upsertTable(.{
+        .table_id = sequence_owner_table_id,
+        .name = "usage_records",
+        .database_name = "tenant_ops",
+        .namespace_name = default_namespace_name,
+        .schema_json = sequence_owner_schema_json,
+    });
+    var created_sequence = try service.applyWithSession(std.testing.allocator, "CREATE SEQUENCE usage_id_seq AS bigint START WITH 10 INCREMENT BY 2 CACHE 8;", tenant_session);
+    defer created_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(created_sequence.created_sequence);
+    {
+        const sequences = try service.manager.listSequences(std.testing.allocator);
+        defer service.manager.freeSequences(std.testing.allocator, sequences);
+        try std.testing.expectEqual(@as(usize, 1), sequences.len);
+        try std.testing.expectEqualStrings("usage_id_seq", sequences[0].name);
+        var parsed_options = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sequences[0].options_json, .{});
+        defer parsed_options.deinit();
+        try std.testing.expectEqualStrings("bigint", parsed_options.value.object.get("as_type").?.string);
+        try std.testing.expectEqual(@as(i64, 10), parsed_options.value.object.get("start_with").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), parsed_options.value.object.get("increment_by").?.integer);
+        try std.testing.expectEqual(@as(i64, 8), parsed_options.value.object.get("cache").?.integer);
+    }
+    var altered_sequence = try service.applyWithSession(std.testing.allocator, "ALTER SEQUENCE usage_id_seq RESTART WITH 1000 CYCLE;", tenant_session);
+    defer altered_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(altered_sequence.altered_sequence);
+    {
+        const sequences = try service.manager.listSequences(std.testing.allocator);
+        defer service.manager.freeSequences(std.testing.allocator, sequences);
+        var parsed_options = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sequences[0].options_json, .{});
+        defer parsed_options.deinit();
+        try std.testing.expectEqual(@as(i64, 1000), parsed_options.value.object.get("restart_with").?.integer);
+        try std.testing.expect(parsed_options.value.object.get("cycle").?.bool);
+    }
+    var dropped_sequence = try service.applyWithSession(std.testing.allocator, "DROP SEQUENCE usage_id_seq;", tenant_session);
+    defer dropped_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_sequence.dropped_sequence);
+    var missing_sequence_noop = try service.applyWithSession(std.testing.allocator, "DROP SEQUENCE IF EXISTS usage_id_seq;", tenant_session);
+    defer missing_sequence_noop.deinit(std.testing.allocator);
+    try std.testing.expect(missing_sequence_noop.noop);
+    try std.testing.expectError(error.TableNotFound, service.applyWithSession(std.testing.allocator, "CREATE SEQUENCE missing_owned_seq OWNED BY public.missing_records.id;", tenant_session));
+    try std.testing.expectError(error.InvalidSqlCatalog, service.applyWithSession(std.testing.allocator, "CREATE SEQUENCE missing_column_seq OWNED BY public.usage_records.missing_id;", tenant_session));
+    var created_owned_sequence = try service.applyWithSession(std.testing.allocator, "CREATE SEQUENCE usage_owned_id_seq AS bigint START WITH 50 OWNED BY public.usage_records.id;", tenant_session);
+    defer created_owned_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(created_owned_sequence.created_sequence);
+    {
+        const sequences = try service.manager.listSequences(std.testing.allocator);
+        defer service.manager.freeSequences(std.testing.allocator, sequences);
+        var found_owned = false;
+        for (sequences) |sequence| {
+            if (!std.mem.eql(u8, sequence.name, "usage_owned_id_seq")) continue;
+            found_owned = true;
+            var parsed_options = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sequence.options_json, .{});
+            defer parsed_options.deinit();
+            try std.testing.expectEqualStrings("usage_records", parsed_options.value.object.get("owned_by").?.object.get("table_name").?.string);
+            try std.testing.expectEqualStrings("id", parsed_options.value.object.get("owned_by").?.object.get("column_name").?.string);
+        }
+        try std.testing.expect(found_owned);
+    }
+    {
+        var snapshot_value = try service.snapshot(std.testing.allocator);
+        defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
+        const owner_table = findTableByQualifiedName(&snapshot_value, "tenant_ops", default_namespace_name, "usage_records").?;
+        try std.testing.expectError(error.TableReferencedBySequence, validateRelationalTableDropAllowed(std.testing.allocator, &snapshot_value, owner_table.*));
+    }
+    var altered_owned_sequence = try service.applyWithSession(std.testing.allocator, "ALTER SEQUENCE usage_owned_id_seq OWNED BY NONE;", tenant_session);
+    defer altered_owned_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(altered_owned_sequence.altered_sequence);
+    {
+        var snapshot_value = try service.snapshot(std.testing.allocator);
+        defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
+        const owner_table = findTableByQualifiedName(&snapshot_value, "tenant_ops", default_namespace_name, "usage_records").?;
+        try validateRelationalTableDropAllowed(std.testing.allocator, &snapshot_value, owner_table.*);
+    }
+    var dropped_owned_sequence = try service.applyWithSession(std.testing.allocator, "DROP SEQUENCE usage_owned_id_seq;", tenant_session);
+    defer dropped_owned_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_owned_sequence.dropped_sequence);
+    var created_cascade_owned_sequence = try service.applyWithSession(std.testing.allocator, "CREATE SEQUENCE usage_cascade_id_seq AS bigint START WITH 60 OWNED BY public.usage_records.id;", tenant_session);
+    defer created_cascade_owned_sequence.deinit(std.testing.allocator);
+    try std.testing.expect(created_cascade_owned_sequence.created_sequence);
+    {
+        var snapshot_value = try service.snapshot(std.testing.allocator);
+        defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
+        const owner_table = findTableByQualifiedName(&snapshot_value, "tenant_ops", default_namespace_name, "usage_records").?;
+        try std.testing.expectEqual(@as(usize, 1), try removeOwnedSequencesForTableOnServiceAlloc(std.testing.allocator, &service, &snapshot_value, owner_table.*));
+    }
+    {
+        const sequences = try service.manager.listSequences(std.testing.allocator);
+        defer service.manager.freeSequences(std.testing.allocator, sequences);
+        for (sequences) |sequence| {
+            try std.testing.expect(!std.mem.eql(u8, sequence.name, "usage_cascade_id_seq"));
+        }
+    }
+    _ = service.manager.removeTable(sequence_owner_table_id);
 
     var created_namespace = try service.apply(std.testing.allocator, "CREATE SCHEMA analytics;");
     defer created_namespace.deinit(std.testing.allocator);
@@ -6016,14 +6475,19 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqualStrings("analytics", qualified_created.table.namespace_name);
     try std.testing.expect(std.mem.indexOf(u8, qualified_created.table.schema_json, "\"analytics.users_pkey\"") == null);
 
-    var qualified_dropped_pk = try applyRelationalSqlDdlToTableRecordAlloc(
+    var qualified_primary_key_dropped = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &qualified_created.table,
         "ALTER TABLE analytics.users DROP CONSTRAINT users_pkey;",
     );
-    defer qualified_dropped_pk.deinit(std.testing.allocator);
-    try std.testing.expect(qualified_dropped_pk.requires_rebuild);
-    try std.testing.expect(qualified_dropped_pk.rewrite_required);
+    defer qualified_primary_key_dropped.deinit(std.testing.allocator);
+    try std.testing.expect(qualified_primary_key_dropped.requires_rebuild);
+    try std.testing.expect(!qualified_primary_key_dropped.validation_required);
+    try std.testing.expect(qualified_primary_key_dropped.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), qualified_primary_key_dropped.work_items.len);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rebuild, qualified_primary_key_dropped.work_items[0].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rewrite, qualified_primary_key_dropped.work_items[1].action);
+    try std.testing.expect(std.mem.indexOf(u8, qualified_primary_key_dropped.table.schema_json, "\"primary_key\"") == null);
 
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,

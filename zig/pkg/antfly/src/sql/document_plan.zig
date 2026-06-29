@@ -478,7 +478,6 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     const window_index = documentStatementTailKeywordIndex(tokens, from_index, .window);
     const tail_start = minOptionalIndex(&.{ where_index, order_index, limit_index, offset_index, fetch_index, for_index, window_index }) orelse statement_end;
     try rejectUnsupportedDocumentStatementShape(tokens, from_index, tail_start, false);
-    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .query) return error.UnsupportedSqlShape;
 
     if (from_index + 1 >= statement_end or tokens[from_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
     const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
@@ -486,6 +485,11 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
 
     var from_binding = try parseDocumentFromTailAlloc(alloc, tokens[from_index + 1].text, tokens[from_index + 2 .. tail_start], schema);
     errdefer from_binding.deinit(alloc);
+    switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
+        .query => {},
+        .join, .lateral => if (from_binding.unnest == null) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
     const source_ref = from_binding.source_ref;
 
     const projection = try parseProjectionAlloc(alloc, tokens[1..from_index], schema, virtual_schema, source_ref, from_binding.unnest);

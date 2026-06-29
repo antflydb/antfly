@@ -255,7 +255,6 @@ test {
     _ = public_api.http_internal_group_read_routes;
     _ = public_api.http_internal_group_join_routes;
     _ = public_api.http_internal_group_write_routes;
-    _ = public_api.tables;
     _ = public_api.indexes;
 
     // Raft integration

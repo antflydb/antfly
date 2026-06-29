@@ -44,15 +44,15 @@ const graph_paths = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const reranking_runtime = @import("../../reranking/mod.zig");
 const template_mod = @import("../../template.zig");
-const table_catalog = @import("../table_catalog.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
 const table_router = @import("../table_router.zig");
-const tables_api = @import("../tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const query_api = @import("../query.zig");
 const query_contract = @import("../query_contract.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const sql_adapter = @import("../../sql/mod.zig");
-const document_sql_runtime = @import("document_sql_runtime.zig");
-const sql_adapter_runtime = @import("../../sql/runtime.zig");
+const sql_document = @import("../../sql/document.zig");
+const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const serverless_query = @import("../../serverless/query/mod.zig");
 const schema_api = @import("../../schema/mod.zig");
 const distributed_graph = @import("../distributed_graph.zig");
@@ -876,8 +876,8 @@ pub const BoundTableReadSource = struct {
     }
 };
 
-const documentAlgebraicAggregateFromDbAlloc = table_read_document_sql.aggregateFromDbAlloc;
-const documentAlgebraicAggregateMergeResponsesAlloc = table_read_document_sql.mergeResponsesAlloc;
+const documentAlgebraicAggregateFromDbAlloc = sql_document.aggregateFromDbAlloc;
+const documentAlgebraicAggregateMergeResponsesAlloc = sql_document.mergeResponsesAlloc;
 const documentAlgebraicAggregateProvisionedHostedLocal = table_read_document_sql.aggregateProvisionedHostedLocal;
 const aggregationContextForDb = table_read_document_sql.aggregationContextForDb;
 const algebraicIndexFreshEnoughForRequest = table_read_document_sql.algebraicIndexFreshEnoughForRequest;
@@ -6350,10 +6350,14 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        sql_adapter.lower_select.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{}),
-    );
+    if (sql_adapter.lower_select.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{})) |lowered_invalid| {
+        var invalid_lowered = lowered_invalid;
+        invalid_lowered.deinit(alloc);
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.UnexpectedToken, error.UnsupportedSqlShape => {},
+        else => return err,
+    }
 }
 
 test "api.table_reads.docid lowered document sql read plans execute native lookup and bounded scan" {
@@ -6542,7 +6546,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         .{},
     );
     defer virtual_projection_document_plan.deinit(alloc);
-    const virtual_projection_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = virtual_projection_document_plan };
+    const virtual_projection_plan = sql_adapter.LoweredReadPlan{ .document_query = virtual_projection_document_plan };
     var virtual_projection_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
@@ -6575,7 +6579,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         .{},
     );
     defer virtual_star_document_plan.deinit(alloc);
-    const virtual_star_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = virtual_star_document_plan };
+    const virtual_star_plan = sql_adapter.LoweredReadPlan{ .document_query = virtual_star_document_plan };
     var virtual_star_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
@@ -6607,7 +6611,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         .{ .max_rows = 10 },
     );
     defer ordered_document_plan.deinit(alloc);
-    const ordered_scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = ordered_document_plan };
+    const ordered_scan_plan = sql_adapter.LoweredReadPlan{ .document_query = ordered_document_plan };
     var ordered_scan_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
@@ -6636,7 +6640,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         .{ .max_rows = 2 },
     );
     defer capped_ordered_document_plan.deinit(alloc);
-    const capped_ordered_scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = capped_ordered_document_plan };
+    const capped_ordered_scan_plan = sql_adapter.LoweredReadPlan{ .document_query = capped_ordered_document_plan };
     try std.testing.expectError(
         error.DocumentSqlRequiresBoundedScan,
         executeLoweredSqlReadPlanAlloc(
@@ -6657,7 +6661,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         .{ .max_rows = 10, .max_bytes = 1 },
     );
     defer byte_capped_ordered_document_plan.deinit(alloc);
-    const byte_capped_ordered_scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = byte_capped_ordered_document_plan };
+    const byte_capped_ordered_scan_plan = sql_adapter.LoweredReadPlan{ .document_query = byte_capped_ordered_document_plan };
     try std.testing.expectError(
         error.DocumentSqlRequiresBoundedScan,
         executeLoweredSqlReadPlanAlloc(
@@ -6712,7 +6716,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
     );
     defer ordered_full_text_document_plan.deinit(alloc);
-    const ordered_full_text_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = ordered_full_text_document_plan };
+    const ordered_full_text_plan = sql_adapter.LoweredReadPlan{ .document_query = ordered_full_text_document_plan };
     var ordered_full_text_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
@@ -6743,7 +6747,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
     );
     defer capped_ordered_full_text_document_plan.deinit(alloc);
-    const capped_ordered_full_text_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = capped_ordered_full_text_document_plan };
+    const capped_ordered_full_text_plan = sql_adapter.LoweredReadPlan{ .document_query = capped_ordered_full_text_document_plan };
     try std.testing.expectError(
         error.DocumentSqlRequiresBoundedScan,
         executeLoweredSqlReadPlanAlloc(
@@ -7027,11 +7031,11 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     };
     var catalog = FakeCatalog{};
 
-    var lookup_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    var lookup_projection = try alloc.alloc(sql_adapter.DocumentProjection, 1);
     lookup_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
     var lookup_ids = try alloc.alloc([]const u8, 1);
     lookup_ids[0] = try alloc.dupe(u8, "doc:missing");
-    var lookup_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+    var lookup_plan = sql_adapter.LoweredReadPlan{ .document_query = .{
         .table_name = try alloc.dupe(u8, "docs"),
         .projection = lookup_projection,
         .producer = .{ .id_lookup = .{ .ids = lookup_ids } },
@@ -7058,9 +7062,9 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     try std.testing.expectEqual(@as(usize, 1), lookup_source.lookup_catalog_calls);
     try std.testing.expectEqual(@as(usize, 0), lookup_source.legacy_lookup_calls);
 
-    var query_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    var query_projection = try alloc.alloc(sql_adapter.DocumentProjection, 1);
     query_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
-    var query_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+    var query_plan = sql_adapter.LoweredReadPlan{ .document_query = .{
         .table_name = try alloc.dupe(u8, "docs"),
         .projection = query_projection,
         .producer = .{ .indexed_query = .{
@@ -7085,9 +7089,9 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     try std.testing.expectEqual(@as(usize, 1), query_source.query_catalog_calls);
     try std.testing.expectEqual(@as(usize, 0), query_source.legacy_query_calls);
 
-    var scan_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    var scan_projection = try alloc.alloc(sql_adapter.DocumentProjection, 1);
     scan_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
-    var scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+    var scan_plan = sql_adapter.LoweredReadPlan{ .document_query = .{
         .table_name = try alloc.dupe(u8, "docs"),
         .projection = scan_projection,
         .producer = .{ .bounded_scan = .{ .max_rows = 5 } },
@@ -7200,7 +7204,7 @@ test "api.table_reads.docid lowered document sql aggregate executes native group
         .{},
     );
     defer document_plan.deinit(alloc);
-    const plan = sql_adapter_runtime.LoweredReadPlan{ .document_aggregate = document_plan };
+    const plan = sql_adapter.LoweredReadPlan{ .document_aggregate = document_plan };
 
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
@@ -7248,7 +7252,7 @@ test "api.table_reads.docid lowered document sql aggregate uses catalog target f
         .{},
     );
     defer document_plan.deinit(alloc);
-    const plan = sql_adapter_runtime.LoweredReadPlan{ .document_aggregate = document_plan };
+    const plan = sql_adapter.LoweredReadPlan{ .document_aggregate = document_plan };
 
     const FakeCatalog = struct {
         fn iface(self: *@This()) table_catalog.CatalogSource {

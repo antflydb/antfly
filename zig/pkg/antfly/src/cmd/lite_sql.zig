@@ -26,12 +26,11 @@ const raft_mod = antfly.raft;
 const raft_reconciler = antfly.raft.reconciler;
 const relational_rows = antfly.public_api.relational_rows;
 const sql_adapter = antfly.public_api.sql_adapter;
-const sql_adapter_runtime = antfly.public_api.sql_adapter_runtime;
 const storage_schema = antfly.schema;
-const table_catalog = antfly.public_api.table_catalog;
+const table_catalog = antfly.metadata.catalog_source;
 const table_reads = antfly.public_api.table_reads;
 const table_writes = antfly.public_api.table_writes;
-const tables_api = antfly.public_api.tables;
+const tables_api = antfly.metadata.catalog.table_ddl;
 
 pub const max_sql_file_bytes = 64 * 1024 * 1024;
 pub const max_repl_statement_bytes = 16 * 1024 * 1024;
@@ -350,7 +349,7 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
     defer storage_schema.freeSchema(allocator, schema);
 
     var write_source = table_writes.BoundTableWriteSource.init(target_table, db);
-    var lowered = try sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
+    var lowered = try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
         allocator,
         parsed_sql,
         &logical_plan,
@@ -374,6 +373,8 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
 }
 
 fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
+    if (try executeLiteAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql)) |body| return body;
+
     var table_names = (try sql_adapter.readSourceTableNamesFromParsedSqlAlloc(allocator, parsed_sql)) orelse return error.UnsupportedSqlShape;
     defer table_names.deinit(allocator);
 
@@ -387,11 +388,10 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
         .session = session.catalog.session(),
     });
     defer logical_plan.deinit(allocator);
-    const statement_kind = switch (logical_plan) {
-        .catalog_read => |catalog_read| try liteReadStatementKindForParsedCatalogRead(&catalog_read, parsed_sql),
+    switch (logical_plan) {
+        .catalog_read => {},
         else => return error.UnsupportedSqlShape,
-    };
-    if (try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind)) |body| return body;
+    }
 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, table_names.left, session.catalog.session());
     defer storage_schema.freeSchema(allocator, schema);
@@ -422,6 +422,19 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     return try encodeReadResultAlloc(allocator, session.sessionId(), try liteStatementKindForParsedLogicalPlan(logical_plan, parsed_sql), result);
 }
 
+fn executeLiteAntflyQueryFunctionReadAlloc(
+    allocator: Allocator,
+    db: *antfly.db.DB,
+    session: *Session,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !?[]u8 {
+    const statement_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse {
+        if (parsed_sql.generatedStatementKind() == .read) return error.UnsupportedSqlShape;
+        return null;
+    };
+    return try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind);
+}
+
 fn executeAntflyQueryFunctionReadAlloc(
     allocator: Allocator,
     db: *antfly.db.DB,
@@ -430,7 +443,7 @@ fn executeAntflyQueryFunctionReadAlloc(
     statement_kind: sql_adapter.SqlReadStatementKind,
 ) !?[]u8 {
     var lowered = sql_adapter.lowerAntflyQueryFunctionReadParsedSqlAlloc(allocator, null, parsed_sql) catch |err| switch (err) {
-        error.UnsupportedSqlShape => return null,
+        error.UnsupportedSqlShape => if (sql_adapter.parsedSqlHasGeneratedAntflyReadSource(parsed_sql)) return err else return null,
         else => return err,
     };
     defer lowered.deinit(allocator);
@@ -838,6 +851,21 @@ test "lite sql statement splitter ignores quoted semicolons" {
     try std.testing.expectEqual(@as(?usize, 35), firstStatementEnd("select ';' as semi, \"x;y\" from docs;"));
     try std.testing.expectEqual(@as(?usize, 22), firstStatementEnd("select $$a;b$$ as body;"));
     try std.testing.expectEqual(@as(?usize, null), firstStatementEnd("select 'unterminated;"));
+}
+
+test "lite sql detects generated Antfly query function reads before source binding" {
+    const allocator = std.testing.allocator;
+
+    var ordinary_read = try sql_adapter.ParsedSql.initAlloc(allocator, "SELECT id FROM usage_records;");
+    defer ordinary_read.deinit(allocator);
+    try std.testing.expect(!sql_adapter.parsedSqlHasGeneratedAntflyReadSource(&ordinary_read));
+
+    var query_function_read = try sql_adapter.ParsedSql.initAlloc(
+        allocator,
+        "SELECT _id FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund', limit => 5);",
+    );
+    defer query_function_read.deinit(allocator);
+    try std.testing.expect(sql_adapter.parsedSqlHasGeneratedAntflyReadSource(&query_function_read));
 }
 
 test "lite sql reads legacy local schema metadata without table record" {

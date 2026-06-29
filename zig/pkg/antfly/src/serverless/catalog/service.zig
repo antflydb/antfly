@@ -34,7 +34,7 @@ const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const shared_vector = @import("antfly_vector").vector;
 

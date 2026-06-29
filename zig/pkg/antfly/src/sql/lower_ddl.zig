@@ -18,7 +18,7 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
-const table_catalog = @import("../metadata/catalog_source.zig");
+const table_catalog = @import("../metadata/catalog/source.zig");
 const tokenized = @import("tokenized.zig");
 
 pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(

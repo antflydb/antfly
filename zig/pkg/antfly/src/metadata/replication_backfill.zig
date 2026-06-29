@@ -23,7 +23,7 @@ const metadata_reconciler = @import("reconciler.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const tables_api = @import("../api/tables.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const secrets = @import("../common/secrets.zig");
@@ -4577,11 +4577,11 @@ test "metadata http service live snapshot and later streaming insert through hos
         .{ dsn, source_table, slot_name, publication_name },
     );
     defer alloc.free(create_body);
-    var create_req = try tables_api.parseCreateTableRequest(alloc, create_body);
+    var create_req = try catalog_table_ddl.parseCreateTableRequest(alloc, create_body);
     defer create_req.deinit(alloc);
 
-    const table = tables_api.deriveTableRecord("docs", create_req);
-    const ranges = try tables_api.deriveInitialRanges(alloc, table);
+    const table = catalog_table_ddl.deriveTableRecord("docs", create_req);
+    const ranges = try catalog_table_ddl.deriveInitialRanges(alloc, table);
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);

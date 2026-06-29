@@ -27,8 +27,8 @@ const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const runtime_status = @import("../runtime_status.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const Io = std.Io;
 
 const backend_current_root_generation: u64 = 0;

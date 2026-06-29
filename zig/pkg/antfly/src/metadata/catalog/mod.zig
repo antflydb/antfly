@@ -12,14 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const http_server = @import("api/http_server.zig");
-const sql_adapter_integration = @import("api/sql_adapter_integration.zig");
-const relational_rows = @import("sql/relational_rows.zig");
-const table_reads = @import("api/table_reads.zig");
-
-test {
-    _ = http_server;
-    _ = sql_adapter_integration;
-    _ = relational_rows;
-    _ = table_reads;
-}
+pub const jobs = @import("jobs.zig");
+pub const lookup = @import("lookup.zig");
+pub const relational_ddl = @import("relational_ddl.zig");
+pub const resources = @import("resources.zig");
+pub const routing = @import("routing.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const source = @import("source.zig");
+pub const table_ddl = @import("table_ddl.zig");

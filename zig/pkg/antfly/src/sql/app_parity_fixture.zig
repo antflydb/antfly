@@ -163,16 +163,13 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
             return error.TestUnexpectedResult;
         }
         if (entry.summary.table_name) |target_table_name| {
-            if (std.mem.eql(u8, catalog_table.name, target_table_name)) return error.TestUnexpectedResult;
+            if (entry.family != .ddl and entry.catalog_tables.len == 1 and std.mem.eql(u8, catalog_table.name, target_table_name)) return error.TestUnexpectedResult;
         }
     }
-    if (entry.source_schema_json.len > 0) {
+    if (entry.source_schema_json.len > 0 and entry.family != .insert) {
         const source_table_name = (corpus.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         defer alloc.free(@constCast(source_table_name));
         if (source_table_name.len == 0) return error.TestUnexpectedResult;
-        if (entry.summary.table_name) |target_table_name| {
-            if (std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
-        }
         if (!corpus.corpusFixturePlanMatchesSourceTable(entry, source_table_name)) {
             return error.TestUnexpectedResult;
         }

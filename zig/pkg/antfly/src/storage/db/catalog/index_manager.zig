@@ -1475,8 +1475,7 @@ pub const IndexManager = struct {
                 anyJsonSubdocumentDomainLifecyclePending(cur);
             if (!capability_changed and !lifecycle_pending) continue;
 
-            // Carry forward user-tunable runtime knobs (the durable regeneration
-            // in api/tables.zig preserves the same set) so a schema/template
+            // Carry forward user-tunable runtime knobs so a schema/template
             // change does not silently reset planner/adaptive/HLL tuning in place.
             new_parsed.value.adaptive = cur.adaptive;
             new_parsed.value.pathfact_policy = cur.pathfact_policy;

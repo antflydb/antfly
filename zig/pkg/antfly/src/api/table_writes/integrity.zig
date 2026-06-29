@@ -22,8 +22,8 @@ const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const distributed_txn = @import("../distributed_txn.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_core = @import("core.zig");
 const integrity_types = @import("integrity_types.zig");
 const table_write_managed_db = @import("managed_db.zig");
@@ -2446,6 +2446,7 @@ pub fn cloneUniqueConstraintOwnerRange(
         .start_encoded_value = &.{},
         .end_encoded_value = null,
         .group_id = range.group_id,
+        .range_id = range.range_id,
         .topology_epoch = range.topology_epoch,
         .state = &.{},
         .active = metadata_table_manager.uniqueConstraintRangeRoutable(range),
@@ -2628,6 +2629,7 @@ pub fn hashUniqueConstraintOwnerRangeForInspection(
         hasher.update(&[_]u8{0});
     }
     hasher.update(std.mem.asBytes(&range.group_id));
+    hasher.update(std.mem.asBytes(&range.range_id));
     hasher.update(std.mem.asBytes(&range.topology_epoch));
     hasher.update(range.state);
 }

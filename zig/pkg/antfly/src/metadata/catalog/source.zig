@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const metadata_api = @import("api.zig");
-const metadata_table_manager = @import("table_manager.zig");
+const metadata_api = @import("snapshot.zig");
+const metadata_table_manager = @import("../table_manager.zig");
 
 pub const CatalogSource = struct {
     ptr: *anyopaque,
@@ -58,6 +58,14 @@ pub const CatalogSource = struct {
         apply_table_catalog_update_with_schema_rewrite_jobs: ?*const fn (
             ptr: *anyopaque,
             request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+        ) anyerror!void = null,
+        apply_table_catalog_batch_update_with_schema_rewrite_jobs: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+        ) anyerror!void = null,
+        apply_table_catalog_drop_with_schema_rewrite_jobs: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
         ) anyerror!void = null,
         remove_table_emptying_job: ?*const fn (
             ptr: *anyopaque,
@@ -174,6 +182,22 @@ pub const CatalogSource = struct {
         request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
     ) !void {
         const fn_ptr = self.vtable.apply_table_catalog_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: CatalogSource,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const fn_ptr = self.vtable.apply_table_catalog_batch_update_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: CatalogSource,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        const fn_ptr = self.vtable.apply_table_catalog_drop_with_schema_rewrite_jobs orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 

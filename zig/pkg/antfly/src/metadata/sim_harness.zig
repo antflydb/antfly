@@ -28,13 +28,15 @@ const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
+const catalog_source_mod = @import("catalog/routing.zig");
+const catalog_jobs = @import("catalog/jobs.zig");
+const catalog_resources = @import("catalog/resources.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_relational_rows = @import("../sql/relational_rows.zig");
 const api_table_router = @import("../api/table_router.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const api_table_writes = @import("../api/table_writes.zig");
-const api_tables = @import("../api/tables.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
@@ -1319,7 +1321,7 @@ fn waitForUniqueOwnerGroupActive(
 
 fn waitForSplitResolvedGroups(
     cluster: *MetadataHttpClusterSimulation,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     route_rounds: usize,
 ) !SplitResolvedGroups {
@@ -1332,7 +1334,7 @@ fn waitForSplitResolvedGroups(
 }
 
 const SplitResolvedGroupsProgressContext = struct {
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     result: SplitResolvedGroups = .{ .left_group = 0, .right_group = 0 },
 };
@@ -1340,13 +1342,13 @@ const SplitResolvedGroupsProgressContext = struct {
 fn splitResolvedGroupsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *SplitResolvedGroupsProgressContext = @ptrCast(@alignCast(ptr));
-    ctx.result.left_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:a")) orelse 0;
-    ctx.result.right_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:z")) orelse 0;
+    ctx.result.left_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:a")) orelse 0;
+    ctx.result.right_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:z")) orelse 0;
     return ctx.result.left_group != 0 and ctx.result.right_group != 0 and ctx.result.left_group != ctx.result.right_group;
 }
 
 const ResolvedGroupForKeyProgressContext = struct {
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1356,13 +1358,13 @@ const ResolvedGroupForKeyProgressContext = struct {
 fn resolvedGroupForKeyProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *ResolvedGroupForKeyProgressContext = @ptrCast(@alignCast(ptr));
-    ctx.resolved_group_id = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, ctx.key);
+    ctx.resolved_group_id = try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, ctx.key);
     return ctx.resolved_group_id == ctx.expected_group_id;
 }
 
 fn waitForResolvedGroupForKey(
     cluster: *MetadataHttpClusterSimulation,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1449,8 +1451,8 @@ fn publicSplitRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, pt
     const query_index = currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index;
     if (query_index >= ctx.catalog_sources.len) return false;
     const catalog = ctx.catalog_sources[query_index].iface();
-    ctx.left_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:a")) orelse 0;
-    ctx.right_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:z")) orelse 0;
+    ctx.left_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:a")) orelse 0;
+    ctx.right_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:z")) orelse 0;
     if (ctx.left_group == 0 or ctx.right_group == 0 or ctx.left_group == ctx.right_group) return false;
 
     ctx.client_index = null;
@@ -1480,7 +1482,7 @@ fn waitForPublicSplitRoute(
 }
 
 const PublicMergedRouteProgressContext = struct {
-    catalog_source: api_table_catalog.CatalogSource,
+    metadata_catalog_source: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1489,7 +1491,7 @@ const PublicMergedRouteProgressContext = struct {
 
 fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     const ctx: *PublicMergedRouteProgressContext = @ptrCast(@alignCast(ptr));
-    const merged_group = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog_source, ctx.table_name, ctx.key);
+    const merged_group = try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.metadata_catalog_source, ctx.table_name, ctx.key);
     if (merged_group != ctx.expected_group_id) return false;
     ctx.client_index = null;
     for (0..cluster.cluster.nodes.len) |i| {
@@ -1503,14 +1505,14 @@ fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, p
 
 fn waitForPublicMergedRoute(
     cluster: *MetadataHttpClusterSimulation,
-    catalog_source: api_table_catalog.CatalogSource,
+    metadata_catalog_source: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
     max_rounds: usize,
 ) !usize {
     var ctx = PublicMergedRouteProgressContext{
-        .catalog_source = catalog_source,
+        .metadata_catalog_source = metadata_catalog_source,
         .table_name = table_name,
         .key = key,
         .expected_group_id = expected_group_id,
@@ -1552,7 +1554,7 @@ fn verifySplitPublicTraffic(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     client_base: []const u8,
     table_name: []const u8,
     roots: []const []const u8,
@@ -1569,8 +1571,8 @@ fn verifySplitPublicTraffic(
 
     _ = (try waitForGroupLeaderIndex(cluster, groups.left_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
     _ = (try waitForGroupLeaderIndex(cluster, groups.right_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, catalog_table_ddl.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const split_groups = [_]u64{ groups.left_group, groups.right_group };
     try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..]);
@@ -1604,7 +1606,7 @@ fn verifyMergePublicTraffic(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     client_base: []const u8,
     table_name: []const u8,
     roots: []const []const u8,
@@ -1622,7 +1624,7 @@ fn verifyMergePublicTraffic(
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, merged_group, table_name, merge_seed_right_batch_body);
 
     _ = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, catalog_table_ddl.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const merge_groups = [_]u64{merged_group};
     try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..]);
@@ -1731,7 +1733,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         .table_id = cfg.table_id,
         .name = "docs",
         .description = cfg.description,
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], cfg.range_create_rounds);
@@ -1749,7 +1751,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, client_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
 
     var pre_split_batch = try client.fetchBatch(client_base, "docs", split_seed_batch_body);
@@ -1764,7 +1766,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     };
     if (cfg.ensure_source_group_text_index_before_transition) {
         const source_leader_index = source_leader orelse return error.TestExpectedEqual;
-        try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, api_tables.default_full_text_index_name, 40);
+        try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     }
 
     try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
@@ -1892,7 +1894,7 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
         .table_id = cfg.table_id,
         .name = "docs",
         .description = cfg.description,
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 2,
     }, initial_ranges[0..], cfg.range_create_rounds);
@@ -1913,8 +1915,8 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group_id, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[left_leader_index];
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, left_leader_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group_id, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group_id, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group_id, catalog_table_ddl.default_full_text_index_name, 40);
 
     var pre_merge_batch = try client.fetchBatch(client_base, "docs", merge_seed_batch_body);
     defer pre_merge_batch.deinit(std.heap.page_allocator);
@@ -2222,7 +2224,7 @@ fn projectedTablePresenceProgressPredicate(cluster: *MetadataHttpClusterSimulati
         const node = cluster.node(i);
         const tables = try node.listProjectedTables(cluster.alloc);
         defer node.freeProjectedTables(cluster.alloc, tables);
-        const table = api_tables.findTableByName(&.{
+        const table = catalog_table_ddl.findTableByName(&.{
             .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
             .tables = tables,
             .ranges = &.{},
@@ -2247,7 +2249,7 @@ fn projectedTableFieldContainsOnAllNodes(
         const node = cluster.node(i);
         const tables = try node.listProjectedTables(cluster.alloc);
         defer node.freeProjectedTables(cluster.alloc, tables);
-        const table = api_tables.findTableByName(&.{
+        const table = catalog_table_ddl.findTableByName(&.{
             .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
             .tables = tables,
             .ranges = &.{},
@@ -2337,7 +2339,7 @@ fn projectedTableFieldContainsOnNode(
     const node = cluster.node(node_index);
     const tables = try node.listProjectedTables(cluster.alloc);
     defer node.freeProjectedTables(cluster.alloc, tables);
-    const table = api_tables.findTableByName(&.{
+    const table = catalog_table_ddl.findTableByName(&.{
         .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
         .tables = tables,
         .ranges = &.{},
@@ -4321,18 +4323,18 @@ fn currentMetadataMutationNode(node: MetadataHttpNodeSimulation) MetadataHttpNod
 fn applyCreateTableMutation(
     node: MetadataHttpNodeSimulation,
     table_name: []const u8,
-    req: api_tables.CreateTableRequest,
+    req: catalog_table_ddl.CreateTableRequest,
 ) !void {
     const target = currentMetadataMutationNode(node);
     var workflow = metadata_table_workflow.TableWorkflow.init(node.cluster.alloc);
     defer workflow.deinit();
     var normalized_req = req;
-    const indexes_json = req.indexes_json orelse api_tables.default_indexes_json;
-    const prepared_indexes_json = try api_tables.prepareTableIndexesForSchemaAlloc(node.cluster.alloc, table_name, indexes_json, api_tables.effectiveSchemaJson(req.schema_json));
+    const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+    const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(node.cluster.alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
     defer node.cluster.alloc.free(prepared_indexes_json);
     normalized_req.indexes_json = prepared_indexes_json;
-    const table = api_tables.deriveTableRecord(table_name, normalized_req);
-    _ = try workflow.createTable(&target, table, api_tables.deriveInitialRange(table));
+    const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+    _ = try workflow.createTable(&target, table, catalog_table_ddl.deriveInitialRange(table));
     try target.runRound();
 }
 
@@ -4344,7 +4346,7 @@ fn applyDropTableMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     for (snapshot.ranges) |record| {
         if (record.table_id != table.table_id) continue;
         try target.removeRange(record.group_id);
@@ -4363,9 +4365,9 @@ fn applyUpdateSchemaMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
-    const updated = try api_tables.applySchemaUpdateRecord(alloc, table, schema_json);
+    const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
     try target.upsertTable(updated);
     try target.runRound();
@@ -4381,7 +4383,7 @@ fn applyCreateIndexMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
     var updated = table.*;
     updated.indexes_json = try @import("../api/indexes.zig").addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -4399,7 +4401,7 @@ fn applyDropIndexMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
     const next = (try @import("../api/indexes.zig").removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(next);
@@ -4461,7 +4463,7 @@ const PublicApiStatusSource = struct {
         self.metadataNode().freeAdminSnapshot(snapshot);
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
+    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
@@ -4622,7 +4624,7 @@ const PublicApiCatalogSource = struct {
         };
     }
 
-    fn iface(self: *@This()) api_table_catalog.CatalogSource {
+    fn iface(self: *@This()) catalog_source_mod.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -5384,6 +5386,79 @@ fn metadataVoprRequireForeignKeyReferenceRange(
     return error.TestExpectedEqual;
 }
 
+const MetadataVoprCatalogJobOwner = struct {
+    alloc: std.mem.Allocator,
+    manager: *metadata_table_manager.TableManager,
+    reset_calls: usize = 0,
+
+    pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        var snapshot = metadata_api.AdminSnapshot{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        snapshot.tables = try self.manager.listTables(self.alloc);
+        snapshot.ranges = try self.manager.listRanges(self.alloc);
+        snapshot.table_emptying_jobs = try self.manager.listTableEmptyingJobs(self.alloc);
+        return snapshot;
+    }
+
+    pub fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+        self.manager.freeTables(self.alloc, snapshot.tables);
+        self.manager.freeRanges(self.alloc, snapshot.ranges);
+        if (snapshot.table_emptying_jobs.len > 0) self.manager.freeTableEmptyingJobs(self.alloc, snapshot.table_emptying_jobs);
+        snapshot.* = undefined;
+    }
+
+    pub fn upsertTableEmptyingJob(self: *@This(), record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.manager.upsertTableEmptyingJob(record);
+    }
+
+    pub fn beginTableEmptyingJob(self: *@This(), request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.manager.beginTableEmptyingJob(request);
+    }
+
+    pub fn finishTableEmptyingJob(self: *@This(), request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.manager.finishTableEmptyingJob(request);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        try self.manager.promoteTableEmptyingBarrier(request);
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        _ = try self.manager.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, request);
+        self.reset_calls += 1;
+    }
+};
+
+fn metadataVoprCompleteTableEmptyingJobs(owner: *MetadataVoprCatalogJobOwner, expected_jobs: usize) !void {
+    const jobs = try owner.manager.listTableEmptyingJobs(owner.alloc);
+    defer owner.manager.freeTableEmptyingJobs(owner.alloc, jobs);
+    try std.testing.expectEqual(expected_jobs, jobs.len);
+    for (jobs, 0..) |job, i| {
+        try std.testing.expect(job.range_id != 0);
+        const lease_owner = "metadata-vopr-rel-empty";
+        try owner.beginTableEmptyingJob(.{
+            .job_id = job.job_id,
+            .lease_owner = lease_owner,
+            .now_ms = @intCast(i),
+            .lease_expires_at_ms = @intCast(i + 10_000),
+        });
+        try owner.finishTableEmptyingJob(.{
+            .job_id = job.job_id,
+            .lease_owner = lease_owner,
+            .completed_row_count = @intCast(i + 1),
+            .progress_row_key = job.end_row_key orelse "",
+        });
+    }
+}
+
 fn metadataVoprRunLivenessWorkload(
     cluster: *MetadataHttpClusterSimulation,
     cfg: MetadataVoprCampaignConfig,
@@ -5699,6 +5774,43 @@ fn runMetadataVoprRelationalIdentityCampaign(alloc: std.mem.Allocator, cfg: Meta
     try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_fkey", cfg.table_id);
     try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_email_fkey", cfg.table_id);
     try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 2, "vopr_lines_order_fkey", cfg.table_id + 1);
+
+    var job_owner = MetadataVoprCatalogJobOwner{
+        .alloc = alloc,
+        .manager = workflow.controlLoop().stateRef().tableManager(),
+    };
+    var admission = try catalog_jobs.scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
+        alloc,
+        &job_owner,
+        "vopr-rel-parent",
+        &.{},
+        true,
+        true,
+        catalog_resources.SqlCatalogSession.default(),
+    );
+    defer admission.applied.deinit(alloc);
+    defer admission.deinitAffectedTables(alloc);
+    try std.testing.expectEqual(@as(usize, 3), admission.affected_tables.len);
+    try std.testing.expectEqual(@as(usize, 3), admission.scheduled_jobs);
+    try metadataVoprCompleteTableEmptyingJobs(&job_owner, admission.scheduled_jobs);
+
+    const promoted_jobs = try catalog_jobs.promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(alloc, &job_owner, "vopr-rel-parent");
+    try std.testing.expectEqual(admission.scheduled_jobs, promoted_jobs);
+    try std.testing.expectEqual(@as(usize, 1), job_owner.reset_calls);
+    const promoted_tables = try job_owner.manager.listTables(alloc);
+    defer job_owner.manager.freeTables(alloc, promoted_tables);
+    for (admission.affected_tables) |table| {
+        const promoted = blk: {
+            for (promoted_tables) |candidate| {
+                if (candidate.table_id == table.table_id) break :blk candidate;
+            }
+            return error.TestExpectedEqual;
+        };
+        try std.testing.expectEqual(table.data_generation + 1, promoted.data_generation);
+    }
+    const remaining_jobs = try job_owner.manager.listTableEmptyingJobs(alloc);
+    defer job_owner.manager.freeTableEmptyingJobs(alloc, remaining_jobs);
+    try std.testing.expectEqual(@as(usize, 0), remaining_jobs.len);
 }
 
 test "metadata VOPR seeded smoke campaign" {
@@ -5958,7 +6070,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     const client_base = api_base_uris[client_index];
 
     const group_leader_index = (try waitForGroupLeaderIndex(&cluster, group_id, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, catalog_table_ddl.default_full_text_index_name, 40);
 
     const TableListEntry = struct { name: []const u8 };
 
@@ -6264,7 +6376,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
-    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486101,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
@@ -6297,8 +6409,8 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
 
     const left_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 96)) orelse return error.TestExpectedEqual;
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, catalog_table_ddl.default_full_text_index_name, 40);
     try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -6463,7 +6575,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
-    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486201,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
@@ -6496,8 +6608,8 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
 
     const left_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 96)) orelse return error.TestExpectedEqual;
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, catalog_table_ddl.default_full_text_index_name, 40);
     try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var pre_merge_batch = try client.fetchBatch(api_base_uris[0], "docs",
@@ -6531,7 +6643,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const client_base = api_base_uris[routed_client_index];
 
     const merged_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 48)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[merged_leader_index], left_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[merged_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
 
     var post_merge_batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:z":{"title":"zeta","body":"hello merged right side"}}}
@@ -7161,7 +7273,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     try createActiveTableRanges(&workflow, &cluster, leader_index, .{
         .table_id = 4512,
         .name = "docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], 32);
@@ -7179,7 +7291,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, 45112, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], 45112, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], 45112, catalog_table_ddl.default_full_text_index_name, 40);
 
     var batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"left"},"doc:m":{"title":"mid","body":"middle"},"doc:z":{"title":"zeta","body":"right"}}}
@@ -7272,7 +7384,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     try createActiveTableRanges(&workflow, &cluster, initial_leader, .{
         .table_id = 4513,
         .name = "docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], 48);
@@ -7303,7 +7415,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, 45113, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], 45113, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], 45113, catalog_table_ddl.default_full_text_index_name, 40);
 
     var batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"left"},"doc:m":{"title":"mid","body":"middle"},"doc:z":{"title":"zeta","body":"right"}}}
@@ -9683,7 +9795,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
 
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -9814,7 +9926,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         .table_id = 483,
         .name = "docs",
         .description = "forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
@@ -9886,7 +9998,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":4") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[actual_host_index], 4831, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[actual_host_index], 4831, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);
@@ -10068,9 +10180,9 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     defer alloc.free(price_v2_key);
     const price_adjustment_key = try relationalPhysicalKeyForRowAlloc(alloc, prices_schema, price_adjustment_row);
     defer alloc.free(price_adjustment_key);
-    const row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "users", ada_key)) orelse return error.TestExpectedEqual;
-    const temporal_row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_v2_key)) orelse return error.TestExpectedEqual;
-    const adjustment_row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_adjustment_key)) orelse return error.TestExpectedEqual;
+    const row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "users", ada_key)) orelse return error.TestExpectedEqual;
+    const temporal_row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_v2_key)) orelse return error.TestExpectedEqual;
+    const adjustment_row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_adjustment_key)) orelse return error.TestExpectedEqual;
 
     const row_host = try waitForSingleActiveGroupHost(&cluster, row_group, 48);
     const temporal_row_host = try waitForSingleActiveGroupHost(&cluster, temporal_row_group, 48);
@@ -10318,7 +10430,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     };
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -10425,7 +10537,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         .table_id = 484,
         .name = "docs",
         .description = "split forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
@@ -10518,8 +10630,8 @@ test "metadata http cluster simulation forwards public table io across split ran
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":5") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[left], 4841, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right], 4842, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left], 4841, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right], 4842, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);
@@ -10597,7 +10709,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     };
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -10712,7 +10824,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         .table_id = 485,
         .name = "docs",
         .description = "merge forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 2,
     }, initial_ranges[0..], 40);
@@ -10799,7 +10911,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":1") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[host], 4851, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[host], 4851, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);

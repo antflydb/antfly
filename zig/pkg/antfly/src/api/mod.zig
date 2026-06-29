@@ -21,9 +21,8 @@ pub const linear_merge = @import("linear_merge.zig");
 pub const relational_rows = @import("relational_rows.zig");
 pub const catalog_resources = @import("catalog_resources.zig");
 pub const sql_adapter = @import("../sql/mod.zig");
-pub const sql_adapter_runtime = @import("../sql/runtime.zig");
 const sql_adapter_integration = @import("sql_adapter_integration.zig");
-pub const catalog_jobs = @import("catalog_jobs.zig");
+pub const catalog_jobs = @import("../metadata/catalog/jobs.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -39,9 +38,8 @@ pub const distributed_txn = @import("distributed_txn.zig");
 pub const transactions = @import("transactions.zig");
 const e2e = @import("e2e.zig");
 const multi_node_e2e = @import("multi_node_e2e.zig");
-pub const table_catalog = @import("table_catalog.zig");
+const catalog_routing = @import("../metadata/catalog/routing.zig");
 pub const table_router = @import("table_router.zig");
-pub const tables = @import("tables.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 pub const http_routes = @import("http_routes.zig");
@@ -61,6 +59,7 @@ pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const pgwire = @import("pgwire.zig");
 pub const pgwire_runtime = @import("pgwire_runtime.zig");
+pub const public_runtime = @import("public_runtime.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const openapi_contract = @import("openapi_contract.zig");
 pub const protocol_adapters = @import("protocol_adapters.zig");
@@ -107,6 +106,7 @@ test {
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "dropNamespaceTableIndex"));
     _ = pgwire;
     _ = pgwire_runtime;
+    _ = public_runtime;
     _ = protocol_adapters;
 }
 
@@ -195,7 +195,6 @@ test "api module compiles" {
     _ = batch;
     _ = backups;
     _ = relational_rows;
-    _ = sql_adapter_runtime;
     _ = sql_adapter_integration;
     _ = query;
     _ = query_contract;
@@ -211,9 +210,8 @@ test "api module compiles" {
     _ = transactions;
     _ = e2e;
     _ = multi_node_e2e;
-    _ = table_catalog;
+    _ = catalog_routing;
     _ = table_router;
-    _ = tables;
     _ = table_contract;
     _ = indexes;
     _ = http_routes;
@@ -297,7 +295,7 @@ test "api table reads reject stale doc identity before multigroup fanout" {
     const FakeCatalog = struct {
         statuses: []const metadata_reconciler.MergedGroupStatus,
 
-        fn iface(self: *@This()) table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_routing.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{

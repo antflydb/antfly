@@ -19,8 +19,8 @@ const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const schema_mod = @import("../../schema/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_relational_mutation = @import("relational_mutation.zig");
 
 const mutateRowsFromSourceAutocommitOnDb = table_write_relational_mutation.mutateRowsFromSourceAutocommitOnDb;
@@ -169,6 +169,15 @@ pub fn runSecondaryIndexRebuildRangeGroupLocal(
     };
     result.claimed = true;
 
+    if (!(try secondaryIndexRebuildRangeMatchesCurrentCatalogRange(metadata, record))) {
+        metadata.invalidateSecondaryIndexRebuildRange(.{
+            .selector = selector,
+            .last_error = @errorName(error.TopologyChanged),
+        }) catch {};
+        result.invalidated = true;
+        return error.TopologyChanged;
+    }
+
     const upper = record.end_row_key orelse "";
     result.report = db.rebuildRelationalSecondaryIndexInRange(
         record.index_name,
@@ -190,6 +199,41 @@ pub fn runSecondaryIndexRebuildRangeGroupLocal(
     });
     result.completed = true;
     return result;
+}
+
+fn secondaryIndexRebuildRangeMatchesCurrentCatalogRange(
+    metadata: anytype,
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+) !bool {
+    if (record.range_id == 0) return true;
+    const MetadataType = @TypeOf(metadata);
+    const MetadataDeclType = switch (@typeInfo(MetadataType)) {
+        .pointer => |pointer| pointer.child,
+        else => MetadataType,
+    };
+    if (comptime !@hasDecl(MetadataDeclType, "adminSnapshot") or !@hasDecl(MetadataDeclType, "freeAdminSnapshot")) {
+        return true;
+    }
+
+    var snapshot = try metadata.adminSnapshot();
+    defer metadata.freeAdminSnapshot(&snapshot);
+    return secondaryIndexRebuildRangeMatchesSnapshotRange(&snapshot, record);
+}
+
+fn secondaryIndexRebuildRangeMatchesSnapshotRange(
+    snapshot: *const metadata_api.AdminSnapshot,
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+) bool {
+    if (record.range_id == 0) return true;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != record.table_id) continue;
+        if (range.group_id != record.group_id) continue;
+        if (range.range_id != record.range_id) continue;
+        if (!std.mem.eql(u8, range.start_key, record.start_row_key)) continue;
+        if (!optionalStringsEqual(range.end_key, record.end_row_key)) continue;
+        return true;
+    }
+    return false;
 }
 
 pub fn secondaryIndexRebuildRecordPending(record: metadata_table_manager.SecondaryIndexRebuildRangeRecord) bool {
@@ -218,6 +262,7 @@ pub fn findSecondaryIndexRebuildRecordForRange(
         if (record.table_id != table_id) continue;
         if (record.index_generation != index_generation) continue;
         if (!std.mem.eql(u8, record.index_name, index_name)) continue;
+        if (record.range_id != 0 and record.range_id != range.range_id) continue;
         if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
         if (!optionalStringsEqual(record.end_row_key, range.end_key)) continue;
         return record;
@@ -385,7 +430,15 @@ pub const SingleSchemaRewriteJobCatalogService = struct {
     }
 
     pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
-        return try self.catalog.beginSchemaRewriteJob(request);
+        try self.catalog.beginSchemaRewriteJob(request);
+        if (!(try schemaRewriteJobMatchesCurrentCatalogRange(self.catalog, self.record))) {
+            self.catalog.invalidateSchemaRewriteJob(.{
+                .job_id = self.record.job_id,
+                .lease_owner = request.lease_owner,
+                .last_error = @errorName(error.TopologyChanged),
+            }) catch {};
+            return error.TopologyChanged;
+        }
     }
 
     pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
@@ -396,6 +449,26 @@ pub const SingleSchemaRewriteJobCatalogService = struct {
         return try self.catalog.invalidateSchemaRewriteJob(request);
     }
 };
+
+fn schemaRewriteJobMatchesCurrentCatalogRange(
+    catalog: table_catalog.CatalogSource,
+    record: metadata_table_manager.SchemaRewriteJobRecord,
+) !bool {
+    if (record.range_id == 0) return true;
+
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    for (snapshot.ranges) |range| {
+        if (range.table_id != record.table_id) continue;
+        if (range.group_id != record.group_id) continue;
+        if (range.range_id != record.range_id) continue;
+        if (!std.mem.eql(u8, range.start_key, record.start_row_key)) continue;
+        if (!optionalStringsEqual(range.end_key, record.end_row_key)) continue;
+        return true;
+    }
+    return false;
+}
 
 pub fn runSchemaRewriteJobGroupLocal(
     alloc: std.mem.Allocator,
@@ -598,6 +671,27 @@ fn tableEmptyingJobMatchesTableGeneration(
         record.data_generation == table.data_generation;
 }
 
+fn tableEmptyingJobMatchesCurrentCatalogRange(
+    catalog: table_catalog.CatalogSource,
+    table: metadata_table_manager.TableRecord,
+    record: metadata_table_manager.TableEmptyingJobRecord,
+) !bool {
+    if (record.range_id == 0) return true;
+
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        if (range.group_id != record.group_id) continue;
+        if (range.range_id != record.range_id) continue;
+        if (!std.mem.eql(u8, range.start_key, record.start_row_key)) continue;
+        if (!optionalStringsEqual(range.end_key, record.end_row_key)) continue;
+        return true;
+    }
+    return false;
+}
+
 pub fn runTableEmptyingJobGroupLocal(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -636,6 +730,15 @@ pub fn runTableEmptyingJobGroupLocal(
         }) catch {};
         result.invalidated = true;
         return error.InvalidTableEmptyingJob;
+    }
+    if (!(try tableEmptyingJobMatchesCurrentCatalogRange(catalog, table, record))) {
+        catalog.invalidateTableEmptyingJob(.{
+            .job_id = record.job_id,
+            .lease_owner = worker_id,
+            .last_error = @errorName(error.TopologyChanged),
+        }) catch {};
+        result.invalidated = true;
+        return error.TopologyChanged;
     }
     if (table.schema_json.len == 0) {
         catalog.invalidateTableEmptyingJob(.{
@@ -860,6 +963,138 @@ test "secondary index rebuild worker helper claims repairs and finishes range" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_amount_key));
 }
 
+test "secondary index rebuild worker invalidates stale range before rebuilding index" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secondary-index-rebuild-stale-range-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:active", .value = "{\"id\":\"active\",\"amount\":1,\"status\":\"active\"}" },
+        .{ .key = "row:inactive", .value = "{\"id\":\"inactive\",\"amount\":2,\"status\":\"inactive\"}" },
+    } });
+
+    const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+    defer alloc.free(inactive_amount_key);
+    try db.core.store.put(inactive_amount_key, "");
+    const stale_inactive_amount = try db.core.store.get(alloc, inactive_amount_key);
+    defer alloc.free(stale_inactive_amount);
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = building_schema_json,
+    };
+    try manager.upsertTable(table);
+    const stale_range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const rebuild = metadata_table_manager.SecondaryIndexRebuildRangeRecord{
+        .table_id = 77,
+        .index_name = "amount",
+        .index_generation = 9,
+        .start_row_key = stale_range.start_key,
+        .end_row_key = stale_range.end_key,
+        .group_id = stale_range.group_id,
+        .range_id = stale_range.range_id,
+    };
+    try manager.upsertSecondaryIndexRebuildRange(rebuild);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+        table: metadata_table_manager.TableRecord,
+        current_range: metadata_table_manager.RangeRecord,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
+                    .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.current_range))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginSecondaryIndexRebuildRange(request);
+        }
+
+        fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishSecondaryIndexRebuildRange(request);
+        }
+
+        fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateSecondaryIndexRebuildRange(request);
+        }
+    };
+
+    const records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    var catalog = Catalog{
+        .manager = &manager,
+        .table = table,
+        .current_range = .{
+            .group_id = stale_range.group_id,
+            .range_id = stale_range.range_id + 1,
+            .table_id = stale_range.table_id,
+            .start_key = stale_range.start_key,
+            .end_key = stale_range.end_key,
+        },
+    };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        runSecondaryIndexRebuildRangeGroupLocal(&db, catalog.iface(), records[0], "worker-a", 1000, 500),
+    );
+
+    const still_stale = try db.core.store.get(alloc, inactive_amount_key);
+    defer alloc.free(still_stale);
+
+    const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
+    try std.testing.expectEqual(@as(usize, 1), final_records.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_invalid, final_records[0].state);
+    try std.testing.expectEqualStrings(@errorName(error.TopologyChanged), final_records[0].last_error);
+}
+
 test "table emptying worker helper claims deletes rows and finishes job" {
     const alloc = std.testing.allocator;
 
@@ -970,6 +1205,134 @@ test "table emptying worker helper claims deletes rows and finishes job" {
     try std.testing.expectEqual(@as(u64, 2), final_jobs[0].completed_row_count);
 }
 
+test "table emptying worker invalidates stale range job before deleting rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-stale-topology-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    try manager.upsertTable(table);
+    const stale_range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = stale_range.group_id,
+        .range_id = stale_range.range_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .data_generation = table.data_generation,
+        .start_row_key = stale_range.start_key,
+        .end_row_key = stale_range.end_key,
+        .affected_table_ids = &.{77},
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+        table: metadata_table_manager.TableRecord,
+        current_range: metadata_table_manager.RangeRecord,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.current_range))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    const records = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    var catalog = Catalog{
+        .manager = &manager,
+        .table = table,
+        .current_range = .{
+            .group_id = stale_range.group_id,
+            .range_id = stale_range.range_id + 1,
+            .table_id = stale_range.table_id,
+            .start_key = stale_range.start_key,
+            .end_key = stale_range.end_key,
+        },
+    };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, records[0], "worker-a", 1000, 500),
+    );
+
+    const row = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, final_jobs[0].state);
+    try std.testing.expectEqualStrings(@errorName(error.TopologyChanged), final_jobs[0].last_error);
+}
+
 test "table emptying worker completes restart identity range delete before catalog reset" {
     const alloc = std.testing.allocator;
 
@@ -1076,6 +1439,143 @@ test "table emptying worker completes restart identity range delete before catal
     try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
     try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, final_jobs[0].state);
     try std.testing.expectEqual(@as(u64, 1), final_jobs[0].completed_row_count);
+}
+
+test "schema rewrite worker invalidates stale range job before rewriting rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/schema-rewrite-stale-range-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ACTIVE\"}" },
+    } });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = schema_v2,
+    };
+    try manager.upsertTable(table);
+    const stale_range = metadata_table_manager.RangeRecord{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 8101,
+        .table_id = 77,
+        .group_id = stale_range.group_id,
+        .range_id = stale_range.range_id,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = stale_range.start_key,
+        .end_row_key = stale_range.end_key,
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{ .kind = .field, .field = "status" }},
+        },
+    };
+    try manager.upsertSchemaRewriteJob(job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+        table: metadata_table_manager.TableRecord,
+        current_range: metadata_table_manager.RangeRecord,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_schema_rewrite_job = beginSchemaRewriteJob,
+                    .finish_schema_rewrite_job = finishSchemaRewriteJob,
+                    .invalidate_schema_rewrite_job = invalidateSchemaRewriteJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.current_range))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginSchemaRewriteJob(request);
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishSchemaRewriteJob(request);
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateSchemaRewriteJob(request);
+        }
+    };
+
+    const records = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    var catalog = Catalog{
+        .manager = &manager,
+        .table = table,
+        .current_range = .{
+            .group_id = stale_range.group_id,
+            .range_id = stale_range.range_id + 1,
+            .table_id = stale_range.table_id,
+            .start_key = stale_range.start_key,
+            .end_key = stale_range.end_key,
+        },
+    };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        runSchemaRewriteJobGroupLocal(alloc, &db, catalog.iface(), records[0], "worker-a", 1000, 500),
+    );
+
+    const row = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"status_key\"") == null);
+
+    const final_jobs = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_invalid, final_jobs[0].state);
+    try std.testing.expectEqualStrings(@errorName(error.TopologyChanged), final_jobs[0].last_error);
 }
 
 test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {

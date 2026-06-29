@@ -865,7 +865,7 @@ test "metadata http client round-trips server endpoints" {
             self.reallocate_count += 1;
         }
 
-        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("catalog/table_ddl.zig").CreateTableRequest) !void {
             _ = alloc;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);

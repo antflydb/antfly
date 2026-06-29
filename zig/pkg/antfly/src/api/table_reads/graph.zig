@@ -24,8 +24,8 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_set = @import("../../storage/db/doc_set.zig");
 const distributed_graph = @import("../distributed_graph.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_read_cache = @import("cache.zig");
 
 const algebraic_ir = db_mod.algebraic.ir;

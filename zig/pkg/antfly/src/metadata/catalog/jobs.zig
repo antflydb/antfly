@@ -14,20 +14,20 @@
 
 const std = @import("std");
 
-const catalog_resources = @import("catalog_resources.zig");
-const table_catalog = @import("table_catalog.zig");
-const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const runtime_schema_mod = @import("../storage/schema.zig");
-const sql_adapter = @import("../sql/mod.zig");
-const tables_api = @import("tables.zig");
+const catalog_resources = @import("resources.zig");
+const table_catalog = @import("source.zig");
+const metadata_api = @import("snapshot.zig");
+const metadata_table_manager = @import("../table_manager.zig");
+const runtime_schema_mod = @import("../../storage/schema.zig");
+const sql_adapter = @import("../../sql/mod.zig");
+const table_ddl = @import("table_ddl.zig");
 
 // Catalog job planning owns deterministic durable job records. Execution stays
 // with the table/range write path that can claim and drain range-local work.
 pub fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
     svc: anytype,
     alloc: std.mem.Allocator,
-    applied: tables_api.AppliedRelationalSqlDdlRecord,
+    applied: table_ddl.AppliedRelationalSqlDdlRecord,
 ) !void {
     if (applied.dropped_table or applied.work_items.len == 0) return;
     const ServiceType = @TypeOf(svc);
@@ -50,7 +50,7 @@ pub fn scheduleSchemaRewriteJobsForAppliedDdlSnapshot(
     scheduler: anytype,
     alloc: std.mem.Allocator,
     ranges: []const metadata_table_manager.RangeRecord,
-    applied: tables_api.AppliedRelationalSqlDdlRecord,
+    applied: table_ddl.AppliedRelationalSqlDdlRecord,
 ) !void {
     const jobs = try schemaRewriteJobsForAppliedDdlSnapshotAlloc(alloc, ranges, applied);
     defer {
@@ -63,7 +63,7 @@ pub fn scheduleSchemaRewriteJobsForAppliedDdlSnapshot(
 pub fn schemaRewriteJobsForAppliedDdlSnapshotAlloc(
     alloc: std.mem.Allocator,
     ranges: []const metadata_table_manager.RangeRecord,
-    applied: tables_api.AppliedRelationalSqlDdlRecord,
+    applied: table_ddl.AppliedRelationalSqlDdlRecord,
 ) ![]metadata_table_manager.SchemaRewriteJobRecord {
     var jobs = std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord).empty;
     errdefer {
@@ -110,6 +110,8 @@ pub fn schemaRewriteJobForAppliedDdlWorkItem(
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&range.group_id));
     hasher.update(&[_]u8{0});
+    hasher.update(std.mem.asBytes(&range.range_id));
+    hasher.update(&[_]u8{0});
     hasher.update(range.start_key);
     hasher.update(&[_]u8{0});
     if (range.end_key) |end_key| hasher.update(end_key);
@@ -147,6 +149,7 @@ pub fn schemaRewriteJobForAppliedDdlWorkItem(
         .job_id = job_id,
         .table_id = table.table_id,
         .group_id = range.group_id,
+        .range_id = range.range_id,
         .schema_generation = schema_generation,
         .action = @tagName(item.action),
         .reason = @tagName(item.reason),
@@ -160,7 +163,7 @@ pub fn schemaRewriteJobForAppliedDdlWorkItem(
     });
 }
 
-pub fn appliedDdlHasSchemaRewriteWork(applied: tables_api.AppliedRelationalSqlDdlRecord) bool {
+pub fn appliedDdlHasSchemaRewriteWork(applied: table_ddl.AppliedRelationalSqlDdlRecord) bool {
     if (applied.dropped_table) return false;
     for (applied.work_items) |item| {
         switch (item.action) {
@@ -233,6 +236,7 @@ pub fn tableEmptyingJobForRangeWithBarrierId(
         .job_id = 0,
         .table_id = table.table_id,
         .group_id = range.group_id,
+        .range_id = range.range_id,
         .schema_generation = schema_generation,
         .data_generation = table.data_generation,
         .barrier_id = barrier_id,
@@ -308,7 +312,7 @@ pub fn scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
 }
 
 pub const TableEmptyingBarrierAdmission = struct {
-    applied: tables_api.AppliedRelationalSqlDdlRecord,
+    applied: table_ddl.AppliedRelationalSqlDdlRecord,
     affected_tables: []metadata_table_manager.TableRecord = &.{},
     scheduled_jobs: usize = 0,
 
@@ -382,7 +386,7 @@ fn appendTableEmptyingTargetWithSession(
     duplicate_policy: TableEmptyingDuplicatePolicy,
 ) !bool {
     const target = try session.tableTargetFromObjectName(table_name);
-    const table = tables_api.findTableByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    const table = table_ddl.findTableByQualifiedName(snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
     return try appendTableEmptyingAffectedRecord(alloc, table, affected_table_ids, affected_tables, duplicate_policy);
 }
 
@@ -403,7 +407,7 @@ fn tableEmptyingForeignKeyReferencesTable(
         .search_path = child_search_path[0..],
     };
     const parent_target = try child_session.tableTargetFromObjectName(parent_table_name);
-    const resolved_parent = tables_api.findTableByQualifiedName(snapshot, parent_target.database_name, parent_target.namespace_name, parent_target.table_name) orelse return error.InvalidSqlCatalog;
+    const resolved_parent = table_ddl.findTableByQualifiedName(snapshot, parent_target.database_name, parent_target.namespace_name, parent_target.table_name) orelse return error.InvalidSqlCatalog;
     return resolved_parent.table_id == parent_table.table_id;
 }
 
@@ -418,9 +422,9 @@ fn appendTableEmptyingCascadeTargets(
         const parent_table = affected_tables.items[cursor].*;
         for (snapshot.tables) |*candidate_table| {
             if (candidate_table.schema_json.len == 0) continue;
-            var parsed_child = try tables_api.parseValidatedTableSchema(alloc, candidate_table.schema_json);
+            var parsed_child = try table_ddl.parseValidatedTableSchema(alloc, candidate_table.schema_json);
             defer parsed_child.deinit(alloc);
-            const child_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_child);
+            const child_schema = try table_ddl.deriveRuntimeTableSchema(alloc, parsed_child);
             defer runtime_schema_mod.freeSchema(alloc, child_schema);
             if (child_schema.storage_mode != .relational) continue;
 
@@ -522,7 +526,7 @@ pub fn scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
         alloc.free(owned_affected_tables);
     }
 
-    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    var applied = try table_ddl.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
     errdefer applied.deinit(alloc);
     metadata_table_manager.freeTable(alloc, applied.table);
     applied.table = try metadata_table_manager.cloneTable(alloc, affected_tables.items[0].*);
@@ -611,6 +615,99 @@ fn findTableEmptyingBarrierRangeJob(
     return null;
 }
 
+fn tableEmptyingRepairCandidateActive(candidate: metadata_table_manager.TableEmptyingJobRecord) bool {
+    if (std.mem.eql(u8, candidate.state, metadata_table_manager.table_emptying_invalid)) {
+        return std.mem.eql(u8, candidate.last_error, @errorName(error.TopologyChanged));
+    }
+    return std.mem.eql(u8, candidate.state, metadata_table_manager.table_emptying_declared) or
+        std.mem.eql(u8, candidate.state, metadata_table_manager.table_emptying_running) or
+        std.mem.eql(u8, candidate.state, metadata_table_manager.table_emptying_ready);
+}
+
+fn repairMissingTableEmptyingBarrierRangeJobsForCandidate(
+    service: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    candidate: metadata_table_manager.TableEmptyingJobRecord,
+) !usize {
+    if (!tableEmptyingRepairCandidateActive(candidate)) return 0;
+    if (candidate.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
+    if (candidate.barrier_id == 0) return error.InvalidTableEmptyingJob;
+
+    const current_barrier_id = tableEmptyingBarrierIdForSnapshot(
+        snapshot,
+        candidate.affected_table_ids,
+        candidate.restart_identity,
+        candidate.cascade,
+    ) catch return 0;
+    if (current_barrier_id != candidate.barrier_id) return 0;
+
+    var repaired: usize = 0;
+    for (candidate.affected_table_ids) |affected_table_id| {
+        const table = findTableById(snapshot, affected_table_id) orelse return error.TableNotFound;
+        var range_count: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (range.table_id != affected_table_id) continue;
+            range_count += 1;
+            const expected = tableEmptyingJobForRangeWithBarrierId(
+                table,
+                range,
+                candidate.affected_table_ids,
+                candidate.restart_identity,
+                candidate.cascade,
+                candidate.barrier_id,
+            );
+            if (findTableEmptyingBarrierRangeJob(snapshot, table, range, expected) != null) continue;
+            try service.upsertTableEmptyingJob(expected);
+            repaired += 1;
+        }
+        if (range_count == 0) return error.InvalidTableEmptyingJob;
+    }
+    return repaired;
+}
+
+pub fn repairMissingTableEmptyingBarrierJobsForTableIdOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    service: anytype,
+    table_id: u64,
+) !usize {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "adminSnapshot") or
+        !@hasDecl(ServiceDeclType, "freeAdminSnapshot") or
+        !@hasDecl(ServiceDeclType, "upsertTableEmptyingJob"))
+    {
+        return error.UnsupportedOperation;
+    }
+
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    if (findTableById(&snapshot, table_id) == null) return error.TableNotFound;
+
+    var repaired_barriers = std.ArrayListUnmanaged(u64).empty;
+    defer repaired_barriers.deinit(alloc);
+
+    var repaired: usize = 0;
+    for (snapshot.table_emptying_jobs) |candidate| {
+        if (!tableEmptyingJobInvolvesTable(candidate, table_id)) continue;
+        if (candidate.barrier_id == 0) return error.InvalidTableEmptyingJob;
+        if (tableEmptyingBarrierAlreadyPromoted(repaired_barriers.items, candidate.barrier_id)) continue;
+        repaired += try repairMissingTableEmptyingBarrierRangeJobsForCandidate(service, &snapshot, candidate);
+        try repaired_barriers.append(alloc, candidate.barrier_id);
+    }
+    return repaired;
+}
+
+pub fn repairMissingTableEmptyingBarrierJobsForTableIdAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_id: u64,
+) !usize {
+    return try repairMissingTableEmptyingBarrierJobsForTableIdOnServiceAlloc(alloc, catalog, table_id);
+}
+
 fn completedTableEmptyingBarrierJobIdsForCandidateAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -635,6 +732,14 @@ fn completedTableEmptyingBarrierJobIdsForCandidateAlloc(
             try appendUniqueTableEmptyingJobId(alloc, &completed_job_ids, record.job_id);
         }
         if (range_count == 0) return error.InvalidTableEmptyingJob;
+    }
+    for (snapshot.table_emptying_jobs) |record| {
+        if (!metadata_table_manager.tableEmptyingJobComplete(record)) continue;
+        if (record.barrier_id != candidate.barrier_id) continue;
+        if (record.restart_identity != candidate.restart_identity) continue;
+        if (record.cascade != candidate.cascade) continue;
+        if (!tableEmptyingAffectedTablesEqual(record.affected_table_ids, candidate.affected_table_ids)) continue;
+        try appendUniqueTableEmptyingJobId(alloc, &completed_job_ids, record.job_id);
     }
 
     return try completed_job_ids.toOwnedSlice(alloc);
@@ -737,7 +842,7 @@ pub fn promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(
 
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     return try promoteCompletedTableEmptyingBarriersForTableIdOnServiceAlloc(alloc, service, table.table_id);
 }
 
@@ -772,6 +877,13 @@ pub fn promoteCompletedTableEmptyingBarriersForTableIdOnServiceAlloc(
             if (!tableEmptyingJobInvolvesTable(candidate, table_id)) continue;
             if (candidate.barrier_id == 0) return error.InvalidTableEmptyingJob;
             if (tableEmptyingBarrierAlreadyPromoted(promoted_barriers.items, candidate.barrier_id)) continue;
+            if (comptime @hasDecl(ServiceDeclType, "upsertTableEmptyingJob")) {
+                const repaired = try repairMissingTableEmptyingBarrierRangeJobsForCandidate(service, &snapshot, candidate);
+                if (repaired != 0) {
+                    promoted_this_pass = true;
+                    break;
+                }
+            }
             const job_ids = (try completedTableEmptyingBarrierJobIdsForCandidateAlloc(alloc, &snapshot, candidate)) orelse continue;
             defer alloc.free(job_ids);
             const promotions = try tableEmptyingGenerationPromotionsForJobIdsAlloc(alloc, &snapshot, job_ids);
@@ -886,7 +998,7 @@ test "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work
             .expression = expression,
         },
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .rewrite_required = true,
         .work_items = work_items,
@@ -986,7 +1098,7 @@ test "catalog jobs schedules durable schema validation jobs from applied SQL DDL
         .subject = .table,
         .reason = .constraints,
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .validation_required = true,
         .work_items = work_items,
@@ -1065,7 +1177,7 @@ test "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL w
         .reason = .row_images,
         .row_rewrite_plan = .{ .renames = renames, .drops = drops },
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .rewrite_required = true,
         .work_items = work_items,
@@ -1146,7 +1258,7 @@ test "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL w
         .reason = .row_images,
         .full_row_rewrite = true,
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .rewrite_required = true,
         .work_items = work_items,
@@ -1216,7 +1328,7 @@ test "catalog jobs rejects schema rewrite jobs without typed row operation" {
         .subject = .table,
         .reason = .row_images,
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .rewrite_required = true,
         .work_items = work_items,
@@ -1242,7 +1354,7 @@ test "catalog jobs detects schema rewrite wakeable applied DDL work" {
         .subject = .table,
         .reason = .constraints,
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .validation_required = true,
         .work_items = work_items,
@@ -1526,6 +1638,116 @@ test "catalog jobs table emptying barrier rejects invalid affected range job" {
     };
 
     try std.testing.expectError(error.TableEmptyingJobInvalid, completedTableEmptyingBarrierJobIdsForTableAlloc(alloc, &snapshot, 91));
+}
+
+test "catalog jobs repairs table emptying barrier jobs after range topology changes" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{
+            .{
+                .table_id = 91,
+                .name = "events",
+                .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .data_generation = 4,
+            },
+        },
+        old_ranges: [1]metadata_table_manager.RangeRecord = .{
+            .{
+                .group_id = 8100,
+                .range_id = 8101,
+                .table_id = 91,
+                .start_key = "",
+                .end_key = null,
+            },
+        },
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 8102, .range_id = 8103, .table_id = 91, .start_key = "", .end_key = "m" },
+            .{ .group_id = 8104, .range_id = 8105, .table_id = 91, .start_key = "m", .end_key = null },
+        },
+        affected: [1]u64 = .{91},
+        jobs: [4]metadata_table_manager.TableEmptyingJobRecord = undefined,
+        job_count: usize = 1,
+        promote_calls: usize = 0,
+
+        fn seed(self: *@This()) !void {
+            const barrier_snapshot = metadata_api.AdminSnapshot{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.old_ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            const barrier_id = try tableEmptyingBarrierIdForSnapshot(&barrier_snapshot, self.affected[0..], false, false);
+            self.jobs[0] = tableEmptyingJobForRangeWithBarrierId(self.tables[0], self.old_ranges[0], self.affected[0..], false, false, barrier_id);
+            self.jobs[0].state = metadata_table_manager.table_emptying_invalid;
+            self.jobs[0].last_error = @errorName(error.TopologyChanged);
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .table_emptying_jobs = self.jobs[0..self.job_count],
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn upsertTableEmptyingJob(self: *@This(), record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            for (self.jobs[0..self.job_count]) |*existing| {
+                if (existing.job_id != record.job_id) continue;
+                existing.* = record;
+                return;
+            }
+            if (self.job_count == self.jobs.len) return error.TestUnexpectedResult;
+            self.jobs[self.job_count] = record;
+            self.job_count += 1;
+        }
+
+        pub fn promoteTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+            self.promote_calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), request.job_ids.len);
+            try std.testing.expectEqual(@as(usize, 1), request.promotions.len);
+            self.tables[0].data_generation = request.promotions[0].target_generation;
+            for (request.job_ids) |job_id| {
+                var i: usize = 0;
+                while (i < self.job_count) : (i += 1) {
+                    if (self.jobs[i].job_id != job_id) continue;
+                    if (i + 1 < self.job_count) self.jobs[i] = self.jobs[self.job_count - 1];
+                    self.job_count -= 1;
+                    break;
+                } else return error.UnknownTableEmptyingJob;
+            }
+        }
+    };
+
+    var service = FakeService{};
+    try service.seed();
+
+    const repaired = try repairMissingTableEmptyingBarrierJobsForTableIdOnServiceAlloc(alloc, &service, 91);
+    try std.testing.expectEqual(@as(usize, 2), repaired);
+    try std.testing.expectEqual(@as(usize, 3), service.job_count);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, service.jobs[0].state);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_declared, service.jobs[1].state);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_declared, service.jobs[2].state);
+    try std.testing.expectEqual(@as(u64, 8102), service.jobs[1].group_id);
+    try std.testing.expectEqual(@as(u64, 8104), service.jobs[2].group_id);
+
+    service.jobs[1].state = metadata_table_manager.table_emptying_ready;
+    service.jobs[2].state = metadata_table_manager.table_emptying_ready;
+    const promoted = try promoteCompletedTableEmptyingBarriersForTableIdOnServiceAlloc(alloc, &service, 91);
+    try std.testing.expectEqual(@as(usize, 2), promoted);
+    try std.testing.expectEqual(@as(usize, 1), service.promote_calls);
+    try std.testing.expectEqual(@as(u64, 5), service.tables[0].data_generation);
+    try std.testing.expectEqual(@as(usize, 1), service.job_count);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, service.jobs[0].state);
 }
 
 test "catalog jobs promotes completed table emptying barrier by removing durable jobs" {
@@ -1976,7 +2198,7 @@ test "catalog jobs snapshot scheduler does not require HTTP service surface" {
         .subject = .table,
         .reason = .constraints,
     };
-    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+    var applied: table_ddl.AppliedRelationalSqlDdlRecord = .{
         .table = table,
         .validation_required = true,
         .work_items = work_items,

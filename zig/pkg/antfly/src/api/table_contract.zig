@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});

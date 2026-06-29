@@ -18,6 +18,7 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const document_plan = @import("document_plan.zig");
 const generated_parser_mod = @import("generated_parser.zig");
+const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const lowering_context = @import("lowering_context.zig");
 const parser_context = @import("parser_context.zig");
@@ -26,7 +27,7 @@ const plan = @import("plan.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const source_binding = @import("source_binding.zig");
-const table_catalog = @import("../metadata/catalog_source.zig");
+const table_catalog = @import("../metadata/catalog/source.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -60,68 +61,65 @@ pub const SqlFunctionBindings = lower_expr.SqlFunctionBindings;
 
 const LoweredAggregate = plan.LoweredAggregate;
 const LoweredAggregatePlan = plan.LoweredAggregatePlan;
+const LoweredExplainPlan = plan.LoweredExplainPlan;
 const LoweredJoin = plan.LoweredJoin;
 const LoweredLateralPlan = plan.LoweredLateralPlan;
 const LoweredQueryPlan = plan.LoweredQueryPlan;
 const LoweredReadPlan = plan.LoweredReadPlan;
 const LoweredRecursiveCtePlan = plan.LoweredRecursiveCtePlan;
+const LoweredRelationPopulationPlan = plan.LoweredRelationPopulationPlan;
 const LoweredSelect = plan.LoweredSelect;
 const LoweredSetOperationPlan = plan.LoweredSetOperationPlan;
 const LoweredWindowPlan = plan.LoweredWindowPlan;
+const LowerWritePlanOptions = plan.LowerWritePlanOptions;
 
 fn generatedReadAstForParsedSql(
     parsed_sql: *const sql_adapter.ParsedSql,
     expected_kind: sql_adapter.generated_parser.GeneratedSqlReadKind,
-) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
-    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
+) !?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generatedStatementKind() != .read) return null;
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else null,
-                else => null,
+                .read => |read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else error.UnsupportedSqlShape,
+                else => error.UnsupportedSqlShape,
             };
         }
     }
-    return null;
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedQueryPlanReadAstForParsedSql(
     parsed_sql: *const sql_adapter.ParsedSql,
-) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
-    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
+) !?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generatedStatementKind() != .read) return null;
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else null,
-                else => null,
+                .read => |read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else error.UnsupportedSqlShape,
+                else => error.UnsupportedSqlShape,
             };
         }
     }
-    return null;
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedCteReadAstForParsedSql(
     parsed_sql: *const sql_adapter.ParsedSql,
-) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
-    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return null;
+) !?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generatedStatementKind() != .read) return null;
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == .cte and read.cte_tokens != null) read else null,
-                else => null,
+                .read => |read| if (read.kind == .cte and read.cte_tokens != null) read else error.UnsupportedSqlShape,
+                else => error.UnsupportedSqlShape,
             };
         }
     }
-    return null;
-}
-
-fn generatedReadAstOrUnsupported(
-    parsed_sql: *const sql_adapter.ParsedSql,
-    read_ast: ?*const sql_adapter.generated_parser.GeneratedSqlReadAst,
-) !?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
-    if (read_ast) |ast| return ast;
-    if (parsed_sql.generatedStatementKind() == .read) return error.UnsupportedSqlShape;
-    return null;
+    return error.UnsupportedSqlShape;
 }
 
 pub fn lowerSelectAlloc(
@@ -144,10 +142,10 @@ pub fn lowerSelectParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedQueryPlanReadAstForParsedSql(parsed_sql),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedQueryPlanReadAstForParsedSql(parsed_sql);
 
     var parser = Parser{
         .alloc = alloc,
@@ -231,10 +229,10 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedQueryPlanReadAstForParsedSql(parsed_sql),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedQueryPlanReadAstForParsedSql(parsed_sql);
 
     var parser = Parser{
         .alloc = alloc,
@@ -373,12 +371,14 @@ pub fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
     if (schema.storage_mode == .document) {
         if (source_schema != null) return error.DocumentSqlUnsupportedJoin;
         const document_capabilities = sql_adapter.documentCapabilitiesForRuntimeSchema(schema);
-        return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
-            .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, null, document_capabilities) },
-            .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, document_capabilities) },
-            .join, .lateral => error.DocumentSqlUnsupportedJoin,
-            else => error.UnsupportedSqlShape,
-        };
+        return try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+            alloc,
+            parsed_sql,
+            schema,
+            null,
+            .{},
+            document_capabilities,
+        );
     }
     var context = sql_adapter.ReadPlanLoweringContext{
         .alloc = alloc,
@@ -420,6 +420,11 @@ pub fn lowerRecursiveCtePlanParsedSqlAlloc(
 ) !LoweredRecursiveCtePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
+    const generated_read_ast = try generatedCteReadAstForParsedSql(parsed_sql);
+    if (generated_read_ast) |read_ast| {
+        if (!read_ast.cte_recursive) return error.UnsupportedSqlShape;
+        try lowering_context.validateGeneratedReadAstForStatement(tokens, read_ast);
+    }
 
     var parser = Parser{
         .alloc = alloc,
@@ -427,6 +432,7 @@ pub fn lowerRecursiveCtePlanParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
+        .generated_read_ast = generated_read_ast,
     };
     return try sql_adapter.parseRecursiveCtePlanAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.recursiveCteParserHooks(&parser));
 }
@@ -537,10 +543,11 @@ pub fn lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(
         if (joined_source_schema.storage_mode != .relational or joined_source_schema.primary_key == null) return error.InvalidSqlCatalog;
     }
     const tokens = parsed_sql.items();
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        generatedReadAstForParsedSql(parsed_sql, .set_operation),
-    );
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .set_operation);
 
     var parser = Parser{
         .alloc = alloc,
@@ -641,6 +648,84 @@ pub fn lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
     return try context.lowerParsedWithSession(parsed_sql, catalog, session);
 }
 
+pub fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    catalog: ?table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredExplainPlan {
+    var context = lowering_context.ExplainPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = params,
+        .options = options,
+        .catalog = catalog,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_read_with_catalog = lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc,
+            .lower_read_without_catalog = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
+            .lower_write_with_catalog = lower_dml.lowerWritePlanWithCatalogParsedSqlAlloc,
+            .lower_write_without_catalog = lower_dml.lowerWritePlanParsedSqlAlloc,
+        },
+    };
+    return try context.lowerParsed(parsed_sql);
+}
+
+pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: ?table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRelationPopulationPlan {
+    var context = lowering_context.RelationPopulationLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = params,
+        .catalog = catalog,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_read_with_catalog = lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc,
+            .lower_read_without_catalog = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
+        },
+    };
+    return try context.lowerParsed(parsed_sql);
+}
+
+pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: ?table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRelationPopulationPlan {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        params,
+        catalog,
+        function_bindings,
+    );
+}
+
+pub fn lowerRelationPopulationPlanWithCatalogAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: ?table_catalog.CatalogSource,
+) !LoweredRelationPopulationPlan {
+    return try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(alloc, sql, schema, params, catalog, .{});
+}
+
 pub fn lowerReadPlanWithBoundStatementAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
@@ -694,27 +779,59 @@ pub fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
 ) !LoweredReadPlan {
     _ = params;
     _ = function_bindings;
+    return try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+        alloc,
+        parsed_sql,
+        document.schema,
+        document.indexes_json,
+        document.virtual_schema,
+        document.capabilities,
+    );
+}
+
+fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    indexes_json: ?[]const u8,
+    virtual_schema: source_binding.DocumentSqlSchema,
+    capabilities: source_binding.DocumentSqlCapabilities,
+) !LoweredReadPlan {
     return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
             .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
                 parsed_sql,
-                document.schema,
-                document.virtual_schema,
-                document.indexes_json,
-                document.capabilities,
+                schema,
+                virtual_schema,
+                indexes_json,
+                capabilities,
             ),
         },
         .query => .{
             .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
                 alloc,
                 parsed_sql,
-                document.schema,
-                document.virtual_schema,
-                document.capabilities,
+                schema,
+                virtual_schema,
+                capabilities,
             ),
         },
-        .join, .lateral => error.DocumentSqlUnsupportedJoin,
+        .join, .lateral => {
+            const document_query = sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
+                alloc,
+                parsed_sql,
+                schema,
+                virtual_schema,
+                capabilities,
+            ) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return error.DocumentSqlUnsupportedJoin,
+                else => return err,
+            };
+            return .{
+                .document_query = document_query,
+            };
+        },
         else => error.UnsupportedSqlShape,
     };
 }
@@ -739,10 +856,10 @@ pub fn lowerWindowPlanParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .window),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .window);
 
     var parser = Parser{
         .alloc = alloc,
@@ -791,10 +908,10 @@ pub fn lowerAggregateParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .aggregate),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .aggregate);
 
     var parser = Parser{
         .alloc = alloc,
@@ -829,10 +946,10 @@ pub fn lowerAggregatePlanParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .aggregate),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .aggregate);
 
     var parser = Parser{
         .alloc = alloc,
@@ -902,10 +1019,10 @@ pub fn lowerJoinWithSchemasParsedSqlAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .join),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .join);
 
     var parser = Parser{
         .alloc = alloc,
@@ -976,10 +1093,10 @@ pub fn lowerLateralPlanWithSchemasParsedSqlAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
-    const generated_read_ast = try generatedReadAstOrUnsupported(
-        parsed_sql,
-        if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .lateral),
-    );
+    const generated_read_ast = if (cte_adapter_shape)
+        try generatedCteReadAstForParsedSql(parsed_sql)
+    else
+        try generatedReadAstForParsedSql(parsed_sql, .lateral);
 
     var parser = Parser{
         .alloc = alloc,
@@ -1010,3 +1127,37 @@ pub fn lowerLateralPlanWithSchemasParsedSqlAlloc(
 }
 
 const Parser = sql_adapter.ParserState;
+
+test "recursive cte lowerer validates retained generated ast before token fallback" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+            .{ .name = "customer_id", .path = "customer_id", .field_type = .keyword },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.customer_id = parent.id) SELECT id FROM source_rows",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    var lowered = try lowerRecursiveCtePlanParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.cte_recursive = false,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerRecursiveCtePlanParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
+    );
+}

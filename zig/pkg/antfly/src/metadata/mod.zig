@@ -13,10 +13,12 @@
 // limitations.
 
 pub const storage = @import("storage/mod.zig");
-pub const catalog_lookup = @import("catalog_lookup.zig");
-pub const catalog_source = @import("catalog_source.zig");
+pub const catalog = @import("catalog/mod.zig");
+pub const catalog_lookup = catalog.lookup;
+pub const catalog_source = catalog.source;
 
 test {
+    _ = catalog;
     _ = catalog_lookup;
     _ = catalog_source;
 }
@@ -46,10 +48,10 @@ pub const AppliedMetadataBatch = storage.AppliedMetadataBatch;
 pub const TransitionCommand = storage.TransitionCommand;
 pub const encodeTransitionCommand = storage.encodeTransitionCommand;
 pub const decodeTransitionCommand = storage.decodeTransitionCommand;
-pub const AdminSnapshot = api.AdminSnapshot;
-pub const MetadataStatus = api.MetadataStatus;
-pub const captureAdminSnapshot = api.captureSnapshot;
-pub const freeAdminSnapshot = api.freeSnapshot;
+pub const AdminSnapshot = catalog.snapshot.AdminSnapshot;
+pub const MetadataStatus = catalog.snapshot.MetadataStatus;
+pub const captureAdminSnapshot = catalog.snapshot.captureSnapshot;
+pub const freeAdminSnapshot = catalog.snapshot.freeSnapshot;
 pub const ActiveTransitionCounts = admin.ActiveTransitionCounts;
 pub const ActiveTransitions = admin.ActiveTransitions;
 pub const findAdminTable = admin.findTable;
@@ -67,6 +69,10 @@ pub const MetadataState = state.MetadataState;
 pub const DatabaseRecord = table_manager.DatabaseRecord;
 pub const NamespaceRecord = table_manager.NamespaceRecord;
 pub const TablespaceRecord = table_manager.TablespaceRecord;
+pub const SequenceRecord = table_manager.SequenceRecord;
+pub const SequenceCompareAndSwapRequest = table_manager.SequenceCompareAndSwapRequest;
+pub const deriveSequenceId = table_manager.deriveSequenceId;
+pub const sequenceInitialLastValueFromOptionsJson = table_manager.sequenceInitialLastValueFromOptionsJson;
 pub const TableRecord = table_manager.TableRecord;
 pub const PlacementClass = table_manager.PlacementClass;
 pub const RangeRecord = table_manager.RangeRecord;

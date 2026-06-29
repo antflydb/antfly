@@ -377,9 +377,7 @@ fn parseLegacyDdlParserPlanAlloc(
     if (cursor.matchKeyword("create")) {
         if (cursor.matchKeyword("or")) {
             try cursor.expectKeyword("replace");
-            if (cursor.peekKeyword("trigger")) {
-                return .{ .create_update_policy = try parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) };
-            }
+            if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLegacyDdlPlanTailAlloc(alloc, tokens, pos, true);
             if (cursor.peekKeyword("materialized")) {
                 return .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, true) } };
             }
@@ -406,9 +404,7 @@ fn parseLegacyDdlParserPlanAlloc(
             return .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tokens, pos) };
         }
         if (unique) return error.UnsupportedSqlShape;
-        if (cursor.peekKeyword("trigger")) {
-            return .{ .create_update_policy = try parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) };
-        }
+        if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLegacyDdlPlanTailAlloc(alloc, tokens, pos, false);
         if (cursor.peekKeyword("materialized")) {
             return .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, false) } };
         }
@@ -540,7 +536,7 @@ fn parseLegacyDdlParserPlanAlloc(
         if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .authorization_catalog = .{ .drop_role = try parseDropRolePlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("policy")) return .{ .row_security_catalog = .{ .drop_policy = try parseDropRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("table")) return .{ .drop_table = try parseDropTablePlanTailAlloc(alloc, tokens, pos) };
-        if (cursor.peekKeyword("trigger")) return .{ .alter_table = try parseDropUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) };
+        if (cursor.peekKeyword("trigger")) return try parseDropTriggerLegacyDdlPlanTailAlloc(alloc, tokens, pos);
         return .{ .drop_index = try parseDropIndexPlanTailAlloc(alloc, tokens, pos) };
     }
     if (cursor.matchKeyword("refresh")) {
@@ -734,7 +730,7 @@ pub fn parseLogicalDdlPlanTokensAlloc(
     if (cursor.matchKeyword("create")) {
         if (cursor.matchKeyword("or")) {
             try cursor.expectKeyword("replace");
-            if (cursor.peekKeyword("trigger")) return .{ .table_ddl = .{ .create_update_policy = try parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) } };
+            if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos, true);
             if (cursor.peekKeyword("materialized")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, true) } } };
             if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .create = try parseCreateViewPlanTailAlloc(alloc, tokens, pos, true) } } };
             if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) return .{ .routine = .{ .function_catalog = .{ .create = try parseCreateRoutinePlanTailAlloc(alloc, tokens, pos, true) } } };
@@ -753,7 +749,7 @@ pub fn parseLogicalDdlPlanTokensAlloc(
             return .{ .table_ddl = .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tokens, pos) } };
         }
         if (unique) return error.UnsupportedSqlShape;
-        if (cursor.peekKeyword("trigger")) return .{ .table_ddl = .{ .create_update_policy = try parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) } };
+        if (cursor.peekKeyword("trigger")) return try parseCreateTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos, false);
         if (cursor.peekKeyword("materialized")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .create = try parseCreateMaterializedViewPlanTailAlloc(alloc, tokens, pos, false) } } };
         if (cursor.peekKeyword("view")) return .{ .table_ddl = .{ .view_catalog = .{ .create = try parseCreateViewPlanTailAlloc(alloc, tokens, pos, false) } } };
         if (cursor.peekKeyword("domain")) return .{ .catalog_ddl = .{ .domain_catalog = .{ .create = try parseCreateDomainPlanAlloc(alloc, tokens, pos, options.domain_options) } } };
@@ -871,7 +867,7 @@ pub fn parseLogicalDdlPlanTokensAlloc(
         if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .auth = .{ .authorization_catalog = .{ .drop_role = try parseDropRolePlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("policy")) return .{ .auth = .{ .row_security_catalog = .{ .drop_policy = try parseDropRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("table")) return .{ .table_ddl = .{ .drop_table = try parseDropTablePlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("trigger")) return .{ .table_ddl = .{ .alter_table = try parseDropUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) } };
+        if (cursor.peekKeyword("trigger")) return try parseDropTriggerLogicalDdlPlanTailAlloc(alloc, tokens, pos);
         return .{ .table_ddl = .{ .drop_index = try parseDropIndexPlanTailAlloc(alloc, tokens, pos) } };
     }
     if (cursor.matchKeyword("refresh")) return .{ .table_ddl = .{ .materialized_view_catalog = .{ .refresh = try parseRefreshMaterializedViewPlanTailAlloc(alloc, tokens, pos) } } };
@@ -3372,12 +3368,7 @@ fn generatedDeallocateStatementNameRange(
 ) !generated_parser.GeneratedSqlTokenRange {
     const range = maybe_range orelse return error.UnsupportedSqlShape;
     if (range.end != end or range.end > tokens.len) return error.UnsupportedSqlShape;
-    if (range.start == 1) {
-        if (range.start + 1 == range.end) return range;
-        if (range.start + 2 == range.end and tokens[range.start].matchesKeywordTag(.prepare)) {
-            return .{ .start = range.start + 1, .end = range.end };
-        }
-    }
+    if (range.start == 1 and range.start + 1 == range.end) return range;
     if (range.start == 2 and range.start + 1 == range.end and tokens.len > 1 and tokens[1].matchesKeywordTag(.prepare)) {
         return range;
     }
@@ -3613,13 +3604,17 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlSessionAst,
 ) !SessionCatalogPlan {
+    const end = try validateGeneratedSessionAstRanges(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    return switch (ast.kind) {
+    var plan: SessionCatalogPlan = switch (ast.kind) {
         .set => try setSessionCatalogPlanFromGeneratedTailAlloc(alloc, tail),
         .reset => try resetSessionCatalogPlanFromGeneratedTailAlloc(alloc, tail),
         .show => try showSessionCatalogPlanFromGeneratedTail(tail),
         .discard_all => try discardSessionCatalogPlanFromGeneratedTail(tail),
     };
+    errdefer plan.deinit(alloc);
+    try validateGeneratedSessionCatalogPlanMatchesAst(tokens, end, ast, plan);
+    return plan;
 }
 
 fn sessionLogicalPlanFromGeneratedAstAlloc(
@@ -3784,40 +3779,28 @@ pub fn sessionDdlPlanFromGeneratedAstAlloc(
     return switch (ast.kind) {
         .set => blk: {
             if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
-            if (tail.len > 0 and tail[0].matchesKeyword("session")) {
-                const checkpoint = pos;
-                if (parseSetSessionCharacteristicsPlanTailAlloc(alloc, tail, &pos)) |plan| {
-                    break :blk .{ .session_catalog = .{ .set_setting = plan } };
-                } else |err| switch (err) {
-                    error.UnsupportedSqlShape => pos = checkpoint,
-                    else => return err,
-                }
-            }
-            pos = 0;
-            if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
-                break :blk .{ .session_catalog = .{ .set_search_path = plan } };
+            if (sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast)) |plan| {
+                break :blk .{ .session_catalog = plan };
             } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos = 0,
+                error.UnsupportedSqlShape => {
+                    if (generatedSessionCommandIsCatalogOwned(tokens, ast)) return err;
+                    pos = 0;
+                },
                 else => return err,
             }
             if (grammar.parseAdapterNoopSetStatementTail(tail, &pos)) {
                 break :blk .{ .adapter_noop = .{ .reason = .session_setting } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos = 0,
-            }
-            if (grammar.parseSetSessionSettingTailAlloc(alloc, tail, &pos)) |plan| {
-                break :blk .{ .session_catalog = .{ .set_setting = plan } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => return err,
-                else => return err,
-            }
+            } else |err| return err;
         },
         .reset => blk: {
             if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.reset)) return error.UnsupportedSqlShape;
             if (sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast)) |plan| {
                 break :blk .{ .session_catalog = plan };
             } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos = 0,
+                error.UnsupportedSqlShape => {
+                    if (generatedSessionCommandIsCatalogOwned(tokens, ast)) return err;
+                    pos = 0;
+                },
                 else => return err,
             }
             try grammar.parseAdapterNoopResetStatementTail(tail, &pos);
@@ -3828,7 +3811,10 @@ pub fn sessionDdlPlanFromGeneratedAstAlloc(
             if (sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast)) |plan| {
                 break :blk .{ .session_catalog = plan };
             } else |err| switch (err) {
-                error.UnsupportedSqlShape => pos = 0,
+                error.UnsupportedSqlShape => {
+                    if (generatedSessionCommandIsCatalogOwned(tokens, ast)) return err;
+                    pos = 0;
+                },
                 else => return err,
             }
             try grammar.parseAdapterNoopShowStatementTail(tail, &pos);
@@ -3839,6 +3825,49 @@ pub fn sessionDdlPlanFromGeneratedAstAlloc(
             break :blk .{ .session_catalog = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast) };
         },
     };
+}
+
+fn generatedSessionCommandIsCatalogOwned(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) bool {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    if (end <= 1) return ast.kind == .discard_all;
+    return switch (ast.kind) {
+        .set => generatedSetSessionTailIsCatalogOwned(tokens, end),
+        .reset, .show => generatedNamedSessionTailIsCatalogOwned(tokens, 1, end) or
+            (ast.kind == .reset and tokens[1].matchesKeyword("all") and end == 2),
+        .discard_all => true,
+    };
+}
+
+fn generatedSetSessionTailIsCatalogOwned(tokens: []const grammar.Token, end: usize) bool {
+    var index: usize = 1;
+    if (index < end and tokens[index].matchesKeyword("local")) index += 1;
+    if (index < end and tokens[index].matchesKeyword("session")) {
+        if (index + 1 < end and tokens[index + 1].matchesKeyword("characteristics")) return true;
+        index += 1;
+    }
+    return generatedNamedSessionTailIsCatalogOwned(tokens, index, end);
+}
+
+fn generatedNamedSessionTailIsCatalogOwned(tokens: []const grammar.Token, name_index: usize, end: usize) bool {
+    if (name_index >= end or tokens[name_index].kind != .identifier) return false;
+    const name = tokens[name_index].text;
+    return std.ascii.eqlIgnoreCase(name, "search_path") or generatedSessionSettingKindForName(name) != null;
+}
+
+fn generatedSessionSettingKindForName(setting: []const u8) ?SessionSettingKind {
+    if (std.mem.startsWith(u8, setting, "app.") and setting.len > "app.".len) return .app;
+    if (std.ascii.eqlIgnoreCase(setting, "antfly.sync_level")) return .antfly;
+    if (std.ascii.eqlIgnoreCase(setting, "statement_timeout") or
+        std.ascii.eqlIgnoreCase(setting, "timezone") or
+        std.ascii.eqlIgnoreCase(setting, "default_transaction_read_only") or
+        std.ascii.eqlIgnoreCase(setting, "transaction_read_only"))
+    {
+        return .runtime;
+    }
+    return null;
 }
 
 fn validateGeneratedSessionAstRanges(
@@ -3888,6 +3917,84 @@ fn validateGeneratedRequiredSessionRange(
     if (range.start == range.end) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedSessionCatalogPlanMatchesAst(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlSessionAst,
+    plan: SessionCatalogPlan,
+) !void {
+    switch (plan) {
+        .set_search_path => try validateGeneratedSetSessionNameAndValue(tokens, end, ast, "search_path", null),
+        .set_setting => |set_setting| {
+            if (std.ascii.eqlIgnoreCase(set_setting.name, "default_transaction_read_only")) {
+                return try validateGeneratedSetSessionCharacteristicsAst(tokens, end, ast);
+            }
+            try validateGeneratedSetSessionNameAndValue(tokens, end, ast, set_setting.name, set_setting.value);
+        },
+        .reset_setting => |reset_setting| try validateGeneratedSingleNameSessionAst(tokens, end, ast, .reset, reset_setting.name),
+        .reset_search_path => try validateGeneratedSingleNameSessionAst(tokens, end, ast, .reset, "search_path"),
+        .show_search_path => try validateGeneratedSingleNameSessionAst(tokens, end, ast, .show, "search_path"),
+        .discard_all => switch (ast.kind) {
+            .reset => try validateGeneratedSingleNameSessionAst(tokens, end, ast, .reset, "all"),
+            .discard_all => {
+                if (end != 2 or !tokens[0].matchesKeywordTag(.discard) or !tokens[1].matchesKeyword("all")) return error.UnsupportedSqlShape;
+                if (ast.name_tokens != null or ast.value_tokens != null) return error.UnsupportedSqlShape;
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+    }
+}
+
+fn validateGeneratedSetSessionNameAndValue(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlSessionAst,
+    expected_name: []const u8,
+    expected_single_value: ?[]const u8,
+) !void {
+    if (ast.kind != .set or end == 0 or !tokens[0].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+    const name = ast.name_tokens orelse return error.UnsupportedSqlShape;
+    const value = ast.value_tokens orelse return error.UnsupportedSqlShape;
+    if (value.start < name.end or value.start >= value.end or value.end != end) return error.UnsupportedSqlShape;
+    if (name.start < 1 or name.end <= name.start or name.end > value.start) return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(tokens[name.end - 1].text, expected_name)) return error.UnsupportedSqlShape;
+    if (expected_single_value) |expected_value| {
+        if (value.end != value.start + 1) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, tokens[value.start].text, expected_value)) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedSetSessionCharacteristicsAst(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) !void {
+    if (ast.kind != .set or end < 5 or ast.value_tokens != null) return error.UnsupportedSqlShape;
+    const name = ast.name_tokens orelse return error.UnsupportedSqlShape;
+    if (name.start != 1 or name.end != end - 1) return error.UnsupportedSqlShape;
+    if (!tokens[0].matchesKeywordTag(.set) or
+        !tokens[1].matchesKeyword("session") or
+        !tokens[2].matchesKeyword("characteristics") or
+        !tokens[3].matchesKeywordTag(.as))
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedSingleNameSessionAst(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlSessionAst,
+    expected_kind: generated_parser.GeneratedSqlSessionKind,
+    expected_name: []const u8,
+) !void {
+    if (ast.kind != expected_kind) return error.UnsupportedSqlShape;
+    if (end == 0 or ast.value_tokens != null) return error.UnsupportedSqlShape;
+    const name = ast.name_tokens orelse return error.UnsupportedSqlShape;
+    if (name.start != 1 or name.end != end or name.start >= name.end) return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(tokens[name.end - 1].text, expected_name)) return error.UnsupportedSqlShape;
+}
+
 pub fn simpleDdlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -3919,15 +4026,14 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     var pos: usize = 0;
     return switch (ast.kind) {
         .create_table => blk: {
-            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
-                if (identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options)) |identity| {
-                    break :blk .{ .identity_allocator_catalog = identity };
-                } else |err| switch (err) {
-                    error.UnsupportedSqlShape => pos = 0,
-                    else => return err,
-                }
+            if (generatedCreateTableUsesRelationLifetime(tokens, ast)) {
+                var lifetime_pos: usize = 1;
+                break :blk .{ .relation_lifetime = try parseGeneratedRelationLifetimePlanAlloc(alloc, tokens, &lifetime_pos, ast.statement_span, options.column_definition_options) };
             }
-            break :blk .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) };
+            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
+                break :blk .{ .identity_allocator_catalog = try identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options) };
+            }
+            break :blk .{ .create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, tail, &pos, options.column_definition_options) };
         },
         .create_view,
         .alter_view,
@@ -4005,15 +4111,14 @@ pub fn logicalDdlPlanFromGeneratedAstAlloc(
     var pos: usize = 0;
     return switch (ast.kind) {
         .create_table => blk: {
-            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
-                if (identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options)) |identity| {
-                    break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = identity } };
-                } else |err| switch (err) {
-                    error.UnsupportedSqlShape => pos = 0,
-                    else => return err,
-                }
+            if (generatedCreateTableUsesRelationLifetime(tokens, ast)) {
+                var lifetime_pos: usize = 1;
+                break :blk .{ .table_ddl = .{ .relation_lifetime = try parseGeneratedRelationLifetimePlanAlloc(alloc, tokens, &lifetime_pos, ast.statement_span, options.column_definition_options) } };
             }
-            break :blk .{ .table_ddl = .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) } };
+            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
+                break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = try identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options) } };
+            }
+            break :blk .{ .table_ddl = .{ .create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, tail, &pos, options.column_definition_options) } };
         },
         .create_view,
         .alter_view,
@@ -4521,10 +4626,36 @@ fn generatedCreateTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: g
     return generatedStatementEnd(tokens, ast.statement_span) != null;
 }
 
+fn generatedCreateTableUsesRelationLifetime(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    if (ast.kind != .create_table) return false;
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    return end > 2 and
+        (tokens[1].matchesKeyword("temporary") or
+            tokens[1].matchesKeyword("temp") or
+            tokens[1].matchesKeyword("unlogged"));
+}
+
 fn generatedCreateTableMayUseIdentityAllocator(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
-    return generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "serial") or
-        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "bigserial");
+    if (end < 6 or !tokens[0].matchesKeywordTag(.create) or !tokens[1].matchesKeywordTag(.table)) return false;
+    var open_index: usize = 3;
+    if (tokens[2].matchesKeywordTag(.@"if")) {
+        if (end < 9 or !tokens[3].matchesKeywordTag(.not) or !tokens[4].matchesKeywordTag(.exists)) return false;
+        open_index = 6;
+    }
+    if (open_index >= end or tokens[open_index].kind != .lparen) {
+        while (open_index < end and tokens[open_index].kind != .lparen) : (open_index += 1) {}
+        if (open_index >= end) return false;
+    }
+    if (open_index + 2 >= end) return false;
+    const type_token = tokens[open_index + 2];
+    return generatedTokenIsUnquotedIdentifierText(type_token, "serial") or
+        generatedTokenIsUnquotedIdentifierText(type_token, "bigserial");
+}
+
+fn generatedTokenIsUnquotedIdentifierText(token: grammar.Token, text: []const u8) bool {
+    if (token.kind != .identifier or !std.ascii.eqlIgnoreCase(token.text, text)) return false;
+    return token.source_end >= token.source_start and token.source_end - token.source_start == token.text.len;
 }
 
 fn viewCatalogPlanFromGeneratedDdlAstAlloc(
@@ -5289,13 +5420,48 @@ fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const gramma
         return generatedAlterTableAddConstraintKindUsesRuntimeBoundary(tokens[constraint_kind_index]);
     }
     if (first.matchesKeywordTag(.drop)) {
-        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
+        return start + 1 < end and
+            (tokens[start + 1].matchesKeywordTag(.column) or
+                tokens[start + 1].matchesKeywordTag(.constraint));
     }
     if (first.matchesKeywordTag(.rename)) {
-        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
+        return start + 1 < end and
+            (tokens[start + 1].matchesKeywordTag(.column) or
+                tokens[start + 1].matchesKeywordTag(.constraint));
+    }
+    if (first.matchesKeywordTag(.alter)) {
+        return generatedAlterTableAlterColumnSegmentUsesRuntimeBoundary(tokens, start, end);
     }
     if (first.matchesKeywordTag(.validate)) {
         return start + 1 < end and tokens[start + 1].matchesKeywordTag(.constraint);
+    }
+    return false;
+}
+
+fn generatedAlterTableAlterColumnSegmentUsesRuntimeBoundary(tokens: []const grammar.Token, start: usize, end: usize) bool {
+    if (start + 2 >= end) return false;
+    var action_index = start + 1;
+    if (tokens[action_index].matchesKeywordTag(.column)) action_index += 1;
+    if (action_index + 1 >= end) return false;
+    action_index += 1;
+
+    if (tokens[action_index].matchesKeywordTag(.type)) return true;
+    if (tokens[action_index].matchesKeywordTag(.drop)) {
+        return action_index + 1 < end and
+            (tokens[action_index + 1].matchesKeywordTag(.default) or
+                (action_index + 2 < end and
+                    tokens[action_index + 1].matchesKeywordTag(.not) and
+                    tokens[action_index + 2].matchesKeywordTag(.null)));
+    }
+    if (tokens[action_index].matchesKeywordTag(.set)) {
+        return action_index + 1 < end and
+            (tokens[action_index + 1].matchesKeywordTag(.default) or
+                (action_index + 2 < end and
+                    tokens[action_index + 1].matchesKeywordTag(.not) and
+                    tokens[action_index + 2].matchesKeywordTag(.null)) or
+                (action_index + 2 < end and
+                    tokens[action_index + 1].matchesKeywordTag(.data) and
+                    tokens[action_index + 2].matchesKeywordTag(.type)));
     }
     return false;
 }
@@ -5360,13 +5526,8 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     ast: generated_parser.GeneratedSqlGraphAst,
 ) !LegacyDdlParserPlan {
     try validateGeneratedGraphAstSpans(tokens, ast);
-    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    var pos: usize = 0;
     var plan: LegacyDdlParserPlan = switch (ast.kind) {
-        .create_index => .{ .create_index = if (ast.edge_tokens != null or ast.extraction_enrichment_tokens != null)
-            try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
-        else
-            try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
+        .create_index => .{ .create_index = try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .create_metric => .{ .create_index = try createGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .alter_metric => .{ .create_index = try alterGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
@@ -5381,13 +5542,8 @@ pub fn graphLogicalDdlPlanFromGeneratedAstAlloc(
     ast: generated_parser.GeneratedSqlGraphAst,
 ) !binder.LogicalSqlPlan {
     try validateGeneratedGraphAstSpans(tokens, ast);
-    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    var pos: usize = 0;
     var create_index: CreateIndexPlan = switch (ast.kind) {
-        .create_index => if (ast.edge_tokens != null or ast.extraction_enrichment_tokens != null)
-            try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast)
-        else
-            try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos),
+        .create_index => try createGraphIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast),
         .create_metric => try createGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast),
         .alter_metric => try alterGraphMetricPlanFromGeneratedAstAlloc(alloc, tokens, ast),
     };
@@ -6506,6 +6662,27 @@ fn alterTablePlanFromGeneratedAstAlloc(
     var plan = try parseAlterTablePlanAlloc(alloc, alter_tokens, &state.pos, local_options);
     errdefer plan.deinit(alloc);
     if (plan.if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+    if (state.pos != alter_tokens.len) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn advisoryLockPlanFromGeneratedReadAst(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlReadAst,
+) !?AdvisoryLockPlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 2 or !tokens[0].matchesKeywordTag(.select)) return null;
+    if (!tokens[1].matchesKeyword("pg_advisory_lock") and !tokens[1].matchesKeyword("pg_advisory_unlock")) return null;
+    if (ast.kind != .query) return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) return error.UnsupportedSqlShape;
+    if (ast.cte_tokens != null or ast.source_tokens != null or ast.where_tokens != null or ast.group_tokens != null or ast.having_tokens != null or ast.window_tokens != null or ast.order_tokens != null or ast.limit_tokens != null or ast.offset_tokens != null or ast.fetch_tokens != null or ast.set_operation_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+    const projection = ast.projection_tokens orelse return error.UnsupportedSqlShape;
+    if (projection.start != 1 or projection.end != end) return error.UnsupportedSqlShape;
+    var pos: usize = 1;
+    const plan = try parseAdvisoryLockPlanTail(tokens, &pos);
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -11673,6 +11850,33 @@ pub fn parseCreateTablePlanAlloc(
     return plan;
 }
 
+fn parseGeneratedCreateTableTailPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !CreateTablePlan {
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .pos = pos.*,
+        .schema = hooks.schema,
+        .params = hooks.params,
+        .function_bindings = hooks.function_bindings,
+        .field_expression_qualifiers = hooks.field_expression_qualifiers,
+        .returning_expression_qualifiers = hooks.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
+    };
+    var local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
+    local_hooks.parse_rewrite_expression = hooks.parse_rewrite_expression;
+
+    var plan = try parseCreateTablePlanAlloc(alloc, tokens, &state.pos, local_hooks);
+    errdefer plan.deinit(alloc);
+    pos.* = state.pos;
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    return plan;
+}
+
 pub fn parseRelationLifetimePlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -11683,6 +11887,35 @@ pub fn parseRelationLifetimePlanAlloc(
     var create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, hooks);
     errdefer create_table.deinit(alloc);
     return .{ .kind = prefix.kind, .create_table = create_table };
+}
+
+fn parseGeneratedRelationLifetimePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    statement_span: token_mod.SourceSpan,
+    hooks: DdlColumnDefinitionOptions,
+) !RelationLifetimePlan {
+    const end = generatedStatementEnd(tokens, statement_span) orelse return error.UnsupportedSqlShape;
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .pos = pos.*,
+        .schema = hooks.schema,
+        .params = hooks.params,
+        .function_bindings = hooks.function_bindings,
+        .field_expression_qualifiers = hooks.field_expression_qualifiers,
+        .returning_expression_qualifiers = hooks.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
+    };
+    var local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
+    local_hooks.parse_rewrite_expression = hooks.parse_rewrite_expression;
+
+    var plan = try parseRelationLifetimePlanAlloc(alloc, tokens, &state.pos, local_hooks);
+    errdefer plan.deinit(alloc);
+    pos.* = state.pos;
+    if (!generatedStatementConsumedThrough(tokens, end, pos.*)) return error.UnsupportedSqlShape;
+    return plan;
 }
 
 pub fn makeDdlForeignKeyAlloc(
@@ -12149,7 +12382,7 @@ fn validateGeneratedUnsupportedCatalogAst(
         return error.UnsupportedSqlShape;
     }
     const subject_tokens = ast.subject_tokens orelse return error.UnsupportedSqlShape;
-    if (!std.meta.eql(subject_tokens, generatedUnsupportedCatalogSubjectRange(boundary, end) orelse return error.UnsupportedSqlShape)) {
+    if (!std.meta.eql(subject_tokens, generatedUnsupportedCatalogSubjectRange(tokens, boundary, end) orelse return error.UnsupportedSqlShape)) {
         return error.UnsupportedSqlShape;
     }
     switch (boundary.family) {
@@ -12274,6 +12507,14 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .update_policy_trigger => switch (boundary.kind) {
             .create_trigger => {
+                if (end >= 4 and
+                    tokens[0].matchesKeyword("create") and
+                    tokens[1].matchesKeyword("or") and
+                    tokens[2].matchesKeyword("replace") and
+                    tokens[3].matchesKeyword("trigger"))
+                {
+                    return;
+                }
                 if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("trigger")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -12289,14 +12530,20 @@ fn validateGeneratedUnsupportedCatalogAst(
 }
 
 fn generatedUnsupportedCatalogSubjectRange(
+    tokens: []const grammar.Token,
     boundary: GeneratedUnsupportedCatalogBoundary,
     end: usize,
 ) ?generated_parser.GeneratedSqlTokenRange {
     const start: usize = switch (boundary.family) {
         .update_policy_trigger => switch (boundary.kind) {
-            .create_trigger,
-            .drop_trigger,
-            => 2,
+            .create_trigger => if (end > 3 and
+                tokens[1].matchesKeyword("or") and
+                tokens[2].matchesKeyword("replace") and
+                tokens[3].matchesKeyword("trigger"))
+                4
+            else
+                2,
+            .drop_trigger => 2,
             else => return null,
         },
         else => 1,
@@ -12493,6 +12740,10 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
         .update_policy_trigger => switch (boundary.kind) {
             .create_trigger => switch (plan) {
                 .create_update_policy => {},
+                .trigger_catalog => |trigger| switch (trigger) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
                 else => return error.UnsupportedSqlShape,
             },
             .drop_trigger => switch (plan) {
@@ -12502,6 +12753,10 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
                         .drop_update_policy => {},
                         else => return error.UnsupportedSqlShape,
                     }
+                },
+                .trigger_catalog => |trigger| switch (trigger) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
                 },
                 else => return error.UnsupportedSqlShape,
             },
@@ -12619,7 +12874,20 @@ fn validateGeneratedUnsupportedLogicalPlan(
             else => return error.UnsupportedSqlShape,
         },
         .update_policy_trigger => switch (boundary.kind) {
-            .create_trigger => try validateGeneratedLogicalPlanExpectation(plan, .{ .table = .create_update_policy }),
+            .create_trigger => switch (plan) {
+                .table_ddl => |table| switch (table) {
+                    .create_update_policy => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                .routine => |routine| switch (routine) {
+                    .trigger_catalog => |trigger| switch (trigger) {
+                        .create => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
             .drop_trigger => switch (plan) {
                 .table_ddl => |table| switch (table) {
                     .alter_table => |alter| {
@@ -12628,6 +12896,13 @@ fn validateGeneratedUnsupportedLogicalPlan(
                             .drop_update_policy => {},
                             else => return error.UnsupportedSqlShape,
                         }
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                .routine => |routine| switch (routine) {
+                    .trigger_catalog => |trigger| switch (trigger) {
+                        .drop => {},
+                        else => return error.UnsupportedSqlShape,
                     },
                     else => return error.UnsupportedSqlShape,
                 },
@@ -12748,16 +13023,7 @@ pub fn parseLogicalDdlPlanAlloc(
     };
     if (parsed_sql.generated_statement) |generated_statement| {
         const generated_ast = try generatedAstOrUnsupported(generated_statement);
-        if (planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
-            error.UnsupportedSqlShape => blk: {
-                if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
-                state.pos = 0;
-                break :blk null;
-            },
-            else => return err,
-        }) |logical_plan| {
-            return logical_plan;
-        }
+        return try planGeneratedLogicalDdlAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options);
     }
     return try parseLogicalDdlPlanTokensAlloc(alloc, tokens, &state.pos, options);
 }
@@ -12774,7 +13040,7 @@ pub fn planGeneratedLogicalDdlAstAlloc(
     generated_statement: tokenized.GeneratedRawSqlStatement,
     generated_ast: generated_parser.GeneratedSqlAst,
     options: DdlPlanParserOptions,
-) !?binder.LogicalSqlPlan {
+) !binder.LogicalSqlPlan {
     switch (generated_ast) {
         .session => |session_ast| return try sessionLogicalPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
         .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, prepared_ast) },
@@ -12805,9 +13071,15 @@ pub fn planGeneratedLogicalDdlAstAlloc(
                 };
             }
         },
-        .dml, .read => {},
+        .read => |read_ast| {
+            if (try advisoryLockPlanFromGeneratedReadAst(tokens, read_ast)) |advisory_lock| {
+                return .{ .transaction = .{ .control = .{ .advisory_lock = advisory_lock } } };
+            }
+            return error.UnsupportedSqlShape;
+        },
+        .dml => return error.UnsupportedSqlShape,
     }
-    return null;
+    return error.UnsupportedSqlShape;
 }
 
 const RoutineTriggerParser = struct {
@@ -12962,6 +13234,93 @@ const RoutineTriggerParser = struct {
     }
 };
 
+fn parseCreateRoutineTriggerCatalogPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !TriggerCatalogPlan {
+    var routine_trigger_parser = RoutineTriggerParser{ .alloc = alloc, .tokens = tokens, .pos = pos.* };
+    if (!routine_trigger_parser.matchKeywordTag(.trigger)) return error.UnsupportedSqlShape;
+    const create = try routine_trigger_parser.parseCreateTriggerTail(replace_existing);
+    pos.* = routine_trigger_parser.pos;
+    return .{ .create = create };
+}
+
+fn parseDropRoutineTriggerCatalogPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !TriggerCatalogPlan {
+    var routine_trigger_parser = RoutineTriggerParser{ .alloc = alloc, .tokens = tokens, .pos = pos.* };
+    if (!routine_trigger_parser.matchKeywordTag(.trigger)) return error.UnsupportedSqlShape;
+    const drop = try routine_trigger_parser.parseDropTriggerTail();
+    pos.* = routine_trigger_parser.pos;
+    return .{ .drop = drop };
+}
+
+fn parseCreateTriggerLegacyDdlPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !LegacyDdlParserPlan {
+    const checkpoint = pos.*;
+    if (parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos)) |plan| {
+        return .{ .create_update_policy = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = checkpoint,
+        else => return err,
+    }
+    return .{ .trigger_catalog = try parseCreateRoutineTriggerCatalogPlanTailAlloc(alloc, tokens, pos, replace_existing) };
+}
+
+fn parseDropTriggerLegacyDdlPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !LegacyDdlParserPlan {
+    const checkpoint = pos.*;
+    if (parseDropUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos)) |plan| {
+        return .{ .alter_table = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = checkpoint,
+        else => return err,
+    }
+    return .{ .trigger_catalog = try parseDropRoutineTriggerCatalogPlanTailAlloc(alloc, tokens, pos) };
+}
+
+fn parseCreateTriggerLogicalDdlPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !binder.LogicalSqlPlan {
+    const checkpoint = pos.*;
+    if (parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos)) |plan| {
+        return .{ .table_ddl = .{ .create_update_policy = plan } };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = checkpoint,
+        else => return err,
+    }
+    return .{ .routine = .{ .trigger_catalog = try parseCreateRoutineTriggerCatalogPlanTailAlloc(alloc, tokens, pos, replace_existing) } };
+}
+
+fn parseDropTriggerLogicalDdlPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !binder.LogicalSqlPlan {
+    const checkpoint = pos.*;
+    if (parseDropUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos)) |plan| {
+        return .{ .table_ddl = .{ .alter_table = plan } };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = checkpoint,
+        else => return err,
+    }
+    return .{ .routine = .{ .trigger_catalog = try parseDropRoutineTriggerCatalogPlanTailAlloc(alloc, tokens, pos) } };
+}
+
 pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -12997,30 +13356,9 @@ fn legacyDdlParserPlanParsedSqlWithFunctionBindingsAlloc(
     };
     if (parsed_sql.generated_statement) |generated_statement| {
         const generated_ast = try generatedAstOrUnsupported(generated_statement);
-        if (legacyDdlParserPlanFromGeneratedAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options) catch |err| switch (err) {
-            error.UnsupportedSqlShape => blk: {
-                if (!generatedAstAllowsLegacyDdlFallback(generated_ast)) return err;
-                state.pos = 0;
-                break :blk null;
-            },
-            else => return err,
-        }) |plan| {
-            return plan;
-        }
+        return try legacyDdlParserPlanFromGeneratedAstAlloc(alloc, parsed_sql, tokens, &state, generated_statement, generated_ast, options);
     }
     return try parseLegacyDdlParserPlanAlloc(alloc, tokens, &state.pos, options);
-}
-
-fn generatedAstAllowsLegacyDdlFallback(generated_ast: generated_parser.GeneratedSqlAst) bool {
-    return switch (generated_ast) {
-        .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
-            .create_table,
-            .alter_table,
-            => true,
-            else => false,
-        },
-        else => false,
-    };
 }
 
 fn legacyDdlParserPlanFromGeneratedAstAlloc(
@@ -13031,7 +13369,7 @@ fn legacyDdlParserPlanFromGeneratedAstAlloc(
     generated_statement: tokenized.GeneratedRawSqlStatement,
     generated_ast: generated_parser.GeneratedSqlAst,
     options: DdlPlanParserOptions,
-) !?LegacyDdlParserPlan {
+) !LegacyDdlParserPlan {
     switch (generated_ast) {
         .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
         .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed_sql, prepared_ast) },
@@ -13052,9 +13390,15 @@ fn legacyDdlParserPlanFromGeneratedAstAlloc(
                 };
             }
         },
-        .dml, .read => {},
+        .read => |read_ast| {
+            if (try advisoryLockPlanFromGeneratedReadAst(tokens, read_ast)) |advisory_lock| {
+                return .{ .transaction_control = .{ .advisory_lock = advisory_lock } };
+            }
+            return error.UnsupportedSqlShape;
+        },
+        .dml => return error.UnsupportedSqlShape,
     }
-    return null;
+    return error.UnsupportedSqlShape;
 }
 
 const legacyDdlParserPlanForTestAlloc = legacyDdlParserPlanAlloc;
@@ -15197,14 +15541,16 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
     );
     defer drop_trigger.deinit(alloc);
     switch (drop_trigger) {
-        .trigger_catalog => |plan| switch (plan) {
-            .drop => |drop| {
-                try std.testing.expectEqualStrings("update_timestamp", drop.trigger_name);
-                try std.testing.expectEqualStrings("public.usage_records", drop.table_name);
-                try std.testing.expect(drop.if_exists);
-                try std.testing.expect(!drop.cascade);
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .drop_update_policy => |drop| {
+                    try std.testing.expectEqualStrings("update_timestamp", drop.trigger_name);
+                    try std.testing.expect(drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         .create_table => return error.TestUnexpectedResult,
         .create_index => return error.TestUnexpectedResult,
@@ -17149,6 +17495,43 @@ test "sql adapter generated session AST lowers to session catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    var parsed_stale_generated_setting = try tokenized.ParsedSql.initAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer parsed_stale_generated_setting.deinit(alloc);
+    var stale_generated_setting_ast = switch ((parsed_stale_generated_setting.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .session => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_generated_setting_ast.name_tokens = stale_generated_setting_ast.value_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed_stale_generated_setting.items(), stale_generated_setting_ast),
+    );
+
+    var parsed_stale_generated_search_path = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
+    defer parsed_stale_generated_search_path.deinit(alloc);
+    if (parsed_stale_generated_search_path.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .session => |*session| session.name_tokens = .{ .start = 1, .end = 3 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        legacyDdlParserPlanParsedSqlAlloc(alloc, &parsed_stale_generated_search_path),
+    );
+
+    stale_generated_setting_ast = switch ((parsed_stale_generated_setting.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .session => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_generated_setting_ast.value_tokens = stale_generated_setting_ast.name_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed_stale_generated_setting.items(), stale_generated_setting_ast),
+    );
+
     var generated_reset = try generatedSessionCatalogPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer generated_reset.deinit(alloc);
     var legacy_reset = try legacyDdlParserPlanForTestAlloc(alloc, "RESET app.tenant_id;");
@@ -17166,6 +17549,18 @@ test "sql adapter generated session AST lowers to session catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_stale_generated_reset = try tokenized.ParsedSql.initAlloc(alloc, "RESET app.tenant_id;");
+    defer parsed_stale_generated_reset.deinit(alloc);
+    var stale_generated_reset_ast = switch ((parsed_stale_generated_reset.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .session => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_generated_reset_ast.name_tokens = .{ .start = 0, .end = 1 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed_stale_generated_reset.items(), stale_generated_reset_ast),
+    );
 
     const tag_cases = [_]struct {
         sql: []const u8,
@@ -17906,6 +18301,47 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var runtime_create_table_check = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text, CONSTRAINT generated_usage_records_status_check CHECK (status != 'deleted'));");
+    defer runtime_create_table_check.deinit(alloc);
+    var runtime_create_table_check_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_table_check);
+    defer runtime_create_table_check_plan.deinit(alloc);
+    switch (runtime_create_table_check_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+            try std.testing.expect(plan.checks[0].expression != null);
+            try std.testing.expectEqualStrings("status", plan.checks[0].expression.?.lhs.field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, plan.checks[0].expression.?.op);
+            try std.testing.expectEqualStrings("\"deleted\"", plan.checks[0].expression.?.rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_temp_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE generated_usage_session_records (id text PRIMARY KEY, status text);");
+    defer runtime_temp_table.deinit(alloc);
+    var runtime_temp_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_temp_table);
+    defer runtime_temp_table_plan.deinit(alloc);
+    switch (runtime_temp_table_plan) {
+        .relation_lifetime => |plan| {
+            try std.testing.expectEqual(RelationLifetimeKind.temporary, plan.kind);
+            try std.testing.expectEqualStrings("generated_usage_session_records", plan.create_table.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.create_table.columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_generated_create_table_entry = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer malformed_generated_create_table_entry.deinit(alloc);
+    if (malformed_generated_create_table_entry.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.command_span.end += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_create_table_entry));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_create_table_entry, .{}));
+
     var runtime_create_function = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_generated_usage() RETURNS trigger LANGUAGE plpgsql;");
     defer runtime_create_function.deinit(alloc);
     var runtime_create_function_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_create_function);
@@ -18014,6 +18450,19 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_generated_serial_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
+    defer malformed_generated_serial_table.deinit(alloc);
+    if (malformed_generated_serial_table.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_serial_table));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_serial_table, .{}));
 
     var runtime_serial_named_column = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_named_column (\"serial\" text, status text);");
     defer runtime_serial_named_column.deinit(alloc);
@@ -18148,6 +18597,19 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_generated_alter_table_entry = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text;");
+    defer malformed_generated_alter_table_entry.deinit(alloc);
+    if (malformed_generated_alter_table_entry.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens.?.start += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_entry));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_alter_table_entry, .{}));
 
     var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
     defer runtime_row_security.deinit(alloc);
@@ -19036,6 +19498,19 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_prepare_layout, malformed_prepare_layout_ast),
     );
 
+    var malformed_deallocate_prepare_layout = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE PREPARE usage_plan;");
+    defer malformed_deallocate_prepare_layout.deinit(alloc);
+    const malformed_deallocate_prepare_layout_raw = malformed_deallocate_prepare_layout.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_deallocate_prepare_layout_ast = switch (malformed_deallocate_prepare_layout_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_deallocate_prepare_layout_ast.name_tokens = .{ .start = 1, .end = 3 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_deallocate_prepare_layout, malformed_deallocate_prepare_layout_ast),
+    );
+
     var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE usage_plan;");
     defer mismatched_kind.deinit(alloc);
     const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
@@ -19144,6 +19619,11 @@ fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) 
 
 test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.UnsupportedSqlShape, generatedGraphDdlPlanForTestAlloc(
+        alloc,
+        "CREATE GRAPH INDEX docs_edge_graph ON doc_edges",
+    ));
 
     const graph_index_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');";
     var legacy_graph_index = try legacyDdlParserPlanForTestAlloc(alloc, graph_index_sql);
@@ -19792,6 +20272,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
     const cases = [_]struct {
         sql: []const u8,
         kind: generated_parser.GeneratedSqlUnsupportedKind,
+        trigger_replace_existing: bool = false,
     }{
         .{ .sql = "CALL rotate_usage();", .kind = .call },
         .{ .sql = "COMMENT ON TABLE usage_records IS 'usage';", .kind = .comment },
@@ -19799,6 +20280,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM app_reader;", .kind = .revoke },
         .{ .sql = "LOCK TABLE usage_records IN SHARE MODE;", .kind = .lock },
         .{ .sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger },
+        .{ .sql = "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger, .trigger_replace_existing = true },
         .{ .sql = "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;", .kind = .drop_trigger },
     };
 
@@ -19838,7 +20320,9 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
                 else => return error.TestUnexpectedResult,
             },
             .create_trigger => switch (lowered) {
-                .create_update_policy => {},
+                .create_update_policy => |trigger| {
+                    try std.testing.expectEqual(case.trigger_replace_existing, trigger.replace_existing);
+                },
                 else => return error.TestUnexpectedResult,
             },
             .drop_trigger => switch (lowered) {
@@ -22309,11 +22793,10 @@ fn dropPrimaryKeyByNameAlloc(
     table_name: []const u8,
     constraint_name: []const u8,
 ) !bool {
+    _ = alloc;
     const primary_key = schema.primary_key orelse return false;
     if (!binder.primaryKeyNameEquals(primary_key, table_name, constraint_name)) return false;
-    freeDdlPrimaryKey(alloc, primary_key);
-    schema.primary_key = null;
-    return true;
+    return error.UnsupportedSqlShape;
 }
 
 fn dropSecondaryIndexByNameAlloc(

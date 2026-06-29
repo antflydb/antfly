@@ -314,6 +314,10 @@ fn validateRuntimeRelationalDefault(
             .keyword, .text, .link => {},
             else => return error.InvalidSchemaUpdateRequest,
         },
+        .sequence_next => switch (field_type) {
+            .numeric => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
     }
 }
 
@@ -351,7 +355,7 @@ fn validateRuntimeRelationalOnUpdate(on_update_value: ?impl.RelationalDefaultVal
             .numeric, .datetime => {},
             else => return error.InvalidSchemaUpdateRequest,
         },
-        .literal, .current_date_ns, .uuid_v4 => return error.InvalidSchemaUpdateRequest,
+        .literal, .current_date_ns, .uuid_v4, .sequence_next => return error.InvalidSchemaUpdateRequest,
     }
 }
 
@@ -390,6 +394,7 @@ fn cloneRelationalDefaultValue(
             .now_ns => .now_ns,
             .current_date_ns => .current_date_ns,
             .uuid_v4 => .uuid_v4,
+            .sequence_next => .sequence_next,
         },
         .value_json = try alloc.dupe(u8, value.value_json),
     };
@@ -1683,6 +1688,28 @@ test "deriveRuntimeTableSchema validates relational literal default types" {
     );
     defer invalid_boolean.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, invalid_boolean));
+}
+
+test "deriveRuntimeTableSchema carries sequence-backed relational defaults" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const id = findRuntimeColumn(runtime, "id").?;
+    try std.testing.expect(id.default_value != null);
+    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.sequence_next, id.default_value.?.kind);
+    try std.testing.expectEqualStrings("{\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", id.default_value.?.value_json);
+
+    var invalid_text = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer invalid_text.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, invalid_text));
 }
 
 test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {

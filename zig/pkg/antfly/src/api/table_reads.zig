@@ -14,8 +14,6 @@
 
 const table_read_core = @import("table_reads/core.zig");
 const table_read_cache = @import("table_reads/cache.zig");
-const table_read_document_sql = @import("table_reads/document_sql.zig");
-pub const document_sql_runtime = @import("table_reads/document_sql_runtime.zig");
 const table_read_relational_rows = @import("table_reads/relational_rows.zig");
 const table_read_external_lake = @import("table_reads/external_lake.zig");
 const table_read_remote_wire = @import("table_reads/remote_wire.zig");
@@ -49,8 +47,6 @@ pub const HostedProvisionedTableReadSource = table_read_sources.HostedProvisione
 
 pub const ProvisionedTableReadCache = table_read_cache.ProvisionedTableReadCache;
 
-pub const DocumentSqlRuntimeSourceAdapter = table_read_document_sql.DocumentSqlRuntimeSourceAdapter;
-
 pub const searchRequestFromVectorWorkerEnvelope = table_read_remote_wire.searchRequestFromVectorWorkerEnvelope;
 
 pub const LoweredSqlReadPlanResult = table_read_relational_rows.LoweredSqlReadPlanResult;
@@ -67,8 +63,10 @@ pub const rowsInsertSourceBatchFromRecursiveCtePlanAlloc = table_read_relational
 pub const rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc = table_read_relational_rows.rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc;
 pub const rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc;
 pub const rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc;
+pub const rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc = table_read_relational_rows.rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc;
 pub const rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc;
 pub const rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc = table_read_relational_rows.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc;
+pub const rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc = table_read_relational_rows.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc;
 pub const rowsJoinPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsJoinPlanFromRoutedScansWithSchemasAlloc;
 pub const rowsLateralPlanFromRoutedScansWithSchemasAlloc = table_read_relational_rows.rowsLateralPlanFromRoutedScansWithSchemasAlloc;
 

@@ -19,7 +19,7 @@ const group_ids = @import("../common/group_ids.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const common_secrets = @import("../common/secrets.zig");
 const extension_domain = @import("../extensions/mod.zig");
 

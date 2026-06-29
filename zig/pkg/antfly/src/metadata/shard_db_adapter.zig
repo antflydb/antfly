@@ -16,7 +16,7 @@ const std = @import("std");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const tables_api = @import("../api/tables.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 
 pub const ShardDbAdapter = struct {
     ptr: *anyopaque,
@@ -135,7 +135,7 @@ pub fn dbStatsSchemaIndexReady(
 }
 
 fn fullTextIndexName(alloc: std.mem.Allocator, version: u32) ![]const u8 {
-    if (version == 0) return tables_api.default_full_text_index_name;
+    if (version == 0) return catalog_table_ddl.default_full_text_index_name;
     return try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{version});
 }
 

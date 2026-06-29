@@ -29,8 +29,8 @@ const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_core = @import("core.zig");
 const table_write_index_config = @import("index_config.zig");
 

@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "c59893c225daa6e581771ea4d6610827d9579e69da9790d1f114405ec1ded716",
+  "source_sha256": "13a7baea64d53e8c971fe6c0affcacbcfa919e236380e3cc2ac0cad367dfdf23",
   "source_entry_count": 1031,
   "entry_count": 1031,
   "skipped_entries": [
@@ -162,9 +162,13 @@
     },
     {
       "name": "merge mutation-producing cte source",
-      "family": "unsupported_merge_mutation",
-      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
-      "classification_reason": "cte_mutation_source_plan",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_rows:ctes=0:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:data_ctes=1:data_cte_update=1:data_cte_returning=2:data_cte_claim_placeholder=1",
       "sql": "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {

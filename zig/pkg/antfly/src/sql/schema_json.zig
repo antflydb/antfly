@@ -147,7 +147,24 @@ pub fn schemaJsonDefaultValueAlloc(alloc: std.mem.Allocator, value: runtime_sche
         .now_ns => "now_ns",
         .current_date_ns => "current_date_ns",
         .uuid_v4 => "uuid_v4",
+        .sequence_next => "sequence_next",
     });
+    if (value.kind == .sequence_next) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSqlCatalog;
+        const sequence = parsed.value.object.get("sequence") orelse return error.InvalidSqlCatalog;
+        if (sequence != .string) return error.InvalidSqlCatalog;
+        try putJsonString(alloc, &object, "sequence", sequence.string);
+        if (parsed.value.object.get("database")) |database| {
+            if (database != .string) return error.InvalidSqlCatalog;
+            try putJsonString(alloc, &object, "database", database.string);
+        }
+        if (parsed.value.object.get("schema")) |schema_name| {
+            if (schema_name != .string) return error.InvalidSqlCatalog;
+            try putJsonString(alloc, &object, "schema", schema_name.string);
+        }
+    }
     return .{ .object = object };
 }
 
@@ -1576,4 +1593,17 @@ fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
         if (std.mem.eql(u8, candidate, value)) return true;
     }
     return false;
+}
+
+test "schema json emits sequence-backed relational defaults" {
+    const alloc = std.testing.allocator;
+    var value = try schemaJsonDefaultValueAlloc(alloc, .{
+        .kind = .sequence_next,
+        .value_json = "{\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}",
+    }, true);
+    defer json_helpers.deinitJsonValue(alloc, &value);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings("{\"op\":\"sequence_next\",\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", encoded);
 }

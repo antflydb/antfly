@@ -1693,6 +1693,7 @@ pub const RelationalRowsSetOperation = enum {
 
 pub const RelationalRowsSetOperationPlan = struct {
     operation: RelationalRowsSetOperation,
+    ctes: []const RelationalRowsCte = &.{},
     left: RelationalRowsQueryPlan,
     right: RelationalRowsQueryPlan,
     order_by: []const RelationalRowsQueryOrder = &.{},
@@ -1703,6 +1704,11 @@ pub const RelationalRowsSetOperationPlan = struct {
     spill_after_bytes: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
         self.left.deinit(alloc);
         self.right.deinit(alloc);
         var order_query: RelationalRowsQueryRequest = .{ .order_by = self.order_by };

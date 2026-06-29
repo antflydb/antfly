@@ -988,6 +988,9 @@ pub fn validateDefaultValueForColumnAlloc(
         .current_date_ns => {
             if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
         },
+        .sequence_next => {
+            if (column.field_type != .numeric) return error.UnsupportedSqlShape;
+        },
         .literal => try validateLiteralDefaultForColumnAlloc(alloc, column, default_value.value_json),
     }
 }
@@ -1622,8 +1625,11 @@ test "sql adapter value validates json values and defaults" {
 
     try validateDefaultValueForColumnAlloc(alloc, keyword_column, .{ .kind = .literal, .value_json = "\"open\"" });
     try validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .now_ns, .value_json = "" });
+    try validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" });
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .literal, .value_json = "\"bad\"" }));
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, array_column, .{ .kind = .uuid_v4, .value_json = "" }));
+    try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, keyword_column, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" }));
+    try std.testing.expectError(error.UnsupportedSqlShape, relational_rows.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" }));
 
     try validateSqlArrayElementValueJson(alloc, text_array_column, "\"blue\"");
     try validateSqlArrayValueJson(alloc, text_array_column, "[\"blue\",\"green\"]");

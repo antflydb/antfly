@@ -146,11 +146,19 @@ pub fn executePreparedTransactionRecoveryIntent(
 }
 
 pub const OwnedSqlCatalogSession = struct {
+    pub const SequenceCurrval = struct {
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+        value: i64,
+    };
+
     current_database_name: []u8,
     search_path: []const []const u8,
     transaction_local_search_path_base: ?[]const []const u8 = null,
     settings: []const catalog_resources.SqlSessionSetting = &.{},
     transaction_local_settings_base: ?[]const catalog_resources.SqlSessionSetting = null,
+    sequence_currvals: []const SequenceCurrval = &.{},
     transaction_local_search_path: bool = false,
     transaction_local_settings: bool = false,
     in_sql_transaction: bool = false,
@@ -197,6 +205,7 @@ pub const OwnedSqlCatalogSession = struct {
             .transaction_local_search_path_base = null,
             .settings = settings,
             .transaction_local_settings_base = null,
+            .sequence_currvals = &.{},
             .transaction_local_search_path = false,
             .transaction_local_settings = false,
             .in_sql_transaction = false,
@@ -227,6 +236,7 @@ pub const OwnedSqlCatalogSession = struct {
             cloned.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
             cloned.transaction_local_settings = self.transaction_local_settings;
         }
+        cloned.sequence_currvals = try cloneSequenceCurrvals(alloc, self.sequence_currvals);
         cloned.in_sql_transaction = self.in_sql_transaction;
         cloned.sql_transaction_failed = self.sql_transaction_failed;
         cloned.request_read_only = self.request_read_only;
@@ -260,6 +270,10 @@ pub const OwnedSqlCatalogSession = struct {
         target.request_read_only = self.request_read_only;
         try self.cloneRequestDatabaseBaseTo(alloc, target);
         try self.cloneRequestSearchPathBaseTo(alloc, target);
+    }
+
+    fn cloneSequenceCurrvalsTo(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator, target: *OwnedSqlCatalogSession) !void {
+        target.sequence_currvals = try cloneSequenceCurrvals(alloc, self.sequence_currvals);
     }
 
     pub fn restoreRequestOverridesForPersistence(self: *@This(), alloc: std.mem.Allocator) void {
@@ -299,6 +313,75 @@ pub const OwnedSqlCatalogSession = struct {
         self.sql_transaction_failed = false;
     }
 
+    pub fn sequenceCurrval(
+        self: OwnedSqlCatalogSession,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) ?i64 {
+        for (self.sequence_currvals) |entry| {
+            if (std.mem.eql(u8, entry.database_name, database_name) and
+                std.mem.eql(u8, entry.namespace_name, namespace_name) and
+                std.mem.eql(u8, entry.sequence_name, sequence_name))
+            {
+                return entry.value;
+            }
+        }
+        return null;
+    }
+
+    pub fn setSequenceCurrvalAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+        value: i64,
+    ) !void {
+        var found = false;
+        for (self.sequence_currvals) |entry| {
+            if (std.mem.eql(u8, entry.database_name, database_name) and
+                std.mem.eql(u8, entry.namespace_name, namespace_name) and
+                std.mem.eql(u8, entry.sequence_name, sequence_name))
+            {
+                found = true;
+                break;
+            }
+        }
+        const out_len = self.sequence_currvals.len + @as(usize, @intFromBool(!found));
+        const out = try alloc.alloc(SequenceCurrval, out_len);
+        var initialized: usize = 0;
+        errdefer {
+            freeSequenceCurrvalEntries(alloc, out[0..initialized]);
+            if (out.len > 0) alloc.free(out);
+        }
+        var wrote = false;
+        for (self.sequence_currvals) |entry| {
+            const matches = std.mem.eql(u8, entry.database_name, database_name) and
+                std.mem.eql(u8, entry.namespace_name, namespace_name) and
+                std.mem.eql(u8, entry.sequence_name, sequence_name);
+            out[initialized] = .{
+                .database_name = try alloc.dupe(u8, if (matches) database_name else entry.database_name),
+                .namespace_name = try alloc.dupe(u8, if (matches) namespace_name else entry.namespace_name),
+                .sequence_name = try alloc.dupe(u8, if (matches) sequence_name else entry.sequence_name),
+                .value = if (matches) value else entry.value,
+            };
+            initialized += 1;
+            wrote = wrote or matches;
+        }
+        if (!wrote) {
+            out[initialized] = .{
+                .database_name = try alloc.dupe(u8, database_name),
+                .namespace_name = try alloc.dupe(u8, namespace_name),
+                .sequence_name = try alloc.dupe(u8, sequence_name),
+                .value = value,
+            };
+            initialized += 1;
+        }
+        freeSequenceCurrvals(alloc, self.sequence_currvals);
+        self.sequence_currvals = out;
+    }
+
     pub fn setTransactionLocalSettingAlloc(self: *@This(), alloc: std.mem.Allocator, name: []const u8, value: []const u8) !void {
         if (self.transaction_local_settings_base == null) {
             self.transaction_local_settings_base = try cloneSessionSettings(alloc, self.settings);
@@ -330,6 +413,7 @@ pub const OwnedSqlCatalogSession = struct {
             }
             if (base.len > 0) alloc.free(base);
         }
+        freeSequenceCurrvals(alloc, self.sequence_currvals);
         if (self.request_database_name_base) |base| alloc.free(base);
         if (self.request_search_path_base) |base| freeStringSlice(alloc, base);
         self.* = undefined;
@@ -384,6 +468,47 @@ fn freeSessionSettings(alloc: std.mem.Allocator, values: []const catalog_resourc
         alloc.free(@constCast(setting.value));
     }
     if (values.len > 0) alloc.free(values);
+}
+
+fn cloneSequenceCurrvals(
+    alloc: std.mem.Allocator,
+    values: []const OwnedSqlCatalogSession.SequenceCurrval,
+) ![]const OwnedSqlCatalogSession.SequenceCurrval {
+    const out = try alloc.alloc(OwnedSqlCatalogSession.SequenceCurrval, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeSequenceCurrvalEntries(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (values, 0..) |entry, i| {
+        out[i] = .{
+            .database_name = try alloc.dupe(u8, entry.database_name),
+            .namespace_name = try alloc.dupe(u8, entry.namespace_name),
+            .sequence_name = try alloc.dupe(u8, entry.sequence_name),
+            .value = entry.value,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeSequenceCurrvals(
+    alloc: std.mem.Allocator,
+    values: []const OwnedSqlCatalogSession.SequenceCurrval,
+) void {
+    freeSequenceCurrvalEntries(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
+fn freeSequenceCurrvalEntries(
+    alloc: std.mem.Allocator,
+    values: []const OwnedSqlCatalogSession.SequenceCurrval,
+) void {
+    for (values) |entry| {
+        alloc.free(@constCast(entry.database_name));
+        alloc.free(@constCast(entry.namespace_name));
+        alloc.free(@constCast(entry.sequence_name));
+    }
 }
 
 pub fn parseSqlStatementTimeoutNs(value: []const u8) !u64 {
@@ -626,6 +751,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             updated.in_sql_transaction = session.in_sql_transaction or set.local;
             updated.sql_transaction_failed = session.sql_transaction_failed;
             try session.cloneRequestDatabaseBaseTo(alloc, &updated);
+            try session.cloneSequenceCurrvalsTo(alloc, &updated);
             if (set.local) {
                 if (session.transaction_local_search_path_base) |base| {
                     updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
@@ -664,6 +790,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
             try session.cloneRequestOverridesTo(alloc, &updated);
+            try session.cloneSequenceCurrvalsTo(alloc, &updated);
             updated.in_sql_transaction = session.in_sql_transaction or set.local;
             updated.sql_transaction_failed = session.sql_transaction_failed;
             if (session.transaction_local_search_path_base) |base| {
@@ -695,6 +822,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
             try session.cloneRequestOverridesTo(alloc, &updated);
+            try session.cloneSequenceCurrvalsTo(alloc, &updated);
             updated.in_sql_transaction = session.in_sql_transaction;
             updated.sql_transaction_failed = session.sql_transaction_failed;
             if (session.transaction_local_search_path_base) |base| {
@@ -725,6 +853,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             updated.in_sql_transaction = session.in_sql_transaction;
             updated.sql_transaction_failed = session.sql_transaction_failed;
             try session.cloneRequestDatabaseBaseTo(alloc, &updated);
+            try session.cloneSequenceCurrvalsTo(alloc, &updated);
             if (session.transaction_local_settings_base) |base| {
                 updated.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
                 updated.transaction_local_settings = session.transaction_local_settings;
@@ -747,6 +876,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
             try session.cloneRequestOverridesTo(alloc, &updated);
+            try session.cloneSequenceCurrvalsTo(alloc, &updated);
             updated.in_sql_transaction = session.in_sql_transaction;
             updated.sql_transaction_failed = session.sql_transaction_failed;
             if (session.transaction_local_search_path_base) |base| {
@@ -2605,32 +2735,26 @@ test "catalog apply applies incremental ddl plans to public schema json" {
         "ALTER TABLE users DROP CONSTRAINT users_pkey;",
     );
     defer drop_default_pk.deinit(alloc);
-    var without_default_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, drop_default_pk);
-    defer without_default_pk.deinit(alloc);
-    try std.testing.expect(without_default_pk.requires_rebuild);
-    try std.testing.expect(!without_default_pk.validation_required);
-    try std.testing.expect(without_default_pk.rewrite_required);
-    var parsed_without_default_pk = try schema_api.parseValidatedTableSchema(alloc, without_default_pk.schema_json);
-    defer parsed_without_default_pk.deinit(alloc);
-    const without_default_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_default_pk);
-    defer runtime_schema.freeSchema(alloc, without_default_pk_runtime);
-    try std.testing.expect(without_default_pk_runtime.primary_key == null);
+    var dropped_default_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, drop_default_pk);
+    defer dropped_default_pk.deinit(alloc);
+    var parsed_dropped_default_pk = try schema_api.parseValidatedTableSchema(alloc, dropped_default_pk.schema_json);
+    defer parsed_dropped_default_pk.deinit(alloc);
+    const dropped_default_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_dropped_default_pk);
+    defer runtime_schema.freeSchema(alloc, dropped_default_pk_runtime);
+    try std.testing.expect(dropped_default_pk_runtime.primary_key == null);
 
     var drop_named_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE users DROP CONSTRAINT users_id_pk;",
     );
     defer drop_named_pk.deinit(alloc);
-    var without_named_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, renamed_default_pk.schema_json, drop_named_pk);
-    defer without_named_pk.deinit(alloc);
-    try std.testing.expect(without_named_pk.requires_rebuild);
-    try std.testing.expect(!without_named_pk.validation_required);
-    try std.testing.expect(without_named_pk.rewrite_required);
-    var parsed_without_named_pk = try schema_api.parseValidatedTableSchema(alloc, without_named_pk.schema_json);
-    defer parsed_without_named_pk.deinit(alloc);
-    const without_named_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_named_pk);
-    defer runtime_schema.freeSchema(alloc, without_named_pk_runtime);
-    try std.testing.expect(without_named_pk_runtime.primary_key == null);
+    var dropped_named_pk = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, renamed_default_pk.schema_json, drop_named_pk);
+    defer dropped_named_pk.deinit(alloc);
+    var parsed_dropped_named_pk = try schema_api.parseValidatedTableSchema(alloc, dropped_named_pk.schema_json);
+    defer parsed_dropped_named_pk.deinit(alloc);
+    const dropped_named_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_dropped_named_pk);
+    defer runtime_schema.freeSchema(alloc, dropped_named_pk_runtime);
+    try std.testing.expect(dropped_named_pk_runtime.primary_key == null);
 
     var trigger = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
@@ -3305,18 +3429,14 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
         "ALTER TABLE usage_records DROP CONSTRAINT usage_records_pkey;",
     );
     defer drop_default_pk.deinit(alloc);
-    const without_default_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_default_pk);
-    defer runtime_schema.freeSchema(alloc, without_default_pk);
-    try std.testing.expect(without_default_pk.primary_key == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, updated, drop_default_pk));
 
     var drop_named_pk = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "ALTER TABLE usage_records DROP CONSTRAINT usage_records_id_pk;",
     );
     defer drop_named_pk.deinit(alloc);
-    const without_named_pk = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, renamed_default_pk, drop_named_pk);
-    defer runtime_schema.freeSchema(alloc, without_named_pk);
-    try std.testing.expect(without_named_pk.primary_key == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, renamed_default_pk, drop_named_pk));
 
     var drop_check = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_check;");
     defer drop_check.deinit(alloc);

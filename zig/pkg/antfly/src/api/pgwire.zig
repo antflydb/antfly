@@ -795,7 +795,7 @@ const Connection = struct {
         outcome: *http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse,
         result_formats: []const i16,
     ) !bool {
-        switch (outcome) {
+        switch (outcome.*) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
                 self.markTransactionError();
@@ -842,10 +842,7 @@ const Connection = struct {
         };
         self.active_execution.store(false, .release);
         if (self.consumeCancelRequested()) {
-            switch (outcome) {
-                .response => |*response| response.deinit(self.api_server.alloc),
-                .result => |*result| result.deinit(self.api_server.alloc),
-            }
+            outcome.deinit(self.api_server.alloc);
             self.markTransactionError();
             try self.sendError("57014", "canceling statement due to user request");
             if (send_ready_on_error) try self.sendReadyForQuery();
@@ -861,7 +858,7 @@ const Connection = struct {
         send_ready_on_error: bool,
         include_row_description: bool,
     ) !bool {
-        switch (outcome) {
+        switch (outcome.*) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
                 self.markTransactionError();
@@ -1636,6 +1633,9 @@ fn commandTagForDdlApplied(applied: anytype) []const u8 {
     if (applied.created_tablespace) return "CREATE TABLESPACE";
     if (applied.renamed_tablespace) return "ALTER TABLESPACE";
     if (applied.dropped_tablespace) return "DROP TABLESPACE";
+    if (applied.created_sequence) return "CREATE SEQUENCE";
+    if (applied.altered_sequence) return "ALTER SEQUENCE";
+    if (applied.dropped_sequence) return "DROP SEQUENCE";
     if (applied.noop) return "DDL";
     return "ALTER TABLE";
 }

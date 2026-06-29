@@ -277,7 +277,7 @@ pub const Reconciler = struct {
             for (parsed.foreign_keys) |foreign_key| {
                 const parent_table = findTableRecordByName(tables, foreign_key.references.table) orelse continue;
                 if (!(try foreignKeyEligibleForRoutedOwner(self.alloc, parent_table, foreign_key))) continue;
-                if (foreignKeyReferenceRangeIdentityExists(self.alloc, manager, child_table.table_id, foreign_key.name, parent_table.table_id)) continue;
+                if (foreignKeyReferenceRangeIdentityExists(self.alloc, manager, child_table.table_id, foreign_key.name, parent_table.table_id, 0)) continue;
                 const group_id = try deriveForeignKeyReferenceOwnerGroupId(self.alloc, manager, ranges, child_table.table_id, foreign_key.name, parent_table.table_id);
                 try manager.upsertForeignKeyReferenceRange(.{
                     .child_table_id = child_table.table_id,
@@ -286,6 +286,7 @@ pub const Reconciler = struct {
                     .start_parent_key = "",
                     .end_parent_key = null,
                     .group_id = group_id,
+                    .range_id = group_id,
                     .topology_epoch = 1,
                     .state = table_manager.foreign_key_ref_range_active,
                 });
@@ -333,7 +334,7 @@ pub const Reconciler = struct {
         table_id: u64,
         constraint_name: []const u8,
     ) !void {
-        if (uniqueConstraintRangeIdentityExists(self.alloc, manager, table_id, constraint_name)) return;
+        if (uniqueConstraintRangeIdentityExists(self.alloc, manager, table_id, constraint_name, 0)) return;
         const group_id = try deriveUniqueConstraintOwnerGroupId(self.alloc, manager, ranges, table_id, constraint_name);
         try manager.upsertUniqueConstraintRange(.{
             .table_id = table_id,
@@ -341,6 +342,7 @@ pub const Reconciler = struct {
             .start_encoded_value = "",
             .end_encoded_value = null,
             .group_id = group_id,
+            .range_id = group_id,
             .topology_epoch = 1,
             .state = table_manager.unique_constraint_range_active,
         });
@@ -376,8 +378,8 @@ pub const Reconciler = struct {
                 const index_name = relationalColumnIndexIdentity(column);
                 for (ranges) |range| {
                     if (range.table_id != table.table_id) continue;
-                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, index_name, column.index_generation, range.start_key)) continue;
-                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, index_name, column.index_generation, range.start_key);
+                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, index_name, column.index_generation, range.start_key, range.range_id)) continue;
+                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, index_name, column.index_generation, range.start_key, range.range_id);
                     try manager.upsertSecondaryIndexRebuildRange(.{
                         .table_id = table.table_id,
                         .index_name = index_name,
@@ -385,6 +387,7 @@ pub const Reconciler = struct {
                         .start_row_key = range.start_key,
                         .end_row_key = range.end_key,
                         .group_id = group_id,
+                        .range_id = range.range_id,
                         .topology_epoch = 1,
                         .state = table_manager.secondary_index_rebuild_declared,
                     });
@@ -1971,7 +1974,7 @@ fn dropFullTextIndexForVersion(
 
     var versioned_name_buf: [64]u8 = undefined;
     const stale_name = if (version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        @import("catalog/table_ddl.zig").default_full_text_index_name
     else
         try std.fmt.bufPrint(&versioned_name_buf, "full_text_index_v{d}", .{version});
     _ = object.swapRemove(stale_name);
@@ -2079,6 +2082,7 @@ fn foreignKeyReferenceRangeIdentityExists(
     child_table_id: u64,
     constraint_name: []const u8,
     parent_table_id: u64,
+    range_id: u64,
 ) bool {
     const records = manager.listForeignKeyReferenceRanges(alloc) catch return false;
     defer manager.freeForeignKeyReferenceRanges(alloc, records);
@@ -2086,6 +2090,7 @@ fn foreignKeyReferenceRangeIdentityExists(
         if (record.child_table_id != child_table_id) continue;
         if (record.parent_table_id != parent_table_id) continue;
         if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+        if (range_id != 0 and record.range_id != range_id) continue;
         return true;
     }
     return false;
@@ -2237,12 +2242,14 @@ fn uniqueConstraintRangeIdentityExists(
     manager: *table_manager.TableManager,
     table_id: u64,
     constraint_name: []const u8,
+    range_id: u64,
 ) bool {
     const records = manager.listUniqueConstraintRanges(alloc) catch return false;
     defer manager.freeUniqueConstraintRanges(alloc, records);
     for (records) |record| {
         if (record.table_id != table_id) continue;
         if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+        if (range_id != 0 and record.range_id != range_id) continue;
         return true;
     }
     return false;
@@ -2319,6 +2326,7 @@ fn secondaryIndexRebuildRangeStillDeclared(
     if (!declared) return false;
     for (ranges) |range| {
         if (range.table_id != record.table_id) continue;
+        if (record.range_id != 0 and range.range_id != record.range_id) continue;
         if (!std.mem.eql(u8, range.start_key, record.start_row_key)) continue;
         if (!optionalBytesEqual(range.end_key, record.end_row_key)) continue;
         return true;
@@ -2333,6 +2341,7 @@ fn secondaryIndexRebuildRangeIdentityExists(
     index_name: []const u8,
     index_generation: u64,
     start_row_key: []const u8,
+    range_id: u64,
 ) bool {
     const records = manager.listSecondaryIndexRebuildRanges(alloc) catch return false;
     defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
@@ -2341,6 +2350,7 @@ fn secondaryIndexRebuildRangeIdentityExists(
         if (record.index_generation != index_generation) continue;
         if (!std.mem.eql(u8, record.index_name, index_name)) continue;
         if (!std.mem.eql(u8, record.start_row_key, start_row_key)) continue;
+        if (range_id != 0 and record.range_id != 0 and record.range_id != range_id) continue;
         return true;
     }
     return false;
@@ -2354,6 +2364,7 @@ fn deriveSecondaryIndexRebuildGroupId(
     index_name: []const u8,
     index_generation: u64,
     start_row_key: []const u8,
+    range_id: u64,
 ) !u64 {
     var attempt: u64 = 0;
     while (attempt < 64) : (attempt += 1) {
@@ -2363,6 +2374,7 @@ fn deriveSecondaryIndexRebuildGroupId(
         hasher.update(index_name);
         hasher.update(std.mem.asBytes(&index_generation));
         hasher.update(start_row_key);
+        hasher.update(std.mem.asBytes(&range_id));
         const candidate = group_ids.dataGroupIdFromHash(hasher.final());
         if (candidate == 0) continue;
         if (rangeGroupIdExists(ranges, candidate)) continue;
@@ -2389,6 +2401,7 @@ fn secondaryIndexRebuildGroupIdExists(
 
 fn uniqueConstraintRangeRecordsEqual(a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
     return a.group_id == b.group_id and
+        uniqueConstraintOwnerRangeIdsEqual(a, b) and
         a.table_id == b.table_id and
         std.mem.eql(u8, a.constraint_name, b.constraint_name) and
         std.mem.eql(u8, a.start_encoded_value, b.start_encoded_value) and
@@ -2397,10 +2410,15 @@ fn uniqueConstraintRangeRecordsEqual(a: table_manager.UniqueConstraintRangeRecor
         a.topology_epoch == b.topology_epoch;
 }
 
+fn uniqueConstraintOwnerRangeIdsEqual(a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
+    return a.range_id == 0 or b.range_id == 0 or a.range_id == b.range_id;
+}
+
 fn secondaryIndexRebuildRangeRecordsEqual(a: table_manager.SecondaryIndexRebuildRangeRecord, b: table_manager.SecondaryIndexRebuildRangeRecord) bool {
     return a.group_id == b.group_id and
         a.table_id == b.table_id and
         a.index_generation == b.index_generation and
+        a.range_id == b.range_id and
         std.mem.eql(u8, a.index_name, b.index_name) and
         std.mem.eql(u8, a.start_row_key, b.start_row_key) and
         optionalBytesEqual(a.end_row_key, b.end_row_key) and
@@ -2416,6 +2434,7 @@ fn secondaryIndexRebuildRangeRecordsEqual(a: table_manager.SecondaryIndexRebuild
 
 fn foreignKeyReferenceRangeRecordsEqual(a: table_manager.ForeignKeyReferenceRangeRecord, b: table_manager.ForeignKeyReferenceRangeRecord) bool {
     return a.group_id == b.group_id and
+        foreignKeyReferenceOwnerRangeIdsEqual(a, b) and
         a.child_table_id == b.child_table_id and
         a.parent_table_id == b.parent_table_id and
         std.mem.eql(u8, a.constraint_name, b.constraint_name) and
@@ -2423,6 +2442,10 @@ fn foreignKeyReferenceRangeRecordsEqual(a: table_manager.ForeignKeyReferenceRang
         optionalBytesEqual(a.end_parent_key, b.end_parent_key) and
         std.mem.eql(u8, a.state, b.state) and
         a.topology_epoch == b.topology_epoch;
+}
+
+fn foreignKeyReferenceOwnerRangeIdsEqual(a: table_manager.ForeignKeyReferenceRangeRecord, b: table_manager.ForeignKeyReferenceRangeRecord) bool {
+    return a.range_id == 0 or b.range_id == 0 or a.range_id == b.range_id;
 }
 
 fn findTableRecord(records: []const table_manager.TableRecord, table_id: u64) ?table_manager.TableRecord {
@@ -2454,6 +2477,7 @@ fn findForeignKeyReferenceRangeRecord(
         if (record.child_table_id != target.child_table_id) continue;
         if (record.parent_table_id != target.parent_table_id) continue;
         if (!std.mem.eql(u8, record.constraint_name, target.constraint_name)) continue;
+        if (target.range_id != 0 and record.range_id != 0 and record.range_id != target.range_id) continue;
         if (!std.mem.eql(u8, record.start_parent_key, target.start_parent_key)) continue;
         return record;
     }
@@ -2477,6 +2501,7 @@ fn findUniqueConstraintRangeRecord(
     for (records) |record| {
         if (record.table_id != target.table_id) continue;
         if (!std.mem.eql(u8, record.constraint_name, target.constraint_name)) continue;
+        if (target.range_id != 0 and record.range_id != 0 and record.range_id != target.range_id) continue;
         if (!std.mem.eql(u8, record.start_encoded_value, target.start_encoded_value)) continue;
         return record;
     }
@@ -2501,6 +2526,7 @@ fn findSecondaryIndexRebuildRangeRecord(
         if (record.table_id != target.table_id) continue;
         if (record.index_generation != target.index_generation) continue;
         if (!std.mem.eql(u8, record.index_name, target.index_name)) continue;
+        if (record.range_id != 0 and target.range_id != 0 and record.range_id != target.range_id) continue;
         if (!std.mem.eql(u8, record.start_row_key, target.start_row_key)) continue;
         return record;
     }
@@ -2967,6 +2993,7 @@ test "metadata reconciler derives secondary index rebuild ranges from building r
         try std.testing.expectEqual(@as(u64, 31), range.table_id);
         try std.testing.expectEqualStrings("status", range.index_name);
         try std.testing.expectEqual(@as(u64, 77), range.index_generation);
+        try std.testing.expect(range.range_id != 0);
         try std.testing.expectEqualStrings(table_manager.secondary_index_rebuild_declared, range.state);
     }
 

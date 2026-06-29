@@ -20,7 +20,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const ddl_plan = @import("ddl_plan.zig");
-const logical_ddl_plan = @import("logical_ddl_plan.zig");
+const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -31,7 +31,7 @@ const query_contract = @import("../query/contract.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
-const table_catalog = @import("../metadata/catalog_source.zig");
+const table_catalog = @import("../metadata/catalog/source.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
@@ -5154,6 +5154,7 @@ pub fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: Low
         "set_operation:op={s}:left={s}:right={s}",
         .{ @tagName(set_operation.operation), left, right },
     );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ctes", set_operation.ctes.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_output", set_operation.output_columns.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_order", set_operation.order_by.len);
     if (set_operation.limit) |limit| fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "result_limit", limit);
@@ -6836,13 +6837,12 @@ test "sql adapter corpus data-driven summary regressions" {
     }
 }
 
-test "sql adapter corpus coverage counts unsupported merge data modifying cte" {
+test "sql adapter corpus coverage counts merge data modifying cte" {
     var coverage = AppParityCorpusCoverage{};
     try coverage.observe(std.testing.allocator, .{
         .name = "merge mutation-producing cte source",
-        .family = .unsupported_merge_mutation,
-        .plan = "unsupported:merge_mutation:requires=cte_mutation_source_plan",
-        .classification_reason = "cte_mutation_source_plan",
+        .family = .merge_mutation,
+        .plan = "merge_mutation:target=usage_records:source=source_rows:ctes=0:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:data_ctes=1:data_cte_update=1:data_cte_returning=2:data_cte_claim_placeholder=1",
         .sql = "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
     });
     try std.testing.expect(coverage.merge_mutation_data_modifying_cte);
@@ -7435,7 +7435,7 @@ fn appParitySetupSqlSummaryAlloc(alloc: std.mem.Allocator, setup_sql: []const []
     for (setup_sql) |sql| {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var plan = try logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
+        var plan = try lower_ddl.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{});
         defer plan.deinit(alloc);
         summary.observePlan(plan);
     }

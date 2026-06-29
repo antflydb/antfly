@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10615
+%expect 10622
 
 %start statement
 
@@ -663,6 +663,7 @@ unsupported_statement:
   | CREATE OPERATOR IDENT diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
+  | CREATE OR REPLACE TRIGGER diagnostic_tail_opt
   | CREATE TRIGGER diagnostic_tail_opt
   | CREATE USER diagnostic_tail_opt
   | ALTER FOREIGN DATA identifier_name diagnostic_tail_opt
@@ -938,16 +939,21 @@ table_reference_list:
   ;
 
 table_reference:
-    qualified_name
-  | qualified_name AS identifier_name
-  | qualified_name identifier_name
-  | ONLY qualified_name
-  | ONLY qualified_name AS identifier_name
-  | ONLY qualified_name identifier_name
+    table_relation_source system_time_as_of_opt
   | qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
   | table_reference qualified_join_operator table_reference join_condition
   | table_reference conditionless_join_operator table_reference
   | LATERAL LPAREN read_statement RPAREN AS identifier_name
+  ;
+
+table_relation_source:
+    qualified_name table_alias_opt
+  | ONLY qualified_name table_alias_opt
+  ;
+
+system_time_as_of_opt:
+    /* empty */
+  | FOR IDENT AS OF NUMBER
   ;
 
 table_function_alias_opt:
@@ -1072,6 +1078,7 @@ returning_clause_opt:
 conflict_clause_opt:
     /* empty */
   | ON CONFLICT conflict_target DO conflict_action
+  | ON CONFLICT DO NOTHING
   ;
 
 conflict_target:

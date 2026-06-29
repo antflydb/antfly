@@ -23,7 +23,7 @@ const db_types = @import("../db/types.zig");
 const group_ids = @import("../../common/group_ids.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_writes = @import("../../api/table_writes.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;

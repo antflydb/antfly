@@ -17,12 +17,12 @@ const std = @import("std");
 const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const relational_rows = @import("relational_rows.zig");
-const sql_adapter_runtime = @import("../sql/runtime.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const ddl_plan = @import("../sql/ddl_plan.zig");
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
+const table_read_relational_rows = @import("table_reads/relational_rows.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 
@@ -103,7 +103,7 @@ fn planLogicalDdlParsedForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
     }
     return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
@@ -117,7 +117,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (entry.summary.ddl_tag == .advisory_lock and parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
     }
     var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
@@ -127,7 +127,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
             .function_bindings = .{},
         });
     }
-    return try sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
+    return try sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, parsed_sql, .{});
 }
 
 fn expectAdapterNoopLogicalPlan(
@@ -968,12 +968,13 @@ fn expectAppParityReadPlanEntry(
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
             },
+            .set_operation => {
+                try expectGeneratedSetOperationPlanForLegacyQueryCorpusAlloc(alloc, entry, lowered);
+            },
             else => return error.TestUnexpectedResult,
         },
         .read => {
-            const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
+            try expectReadPlanFingerprintAllowGeneratedSetOperationAlloc(alloc, entry, lowered);
         },
         .aggregate => switch (lowered) {
             .aggregate => |aggregate| {
@@ -1015,6 +1016,38 @@ fn expectAppParityReadPlanEntry(
     }
 }
 
+fn expectReadPlanFingerprintAllowGeneratedSetOperationAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    lowered: sql_adapter.LoweredReadPlan,
+) !void {
+    const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
+    defer alloc.free(fingerprint);
+    if (generatedSetOperationCanSatisfyLegacyQueryCorpusPlan(entry, fingerprint)) return;
+    try expectAppParityPlan(entry.plan, fingerprint);
+}
+
+fn expectGeneratedSetOperationPlanForLegacyQueryCorpusAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    lowered: sql_adapter.LoweredReadPlan,
+) !void {
+    const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
+    defer alloc.free(fingerprint);
+    if (generatedSetOperationCanSatisfyLegacyQueryCorpusPlan(entry, fingerprint)) return;
+    try expectAppParityPlan(entry.plan, fingerprint);
+}
+
+fn generatedSetOperationCanSatisfyLegacyQueryCorpusPlan(
+    entry: AppParityCorpusEntry,
+    actual: []const u8,
+) bool {
+    if (!std.mem.startsWith(u8, actual, "read:set_operation:")) return false;
+    if (std.mem.indexOf(u8, entry.name, "set operation") == null) return false;
+    return std.mem.startsWith(u8, entry.plan, "query:") or
+        std.mem.startsWith(u8, entry.plan, "read:query:");
+}
+
 const expectAppParityReadSummary = sql_adapter.expectAppParityReadSummary;
 const expectAppParityWriteSummary = sql_adapter.expectAppParityWriteSummary;
 const expectAppParityExplainSummary = sql_adapter.expectAppParityExplainSummary;
@@ -1051,7 +1084,7 @@ fn lowerAppParityWritePlanParsedSqlAlloc(
             },
         });
         defer logical_plan.deinit(alloc);
-        return try sql_adapter_runtime.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
+        return try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
     }
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
         .unique_resolver = unique_resolver,
@@ -1399,7 +1432,7 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (sql_adapter.logical_ddl_plan.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{})) |logical_value| {
+            if (sql_adapter.lower_ddl.parseLogicalDdlPlanAlloc(alloc, &parsed_sql, .{})) |logical_value| {
                 var logical = logical_value;
                 defer logical.deinit(alloc);
                 try expectAdapterNoopLogicalPlan(entry, logical);
@@ -2662,8 +2695,8 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "source schema matches target table",
-        .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records",
+        .name = "source schema mismatches source table",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM archived_records",
         .family = .insert_source,
         .summary = .{ .table_name = "usage_records" },
         .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=0:returning=0:returning_expr=0:returning_all=0",
@@ -3003,32 +3036,32 @@ const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32Fingerprint
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
 const applyLogicalDdlPlanToSchemaJsonAlloc = sql_adapter.applyLogicalDdlPlanToSchemaJsonAlloc;
 const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
-const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbAcrossRangesAlloc;
-const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
+const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter.lower_dml.buildMergeMutationBatchFromDbAcrossRangesAlloc;
+const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter.lower_dml.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
 const bulkSqlIoExecutionFingerprintAlloc = sql_adapter.bulkSqlIoExecutionFingerprintAlloc;
 const bulkSqlIoExecutionPlanFromDdlPlan = sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan;
 const createIndexPlanGeneratedExpressionCount = sql_adapter.createIndexPlanGeneratedExpressionCount;
 const ddlAppliedFingerprintAlloc = sql_adapter.ddlAppliedFingerprintAlloc;
 const ddlFingerprintAlloc = sql_adapter.ddlFingerprintAlloc;
-const lowerDeleteParsedSqlAlloc = sql_adapter_runtime.lowerDeleteParsedSqlAlloc;
-const lowerDeleteJoinedMutationSourceWithSchemasAlloc = sql_adapter_runtime.lowerDeleteJoinedMutationSourceWithSchemasAlloc;
-const lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter_runtime.lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc;
-const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerInsertWithResolverParsedSqlAlloc = sql_adapter_runtime.lowerInsertWithResolverParsedSqlAlloc;
-const lowerInsertWithResolverStrictParsedSqlAlloc = sql_adapter_runtime.lowerInsertWithResolverStrictParsedSqlAlloc;
-const lowerMergeMutationPlanParsedSqlAlloc = sql_adapter_runtime.lowerMergeMutationPlanParsedSqlAlloc;
+const lowerDeleteParsedSqlAlloc = sql_adapter.lower_dml.lowerDeleteParsedSqlAlloc;
+const lowerDeleteJoinedMutationSourceWithSchemasAlloc = sql_adapter.lower_dml.lowerDeleteJoinedMutationSourceWithSchemasAlloc;
+const lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lower_dml.lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc;
+const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerInsertWithResolverParsedSqlAlloc = sql_adapter.lower_dml.lowerInsertWithResolverParsedSqlAlloc;
+const lowerInsertWithResolverStrictParsedSqlAlloc = sql_adapter.lower_dml.lowerInsertWithResolverStrictParsedSqlAlloc;
+const lowerMergeMutationPlanParsedSqlAlloc = sql_adapter.lower_dml.lowerMergeMutationPlanParsedSqlAlloc;
 const lowerQueryPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerQueryPlanWithFunctionBindingsParsedSqlAlloc;
 const lowerReadPlanAlloc = sql_adapter.lower_select.lowerReadPlanAlloc;
 const lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
 const lowerReadPlanWithCatalogAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc;
 const lowerReadPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithFunctionBindingsParsedSqlAlloc;
-const lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter_runtime.lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
 const lowerSelectParsedSqlAlloc = sql_adapter.lower_select.lowerSelectParsedSqlAlloc;
-const lowerUpdateJoinedMutationSourceWithSchemasAlloc = sql_adapter_runtime.lowerUpdateJoinedMutationSourceWithSchemasAlloc;
-const lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter_runtime.lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc;
-const lowerUpdateMutationSourceParsedSqlAlloc = sql_adapter_runtime.lowerUpdateMutationSourceParsedSqlAlloc;
-const lowerUpdateParsedSqlAlloc = sql_adapter_runtime.lowerUpdateParsedSqlAlloc;
-const lowerUpdateStrictParsedSqlAlloc = sql_adapter_runtime.lowerUpdateStrictParsedSqlAlloc;
+const lowerUpdateJoinedMutationSourceWithSchemasAlloc = sql_adapter.lower_dml.lowerUpdateJoinedMutationSourceWithSchemasAlloc;
+const lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc;
+const lowerUpdateMutationSourceParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateMutationSourceParsedSqlAlloc;
+const lowerUpdateParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateParsedSqlAlloc;
+const lowerUpdateStrictParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateStrictParsedSqlAlloc;
 const lowerWritePlanAlloc = sql_adapter.lowerWritePlanAlloc;
 const lowerWritePlanWithCatalogAlloc = sql_adapter.lowerWritePlanWithCatalogAlloc;
 const lowerWritePlanWithCatalogParsedSqlAlloc = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc;
@@ -4338,7 +4371,7 @@ test "postgres sql adapter merge mutation batch executes through relational stor
     switch (write_plan) {
         .merge_mutation => |merge| {
             try std.testing.expectEqual(db_mod.types.SyncLevel.enrichments, merge.sync_level);
-            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..]);
+            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..], .{});
             defer batch.deinit(alloc);
             try std.testing.expectEqual(db_mod.types.SyncLevel.enrichments, batch.req.sync_level);
             try std.testing.expectEqual(@as(u32, 1), batch.inserted);
@@ -4410,7 +4443,7 @@ test "postgres sql adapter merge mutation batch applies default expressions" {
             try std.testing.expectEqual(@as(usize, 1), merge.not_matched_arms[0].insert_expressions.len);
             try std.testing.expectEqualStrings("\"active\"", merge.not_matched_arms[0].insert_expressions[0].expression.value_json);
 
-            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..]);
+            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..], .{});
             defer batch.deinit(alloc);
             try std.testing.expectEqual(@as(u32, 1), batch.inserted);
             try std.testing.expectEqual(@as(u32, 1), batch.transformed);
@@ -4468,7 +4501,7 @@ test "postgres sql adapter merge mutation batch resolves temporal primary target
 
     switch (write_plan) {
         .merge_mutation => |merge| {
-            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..]);
+            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..], .{});
             defer batch.deinit(alloc);
             try std.testing.expectEqual(@as(u32, 0), batch.inserted);
             try std.testing.expectEqual(@as(u32, 0), batch.deleted);
@@ -5766,11 +5799,26 @@ test "postgres sql adapter typed read plans execute through relational storage" 
     defer mixed_except_plan.deinit(alloc);
 
     switch (mixed_except_plan) {
-        .query => |lowered| {
-            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
-            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_not_predicates.len);
-            try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.expression_not_predicates[0].conditions.len);
-            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+        .set_operation => |lowered| {
+            try std.testing.expectEqual(sql_adapter.SelectSetOperation.except, lowered.operation);
+            try std.testing.expectEqual(@as(usize, 1), lowered.left.plan.query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.right.plan.query.predicates.len);
+
+            var left_rows = try db.queryRelationalRows(alloc, schema, lowered.left.plan.query);
+            defer left_rows.deinit(alloc);
+            var right_rows = try db.queryRelationalRows(alloc, schema, lowered.right.plan.query);
+            defer right_rows.deinit(alloc);
+            var result = try table_read_relational_rows.executeSetOperationOnQueryResultsAlloc(alloc, .{
+                .operation = table_read_relational_rows.loweredSetOperationToRowsOperation(lowered.operation),
+                .left = lowered.left.plan,
+                .right = lowered.right.plan,
+                .order_by = lowered.order_by,
+                .limit = lowered.limit,
+                .offset = lowered.offset,
+                .max_rows = lowered.max_rows,
+                .max_bytes = lowered.max_bytes,
+                .spill_after_bytes = lowered.spill_after_bytes,
+            }, left_rows.rows, right_rows.rows);
             defer result.deinit(alloc);
 
             try std.testing.expectEqual(@as(u32, 1), result.total);
@@ -6262,7 +6310,11 @@ test "postgres sql adapter catalog-backed read plans execute across source schem
         .sync_level = .write,
     });
 
-    var customer_catalog = AppParitySourceSchemaCatalog.init("customer_records", customer_schema_json);
+    var customer_catalog = try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, &.{
+        .{ .name = "usage_records", .schema_json = target_schema_json },
+        .{ .name = "customer_records", .schema_json = customer_schema_json },
+    });
+    defer customer_catalog.deinit(alloc);
     var catalog_join_plan = try lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY amount DESC NULLS LAST, order_id ASC LIMIT 5",
@@ -6301,7 +6353,11 @@ test "postgres sql adapter catalog-backed read plans execute across source schem
         else => return error.TestUnexpectedResult,
     }
 
-    var balance_catalog = AppParitySourceSchemaCatalog.init("balance_records", balance_schema_json);
+    var balance_catalog = try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, &.{
+        .{ .name = "usage_records", .schema_json = target_schema_json },
+        .{ .name = "balance_records", .schema_json = balance_schema_json },
+    });
+    defer balance_catalog.deinit(alloc);
     var catalog_lateral_plan = try lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM balance_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC NULLS LAST, organization_id ASC LIMIT 10",

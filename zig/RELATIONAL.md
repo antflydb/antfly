@@ -1128,14 +1128,14 @@ The maintainable code shape is now a SQL-owned compiler/runtime package plus
 API-owned integration coverage rather than one growing parser file. The
 PostgreSQL-compatible SQL language surface lives under `pkg/antfly/src/sql/`.
 `sql/mod.zig` is the facade for pure parser, binder, lowerer, diagnostic,
-fixture, and catalog-plan APIs. `sql/runtime.zig` is the storage/API execution
-bridge and is intentionally allowed to depend on API and storage modules until
-the remaining storage-backed helpers have clearer owning modules. API parity,
-HTTP, app-parity, and storage execution tests stay beside the API surface in
-`api/sql_adapter_integration.zig`. Older migration notes in this section that
-refer to `sql/runtime.zig` or `sql/` describe the path that
-led to this split; new work should target `src/sql/` unless it is explicitly
-API/storage integration.
+fixture, and catalog-plan APIs. Statement-family lowering is split across
+`sql/lower_select.zig`, `sql/lower_dml.zig`, and `sql/lower_ddl.zig`; runtime
+state lives in narrow SQL modules such as `sql/sessions.zig`,
+`sql/transactions.zig`, `sql/prepared_statements.zig`, `sql/cursors.zig`,
+`sql/notifications.zig`, `sql/routines.zig`, `sql/document_runtime.zig`, and
+`sql/document.zig`. API parity, HTTP, app-parity, and storage execution tests
+stay beside the API surface in `api/sql_adapter_integration.zig`. New work
+should target `src/sql/` unless it is explicitly API/storage integration.
 
 - `mod.zig`: public facade for the existing SQL lowering entrypoints and shared
   deinit helpers.
@@ -1177,8 +1177,7 @@ API/storage integration.
   surface rather than duplicated SQL facade helpers. SQL select-list,
   `ORDER BY` expression, general row-expression operand start classification,
   and binding-aware extension/routine expression starts also live here as typed
-  enum dispatch helpers; `sql/runtime.zig` can still own the temporary
-  parser methods that build each expression, but it should no longer carry long
+  enum dispatch helpers, so statement lowerers do not carry long
   PostgreSQL-token predicate chains for deciding which expression family starts
   at the current token.
 - `lower_select.zig`, `lower_dml.zig`, and `lower_ddl.zig`: statement-family
@@ -1189,33 +1188,26 @@ API/storage integration.
   predicates, golden-plan fingerprint append mechanics, fixture parsers, and
   fingerprint assertions.
 
-This split has already started, so new SQL semantics should extend the adapter
-package boundary even when compatibility wrappers still live in
-`sql/runtime.zig`. Create-table and create-index DDL plan parsing now
-live in `sql/ddl_plan.zig`; parser-local state crosses that
-boundary only through narrow hooks for row-expression/default parsing until
-those remaining expression entrypoints are fully adapter-owned. Binding-aware
-extension and routine functions follow the same rule: `sql/runtime.zig` may
-expose public `lower*WithFunctionBindings` entrypoints, but function-call
-recognition, duplicate binding rejection, arity checks, and row-expression
-lowering belong to `sql/lower_expr.zig` or adjacent adapter
-modules until the remaining parser code physically moves. Ready extension
+New SQL semantics should extend the adapter package boundary directly.
+Create-table and create-index DDL plan parsing live in `sql/ddl_plan.zig`;
+parser-local state crosses that boundary only through narrow hooks for
+row-expression/default parsing until those remaining expression entrypoints are
+fully adapter-owned. Binding-aware extension and routine functions follow the
+same rule: function-call recognition, duplicate binding rejection, arity checks,
+and row-expression lowering belong to `sql/lower_expr.zig` or adjacent adapter
+modules. Ready extension
 bindings passed into the adapter are typed
 `RelationalRowsExpressionKind` values, not parser-local string mappings. The
-test split follows the same boundary. `sql/runtime.zig` should keep
-public API, storage execution, schema-application, app-parity, catalog-backed
-plan, and end-to-end typed-plan coverage. Pure adapter regressions such as
-PostgreSQL syntax lowering, DDL plan shapes, expression lowering, DML plan
-construction, parser grammar tails, and fail-closed adapter diagnostics should
-live beside the owning `sql/` module, using local test helpers that
-exercise the adapter contract directly instead of reaching back through the
-public facade. The second migration slice keeps parser syntax methods in
-`sql/runtime.zig` but
-moves `SqlFunctionBindings`, routine expression binding metadata, `argN`
-substitution, duplicate/arity lookup, and null-input short-circuit helpers to
-the adapter expression layer. A follow-on cleanup routes DDL predicate literal
-parsing through `sql/value.zig` instead of carrying a second local
-token-slice parser in `sql/runtime.zig`; the next grammar slice moves
+test split follows the same boundary. API, storage execution,
+schema-application, app-parity, catalog-backed plan, and end-to-end typed-plan
+coverage should stay beside the owning integration surface, while pure adapter
+regressions such as PostgreSQL syntax lowering, DDL plan shapes, expression
+lowering, DML plan construction, parser grammar tails, and fail-closed adapter
+diagnostics should live beside the owning `sql/` module. `SqlFunctionBindings`,
+routine expression binding metadata, `argN` substitution, duplicate/arity
+lookup, and null-input short-circuit helpers live in the adapter expression
+layer. DDL predicate literal parsing routes through `sql/value.zig` instead of
+carrying a second local token-slice parser; the grammar slice moves
 partial unique-predicate token grouping and atom parsing into
 `sql/grammar.zig` while keeping the runtime `UniquePredicate`
 contract unchanged. Parser-local forwarding wrappers for identifier lists and
@@ -1229,12 +1221,11 @@ Case-insensitive identifier-list uniqueness and disjointness checks move with
 the list grammar into `sql/grammar.zig`. The validating DDL
 constraint column-list entrypoints for primary keys, unique constraints,
 temporal `WITHOUT OVERLAPS` lists, and `INCLUDE` columns also live in
-`grammar.zig`, so `sql/runtime.zig` no longer needs parser-local wrappers
-that parse a list and then re-run identifier-list validation. Mutation-path
+`grammar.zig`, so statement lowerers do not need parser-local wrappers that
+parse a list and then re-run identifier-list validation. Mutation-path
 conflict validation for insert columns, dotted field paths, JSON set paths, and
 typed JSON-set transform path construction now lives in
-`sql/lower_dml.zig`, with `sql/runtime.zig` only adapting its
-parser-local temporary assignment structs to that shared DML surface. MERGE
+`sql/lower_dml.zig`. MERGE
 target-row usage checks for expressions and predicate groups
 also live in `lower_dml.zig`, so source-only clauses fail closed through
 adapter-owned DML rules instead of parser-local recursion. Basic runtime-column
@@ -1243,8 +1234,8 @@ and later catalog binding use the same column-name and type matching helper.
 Relational catalog-existence checks, DDL column lookup, declared index-name
 lookup, primary/unique/foreign-key/check constraint-name lookup, and default
 primary-key naming rules also move into `binder.zig`, leaving schema mutation
-code in `sql/runtime.zig` to apply typed operations rather than own catalog
-name-resolution primitives. Temporal period lookup/type checks, period catalog
+code to apply typed operations rather than own catalog name-resolution
+primitives. Temporal period lookup/type checks, period catalog
 validation, primary-key `WITHOUT OVERLAPS` validation, and foreign-key
 column/temporal-action validation follow the same binder boundary because they
 bind typed catalog metadata to existing relational columns and periods.
@@ -1263,10 +1254,10 @@ expression checks share the same definition of catalog-safe deterministic and
 type-compatible expression trees. DDL catalog validation for relational columns,
 primary keys, `CHECK`, foreign-key names, generated columns, unique constraints,
 index `INCLUDE` columns, and field-based unique predicates is adapter-owned as
-well: `sql/runtime.zig` asks `lower_expr.zig` and `binder.zig` to validate
-the typed catalog metadata instead of retaining parallel schema-specific helpers
-beside the parser. The future larger slice can move the full row-expression
-parser once this contract is stable.
+well: lowerers ask `lower_expr.zig` and `binder.zig` to validate the typed
+catalog metadata instead of retaining parallel schema-specific helpers beside
+the parser. The future larger slice can move the full row-expression parser
+once this contract is stable.
 
 The internal flow is always:
 
@@ -1307,7 +1298,7 @@ token predicates for golden plan assertions also live in `corpus.zig` and
 reject duplicate or malformed token occurrences, so coverage checks cannot
 accidentally pass on substring matches or ambiguous plan summaries; fixture
 validation should call those corpus exports directly rather than maintaining
-local forwarding wrappers in `sql/runtime.zig`. Exact-token regression tests
+local forwarding wrappers. Exact-token regression tests
 for DDL submodes, `EXPLAIN` wrappers, and empty-catalog DDL applicability live
 with those corpus helpers. Coverage-token regression tests for DDL booleans,
 temporal DDL counts, aggregate zero-count buckets, and truncate identity tokens
@@ -1625,7 +1616,7 @@ tail-boundary predicates that the shared expression lowerer uses, plus the
 token-level rule that distinguishes a parenthesized boolean predicate group
 from a parenthesized scalar expression followed by comparison, pattern, range,
 membership, or JSON/path operators;
-`sql/runtime.zig` keeps the public lowering entrypoints and maps adapter
+The SQL lowerer modules keep the public lowering entrypoints and map adapter
 syntax into Antfly-native typed plans. Row-lock target
 validation remains in the lowerer/binder boundary because it depends on table
 aliases and catalog-normalized object names, but the SQL grammar emits only the
@@ -3323,6 +3314,13 @@ the write planner until validation promotion marks them enforced.
   nanoseconds.
 - `{"op":"current_date_ns"}` on `numeric` or `datetime` columns, stored as the
   UTC day-start epoch nanosecond value.
+- `{"op":"sequence_next","sequence":"name"}` on `numeric` columns, with optional
+  `database` and `schema` fields carrying resolved catalog identity. This is
+  durable schema metadata; public row-batch inserts, REST/SDK insert-source
+  execution, SQL point/insert-source writes, `MERGE`, and `COPY FROM`
+  materialize it through the server's explicit sequence-default resolver. Pure
+  planner paths and unsupported write families still fail closed unless they
+  receive that resolver.
 
 Defaults are materialized once per planned row by the write planner before
 primary-key encoding, unique tuple derivation, constraint checks, and
@@ -5057,10 +5055,10 @@ transaction before returning mutation-source `matched`/`staged` counts and
 and `DELETE ... USING`) also join the endpoint through typed side-table reads and
 the native joined mutation-source planner/stager, with the SQL executor
 autocommitting or aborting the row-claim transaction around the staged joined
-mutation. Single-table `TRUNCATE` joins the endpoint through the same typed
-table-emptying mutation-source path; multi-table truncate, `CASCADE`, and
-`RESTART IDENTITY` should remain fail-closed until their SQL executor wiring can
-use native cross-table catalog barriers, identity allocator reset work, and 2PC.
+mutation. Single-table `TRUNCATE`, multi-table truncate, and `CASCADE` join the
+endpoint through the catalog-owned table-emptying barrier path; `RESTART
+IDENTITY` carries allocator-reset intent on that same barrier and remains gated
+on native identity-allocator reset work before table-generation promotion.
 Recursive write sources and merge writes should remain fail-closed until their
 SQL executor wiring can use the native recursive materialization, trigger,
 catalog barrier, and 2PC paths already used by native APIs. Prepared
@@ -5104,9 +5102,9 @@ can report executed work instead of just the typed plan it would execute.
 
 Maintenance and transaction-mode SQL also stays out of storage until it maps to
 native typed work. Table-targeted `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER`
-syntax parses in `sql/grammar.zig` before `sql/runtime.zig`
-allocates typed maintenance-job intents that capture target table, index, or
-catalog scope and supported options, then fail closed when applied to table
+syntax parses in `sql/grammar.zig` before `sql/lower_ddl.zig` allocates typed
+maintenance-job intents that capture target table, index, or catalog scope and
+supported options, then fail closed when applied to table
 schema or runtime storage. The production shape is a durable maintenance-job model with
 table/index generations, range ownership, leases, throttling, resumable
 progress, repair/rebuild integration, stats output, and catalog promotion
@@ -5135,9 +5133,9 @@ effect is coordinator recovery state, not table schema.
 Notification-channel SQL is also adapter grammar over typed native intent, not
 backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
 `sql/grammar.zig`; `NOTIFY` payload literals use the shared
-`sql/value.zig` untyped literal-to-JSON helper; and
-`sql/runtime.zig` only maps the resulting channel name, optional payload JSON,
-or `UNLISTEN *` flag into typed notification-channel plans. `ApiHttpServer`
+`sql/value.zig` untyped literal-to-JSON helper; and `sql/lower_ddl.zig` maps the
+resulting channel name, optional payload JSON, or `UNLISTEN *` flag into typed
+notification-channel plans. `ApiHttpServer`
 executes those plans through `sql/notifications.zig`, an Antfly-owned
 notification runtime that assigns stable SQL notification session ids to owned
 catalog sessions, records idempotent `LISTEN` subscriptions, applies
@@ -5180,8 +5178,8 @@ flattening them into table names or schema JSON. Basic `CREATE TABLESPACE ...
 LOCATION`, `ALTER TABLESPACE ... RENAME TO`, and `DROP TABLESPACE` statements
 produce tablespace catalog plans so placement/storage-class intent is explicit
 but cannot silently change table storage paths. These database/tablespace SQL
-tails parse in `sql/grammar.zig`; `sql/runtime.zig` maps the
-syntax into typed catalog plans and owns only plan allocation/ownership transfer.
+tails parse in `sql/grammar.zig`; `sql/lower_ddl.zig` maps the syntax into
+typed catalog plans and owns only plan allocation/ownership transfer.
 Database catalog DDL now applies
 basic create, alter-settings, and empty-drop operations through durable typed
 database and namespace records, including automatic `public` namespace creation
@@ -5388,20 +5386,28 @@ and `CYCLE`), and `OWNED BY` dependency metadata including `OWNED BY NONE`;
 Standalone sequence tails, generated-identity sequence option clauses, and the
 identity-allocator `CREATE TABLE name (identity_column ...` header parse in
 `sql/grammar.zig`; the SQL lowerer only transfers owned grammar
-syntax into typed sequence and identity-allocator plans. Schema application
-remains fail-closed until the durable sequence catalog and
-allocator exist: sequences must allocate transactionally through owner/range
-routing, expose snapshot-consistent catalog state, and track schema-owned
-dependencies. Column-level `serial`/`bigserial`, `GENERATED ... AS IDENTITY`,
-generated-identity option clauses, and sequence-backed column defaults are
-schema-bearing allocator intent. `serial`/`bigserial` columns and
+syntax into typed sequence and identity-allocator plans. Basic schema
+application now persists durable sequence catalog records and initializes a
+catalog cursor. Public row writes can consume sequence-backed defaults through
+the explicit sequence resolver, which advances that cursor with a raft-applied
+compare-and-swap command carrying a durable allocation token so concurrent
+callers cannot claim the same reserved value. The remaining production
+allocator work is to add range/block allocation, track schema-owned
+dependencies, and wire identity reset semantics. PostgreSQL-shaped runtime
+sequence functions (`nextval`, `currval`, and `setval`) execute through the
+metadata-owned sequence catalog and SQL session currval state rather than SQL
+text. Column-level `serial`/`bigserial`, `GENERATED ... AS IDENTITY`,
+generated-identity option clauses, and sequence-backed column defaults now have
+native `sequence_next` schema metadata for the default expression.
+`serial`/`bigserial` columns and
 `GENERATED ... AS IDENTITY` columns lower to typed fail-closed
 identity-allocator catalog plans that preserve table identity, column identity,
 allocator kind, supported sequence-style options (`START`, `INCREMENT`,
 `MINVALUE`, `NO MINVALUE`, `MAXVALUE`, `NO MAXVALUE`, `CACHE`, and `CYCLE`),
-primary-key intent, and the count of ordinary peer columns. Schema application
-remains fail-closed until those defaults can claim monotonic values through the
-native allocator instead of raw SQL state.
+primary-key intent, and the count of ordinary peer columns. Full identity-column
+application remains fail-closed until those table-owned allocators can claim and
+reset monotonic values through the same native allocator owner instead of raw SQL
+state.
 
 PostgreSQL table partition DDL is schema-bearing catalog intent, not adapter
 text. `CREATE TABLE ... PARTITION BY RANGE (...)`, `CREATE TABLE ... PARTITION
@@ -5471,8 +5477,8 @@ PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 intent that captures role names, privilege counts, object kind/name, principal
 identity, and role setting names, then fail closed when applied to table schema
 storage. Those role and privilege tails parse in `sql/grammar.zig`;
-`sql/runtime.zig` only maps the owned authorization syntax into typed plan
-fields and validation-owned allocation. Public API execution routes
+`sql/lower_ddl.zig` maps the owned authorization syntax into typed plan fields
+and validation-owned allocation. Public API execution routes
 authorization-catalog SQL through the
 native user-management surface instead: `CREATE ROLE app_writer` creates the
 Antfly auth subject `role:app_writer`, `DROP ROLE` succeeds only after that
@@ -5619,8 +5625,7 @@ freezes the current ordered SQL session search path into durable routine
 metadata, and other `FROM CURRENT` routine settings freeze the current value
 only when it exists in the typed SQL session setting map; absent or unsupported
 settings fail closed before the routine record is stored. Routine lifecycle
-tails parse in
-`sql/grammar.zig`; `sql/runtime.zig` only maps that owned syntax
+tails parse in `sql/grammar.zig`; `sql/lower_ddl.zig` maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
@@ -6773,6 +6778,18 @@ persisted table-emptying workers still reject identity-reset work until the
 durable catalog-owned table-emptying job can claim all affected owner ranges,
 reset owned allocators, and promote table generations atomically.
 
+`CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` now apply through the
+metadata-owned catalog path rather than remaining parser-only compatibility
+syntax. Sequence records carry deterministic catalog identity, database/schema
+scope, and typed option JSON through metadata snapshots and raft apply storage.
+Public row-batch, insert-source, MERGE, and COPY FROM default materialization
+can reserve `sequence_next` values through an explicit server-side resolver
+backed by a raft-applied compare-and-swap cursor command with a durable
+allocation token. Runtime sequence functions (`nextval`, `currval`, `setval`)
+now use that sequence catalog plus SQL session currval state. Range/block
+allocation, owned-by dependency enforcement, and storage-specific reset state
+remain native allocator work rather than SQL text behavior.
+
 Unsupported and adapter-noop classification reasons are exact fingerprint
 tokens. A fixture reason must match the full `requires` or `reason` token value,
 so prefix-only matches such as `session_setting_extra` cannot satisfy
@@ -7199,9 +7216,9 @@ such as `read:query_extra` or `insert_source` cannot satisfy `read:query` or
 | SQL family | Current Antfly baseline | Remaining long-term work | Completion signal |
 | --- | --- | --- | --- |
 | SQL capture and adapter boundary | Supported statements fail closed into typed DDL, row-query, mutation, aggregate, join, CTE, and expression plans; unsupported syntax is not passed to storage. Source fixture entries now pin typed-plan fingerprints for representative supported shapes, explicit no-op classifications for session/reset-show/transaction-control/schema-namespace/known-extension syntax, typed extension catalog fingerprints, typed transaction-control fingerprints for advisory locks, table locks, constraint modes, savepoints, and mode-bearing transaction starts, typed SQL routine-expression body fingerprints, typed comment metadata fingerprints, typed table-drop catalog fingerprints, typed `TRUNCATE` mutation-source fingerprints, reasoned unsupported classifications with required native model-feature labels through one map-driven fail-closed assertion path, and structured catalog-application fingerprints for unique, FK, check validation, rebuild, rewrite, table-drop, and row-rewrite lifecycles. Fixture metadata validation rejects malformed applied-plan fingerprints instead of accepting arbitrary non-empty strings, applied catalog fingerprints are valid only on DDL entries where the fixture runner derives and checks them, stored applied catalog fingerprints must exactly match the typed DDL catalog applier result for the embedded base schema plus any setup SQL, row-rewrite applied fingerprints carry the same row-expression AST fingerprint used by native plans, applied catalog coverage is satisfied through exact parsed lifecycle tokens instead of substring matches, generated fixture roots carry the SHA-256 of the source corpus that produced them, setup SQL must be valid typed DDL that either defines runtime schema context or is consumed by an applied catalog fingerprint, classification reasons are allowed only on unsupported or adapter-no-op entries where the reason is part of the golden fingerprint, summary fields are accepted only on plan families where the fixture runner has a structural assertion path, `EXPLAIN` summaries are checked against the wrapped typed read or write plan, direct read plus `EXPLAIN` read summaries share one read assertion helper and dispatch through one read runner, direct write plus `EXPLAIN` write summaries share one write assertion helper and dispatch through one write runner, source schemas are valid parsed relational runtime schemas with primary keys only on cross-table source families whose SQL resolves a separate source side, deterministic returning rows are valid JSON objects only on point write families, and their count must match the asserted point-write returning count before the runner compares them, resolver hints are valid only on primary/unique-resolving write families and must describe either a versioned resolved JSON object or an explicit miss, single-source and joined-mutation summaries verify their target row-claim policy, operation-count summaries are valid only on plan families that structurally assert operations, generic read-family summaries are checked against their resolved typed read variant, and bind parameters must correspond exactly to consecutive numbered SQL placeholders: placeholders require params, params require placeholders, placeholder numbers must be consecutive, and malformed suffixes such as `$1abc` are rejected instead of being counted as `$1`. The corpus-owned coverage gate uses the same exact-token helpers as fixture validation, so malformed suffixes, duplicate tokens, and substring matches cannot claim feature coverage; it also requires parameterized examples across row-query, aggregate, join, lateral, window, point write, mutation-source, and joined mutation-source families. `zig build sql-api-parity-test` runs that corpus as a focused CI gate. | Expand the representative SQL and migration-equivalence corpus, normalize placeholders and aliases, bind each runtime statement and native migration step against Antfly catalog snapshots, and store golden typed plans, explicit adapter-only no-ops, or explicit unsupported classifications. | Every harvested runtime statement and migration-equivalence step is classified; adapter-only no-ops are named; unsupported shapes include the model feature they need before they can run. |
-| Schema and migrations | Supported `CREATE TABLE`, idempotent `CREATE TABLE IF NOT EXISTS`, typed `CREATE OR REPLACE TABLE` and `CREATE OR REPLACE TABLE IF NOT EXISTS` schema replacement with rebuild/validation/rewrite work, `CREATE INDEX`, idempotent `CREATE INDEX IF NOT EXISTS`, `CREATE INDEX CONCURRENTLY`, `DROP INDEX`, `DROP INDEX IF EXISTS`, `DROP INDEX CONCURRENTLY`, `DROP TABLE`, idempotent `DROP TABLE IF EXISTS`, SQL `DROP TABLE ... CASCADE` child-FK metadata cleanup, direct table deletion, catalog-level restrict semantics for referenced plain/direct table drops, and claimed table-emptying `TRUNCATE` lowering including explicit native `CONTINUE IDENTITY`, `RESTART IDENTITY`, multi-table target lists, and cascade metadata, additive `ALTER TABLE`, top-level `ALTER TABLE IF EXISTS`, grouped `ADD COLUMN IF NOT EXISTS` inline constraints, structured `DROP COLUMN` rewrite-required mutations with `IF EXISTS` and dependency-mode semantics, named `DROP CONSTRAINT` mutations for unique/FK/check metadata, `ALTER COLUMN SET/DROP DEFAULT` metadata mutations, `ALTER COLUMN SET/DROP NOT NULL` nullability mutations, `ALTER COLUMN TYPE` rewrite/validation mutations, `RENAME COLUMN` rewrite-required mutations, `RENAME CONSTRAINT` metadata mutations, defaults, checks, generated columns, JSONB/array columns, foreign keys, durable primary-key constraint names, unique constraints, named inline column unique/check/FK constraints, partial indexes, JSON/array GIN indexes over declared JSON and array columns, multi-column ordinary indexes as named column-set lifecycle metadata, expression indexes, harmless wrapper parentheses around supported expression-index elements, btree `ASC`/`DESC` and `NULLS` index element syntax, simple parenthesized/casted partial-index predicates, `NOT VALID` constraint additions, `VALIDATE CONSTRAINT`, and updated-at trigger create/replace/drop shapes lower to typed catalog plans. Native schema JSON accepts both atom checks and row-expression checks, validates their declared-field dependencies during schema updates, persists the expression AST in storage schema metadata, rejects same-name check definition drift outside explicit drop/re-add, validates newly enforced or promoted checks against existing rows before catalog commit, and enforces promoted checks during final-row write validation. SQL DDL lowering for supported `CHECK (...)` syntax emits that same native metadata rather than storing SQL text: simple column checks remain atom checks, computed scalar/function/arithmetic checks become row-expression checks, and grouped, parenthesized, or negated predicates become boolean row-expression checks. SQL DDL application schedules rewrite work for table updates as raft-backed `SchemaRewriteJobRecord` catalog metadata, including cloned typed row-expression ASTs for `ALTER TABLE ... USING` targets, so row-rewrite intent survives request cleanup and metadata restart. Per-range rewrite job ids are deterministic for the applied table schema generation, range, action/reason, and work ordinal, so retrying the same SQL DDL scheduling path upserts the same durable jobs rather than duplicating backfill work. The source fixture applies representative unique, FK, check, default, nullability, type-change, rename-column, rename-constraint, table replacement, drop-index, drop-constraint, drop-column, drop-table, drop-table cascade cleanup, update-policy creation/removal, and truncate changes and pins the resulting typed plans or rebuild/validation/rewrite/mutation-source state. | Apply native migration-equivalent plans transactionally through catalog schema JSON, schedule validation/rebuild work for every non-empty-table derived artifact, and run durable rewrite/backfill jobs for remaining non-additive data changes because the relational format starts here. `CREATE OR REPLACE TABLE` and the combined idempotent form are already typed replacement operations at the catalog-plan boundary; production execution should bind their rebuild/validation/rewrite work to the same durable job/promotion path as index, constraint, and row-rewrite jobs. SQL `DROP TABLE ... CASCADE` removes dependent FK metadata through ordinary schema-update validation before the parent drop; production hardening should attach that multi-table catalog change to one durable schema job and table-generation promotion. `DELETE FROM table` and `TRUNCATE` both lower to transaction-claimed delete-from-source requests over all rows; explicit `TRUNCATE ... CONTINUE IDENTITY` normalizes to the default table-emptying shape, `TRUNCATE ... RESTART IDENTITY` preserves allocator-reset intent on the native mutation-source request, and multi-table/cascade forms carry their affected-table metadata on the typed truncate-source plan. Public SQL admission rejects allocator resets unless the catalog service exposes a native reset owner, persisted range workers execute the ordinary table-emptying delete, and completed barrier promotion resets owned identity allocators before advancing table generations. The remaining production step is wrapping table-emptying jobs that change table generations in a catalog-owned barrier that claims all affected owner ranges, deletes base rows and derived index rows through ordinary mutation/replay paths, resets owned identity allocators when requested, applies cascade expansion from catalog FK metadata, and advances table generations before new writes proceed. Ordered index element clauses are accepted at the adapter boundary today and normalized to column membership; durable ordered-composite access-path metadata should land with routed ordering/planner work. Unsupported future predicate syntax should continue extending native expression-check metadata instead of storing SQL text. | Intended final schema and migration effects compile into catalog state; rebuild/validation/rewrite intent is durable and remaining rewrite workers must prove completion before promotion; dump, extension, PL/pgSQL, or unsupported trigger syntax is either proven adapter-only no-op behavior or rejected before storage. |
+| Schema and migrations | Supported `CREATE TABLE`, idempotent `CREATE TABLE IF NOT EXISTS`, typed `CREATE OR REPLACE TABLE` and `CREATE OR REPLACE TABLE IF NOT EXISTS` schema replacement with rebuild/validation/rewrite work, `CREATE INDEX`, idempotent `CREATE INDEX IF NOT EXISTS`, `CREATE INDEX CONCURRENTLY`, `DROP INDEX`, `DROP INDEX IF EXISTS`, `DROP INDEX CONCURRENTLY`, `DROP TABLE`, idempotent `DROP TABLE IF EXISTS`, SQL `DROP TABLE ... CASCADE` child-FK metadata cleanup, direct table deletion, catalog-level restrict semantics for referenced plain/direct table drops, and claimed table-emptying `TRUNCATE` lowering including explicit native `CONTINUE IDENTITY`, `RESTART IDENTITY`, multi-table target lists, and cascade metadata, additive `ALTER TABLE`, top-level `ALTER TABLE IF EXISTS`, grouped `ADD COLUMN IF NOT EXISTS` inline constraints, structured `DROP COLUMN` rewrite-required mutations with `IF EXISTS` and dependency-mode semantics, named `DROP CONSTRAINT` mutations for unique/FK/check metadata, `ALTER COLUMN SET/DROP DEFAULT` metadata mutations, `ALTER COLUMN SET/DROP NOT NULL` nullability mutations, `ALTER COLUMN TYPE` rewrite/validation mutations, `RENAME COLUMN` rewrite-required mutations, `RENAME CONSTRAINT` metadata mutations, defaults, checks, generated columns, JSONB/array columns, foreign keys, durable primary-key constraint names, unique constraints, named inline column unique/check/FK constraints, partial indexes, JSON/array GIN indexes over declared JSON and array columns, multi-column ordinary indexes as named column-set lifecycle metadata, expression indexes, harmless wrapper parentheses around supported expression-index elements, btree `ASC`/`DESC` and `NULLS` index element syntax, simple parenthesized/casted partial-index predicates, `NOT VALID` constraint additions, `VALIDATE CONSTRAINT`, and updated-at trigger create/replace/drop shapes lower to typed catalog plans. Native schema JSON accepts both atom checks and row-expression checks, validates their declared-field dependencies during schema updates, persists the expression AST in storage schema metadata, rejects same-name check definition drift outside explicit drop/re-add, validates newly enforced or promoted checks against existing rows before catalog commit, and enforces promoted checks during final-row write validation. SQL DDL lowering for supported `CHECK (...)` syntax emits that same native metadata rather than storing SQL text: simple column checks remain atom checks, computed scalar/function/arithmetic checks become row-expression checks, and grouped, parenthesized, or negated predicates become boolean row-expression checks. SQL DDL application schedules rewrite work for table updates as raft-backed `SchemaRewriteJobRecord` catalog metadata, including cloned typed row-expression ASTs for `ALTER TABLE ... USING` targets, so row-rewrite intent survives request cleanup and metadata restart. Per-range rewrite job ids are deterministic for the applied table schema generation, range, action/reason, and work ordinal, so retrying the same SQL DDL scheduling path upserts the same durable jobs rather than duplicating backfill work. SQL `TRUNCATE` admission now schedules catalog-owned table-emptying barrier jobs for every form, including simple single-table truncate, and the source fixture applies representative unique, FK, check, default, nullability, type-change, rename-column, rename-constraint, table replacement, drop-index, drop-constraint, drop-column, drop-table, drop-table cascade cleanup, update-policy creation/removal, and truncate changes and pins the resulting typed plans or rebuild/validation/rewrite/table-emptying state. | Apply native migration-equivalent plans transactionally through catalog schema JSON, schedule validation/rebuild work for every non-empty-table derived artifact, and run durable rewrite/backfill jobs for remaining non-additive data changes because the relational format starts here. `CREATE OR REPLACE TABLE` and the combined idempotent form are already typed replacement operations at the catalog-plan boundary; production execution should bind their rebuild/validation/rewrite work to the same durable job/promotion path as index, constraint, and row-rewrite jobs. SQL `DROP TABLE ... CASCADE` removes dependent FK metadata through ordinary schema-update validation before the parent drop; production hardening should attach that multi-table catalog change to one durable schema job and table-generation promotion. `DELETE FROM table` and `TRUNCATE` both lower to transaction-claimed delete-from-source requests over all rows; explicit `TRUNCATE ... CONTINUE IDENTITY` normalizes to the default table-emptying shape, `TRUNCATE ... RESTART IDENTITY` preserves allocator-reset intent on the native mutation-source request, and multi-table/cascade forms carry their affected-table metadata on the typed truncate-source plan. Public SQL admission rejects allocator resets unless the catalog service exposes a native reset owner, persisted range workers execute the ordinary table-emptying delete, and completed barrier promotion resets owned identity allocators before advancing table generations. Catalog-owned table-emptying barriers now claim all affected owner ranges, execute the ordinary mutation/replay delete path through persisted range jobs, apply cascade expansion from catalog FK metadata, validate completed `RESTART IDENTITY` barriers through the real metadata catalog reset boundary, and advance affected table generations before new writes observe the promoted generation. Remaining production hardening is range-movement/chaos coverage, storage-specific allocator-state attachment behind that reset boundary, and broader operational controls for large table-emptying barriers. Ordered index element clauses are accepted at the adapter boundary today and normalized to column membership; durable ordered-composite access-path metadata should land with routed ordering/planner work. Unsupported future predicate syntax should continue extending native expression-check metadata instead of storing SQL text. | Intended final schema and migration effects compile into catalog state; rebuild/validation/rewrite intent is durable and remaining rewrite workers must prove completion before promotion; dump, extension, PL/pgSQL, or unsupported trigger syntax is either proven adapter-only no-op behavior or rejected before storage. |
 | Point CRUD and conflict upserts | Point `INSERT`, `UPDATE`, `DELETE`, point mutation selectors over primary keys, enforced unique column constraints, and enforced partial unique column constraints when selector predicates prove the partial predicate, primary/unique `ON CONFLICT`, `excluded.column`, conflict-action expressions over proposed and committed-row inputs, numeric conflict deltas from `excluded` values, defaults, `NOW()`/`CURRENT_TIMESTAMP`/`CURRENT_DATE`, updated-at policies, JSONB/array transforms, and field/expression `RETURNING` have row-batch model homes. `RowsInsertSourceRequest` provides the typed API home for `INSERT ... SELECT`; bound same-table execution reads the typed source query, evaluates target assignments over source rows, lowers planned rows through the same row-batch constraint path as ordinary inserts, returns final inserted images, and executes typed primary/unique `ON CONFLICT DO NOTHING` and `DO UPDATE` by resolving the planned proposed row against committed primary/unique owner rows. `DO NOTHING` skips duplicate proposed conflict targets; `DO UPDATE` rejects duplicate proposed targets because two source rows would otherwise update the same committed row in one statement. The native insert-source validator, public parser, row-batch builder, DB-backed source-preimage bridge, and DB-backed plan/CTE bridge have target/source schema-aware entrypoints; local and routed callers can collect source rows through the storage query/preimage path, materialize typed CTEs over those rows when present, then feed the same typed assignment, conflict, predicate, and `RETURNING` executor. Provisioned and hosted typed execution collect cross-table source rows through source-table catalog ownership, apply global source ordering/pagination once, resolve primary and durable unique conflict targets through routed target-table reads, and stage proposed target rows or conflict transforms through the existing target row-batch path. The SQL adapter lowers field-projected same-table and catalog-backed cross-table `INSERT ... SELECT ... [ON CONFLICT (...) DO NOTHING|DO UPDATE ...] RETURNING ...` into the same typed insert-source family, including proposed-row `excluded.field` update expressions, `DO UPDATE SET field = DEFAULT` static transforms over target-column defaults, and guarded conflict predicates; catalog-backed lowering uses SQL only to identify source table identity, then loads the source schema and validates through the same typed request boundary. The source SQL/API golden corpus pins that cross-table insert-source shape with a separate source schema, so missing catalog/source-schema context remains an intentional fail-closed helper limitation rather than a missing native plan family. | Keep conflict actions and `RETURNING` on the shared expression tree, evaluate them over the final committed row image, harden range-movement chaos coverage around routed insert-source conflict lookup/staging, and keep non-unique selectors on explicit claimed mutation-source plans. | Identity, authorization, billing, seed, source-driven copy/backfill, and JSON metadata flows run from typed row-batch or insert-source plans without raw SQL or hidden scans. |
-| Multi-row DML and queue claims | Base-row queries can carry row-claim metadata, `FOR [NO KEY] UPDATE [NOWAIT|SKIP LOCKED]` lowering exists for lockable sources, and local plus catalog-routed provisioned/hosted mutation-source update/delete stages claimed rows in the owning transaction with OCC predicates. Pending row-claim intents carry durable owner/lease payloads and transaction resolution consumes those intents without leaving permanent claim keys. Public mutation-source update/delete plans can intentionally omit predicates to stage claimed table-wide updates or table-emptying deletes; `TRUNCATE` lowering uses the same claimed delete-source shape. | Lease reclaim is implemented; add routed range-movement hardening. Keep claims illegal over joins, aggregates, windows, and materialized CTEs until those stages expose lockable base rows. Catalog-owned table-emptying jobs still need a generation barrier around the existing typed delete-source plan. | Queue, re-encryption, cleanup, and batch update/delete flows do not double-claim, miss rows after range movement, or mutate rows without a lockable source contract. |
+| Multi-row DML and queue claims | Base-row queries can carry row-claim metadata, `FOR [NO KEY] UPDATE [NOWAIT|SKIP LOCKED]` lowering exists for lockable sources, and local plus catalog-routed provisioned/hosted mutation-source update/delete stages claimed rows in the owning transaction with OCC predicates. Pending row-claim intents carry durable owner/lease payloads and transaction resolution consumes those intents without leaving permanent claim keys. Public mutation-source update/delete plans can intentionally omit predicates to stage claimed table-wide updates or table-emptying deletes; `TRUNCATE` lowering uses the same claimed delete-source shape, and SQL `TRUNCATE` admission uses catalog-owned table-emptying barriers rather than a synchronous delete shortcut. | Lease reclaim is implemented; add routed range-movement hardening. Keep claims illegal over joins, aggregates, windows, and materialized CTEs until those stages expose lockable base rows. Harden table-emptying barrier workers under range movement, retries, aborts, and concurrent writers. | Queue, re-encryption, cleanup, and batch update/delete flows do not double-claim, miss rows after range movement, or mutate rows without a lockable source contract. |
 | Scalar expressions | Many common predicates, text-pattern predicates, projections, casts, null tests, generated expressions, JSON/array predicates, expression order keys, aggregate filter expressions, aggregate input expressions, aggregate-output `having_expressions`, `having_any`, `having_not`, and returning expressions lower through typed paths. The expression structs are now owned by `storage/schema.zig` and re-exported by db request types, so schema/catalog metadata can share the same AST instead of copying row-execution-only structs. Generated columns can use either legacy shorthand operations (`lower`, `upper`, `md5`, `concat`, `concat_ws`) or the native `generated.expression` row-expression AST; the latter is deterministic, type-validated against the relational schema, evaluated by both public row planning and storage rewrite/backfill, and included in durable schema serialization and index-generation hashes. SQL DDL lowers stored generated-column expressions and `ALTER COLUMN ... USING` row-rewrite expressions into that same AST for the supported scalar/function/arithmetic/JSON extraction subset, while volatile functions and unsupported syntax still fail closed before catalog storage. | Replace remaining scattered lowerer cases with one typed expression AST for checks, generated columns, expression indexes, partial predicates, conflict actions, update transforms, aggregate filters/inputs, aggregate-output predicates, order keys, and `RETURNING`. Planner pushdown becomes an optimizer property of that AST. | Every supported expression is type-bound once at the adapter boundary and can be executed through REST/SDK plans as well as SQL. |
 | JSONB and arrays | Declared `json` and `array` columns have typed predicates/transforms, and embedded JSON columns have a document-index-in-row design. | Route remaining SQL operators through typed JSON/array expression nodes, expose the same selectors/transforms directly through API/SDK plans, and run embedded JSON schema/template changes through catalog rebuild work. | JSONB metadata, array membership, rollup metadata, and embedded document-index queries work without bypassing the relational row store. |
 | Indexes and planner trust | Ordinary secondary indexes have lifecycle state and rebuild generations; unique constraints have validation state; simple partial indexes, generated expression secondary indexes for case-fold, stable unary hash, simple concat keys, simple `concat_ws` keys, and richer deterministic row-expression secondary indexes, including harmlessly parenthesized SQL expression-index elements, and case-fold plus stable unary hash unique expression keys are modeled. Partial index and unique metadata accepts deterministic `where_expressions`; write-time secondary-index maintenance and partial unique-owner maintenance apply the supported row-local typed expression subset, including case-fold, stable unary hash, simple `concat`, simple `concat_ws`, rich text transforms and tests such as `initcap`, `trim`, `replace`, `translate`, `substring`, `overlay`, `split_part`, `left`/`right`, `lpad`/`rpad`, `repeat`, `reverse`, `starts_with`/`ends_with`, `length`/`octet_length`/`bit_length`, `strpos`, `ascii`, `chr`, and null-preserving `coalesce`. Schema validation checks expression-predicate operand domains per operation before catalog application. Planners and conflict-target inference use expression-partial indexes and partial unique-owner rows after exact typed-expression predicate proof or semantic proof from complete concrete equality predicates through the shared expression evaluator, and missing proof falls back to base-row scans or rejects unsupported conflict targets. | Extend the shared semantic expression implication checker across additional safe equivalence classes, add collation/null semantics, and route expression-derived rebuild/promotion through the same generation/CAS lifecycle as ordinary indexes. | Planner choices depend only on ready/enforced catalog metadata; stale, building, or unvalidated derived artifacts cannot affect query answers or write enforcement. |

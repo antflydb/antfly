@@ -193,6 +193,7 @@ pub const RelationalDefaultKind = enum(u8) {
     now_ns = 1,
     uuid_v4 = 2,
     current_date_ns = 3,
+    sequence_next = 4,
 };
 
 pub const RelationalDefaultValue = struct {
@@ -2817,6 +2818,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" }, .on_update_value = .{ .kind = .now_ns, .value_json = "" } },
             .{ .name = "request_id", .path = "request_id", .field_type = .keyword, .nullable = true, .default_value = .{ .kind = .uuid_v4, .value_json = "" } },
             .{ .name = "created_day", .path = "created_day", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .current_date_ns, .value_json = "" } },
+            .{ .name = "sequence_id", .path = "sequence_id", .field_type = .numeric, .nullable = false, .default_value = .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"orders_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}" } },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
             .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
             .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
@@ -2972,10 +2974,14 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[5].field_type);
     try std.testing.expect(loaded.relational_columns[5].default_value != null);
     try std.testing.expectEqual(RelationalDefaultKind.current_date_ns, loaded.relational_columns[5].default_value.?.kind);
-    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[6].field_type);
-    try std.testing.expect(!loaded.relational_columns[6].indexed);
-    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[7].field_type);
-    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[7].array_item_type.?);
+    try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[6].field_type);
+    try std.testing.expect(loaded.relational_columns[6].default_value != null);
+    try std.testing.expectEqual(RelationalDefaultKind.sequence_next, loaded.relational_columns[6].default_value.?.kind);
+    try std.testing.expectEqualStrings("{\"sequence\":\"orders_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", loaded.relational_columns[6].default_value.?.value_json);
+    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[7].field_type);
+    try std.testing.expect(!loaded.relational_columns[7].indexed);
+    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[8].field_type);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[8].array_item_type.?);
     try std.testing.expect(loaded.relational_columns[2].default_value != null);
     try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_columns[2].index_lifecycle);
     try std.testing.expectEqual(@as(u64, 12345), loaded.relational_columns[2].index_generation);

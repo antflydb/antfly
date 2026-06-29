@@ -24,8 +24,8 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
-const table_catalog = @import("../table_catalog.zig");
-const tables_api = @import("../tables.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_read_core = @import("../table_reads/core.zig");
 const table_read_relational_rows = @import("../table_reads/relational_rows.zig");
 const table_write_core = @import("core.zig");
@@ -140,7 +140,7 @@ pub fn mergeRowsFromSourceRowsOnDb(
         };
     }
 
-    var batch_req = try sql_adapter.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
+    var batch_req = try sql_adapter.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows, .{});
     errdefer batch_req.deinit(alloc);
     db.batch(batch_req.req) catch |err| return normalize_error(err);
     return batch_req;
