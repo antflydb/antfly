@@ -3342,7 +3342,10 @@ pub const DataServer = struct {
     fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
         const raft_status = status orelse return false;
         if (raft_status.soft.leader_id != null) return false;
-        if (raft_status.soft.role == .leader) return false;
+        switch (raft_status.soft.role) {
+            .follower, .pre_candidate => {},
+            .candidate, .leader => return false,
+        }
         return localRaftStatusIsVoter(raft_status, local_node_id);
     }
 
@@ -8980,7 +8983,7 @@ test "data raft bootstrap campaign retries leaderless voter elections" {
     try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .candidate;
-    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .leader;
     status.soft.leader_id = 1;
