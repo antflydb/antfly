@@ -19864,13 +19864,13 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             _ = try ctx.index_manager.runDenseLsmMaintenanceByName(index_ref.name, denseCatchUpMaintenanceSteps());
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
-        if (stats.last_sequence > applied) {
+        if (stats.appliedSequenceAdvance(applied)) |sequence| {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
-                .sequence = stats.last_sequence,
+                .sequence = sequence,
             });
-        } else if (stats.scanned_entries == 0 and target_sequence > applied and
+        } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
             try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
         {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
@@ -20286,10 +20286,10 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             }
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
-        if (stats.last_sequence > applied) {
-            try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+        if (stats.appliedSequenceAdvance(applied)) |sequence| {
+            try self.core.saveAppliedSequence(index_ref.name, sequence);
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
-        } else if (stats.scanned_entries == 0 and target_sequence > applied and
+        } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
             try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
         {
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);

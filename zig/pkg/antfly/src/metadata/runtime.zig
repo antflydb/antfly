@@ -26,6 +26,8 @@ const platform_time = @import("../platform/time.zig");
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
+const metadata_raft_election_max_ticks = 60;
+const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -583,6 +585,13 @@ pub const Server = struct {
         try self.server.runCdcRound();
     }
 
+    pub fn campaignMetadataGroupIfBootstrapLeaderless(self: *Server, metadata_group_id: u64, local_node_id: u64) !bool {
+        const raft_status = self.server.svc.raft.host.http_host.host.raftStatus(metadata_group_id);
+        if (!metadataRaftStatusShouldBootstrapCampaign(raft_status, local_node_id)) return false;
+        try self.server.campaignMetadataGroup();
+        return true;
+    }
+
     pub fn status(self: *Server) !antfly.metadata_api.MetadataStatus {
         return try self.server.status();
     }
@@ -655,6 +664,39 @@ fn indexOfClusterPeer(cluster_peers: []const MetadataClusterPeer, node_id: u64) 
         if (peer.node_id == node_id) return index;
     }
     return null;
+}
+
+fn metadataClusterPreferredCampaigner(cluster_peers: []const MetadataClusterPeer, local_node_id: u64) bool {
+    if (cluster_peers.len == 0) return true;
+    var min_node_id = cluster_peers[0].node_id;
+    for (cluster_peers[1..]) |peer| {
+        if (peer.node_id < min_node_id) min_node_id = peer.node_id;
+    }
+    return local_node_id == min_node_id;
+}
+
+fn metadataRaftStatusIsVoter(status: raft_engine.core.Status, local_node_id: u64) bool {
+    for (status.conf_state.voters) |node_id| {
+        if (node_id == local_node_id) return true;
+    }
+    return false;
+}
+
+fn metadataRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
+    const raft_status = status orelse return false;
+    if (raft_status.soft.leader_id != null) return false;
+    switch (raft_status.soft.role) {
+        .follower, .pre_candidate, .candidate => {},
+        .leader => return false,
+    }
+    return metadataRaftStatusIsVoter(raft_status, local_node_id);
+}
+
+fn metadataBootstrapCampaignRetryIntervalNs(tick_ms: u64) u64 {
+    return @max(
+        metadata_bootstrap_campaign_retry_min_interval_ns,
+        tick_ms * std.time.ns_per_ms * metadata_raft_election_max_ticks * 2,
+    );
 }
 
 fn allocMetadataPeerNodeIds(
@@ -844,7 +886,21 @@ pub fn runFromIterator(
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
+    const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
+    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
+    var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
     while (true) {
+        if (preferred_bootstrap_campaigner) {
+            const now_ns = platform_time.monotonicNs();
+            if (last_bootstrap_campaign_retry_ns == 0 or
+                now_ns -| last_bootstrap_campaign_retry_ns >= bootstrap_campaign_retry_interval_ns)
+            {
+                if (try server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id)) {
+                    std.log.warn("metadata bootstrap campaign retry node_id={}", .{local_node_id});
+                    last_bootstrap_campaign_retry_ns = now_ns;
+                }
+            }
+        }
         const run_round_start_ns = platform_time.monotonicNs();
         try server.runRound();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
@@ -1486,6 +1542,60 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
     try std.testing.expect(!wal_cfg.compaction_single_node_only);
+}
+
+test "metadata runtime chooses one preferred bootstrap campaigner" {
+    const peers = [_]MetadataClusterPeer{
+        .{ .node_id = 3, .raft_url = "http://127.0.0.1:3003" },
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:3001" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:3002" },
+    };
+
+    try std.testing.expect(metadataClusterPreferredCampaigner(&.{}, 7));
+    try std.testing.expect(metadataClusterPreferredCampaigner(&peers, 1));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 2));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 3));
+}
+
+test "metadata runtime retries bootstrap campaign only for leaderless voters" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = group_ids.main_metadata_group_id,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "metadata runtime scales bootstrap campaign retry interval with tick" {
+    try std.testing.expectEqual(
+        @as(u64, 600 * std.time.ns_per_ms),
+        metadataBootstrapCampaignRetryIntervalNs(5),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 12 * std.time.ns_per_s),
+        metadataBootstrapCampaignRetryIntervalNs(100),
+    );
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
