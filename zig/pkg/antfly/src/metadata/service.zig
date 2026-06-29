@@ -112,6 +112,25 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
         },
     );
+    const persist = ready.persist_ready_detail;
+    std.log.warn(
+        "metadata raft ready persist detail group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        .{
+            ready.group_id,
+            @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_wait_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_coalesce_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_txn_open_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
+            persist.wal_physical_commits,
+            persist.encoded_bytes,
+            persist.delta_records_since_checkpoint,
+            persist.delta_bytes_since_checkpoint,
+        },
+    );
     std.log.warn(
         "metadata raft ready pressure group_id={d} ready_messages={d} ready_message_bytes={d} ready_committed_entries={d} ready_committed_bytes={d} ready_unstable_entries={d} ready_unstable_bytes={d} ready_read_states={d} ready_has_snapshot={} ready_snapshot_bytes={d} ready_async_storage={} ready_processed={} ready_denied_backpressure={} ready_denied_transport_capacity={} ready_denied_apply_capacity={} ready_denied_snapshot_throttle={} ready_has_more={}",
         .{
@@ -3243,6 +3262,26 @@ pub const MetadataHttpService = struct {
                 @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+        const persist = ready.persist_ready_detail;
+        std.log.warn(
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            .{
+                request_id,
+                ready.group_id,
+                @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_wait_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_coalesce_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_txn_open_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
+                persist.wal_physical_commits,
+                persist.encoded_bytes,
+                persist.delta_records_since_checkpoint,
+                persist.delta_bytes_since_checkpoint,
             },
         );
         std.log.warn(

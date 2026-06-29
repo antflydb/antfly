@@ -4210,6 +4210,16 @@ pub const Backend = struct {
         return std.fmt.parseUnsigned(u64, stem, 10) catch null;
     }
 
+    fn parseRunIdFromRecoveredTableTempFileName(name: []const u8) ?u64 {
+        const marker = ".tbl.tmp-";
+        const marker_index = std.mem.indexOf(u8, name, marker) orelse return null;
+        if (marker_index == 0) return null;
+        const nonce = name[marker_index + marker.len ..];
+        if (nonce.len == 0) return null;
+        _ = std.fmt.parseUnsigned(u64, nonce, 10) catch return null;
+        return std.fmt.parseUnsigned(u64, name[0..marker_index], 10) catch null;
+    }
+
     fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
         for (self.runs.items) |run| {
             if (run.id == run_id) return true;
@@ -4235,7 +4245,46 @@ pub const Backend = struct {
     }
 
     pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !bool {
-        _ = self;
+        const root_dir = self.root_dir orelse return false;
+        if (self.storage == null or self.options.backend.read_only) return false;
+        if (!std.fs.path.isAbsolute(root_dir)) return false;
+
+        const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
+        defer self.allocator.free(runs_dir);
+
+        var io_impl = std.Io.Threaded.init(self.allocator, .{});
+        defer io_impl.deinit();
+
+        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io_impl.io());
+
+        var deleted_count: u64 = 0;
+        var deleted_bytes: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(io_impl.io())) |entry| {
+            if (entry.kind != .file) continue;
+            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            defer self.allocator.free(path);
+            const size = self.storage.?.fileSize(path) catch 0;
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            deleted_count += 1;
+            deleted_bytes += size;
+        }
+        if (deleted_count > 0) {
+            std.log.warn(
+                "lsm backend open cleaned recovered table temp files root={s} count={d} bytes={d}",
+                .{ root_dir, deleted_count, deleted_bytes },
+            );
+            return true;
+        }
         return false;
     }
 
@@ -11563,6 +11612,42 @@ test "lsm backend close reclaims eligible queued obsolete files" {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
     try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024));
+}
+
+test "lsm backend open removes recovered atomic table temp files" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "recovered-table-temp");
+    defer repository_mod.cleanupTmp(path);
+
+    var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+
+    const root_dir = std.mem.span(path);
+    const runs_dir = try std.fs.path.join(std.testing.allocator, &.{ root_dir, "runs" });
+    defer std.testing.allocator.free(runs_dir);
+    try native.storage().createDirPath(runs_dir);
+
+    const live_run_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "1.tbl" });
+    defer std.testing.allocator.free(live_run_path);
+    const stale_tmp_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "1.tbl.tmp-42" });
+    defer std.testing.allocator.free(stale_tmp_path);
+    const malformed_tmp_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "not-a-run.tbl.tmp-42" });
+    defer std.testing.allocator.free(malformed_tmp_path);
+
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), live_run_path, "live");
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), stale_tmp_path, "stale");
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), malformed_tmp_path, "malformed");
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{});
+    backend.close();
+
+    try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, stale_tmp_path, 1024));
+    const live = try native.storage().readFileAlloc(std.testing.allocator, live_run_path, 1024);
+    defer std.testing.allocator.free(live);
+    try std.testing.expectEqualStrings("live", live);
+    const malformed = try native.storage().readFileAlloc(std.testing.allocator, malformed_tmp_path, 1024);
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectEqualStrings("malformed", malformed);
 }
 
 test "lsm repository run readers request cap above 64 MiB" {
