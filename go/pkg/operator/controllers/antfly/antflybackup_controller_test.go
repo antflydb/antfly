@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func TestShellQuote(t *testing.T) {
@@ -312,6 +313,53 @@ func TestRequestsForClusterEnqueuesReferencingBackups(t *testing.T) {
 	}
 	if got["cluster-ns/other"] {
 		t.Fatalf("did not expect unrelated backup request, got %#v", got)
+	}
+}
+
+func TestBackupClusterDependencyChangedPredicate(t *testing.T) {
+	pred := backupClusterDependencyChangedPredicate()
+
+	base := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "cluster",
+			Namespace:  "default",
+			Generation: 10,
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:v1",
+			Mode:  antflyv1.ClusterModeClustered,
+		},
+	}
+
+	if !pred.Create(event.CreateEvent{Object: base}) {
+		t.Fatalf("expected create event to enqueue backups")
+	}
+	if !pred.Delete(event.DeleteEvent{Object: base}) {
+		t.Fatalf("expected delete event to enqueue backups")
+	}
+	if !pred.Generic(event.GenericEvent{Object: base}) {
+		t.Fatalf("expected generic event to enqueue backups")
+	}
+
+	statusOnly := base.DeepCopy()
+	statusOnly.Status.Phase = "Running"
+	statusOnly.Generation = base.Generation
+	if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: statusOnly}) {
+		t.Fatalf("expected status-only cluster update to be filtered")
+	}
+
+	unrelatedSpec := base.DeepCopy()
+	unrelatedSpec.Generation = base.Generation + 1
+	unrelatedSpec.Spec.Mode = antflyv1.ClusterModeSwarm
+	if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: unrelatedSpec}) {
+		t.Fatalf("expected non-image spec update to be filtered")
+	}
+
+	imageChanged := base.DeepCopy()
+	imageChanged.Generation = base.Generation + 1
+	imageChanged.Spec.Image = "antfly:v2"
+	if !pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: imageChanged}) {
+		t.Fatalf("expected image update to enqueue backups")
 	}
 }
 

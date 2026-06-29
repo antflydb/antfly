@@ -505,7 +505,10 @@ pub const MultiRaft = struct {
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (diagnostics) |diag| diag.persist_batch_begin_elapsed_ns = clock.elapsedSinceNs(persist_batch_begin_start_ns);
         if (batch != null) self.metrics.persist_batches += 1;
-        errdefer if (batch) |persist_batch| persist_batch.finish() catch unreachable;
+        var batch_finish_attempted = false;
+        errdefer if (!batch_finish_attempted) {
+            if (batch) |persist_batch| persist_batch.finish() catch unreachable;
+        };
 
         var scanned: usize = 0;
         const scan_limit = self.groups.count();
@@ -536,7 +539,11 @@ pub const MultiRaft = struct {
         if (diagnostics) |diag| diag.transport_flush_elapsed_ns = clock.elapsedSinceNs(transport_flush_start_ns);
         if (batch) |persist_batch| {
             const persist_batch_finish_start_ns = clock.monotonicNs();
-            try persist_batch.finish();
+            batch_finish_attempted = true;
+            persist_batch.finish() catch |err| {
+                if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
+                return err;
+            };
             if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
         }
         self.refreshQueueMetrics();

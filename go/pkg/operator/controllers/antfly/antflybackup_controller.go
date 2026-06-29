@@ -14,10 +14,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
@@ -389,8 +392,38 @@ func (r *AntflyBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyBackup{}).
 		Owns(&batchv1.CronJob{}).
-		Watches(&antflyv1.AntflyCluster{}, handler.EnqueueRequestsFromMapFunc(r.requestsForCluster)).
+		Watches(
+			&antflyv1.AntflyCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForCluster),
+			builder.WithPredicates(backupClusterDependencyChangedPredicate()),
+		).
 		Complete(r)
+}
+
+func backupClusterDependencyChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return true
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldCluster, oldOK := e.ObjectOld.(*antflyv1.AntflyCluster)
+			newCluster, newOK := e.ObjectNew.(*antflyv1.AntflyCluster)
+			if !oldOK || !newOK {
+				return false
+			}
+			return backupClusterDependencyKey(oldCluster) != backupClusterDependencyKey(newCluster)
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return true
+		},
+	}
+}
+
+func backupClusterDependencyKey(cluster *antflyv1.AntflyCluster) string {
+	return cluster.Spec.Image
 }
 
 func (r *AntflyBackupReconciler) requestsForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
