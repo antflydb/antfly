@@ -366,8 +366,11 @@ PostgreSQL-style relation population heads, including `SELECT ... INTO` and
 now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
 Relation-population source lowering now builds owned nested `ParsedSql` source
-reads from retained token ranges with rebased source spans, including
-non-contiguous `SELECT ... INTO` source ranges that omit the target clause.
+reads from retained generated read AST metadata with rebased source spans,
+including non-contiguous `SELECT ... INTO` source ranges that omit the target
+clause. Generated relation-population DDL now fails closed if that retained
+source read payload is missing instead of rebuilding generated metadata from
+the child token text.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
@@ -400,25 +403,28 @@ plans, including `ON CONFLICT` actions and field/all-field/expression
 AST ranges into relational row batches. Supported explicit-column
 `INSERT ... SELECT` plans, including `ON CONFLICT` actions and returning lists,
 now validate generated source, conflict, and returning ranges and parse the
-source `SELECT` body into a retained lightweight generated read-body payload before direct
+source `SELECT` body into a retained generated read-body payload before direct
 insert-source lowering, with generated-direct coverage for computed source
 projections, expression predicates, ordering, pagination, `RETURNING *`
 plus expressions, cross-table sources, conflict-update predicates and
 expressions, and non-recursive CTE write prefixes. Generated DML child-read
-metadata now also fails closed when the retained read kind disagrees with the
-retained `SELECT`/set-operation/relation-source clause shape, so insert-source
-and mutation-source wrappers cannot publish impossible child-read families or
-unrecognized retained child-`SELECT` tails for later lowerers to rediscover.
+metadata now retains body-local generated read ASTs for standalone child
+`SELECT` bodies and validates those ASTs against the absolute DML body ranges,
+so insert-source and mutation-source wrappers cannot publish impossible
+child-read families or unrecognized retained child-`SELECT` tails for later
+lowerers to rediscover. Relation-source wrappers remain generated range
+wrappers around a table source rather than standalone `SELECT` bodies.
 Parsed-statement classification also validates
 generated top-level DML clause layout before publishing a write family:
 `INSERT` target/column/value/default/conflict/returning ranges must align with
 `INTO`, `VALUES`, `DEFAULT VALUES`, `ON CONFLICT`, and `RETURNING`; `UPDATE`
 assignment/source/predicate/returning ranges must align with `SET`, `FROM`,
 `WHERE`, and `RETURNING`; `DELETE` source/predicate/returning ranges must align
-with `FROM`, `USING`, `WHERE`, and `RETURNING`; `TRUNCATE` extra targets must
-remain comma-delimited after the primary target; and `MERGE` source and match
-predicate ranges must align with `USING` and `ON`. Single-table point `UPDATE`
-and `DELETE` statements with generated
+with `FROM`, `USING`, `WHERE`, and `RETURNING`; `TRUNCATE` extra targets now
+retain generated target-list items and must remain comma-delimited identifier
+items after the primary target before publication or direct lowering can
+consume them; and `MERGE` source and match predicate ranges must align with
+`USING` and `ON`. Single-table point `UPDATE` and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches, including
 non-recursive CTE write prefixes. Table-wide and
@@ -496,39 +502,51 @@ joined-source prebinding for generated `UPDATE ... FROM`, `DELETE ... USING`,
 and `MERGE ... USING` consumes retained relation-source wrapper metadata and
 fails closed when source table metadata is stale instead of reopening the
 legacy joined-write token scanner. Recursive DML CTE producer body slices are
-also reparsed as generated read ASTs and passed into the existing typed
+retained as body-local generated read ASTs and passed into the existing typed
 recursive CTE lowerers, so anchor/final child reads no longer enter recursive
-write planning as generated-unaware token slices. Generated recursive
+write planning as generated-unaware token slices or through a child-statement
+reparse path. Generated recursive
 `INSERT`, `UPDATE`, `DELETE`, and `MERGE` write plans now parse the recursive
 CTE producer once, then lower the retained command body from the generated
 command start with recursive CTE context, requiring exact retained statement
 boundary consumption instead of rediscovering the whole recursive mutation
-through the legacy token entry points. Generated DML read-body metadata now
+through the legacy token entry points. Recursive generated final-command
+lowering also carries the retained DML AST, final `RETURNING` item list,
+conflict target/action metadata, update assignment list, insert column list,
+and merge-arm list into the typed lowerer context, so corrupted recursive
+assignment, conflict, returning, or merge-arm payloads fail closed before the
+typed lowerers can rescan those tails from tokens. Generated DML read-body metadata now
 also retains Antfly and graph table-function source payloads for non-recursive
 write CTEs and relation-source wrappers; generated `WITH ... MERGE` graph
 table-function CTEs are selected from retained metadata, and corrupt graph
 argument ranges fail closed instead of being rediscovered by a generic graph
 CTE token probe. Generated DML now also retains top-level assignment item
 lists for `UPDATE ... SET`, `INSERT ... ON CONFLICT DO UPDATE SET`, and
-`MERGE ... WHEN MATCHED THEN UPDATE SET`; generated validation requires those
-lists to cover the retained assignment body exactly, and point-update lowering
-plus source-update and joined-update mutation-source lowering consume each
-retained assignment item instead of scanning the whole assignment tail and
-rediscovering comma boundaries. Generated insert-values and insert-source
-conflict-action lowering use the retained `ON CONFLICT DO UPDATE SET`
-assignment item list the same way, so stale generated conflict assignment
-boundaries fail closed before the conflict parser can rescan comma-separated
-assignment tails. Generated `ON CONFLICT (...)` targets now retain
-comma-separated target item ranges as well, and generated insert-values plus
-insert-source conflict lowering consumes those exact target items instead of
-rediscovering the parenthesized target list. Generated INSERT target-column
-lists now retain item ranges, and generated insert-values plus insert-source
-lowering consume those exact column items instead of rediscovering comma
-boundaries from the parent parenthesized range. Generated `INSERT ... VALUES`
-row lists also retain
+`MERGE ... WHEN MATCHED THEN UPDATE SET`; parsed-statement publication and
+generated validation require those lists to cover the retained assignment body
+exactly, and point-update lowering plus source-update and joined-update
+mutation-source lowering consume each retained assignment item instead of
+scanning the whole assignment tail and rediscovering comma boundaries.
+Generated insert-values and insert-source conflict-action lowering use the
+retained `ON CONFLICT DO UPDATE SET` assignment item list the same way, so
+stale generated conflict assignment boundaries fail closed before the conflict
+parser can rescan comma-separated assignment tails. Generated
+`ON CONFLICT (...)` targets now retain comma-separated target item ranges as
+well, and generated insert-values plus insert-source conflict lowering consumes
+those exact target items instead of rediscovering the parenthesized target
+list. Generated INSERT target-column
+lists now retain item ranges and validate those retained single-token column
+items at parsed-statement publication, and generated insert-values plus
+insert-source lowering consume those exact column items instead of
+rediscovering comma boundaries from the parent parenthesized range. Generated
+`INSERT ... VALUES` row lists also retain
 top-level row ranges, and generated insert-values lowering consumes those
 exact row items instead of scanning row parentheses and inter-row commas from
-the parent values range. Generated `MERGE WHEN MATCHED THEN UPDATE SET` arms
+the parent values range. Generated DML `RETURNING` lists now validate their
+retained generated item, alias, and expression payloads at parsed-statement
+publication, so stale projection-item metadata cannot publish a write family
+and then be reparsed by DML returning lowerers. Generated
+`MERGE WHEN MATCHED THEN UPDATE SET` arms
 now pass the retained arm-local assignment item list into matched-arm lowering
 as well, so stale generated MERGE assignment boundaries fail before typed arm
 parsing can rescan the assignment tail. Generated `MERGE WHEN NOT MATCHED THEN
@@ -697,8 +715,16 @@ recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
 CTE reads now validate generated recursive CTE metadata before dispatching to
 the typed recursive CTE lowerer, including the direct public recursive CTE
-lowering helper, so corrupted retained recursive flags cannot recover through
-the legacy token parser; generated pagination
+lowering helper, and the typed recursive CTE producer consumes retained
+generated CTE names, column-alias lists, materialization hints, and body ranges
+before parsing the anchor/member body, so corrupted retained recursive flags or
+prefix metadata cannot recover through the legacy token parser. Recursive
+member parsing now receives the cloned body-local generated set-operation AST
+and consumes the retained right-arm projection item ranges plus join side
+table/alias ranges for member projection and join binding, so stale
+recursive-member projection or join-side metadata fails before
+comma-separated projection items or table aliases can be rediscovered from the
+token slice; generated pagination
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata, and simple query, aggregate, join, and
 window pagination use generated range-validated lowering when generated read
@@ -726,8 +752,9 @@ pagination expressions, set-operation payloads, Antfly/graph table-function
 source item counts and argument ranges, and join metadata cannot drift from
 the generated AST while token fallback still exists. Set-operation payload
 validation now also fail-closes right-hand `DISTINCT`/`DISTINCT ON`, projection,
-source, and `WHERE` metadata so right-arm generated clause ranges cannot drift
-independently of the retained set-operation AST. Generated CTE read lowering now derives non-recursive final read-family
+source, right-arm join-tree, and `WHERE` metadata so right-arm generated clause
+ranges and joined source metadata cannot drift independently of the retained
+set-operation AST. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads and final no-`FROM` projection reads, instead of
 re-entering the legacy read classifier;
@@ -917,9 +944,12 @@ incomplete savepoint-name tails. Bulk I/O commands use the validated
 unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
-generated option payloads and subject-range validation before the inner
-read/write statement is lowered through an owned nested `ParsedSql` subject
-with rebased source spans.
+generated option payloads and subject-range validation. Generated `EXPLAIN`
+read and DML subjects now retain body-local generated subject ASTs and lower
+the owned nested `ParsedSql` subject through that retained AST with rebased
+source spans, so stale read/write subject metadata fails closed instead of
+letting explain planning reparse the subject from tokens. DDL/utility
+`EXPLAIN` subjects remain unsupported by the typed explain lowerer.
 Generated unsupported utility command heads that require a subject, such as
 `CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `MATCH`, `NOTIFY`, `REINDEX`,
 `REVOKE`, and `UNLISTEN`, now fail closed through the generated parser when
@@ -939,9 +969,12 @@ unsupported statements rather than generic syntax failures. Generated unsupporte
 heads that already have typed catalog/runtime support now enter the parsed DDL
 family directly and are accepted only through the validated generated
 unsupported boundary. Recognized generated-owned unsupported heads now require
-retained unsupported AST kind, matching reason, statement/command span,
-subject-range, and `EXPLAIN` option-range validation before publishing unsupported, explain, or
-DDL-family parsed statements. Unsupported/admin subject ranges are also
+the generated LR parser to accept the statement before the generated facade
+can publish unsupported AST metadata; the old token-head shortcut for
+unsupported statements has been removed. They also require retained
+unsupported AST kind, matching reason, statement/command span, subject-range,
+and `EXPLAIN` option-range validation before publishing unsupported, explain,
+or DDL-family parsed statements. Unsupported/admin subject ranges are also
 checked against family-specific subject starts before classification, including
 trigger heads whose typed subject begins after `CREATE TRIGGER`/`DROP TRIGGER`,
 so corrupted generated unsupported payloads fail closed before reaching typed
@@ -954,6 +987,12 @@ starts after the `TRIGGER` command keyword, so `CREATE TRIGGER` and
 with a broad command-tail range; unsupported materialized-view variants such as
 `ALTER MATERIALIZED VIEW` are intentionally outside that allowlist until Antfly
 has a typed plan for them.
+Unsupported maintenance and bulk-I/O compatibility shapes are accepted through
+narrow grammar productions or statement-local token normalization instead of a
+global diagnostic-token free-for-all: `ANALYZE [VERBOSE] table [(columns)]`
+uses a generated-only `ANALYZE_VERBOSE` token, while rich `COPY` diagnostic
+tails keep PostgreSQL option names such as `ESCAPE` and filter-like `WHERE`
+identifier-like only inside `COPY`.
 
 ## Compatibility Policy
 
@@ -1087,7 +1126,8 @@ Unsupported DDL remains on the existing parser until
    matched/not-matched `DO NOTHING`, expression-filtered matched `UPDATE`,
    filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE` has a direct
    generated AST-to-plan lowerer for the supported table-list, identity, and
-   drop-behavior surface. Public SQL execution accepts the generated simple
+   drop-behavior surface, with generated extra-target items consumed directly
+   instead of reparsing the retained comma tail. Public SQL execution accepts the generated simple
    table-emptying truncate path and returns structured plan diagnostics for
    unsupported generated truncate variants that still need catalog-owned
    multi-table expansion, identity allocator reset, or cascade expansion.
@@ -1099,27 +1139,27 @@ Unsupported DDL remains on the existing parser until
    Generated-DML-specific coverage now calls the direct generated lowerer
    without retrying the classifier path, so promoted generated DML cases fail
    closed if their AST-to-plan contract regresses.
-   Direct DML relation-source paths now parse nested generated child-read ASTs
-   and validate them through the shared generated read-AST contract before typed
-   write-plan lowering, so `INSERT ... SELECT`, relation-source mutation paths,
-   and `MERGE ... USING` wrappers do not depend only on lightweight range
-   payload checks. Generated DML child-read validation now creates owned nested
-   `ParsedSql` child statements from retained token slices with rebased source
-   spans, so child validation no longer relies on parent-source span views.
+   Direct DML child-read paths now retain body-local generated read ASTs and
+   validate them through the shared generated read-AST contract before typed
+   write-plan lowering, so `INSERT ... SELECT` and recursive DML CTE reads do
+   not depend only on lightweight range payload checks or nested child-statement
+   reparsing. Generated relation-source wrappers for mutation paths and
+   `MERGE ... USING` remain table-source wrappers and must not carry a
+   standalone child read AST.
    Insert-source and recursive DML CTE retained generated
    child-read metadata now also validate `SELECT`, `FROM`, `WHERE`, and
    set-operation keyword layout plus statement/command source spans before the
    child read is validated. Joined mutation and merge relation-source wrappers
    apply the same retained source-span validation before wrapping their source
    body in a generated child read.
-   Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
-   child read and validate that child through the shared generated read-AST
-   contract before dispatching to typed recursive write-plan lowering.
-   Recursive CTE anchor/final child-select parser hooks now also parse detached
-   CTE body token slices through the generated read parser when no parent read
-   AST is available, so recursive DML CTE bodies feed generated read metadata
-   into the typed recursive CTE lowerers instead of falling back to
-   generated-unaware token slices; selector-based
+   Recursive DML CTE prefixes now validate each recorded generated CTE body
+   through its retained body-local generated read AST before dispatching to
+   typed recursive write-plan lowering.
+   Recursive CTE anchor/final child-select parser hooks now require retained
+   generated CTE body metadata in generated mode and clone that body-local AST
+   into the child parser. Detached child token slices outside retained CTE body
+   metadata fail closed instead of being reparsed through the generated parser
+   or lowered as generated-unaware token slices; selector-based
    recursive `UPDATE`/`DELETE` forms that classify as joined mutation sources
    through their recursive CTE predicates validate the generated command body
    without requiring an explicit generated `FROM`/`USING` relation-source
@@ -1175,9 +1215,14 @@ Unsupported DDL remains on the existing parser until
    projection to match retained generated final-statement item boundaries.
    Top-level DML CTE metadata now retains per-item generated child-body
    ownership for both read CTE bodies and data-modifying `UPDATE`/`DELETE`
-   CTE bodies; generated `MERGE` lowering consumes the retained body-local DML
+   CTE bodies, plus retained CTE column-alias lists and materialization hints;
+   generated DML publication validates those CTE item payloads before a write
+   family can publish. Generated `MERGE` lowering consumes the retained
+   CTE prefix item in sequence, including retained CTE name, column-alias,
+   materialization, and body ranges, then consumes the retained body-local DML
    AST and requires its returning projection to match retained generated
-   body-local item boundaries instead of reparsing the CTE body slice.
+   body-local item boundaries instead of reparsing or range-searching the CTE
+   body slice.
    Generated `INSERT ... VALUES`, `INSERT ... DEFAULT VALUES`, and
    `INSERT ... SELECT` direct lowerers now retain generated `ON CONFLICT`
    target, target predicate, action, update-assignment, and action-predicate
@@ -1416,10 +1461,19 @@ contract until storage and API row plans grow those outer-join semantics.
    publishes the same read family as the parsed statement before dispatching
    through the generated-AST path, so corrupted retained read metadata cannot
    bypass parsed-statement publication and be reinterpreted by typed token
-   planning. Shared runtime/document read-kind helpers apply the same
-   publication check when generated read metadata is present, so catalog
-   routing cannot recover a generated read family from corrupted retained
-   generated metadata after the parsed statement boundary. Shared read lowering
+   planning. Direct read lowerer entry helpers for query, aggregate, window,
+   join, lateral, set-operation, and CTE reads now validate the full retained
+   generated read AST before constructing typed parser contexts, so direct
+   helper callers cannot skip the generated read boundary and let typed
+   planning rediscover stale CTE final-kind, list, or clause metadata from
+   tokens. Document SQL routing now validates the retained generated read AST
+   before selecting query/aggregate document planning, so document lowerers
+   cannot recover a generated read family by rediscovering `FROM`, grouping, or
+   aggregate structure from tokens after retained read metadata has gone stale.
+   Shared runtime/document read-kind helpers apply the same publication check
+   when generated read metadata is present, so catalog routing cannot recover a
+   generated read family from corrupted retained generated metadata after the
+   parsed statement boundary. Shared read lowering
    now also fails closed when a statement retains generated read ownership but
    no generated read AST is available, so token classifier fallback is reserved
    for statements without generated read payloads. Public row-claim diagnostics
@@ -1434,19 +1488,28 @@ contract until storage and API row plans grow those outer-join semantics.
    read publication fails. Prepared statement subject caching uses those same
    generated-aware published read/write helpers before accepting a stored
    executable subject, and malformed generated-owned subject classification now
-   returns `UnsupportedSqlShape` instead of a nullable family miss. Specialized runtime read-family lowerers for simple
+   returns `UnsupportedSqlShape` instead of a nullable family miss, including
+   cases where corrupted generated metadata has already degraded the parsed
+   statement union to `unknown`. Specialized runtime read-family lowerers for simple
    select/query, aggregate, set-operation, window, join, and lateral plans also
    reject generated-owned reads whose retained AST does not match the expected
    family instead of passing a null generated AST into token fallback; their
    shared generated-read AST accessors now return `UnsupportedSqlShape` for
    malformed generated-owned reads and reserve `null` only for non-generated
-   statements. The shared read-lowering context and expression-lowering
-   test/runtime helper paths use the same generated-read accessor contract
-   before handing generated metadata into query, aggregate, set-operation,
-   window, join, lateral, recursive CTE, and lateral-subquery parsing. DML write-kind
-   helpers apply the same publication check for generated write family and
-   recursive CTE flags before shared write lowering selects the generated DML
-   execution path.
+   statements. Shared generated-aware parsed read/write helper methods now
+   publish a generated-owned read/write kind only when the retained generated
+   metadata and the already-published parsed `.read`/`.write` union agree, so
+   callers cannot recover a family from generated metadata after parsed
+   publication has degraded to `unknown` or a mismatched typed kind. The shared read-lowering context, public direct generated-read
+   AST lowerer, and expression-lowering test/runtime helper paths use the same
+   generated-read publication contract before handing generated metadata into
+   query, aggregate, set-operation, window, join, lateral, recursive CTE, and
+   lateral-subquery parsing. DML
+   write-kind helpers and retained generated-DML AST accessors apply the same
+   publication check for generated write family, recursive CTE flags, and the
+   already-published parsed `.write` statement union before shared write
+   lowering, public direct generated-DML AST lowering, or catalog binding can
+   select the generated DML execution path.
    Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Generated CTE reads now
@@ -1456,7 +1519,8 @@ contract until storage and API row plans grow those outer-join semantics.
    metadata before dispatch. Recursive CTE reads now validate generated
    recursive CTE ranges and the recursive flag before dispatching to the typed
    recursive CTE lowerer, including the direct public recursive CTE lowering
-   helper. Generated CTE read lowering now derives non-recursive final
+   helper, and recursive producer parsing consumes retained generated CTE prefix
+   metadata before parsing the anchor/member body. Generated CTE read lowering now derives non-recursive final
    read-family dispatch from generated final-select kind metadata, including
    final set-operation reads, instead of re-entering the legacy read
    classifier.
@@ -1595,7 +1659,10 @@ contract until storage and API row plans grow those outer-join semantics.
    select-list,
    `GROUP BY`, and order-expression item handoffs now also require the
    retained generated expression payload to be internally valid at the lookup
-   boundary before the broad start-kind check is accepted, and generated
+   boundary before the broad start-kind check is accepted. Generated
+   single-join predicate handoff now filters placeholder predicate
+   ASTs before predicate lookup and fails closed when retained predicate
+   expression tokens disagree with the join predicate range. Generated
    order-expression function starts validate the retained function identity for
    case-fold, `md5`, concat, routine/extension, and general row-expression
    branches. Aggregate
@@ -1654,14 +1721,22 @@ contract until storage and API row plans grow those outer-join semantics.
    list boundary, each CTE item name and optional column-alias group, required
    `AS`, optional `MATERIALIZED`/`NOT MATERIALIZED`, body parentheses, comma
    separation, and final item boundary before CTE body planning consumes the
-   generated metadata.
+   generated metadata. Read CTE planning now consumes those retained generated
+   CTE names, column-alias lists, materialization hints, and body ranges before
+   invoking body lowerers, so stale generated CTE prefix metadata cannot be
+   recovered by the generic CTE token parser.
    Simple top-level and CTE-body read sources now retain generated
    `FOR system_time AS OF <integer>` suffix metadata and validate the exact
    five-token suffix layout before read classification or typed source
    planning can consume it. Because `system_time` remains an identifier text
-   check rather than a reserved scanner keyword, the grammar records the single
-   additional `FOR` shift/reduce conflict and the runtime boundary fails closed
-   unless the retained identifier text is exactly `system_time`. The production
+   check rather than a reserved scanner keyword, the SQL facade maps the leading
+   `FOR` to a generated-only contextual token only for the full
+   `FOR system_time AS OF` prefix. Ordinary PostgreSQL row-lock tails such as
+   `FOR UPDATE`, `FOR NO KEY UPDATE ... NOWAIT`, and `FOR SHARE SKIP LOCKED`
+   therefore parse through the row-lock grammar instead of being stolen by the
+   temporal-source suffix, and parsed-statement publication no longer keeps a
+   complete-row-lock legacy fallback when strict generated parsing rejects the
+   statement. The production
    generated read-lowering validator now enforces those same top-level and
    CTE-body temporal-source ranges, so stale temporal metadata cannot pass
    classification and then be rediscovered by typed read lowering. Generated
@@ -1719,9 +1794,13 @@ catalog prebinding, including recursive-anchor source resolution, and fail
 closed when generated CTE body source metadata is corrupted instead of
 recovering through the legacy token scanner. Catalog prebinding no longer
 probes the legacy token source scanners once a generated read or DML AST is
-retained: generated read prebinding now resolves CTE aliases, top-level joins,
-lateral subquery joins, set-operation sources, and graph table-function
-`table_name` arguments from generated metadata, and generated graph
+retained: generated read prebinding now validates the full retained read AST
+before resolving CTE aliases, top-level joins, lateral subquery joins,
+set-operation sources, and graph table-function `table_name` arguments from
+generated metadata. Set-operation prebinding
+now consumes the retained right-source table range, so missing or stale
+right-hand table metadata fails closed instead of being recovered by scanning
+the generated right-source token range. Generated graph
 table-function prebinding no longer rescans argument tokens when the retained
 `table_name` value range is missing or malformed. Generated read CTE planning
 now also lowers graph table-function CTEs from retained CTE body
@@ -1733,12 +1812,26 @@ retained read AST is missing, instead of rediscovering source tables through
 the legacy token scanner; generated DML prebinding
 resolves insert-source CTEs, recursive insert anchors, joined write CTEs,
 data-modifying CTE producer targets, and semijoin sources from retained
-generated ranges or fails closed. Generated DML prebinding and write-target
+generated ranges or fails closed; semijoin write prebinding now consumes the
+retained generated semijoin source-table token instead of scanning the retained
+`WHERE` predicate text. Generated DML graph table-function CTE
+lowering now validates retained Antfly/graph function counts and required graph
+argument metadata before lowering the CTE from generated payloads, so stale
+function counts or missing metric/table metadata cannot be recovered through
+the token table-function parser. Generated joined-source prebinding now also
+fails closed when a retained source-read payload is present but its source span
+is missing, preserving `null` only for generated writes that genuinely have no
+joined source. Generated DML CTE prebinding now also requires retained CTE item
+counts to match the retained item slices before resolving non-recursive,
+recursive, or joined write CTE source bindings. Generated DML prebinding and write-target
 binding now also fail closed when a statement is published as generated DML but
 the retained DML AST is missing, instead of rediscovering target/source tables
 through legacy token scanners; generated read/DML binding accessors now return
 `UnsupportedSqlShape` for malformed generated-owned statements and reserve
-`null` only for non-generated statements. The write-plan dispatcher applies the
+`null` only for non-generated statements. Public parsed read/write kind
+accessors now publish generated-covered families from validated generated AST
+metadata directly, rather than cross-checking the older token-family
+classifier. The write-plan dispatcher applies the
 same accessor contract before handwritten write lowering can run. Generated DML write-target binding
 now validates retained target table ranges against the generated command layout
 for insert/update/delete/truncate/merge before falling back to legacy token
@@ -1776,7 +1869,15 @@ table-alias parsing are left for reads without generated source metadata.
 Set-operation right-hand `SELECT` payloads
 now retain the same right-source table/alias/system-time subranges, so
 generated set-operation lowering can bind right-side qualifiers from generated
-metadata instead of borrowing the top-level source scanner. Generated
+metadata instead of borrowing the top-level source scanner. The right-hand
+source binder now also treats missing set-operation ownership or missing
+right-source metadata as generated payload corruption, so typed lowering fails
+closed before source inference or table-alias parsing can recover from tokens.
+Generated `WHERE` lowering now pairs retained clause boundaries with retained
+expression payload lookup, including set-operation right-hand reads, so accepted
+generated `WHERE` spans cannot continue into typed predicate parsing without the
+matching generated expression AST.
+Generated
 single-join lowering now consumes retained generated left/right source
 table/alias ranges for table/alias binding, consumes retained qualified
 projection item and alias ranges for join output binding, and `USING (...)`
@@ -1785,15 +1886,23 @@ stale join projection, join side, or `USING` list metadata fails before the
 typed join lowerer can reparse the select list, table aliases, or
 parenthesized identifier list. Lateral
 lowering now also consumes retained parent projection item/alias ranges and the
-left source range before typed planning, while the lateral subquery lowerer
-derives generated read metadata for the parenthesized subquery token slice and
-uses retained source table/alias spans for both early right-side qualifier
-inference and `FROM`-clause consumption, leaving raw token source inference as
-the non-generated fallback path only.
+left source range before typed planning. Generated join metadata now retains a
+body-local read AST plus alias/name spans for `LATERAL (SELECT ...)` right
+sides, and lateral subquery lowering consumes that retained child AST and alias
+metadata for early right-side qualifier inference, alias binding, and
+`FROM`-clause consumption instead of reparsing the parenthesized token slice or
+alias tail. Catalog prebinding uses the same retained lateral child read AST
+and alias metadata before resolving right-side source tables, leaving raw token
+source inference as the non-generated fallback path only.
 Public SQL special-case read dispatch for Antfly query functions also uses the
-shared generated-aware read classifier, so generated-covered reads with stale or
-inconsistent retained read metadata reach the normal fail-closed planning
-diagnostic path instead of being routed by handwritten classification first.
+shared generated-aware read classifier and retained read-AST validator, so
+generated-covered reads with stale or inconsistent retained table-function,
+projection, source, or read-family metadata reach the normal fail-closed
+planning diagnostic path instead of being routed by handwritten classification
+or a narrower table-function fast path first. The public generated-Antfly-source
+predicate only reports retained read ASTs that actually carry generated Antfly
+table-function payloads; missing or non-read AST payloads no longer infer
+Antfly ownership for fallback routing.
    Completing the generated-parser-only read path still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
@@ -2018,11 +2127,14 @@ variants for:
   reason metadata. Parsed SQL now distinguishes
   generated unsupported statements from ordinary DDL for unsupported heads that
   have no typed catalog/control plan, so lowerers fail closed instead of trying
-  a generic DDL parse for those shapes. Generated unsupported AST heads that
-  already have typed catalog/control plans enter the parsed DDL family and are
-  accepted only through the validated generated unsupported boundary; unsupported
-  materialized-view variants such as `ALTER MATERIALIZED VIEW` are part of the
-  fail-closed path rather than the materialized-view catalog boundary.
+  a generic DDL parse for those shapes. Unsupported facade classification now
+  runs only after LR parser acceptance, so generated unsupported nodes cannot
+  be created from token-head classification alone. Generated unsupported AST
+  heads that already have typed catalog/control plans enter the parsed DDL
+  family and are accepted only through the validated generated unsupported
+  boundary; unsupported materialized-view variants such as
+  `ALTER MATERIALIZED VIEW` are part of the fail-closed path rather than the
+  materialized-view catalog boundary.
   `CREATE TRIGGER` and `DROP TRIGGER` are now split at this boundary: supported
   update-policy triggers lower to existing update-policy plans, supported
   routine row triggers lower to `trigger_catalog`, and richer PostgreSQL trigger
@@ -2078,9 +2190,14 @@ Generated grammar work needs evidence at multiple levels:
   `CREATE DATABASE` and `CREATE SCHEMA`, multi-target `DROP TABLE`, `DROP INDEX`,
   `DROP EXTENSION`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP DOMAIN`,
   `DROP SEQUENCE`, `DROP TYPE`, `DROP PUBLICATION`, `DROP ROLE`, `DROP COLLATION`,
-  and `DROP SCHEMA`, and bare, simple, optioned, and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
-  stable reason metadata, explain-option payloads, and subject ranges where
-  available. Incomplete generated-unsupported required-tail prefixes such as
+  and `DROP SCHEMA`; `ANALYZE [VERBOSE] table [(columns)]`; rich
+  `COPY ... FROM STDIN WITH (...)` tails, including option names that overlap
+  expression or clause keywords such as `ESCAPE` and `WHERE`; and bare, simple,
+  optioned, and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
+  stable reason metadata, explain-option payloads, subject ranges where
+  available, and retained read/DML subject ASTs for generated read/write
+  subjects.
+  Incomplete generated-unsupported required-tail prefixes such as
   `ALTER AGGREGATE` and `ALTER OPERATOR` now propagate generated syntax
   failure instead of entering raw DDL fallback; incomplete
   `IMPORT FOREIGN SCHEMA ... FROM SERVER ...` prefixes are covered explicitly
@@ -2180,11 +2297,24 @@ Generated grammar work needs evidence at multiple levels:
   generated-direct validation and dispatch with retained generated per-CTE body
   metadata plus generated child-read validation for recursive CTE insert-source, update, delete, and merge
   write-plan variants,
+  generated DML CTE prefixes now retain and validate first/last
+  data-modifying body mirrors in addition to read body mirrors before a
+  generated write family can publish or a generated DML CTE lowerer can consume
+  the prefix, including recursive CTE write validation; generated DML CTE
+  source binding applies the same retained prefix mirror contract before
+  deriving catalog source tables,
   generated-first write lowering context
   dispatch, generated DML AST kind now drives parsed-statement write-family
   classification for generated-covered writes without re-entering the
   hand-written write classifier, fail-closed generated DML dispatch when retained
-  generated AST metadata is malformed, and generated-family validation over
+  generated AST metadata is malformed, generated DML publication rejects stale
+  retained assignment-list payloads for top-level update, conflict-action
+  update, and merge-update arms before lowerers can rescan comma-separated
+  assignment tails, rejects stale retained insert target-column payloads before
+  insert lowerers can rescan parenthesized column lists, rejects stale retained
+  returning-list payloads before returning lowerers can rescan projection tails,
+  rejects stale retained DML CTE column-list and materialization payloads before
+  CTE layout parsing can skip over them, and generated-family validation over
   other representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
   dispatch with the same generated read AST handoff into simple, aggregate,

@@ -13,7 +13,7 @@ The source row is intentionally small:
   "mime_type": "text/markdown",
   "sha256": "...",
   "source_path": "docs/guide.md",
-  "_type": "source_document"
+  "doc_type": "source_document"
 }
 ```
 

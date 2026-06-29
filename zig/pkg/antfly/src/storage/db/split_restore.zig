@@ -27,6 +27,7 @@ const doc_identity = @import("doc_identity.zig");
 const mapper = @import("document_mapper.zig");
 const apply_state = @import("derived/apply_state.zig");
 const range_state_mod = @import("range_state.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const types = @import("types.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -82,6 +83,107 @@ fn skipNonRelationalMedianKey(key: []const u8) bool {
 fn isSplitMetadataKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "splitstate:") or
         std.mem.startsWith(u8, key, "splitdelta:");
+}
+
+fn splitLogicalWriteFromPhysicalAlloc(
+    alloc: Allocator,
+    relational_base_rows: bool,
+    write: types.BatchWrite,
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !?types.BatchWrite {
+    if (internal_keys.isInternalPhysicalTableDataKey(write.key) and
+        !internal_keys.isStoredDocumentRowKey(write.key)) return null;
+
+    if (!internal_keys.isStoredDocumentRowKey(write.key)) return write;
+    if (!isBaseDocumentStoreKeyForMode(relational_base_rows, write.key)) return null;
+
+    const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, write.key)) orelse return error.InvalidInternalUserKey;
+    try owned_keys.append(alloc, raw);
+    const value = if (relational_base_rows) blk: {
+        const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, write.value);
+        try owned_values.append(alloc, materialized);
+        break :blk materialized;
+    } else write.value;
+    return .{
+        .key = raw,
+        .value = value,
+    };
+}
+
+test "split logical writes skip relational secondary physical table data" {
+    const alloc = std.testing.allocator;
+
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_key);
+    const doc_logical = (try splitLogicalWriteFromPhysicalAlloc(
+        alloc,
+        false,
+        .{ .key = doc_key, .value = "{\"title\":\"alpha\"}" },
+        &owned_keys,
+        &owned_values,
+    )) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("doc:a", doc_logical.key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", doc_logical.value);
+
+    const row_value = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 1.0 },
+        },
+    });
+    defer alloc.free(row_value);
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+    defer alloc.free(row_key);
+    const row_logical = (try splitLogicalWriteFromPhysicalAlloc(
+        alloc,
+        true,
+        .{ .key = row_key, .value = row_value },
+        &owned_keys,
+        &owned_values,
+    )) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("row:a", row_logical.key);
+    try std.testing.expect(std.mem.indexOf(u8, row_logical.value, "\"amount\"") != null);
+
+    const relational_secondary_keys = [_][]u8{
+        try internal_keys.relationalColumnKeyAlloc(alloc, "row:a", "status"),
+        try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "row:a"),
+        try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, "tags", "hot", "row:a"),
+        try internal_keys.relationalArrayValueIndexKeyAlloc(alloc, "tags", "[hot]", "row:a"),
+        try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, "attrs", "billing.plan", "\"pro\"", "row:a"),
+        try internal_keys.relationalJsonPathIndexKeyAlloc(alloc, "attrs", "billing.plan", "row:a"),
+        try internal_keys.relationalColumnIndexByDocKeyAlloc(alloc, "row:a", "status"),
+        try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "orders", "row:a"),
+        try internal_keys.relationalUniqueKeyAlloc(alloc, "orders_external_id_key", "external:a"),
+        try internal_keys.relationalTemporalUniqueKeyAlloc(alloc, "prices_sku_valid_time_key", "sku:a", "10", "20", "row:a"),
+        try internal_keys.relationalForeignKeyConflictKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a"),
+    };
+    defer {
+        for (relational_secondary_keys) |key| alloc.free(key);
+    }
+
+    for (relational_secondary_keys) |key| {
+        const logical = try splitLogicalWriteFromPhysicalAlloc(
+            alloc,
+            true,
+            .{ .key = key, .value = "not-json-and-not-a-packed-row" },
+            &owned_keys,
+            &owned_values,
+        );
+        try std.testing.expect(logical == null);
+    }
 }
 
 fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
@@ -231,23 +333,14 @@ fn putIndexedSplitBatchDirect(
     }
 
     for (writes) |write| {
-        if (internal_keys.isRelationalColumnKey(write.key)) continue;
-        if (internal_keys.isStoredDocumentRowKey(write.key)) {
-            if (!isBaseDocumentStoreKeyForMode(dest_indexes.relational_base_rows, write.key)) continue;
-            const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
-            try owned_keys.append(dest_indexes.alloc, raw);
-            const value = if (dest_indexes.relational_base_rows) blk: {
-                const materialized = try mapper.materializeRelationalRowValueAlloc(dest_indexes.alloc, write.value);
-                try owned_values.append(dest_indexes.alloc, materialized);
-                break :blk materialized;
-            } else write.value;
-            try logical_writes.append(dest_indexes.alloc, .{
-                .key = raw,
-                .value = value,
-            });
-        } else {
-            try logical_writes.append(dest_indexes.alloc, write);
-        }
+        const logical = try splitLogicalWriteFromPhysicalAlloc(
+            dest_indexes.alloc,
+            dest_indexes.relational_base_rows,
+            write,
+            &owned_keys,
+            &owned_values,
+        ) orelse continue;
+        try logical_writes.append(dest_indexes.alloc, logical);
     }
 
     try dest_indexes.indexSplitBatch(dest_store, logical_writes.items, dense_handoffs, text_handoffs, sparse_handoffs);

@@ -403,7 +403,7 @@ pub const BoundTableReadSource = struct {
 
         for (result.hashes, 0..) |entry, i| {
             const json = if (opts.include_documents) result.documents[i].json else null;
-            try appendScanLine(alloc, &out, entry.id, json);
+            try appendScanLine(alloc, &out, entry.id, json, try self.db.getTimestamp(alloc, entry.id));
         }
 
         return .{
@@ -4549,7 +4549,7 @@ fn scanLocal(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (opts.include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json);
+        try appendScanLine(alloc, &out, entry.id, json, try db.getTimestamp(alloc, entry.id));
     }
     return .{ .ndjson = try out.toOwnedSlice(alloc) };
 }
@@ -4584,7 +4584,7 @@ fn scanProvisionedLocal(
         defer out.deinit(alloc);
         for (result.hashes, 0..) |entry, i| {
             const json = if (opts.include_documents) result.documents[i].json else null;
-            try appendScanLine(alloc, &out, entry.id, json);
+            try appendScanLine(alloc, &out, entry.id, json, try db.getTimestamp(alloc, entry.id));
         }
         return .{ .ndjson = try out.toOwnedSlice(alloc) };
     } else {
@@ -4599,7 +4599,7 @@ fn scanProvisionedLocal(
         defer out.deinit(alloc);
         for (result.hashes, 0..) |entry, i| {
             const json = if (opts.include_documents) result.documents[i].json else null;
-            try appendScanLine(alloc, &out, entry.id, json);
+            try appendScanLine(alloc, &out, entry.id, json, try db.getTimestamp(alloc, entry.id));
         }
         return .{ .ndjson = try out.toOwnedSlice(alloc) };
     }
@@ -6259,6 +6259,24 @@ test "bound table read source uses feature db reads and returns version" {
     var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1234), lookup.version);
+
+    var scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    }, .read_index)).?;
+    defer scan.deinit(alloc);
+    const ScanRow = struct {
+        key: []const u8,
+        version: u64,
+        title: []const u8,
+    };
+    const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
+    defer alloc.free(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("doc:a", rows[0].key);
+    try std.testing.expectEqual(@as(u64, 1234), rows[0].version);
+    try std.testing.expectEqualStrings("alpha", rows[0].title);
 }
 
 test "bound table read source executes SQL system-time as-of by commit sequence" {
@@ -7411,12 +7429,14 @@ test "bound table read source scans keys as ndjson" {
     defer scan.deinit(alloc);
     const ScanRow = struct {
         key: []const u8,
+        version: u64,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
     defer alloc.free(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("doc:a", rows[0].key);
+    try std.testing.expect(rows[0].version > 0);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
 }
 
@@ -7683,11 +7703,14 @@ test "provisioned table read source routes lookup and scan across ranges" {
     defer scan.deinit(alloc);
     const ScanRow = struct {
         key: []const u8,
+        version: u64,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
     defer alloc.free(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expect(rows[0].version > 0);
+    try std.testing.expect(rows[1].version > 0);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
     try std.testing.expectEqualStrings("zeta", rows[1].title);
 }
@@ -8415,6 +8438,11 @@ test "provisioned table read source preflights every local group" {
     defer right_db.close();
 
     try left_db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try right_db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
@@ -10127,6 +10155,7 @@ test "hosted table read source preflights every local group" {
     var right_db = try openTestGroupDb(test_alloc, right_path, 8);
     defer right_db.close();
     try left_db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
+    try right_db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -10783,7 +10812,8 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
         .start_index_workers = false,
         .identity_namespace = .{ .table_id = 7, .shard_id = 7341, .range_id = 7341 },
     });
-    defer left_db.close();
+    var left_db_open = true;
+    defer if (left_db_open) left_db.close();
     try left_db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"store\":true}" });
     try left_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
     try left_db.batch(.{
@@ -10810,7 +10840,8 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
         .start_index_workers = false,
         .identity_namespace = .{ .table_id = 7, .shard_id = 7342, .range_id = 7342 },
     });
-    defer right_db.close();
+    var right_db_open = true;
+    defer if (right_db_open) right_db.close();
     try right_db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"store\":true}" });
     try right_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
     try right_db.batch(.{
@@ -10974,6 +11005,11 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
             return error.UnexpectedHttpRequest;
         }
     };
+
+    left_db.close();
+    left_db_open = false;
+    right_db.close();
+    right_db_open = false;
 
     var executor_state = ExecutorState{};
     var hosted = HostedProvisionedTableReadSource.init(
@@ -11649,6 +11685,9 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
         try std.testing.expect(scan.claimed_page);
         try std.testing.expect(scan.completed_page);
     }
+
+    for (dbs[0..db_count]) |*db| db.close();
+    db_count = 0;
 
     const FakeCatalog = struct {
         const statuses = [_]metadata_reconciler.MergedGroupStatus{

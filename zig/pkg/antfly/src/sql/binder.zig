@@ -29,6 +29,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
+const lowering_context = @import("lowering_context.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const source_binding = @import("source_binding.zig");
@@ -586,6 +587,13 @@ pub fn relationalFieldTypeSupportsCollation(field_type: runtime_schema.AntflyTyp
         .keyword, .text => true,
         else => false,
     };
+}
+
+pub fn relationalColumnTypeSupportsCollation(field_type: runtime_schema.AntflyType, array_item_type: ?runtime_schema.AntflyType) bool {
+    if (relationalFieldTypeSupportsCollation(field_type)) return true;
+    if (field_type != .array) return false;
+    const item_type = array_item_type orelse return false;
+    return relationalFieldTypeSupportsCollation(item_type);
 }
 
 pub fn relationalPeriodColumnType(field_type: runtime_schema.AntflyType) bool {
@@ -1867,7 +1875,13 @@ pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed
 
 fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlDmlAst {
     if (parsed_sql.generatedStatementKind() != .dml) return null;
-    _ = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    const published = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != published.kind or statement.recursive != published.recursive) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -1941,7 +1955,7 @@ fn appendGeneratedDmlCteReadBindingsAlloc(
     cte_prefix: generated_parser.GeneratedSqlDmlCteAst,
     cte_bindings: *std.ArrayListUnmanaged(CteSourceBinding),
 ) !void {
-    if (cte_prefix.items.len == 0) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlCtePrefixItems(cte_prefix);
     for (cte_prefix.items) |item| {
         const cte_name = try normalizeGeneratedSingleIdentifierAlloc(alloc, tokens, item.name_tokens);
         var cte_name_transferred = false;
@@ -1966,6 +1980,58 @@ fn appendGeneratedDmlCteReadBindingsAlloc(
         });
         cte_name_transferred = true;
     }
+}
+
+fn validateGeneratedDmlCtePrefixItems(cte_prefix: generated_parser.GeneratedSqlDmlCteAst) !void {
+    if (cte_prefix.count == 0 or cte_prefix.items.len == 0 or cte_prefix.count != cte_prefix.items.len) return error.UnsupportedSqlShape;
+    const first = cte_prefix.items[0];
+    if (!generatedTokenRangeEqual(cte_prefix.first_name_tokens, first.name_tokens) or
+        !generatedTokenRangeEqual(cte_prefix.first_body_tokens, first.body_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedDmlCteBodyMirror(first, cte_prefix.first_body_read, cte_prefix.first_body_dml);
+
+    const last = cte_prefix.items[cte_prefix.items.len - 1];
+    if (!generatedTokenRangeEqual(cte_prefix.last_name_tokens, last.name_tokens) or
+        !generatedTokenRangeEqual(cte_prefix.last_body_tokens, last.body_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedDmlCteBodyMirror(last, cte_prefix.last_body_read, cte_prefix.last_body_dml);
+}
+
+fn validateGeneratedDmlCteBodyMirror(
+    item: generated_parser.GeneratedSqlDmlCteItemAst,
+    mirror_read: ?generated_parser.GeneratedSqlDmlReadBodyAst,
+    mirror_dml: ?*const generated_parser.GeneratedSqlDmlAst,
+) !void {
+    if (item.body_read) |body_read| {
+        if (mirror_dml != null) return error.UnsupportedSqlShape;
+        const prefix_read = mirror_read orelse return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(body_read.tokens, prefix_read.tokens)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (item.body_dml) |body_dml| {
+        if (mirror_read != null) return error.UnsupportedSqlShape;
+        const prefix_dml = mirror_dml orelse return error.UnsupportedSqlShape;
+        if (body_dml.kind != prefix_dml.kind or
+            !std.meta.eql(body_dml.statement_span, prefix_dml.statement_span) or
+            !std.meta.eql(body_dml.command_span, prefix_dml.command_span))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (mirror_read != null or mirror_dml != null) return error.UnsupportedSqlShape;
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedTokenRangeEqual(
+    left: generated_parser.GeneratedSqlTokenRange,
+    right: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return left.start == right.start and left.end == right.end;
 }
 
 fn normalizeGeneratedDmlCteBodyTargetNameAlloc(
@@ -2015,7 +2081,8 @@ fn recursiveInsertSourceTableNamesFromGeneratedDmlAstAlloc(
 ) !?InsertSourceTableNames {
     if (dml_ast.kind != .insert_select or !dml_ast.cte_recursive) return null;
     const cte_prefix = dml_ast.cte_prefix orelse return error.UnsupportedSqlShape;
-    if (!cte_prefix.recursive or cte_prefix.items.len == 0) return error.UnsupportedSqlShape;
+    if (!cte_prefix.recursive) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlCtePrefixItems(cte_prefix);
 
     var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
     defer {
@@ -2163,14 +2230,17 @@ fn joinedWriteSourceNameFromGeneratedDmlAstAlloc(
     dml_ast: *const generated_parser.GeneratedSqlDmlAst,
 ) !?[]const u8 {
     if (dml_ast.source_read) |source_read| {
-        const source_tokens = source_read.source_tokens orelse return null;
+        const source_tokens = source_read.source_tokens orelse return error.UnsupportedSqlShape;
         const source_table_tokens = source_read.source_table_tokens orelse return error.UnsupportedSqlShape;
         try validateGeneratedSimpleReadSourceTableTokens(tokens, source_tokens, source_table_tokens);
         return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_table_tokens.start].text);
     }
-    const where_tokens = dml_ast.where_tokens orelse return null;
-    if (where_tokens.start >= where_tokens.end or where_tokens.end > tokens.len) return error.UnsupportedSqlShape;
-    return try joinedWriteSemiJoinSourceTableAlloc(alloc, tokens[where_tokens.start..where_tokens.end]);
+    if (dml_ast.semijoin_source_table_tokens) |source_table| {
+        if (source_table.end != source_table.start + 1 or source_table.end > tokens.len or tokens[source_table.start].kind != .identifier) return error.UnsupportedSqlShape;
+        return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_table.start].text);
+    }
+    if (dml_ast.mutation_join_source) return error.UnsupportedSqlShape;
+    return null;
 }
 
 fn joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(
@@ -3174,7 +3244,10 @@ fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| read,
+                .read => |read| blk: {
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -3258,7 +3331,10 @@ fn readSourceTableNamesFromGeneratedReadBodyAlloc(
             errdefer alloc.free(source);
             return .{ .left = left, .source = source };
         }
-        const source = try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.right_tokens);
+        const source = if (join.right_lateral_subquery_read_ast != null or join.right_lateral_subquery_tokens != null)
+            try generatedLateralJoinRightSourceNameAlloc(alloc, tokens, join)
+        else
+            try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.right_tokens);
         errdefer alloc.free(source);
         return .{ .left = left, .source = source };
     }
@@ -3276,8 +3352,7 @@ fn readSourceTableNamesFromGeneratedReadBodyAlloc(
     const left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[table_tokens.start].text);
     errdefer alloc.free(left);
     if (maybe_set_operation_tokens != null) {
-        const right_source_tokens = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
-        const source = try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, right_source_tokens);
+        const source = try generatedSetOperationRightSourceTableNameAlloc(alloc, tokens, set_operation);
         errdefer alloc.free(source);
         return .{ .left = left, .source = source };
     }
@@ -3319,16 +3394,52 @@ fn normalizeGeneratedSourceRangeTableNameAlloc(
     return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[table_start].text);
 }
 
+fn generatedLateralJoinRightSourceNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    join: generated_parser.GeneratedSqlJoinAst,
+) ![]const u8 {
+    const right = join.right_tokens;
+    if (right.start >= right.end or right.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[right.start].matchesKeywordTag(.lateral)) return error.UnsupportedSqlShape;
+    const subquery = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
+    if (subquery.start <= right.start + 1 or subquery.end >= right.end or subquery.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[subquery.start - 1].kind != .lparen or tokens[subquery.end].kind != .rparen) return error.UnsupportedSqlShape;
+    const alias = join.right_lateral_alias_tokens orelse return error.UnsupportedSqlShape;
+    const alias_name = join.right_lateral_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.start <= subquery.end or alias.end != right.end or alias_name.start < alias.start or alias_name.end > alias.end) return error.UnsupportedSqlShape;
+
+    const child = join.right_lateral_subquery_read_ast orelse return error.UnsupportedSqlShape;
+    return try generatedReadBodySourceNameAlloc(
+        alloc,
+        tokens[subquery.start..subquery.end],
+        child.source_tokens,
+        child.source_table_tokens,
+        child.set_operation_tokens,
+        child.set_operation,
+    );
+}
+
 fn ensureGeneratedSetOperationSourceMatches(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     source_name: []const u8,
     set_operation: generated_parser.GeneratedSqlSetOperationAst,
 ) !void {
-    const right_source_tokens = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
-    const right_source = try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, right_source_tokens);
+    const right_source = try generatedSetOperationRightSourceTableNameAlloc(alloc, tokens, set_operation);
     defer alloc.free(right_source);
     if (!std.mem.eql(u8, source_name, right_source)) return error.UnsupportedSqlShape;
+}
+
+fn generatedSetOperationRightSourceTableNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    set_operation: generated_parser.GeneratedSqlSetOperationAst,
+) ![]const u8 {
+    const right_source_tokens = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
+    const right_source_table_tokens = set_operation.right_source_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSimpleReadSourceTableTokens(tokens, right_source_tokens, right_source_table_tokens);
+    return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[right_source_table_tokens.start].text);
 }
 
 fn generatedReadBodySourceNameAlloc(
@@ -3873,6 +3984,32 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     try std.testing.expectEqualStrings("usage_records", alias_source.left);
     try std.testing.expectEqualStrings("usage_records", alias_source.source);
 
+    var set_operation_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records UNION SELECT id FROM usage_archive",
+    );
+    defer set_operation_sql.deinit(alloc);
+    var set_operation = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &set_operation_sql)).?;
+    defer set_operation.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", set_operation.left);
+    try std.testing.expectEqualStrings("usage_archive", set_operation.source);
+
+    var malformed_set_operation_source_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records UNION SELECT id FROM usage_archive",
+    );
+    defer malformed_set_operation_source_table.deinit(alloc);
+    if (malformed_set_operation_source_table.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .read => |read| {
+                if (read.set_operation.right_source_table_tokens == null) return error.TestUnexpectedResult;
+                read.set_operation.right_source_table_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &malformed_set_operation_source_table));
+
     var unnest_source_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;",
@@ -3886,7 +4023,7 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
 
     if (alias_source_sql.generated_statement) |*generated_statement| {
         switch (generated_statement.ast.?) {
-            .read => |*read| read.source_table_tokens = read.source_alias_name_tokens,
+            .read => |read| read.source_table_tokens = read.source_alias_name_tokens,
             else => return error.TestUnexpectedResult,
         }
     } else return error.TestUnexpectedResult;
@@ -3905,7 +4042,7 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
 
     if (simple_cte_sql.generated_statement) |*generated_statement| {
         switch (generated_statement.ast.?) {
-            .read => |*read| read.cte_items[0].body_source_table_tokens = read.cte_items[0].name_tokens,
+            .read => |read| read.cte_items[0].body_source_table_tokens = read.cte_items[0].name_tokens,
             else => return error.TestUnexpectedResult,
         }
     } else return error.TestUnexpectedResult;
@@ -3921,15 +4058,42 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     try std.testing.expectEqualStrings("usage_records", joined.left);
     try std.testing.expectEqualStrings("customer_records", joined.source);
 
-    var lateral_sql = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "WITH orgs AS (SELECT id FROM usage_records), balances AS (SELECT organization_id, amount FROM balance_records) SELECT org.id, latest.amount FROM orgs AS org LEFT JOIN LATERAL (SELECT amount FROM balances AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true",
-    );
+    const lateral_query =
+        "WITH orgs AS (SELECT id FROM usage_records), balances AS (SELECT organization_id, amount FROM balance_records) SELECT org.id, latest.amount FROM orgs AS org LEFT JOIN LATERAL (SELECT amount FROM balances AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true";
+    var lateral_sql = try tokenized.ParsedSql.initAlloc(alloc, lateral_query);
     defer lateral_sql.deinit(alloc);
     var lateral = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &lateral_sql)).?;
     defer lateral.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", lateral.left);
     try std.testing.expectEqualStrings("balance_records", lateral.source);
+
+    var malformed_lateral_child_source = try tokenized.ParsedSql.initAlloc(alloc, lateral_query);
+    defer malformed_lateral_child_source.deinit(alloc);
+    if (malformed_lateral_child_source.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .read => |read| {
+                try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+                const child = read.join_items[0].right_lateral_subquery_read_ast orelse return error.TestUnexpectedResult;
+                child.source_table_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &malformed_lateral_child_source));
+
+    var malformed_lateral_metadata = try tokenized.ParsedSql.initAlloc(alloc, lateral_query);
+    defer malformed_lateral_metadata.deinit(alloc);
+    if (malformed_lateral_metadata.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .read => |read| {
+                try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+                if (read.join_items[0].right_lateral_subquery_tokens == null) return error.TestUnexpectedResult;
+                read.join_items[0].right_lateral_subquery_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &malformed_lateral_metadata));
 
     var recursive_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4027,6 +4191,12 @@ test "sql adapter binder resolves write target tables from parsed statements" {
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, writeTargetTableNameFromParsedSqlAlloc(alloc, &missing_generated_target_ast));
 
+    var stale_published_write = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer stale_published_write.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, stale_published_write.generatedStatementKind().?);
+    stale_published_write.statement = .{ .unknown = stale_published_write.raw_statement };
+    try std.testing.expectError(error.UnsupportedSqlShape, writeTargetTableNameFromParsedSqlAlloc(alloc, &stale_published_write));
+
     var malformed_generated_target = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage");
     defer malformed_generated_target.deinit(alloc);
     if (malformed_generated_target.generated_statement) |*generated_statement| {
@@ -4064,6 +4234,26 @@ test "sql adapter binder source table helpers validate parsed statement family" 
     try std.testing.expectEqualStrings("incoming_usage", insert_tables.source);
     try std.testing.expect((try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source)) == null);
 
+    var insert_source_cte = try tokenized.ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM incoming_usage) INSERT INTO usage_records (id) SELECT id FROM source_rows");
+    defer insert_source_cte.deinit(alloc);
+    var insert_cte_tables = (try insertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source_cte)).?;
+    defer insert_cte_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", insert_cte_tables.target);
+    try std.testing.expectEqualStrings("incoming_usage", insert_cte_tables.source);
+
+    var stale_insert_cte_count = try tokenized.ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM incoming_usage) INSERT INTO usage_records (id) SELECT id FROM source_rows");
+    defer stale_insert_cte_count.deinit(alloc);
+    if (stale_insert_cte_count.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| {
+                const cte_prefix = if (dml.cte_prefix) |*cte_prefix| cte_prefix else return error.TestUnexpectedResult;
+                cte_prefix.count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, insertSourceTableNamesFromParsedSqlAlloc(alloc, &stale_insert_cte_count));
+
     var missing_insert_source_ast = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage");
     defer missing_insert_source_ast.deinit(alloc);
     if (missing_insert_source_ast.generated_statement) |*generated_statement| {
@@ -4100,6 +4290,19 @@ test "sql adapter binder source table helpers validate parsed statement family" 
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &missing_recursive_insert_ast));
 
+    var stale_recursive_cte_count = try tokenized.ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM incoming_usage) INSERT INTO usage_records (id) SELECT id FROM source_rows");
+    defer stale_recursive_cte_count.deinit(alloc);
+    if (stale_recursive_cte_count.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| {
+                const cte_prefix = if (dml.cte_prefix) |*cte_prefix| cte_prefix else return error.TestUnexpectedResult;
+                cte_prefix.count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &stale_recursive_cte_count));
+
     if (recursive_insert.generated_statement) |*generated_statement| {
         switch (generated_statement.ast.?) {
             .dml => |*dml| {
@@ -4135,6 +4338,80 @@ test "sql adapter binder source table helpers validate parsed statement family" 
         }
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &update_source));
+
+    var missing_update_source_range = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = source.status FROM incoming_usage AS source WHERE source.id = usage_records.id");
+    defer missing_update_source_range.deinit(alloc);
+    if (missing_update_source_range.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| dml.source_read.?.source_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &missing_update_source_range));
+
+    var data_cte_merge = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+    );
+    defer data_cte_merge.deinit(alloc);
+    const data_cte_merge_ast = switch ((data_cte_merge.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    const data_cte_prefix = data_cte_merge_ast.cte_prefix orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlDmlKind.update, (data_cte_prefix.first_body_dml orelse return error.TestUnexpectedResult).kind);
+    var data_cte_tables = (try joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(alloc, data_cte_merge.items(), &data_cte_merge_ast, data_cte_prefix)).?;
+    defer data_cte_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", data_cte_tables.target);
+    try std.testing.expectEqualStrings("usage_records", data_cte_tables.source);
+
+    var missing_data_cte_first_body = data_cte_prefix;
+    missing_data_cte_first_body.first_body_dml = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(alloc, data_cte_merge.items(), &data_cte_merge_ast, missing_data_cte_first_body),
+    );
+
+    const mismatched_data_cte_last_body = data_cte_prefix;
+    const last_body_dml = mismatched_data_cte_last_body.last_body_dml orelse return error.TestUnexpectedResult;
+    last_body_dml.command_span = data_cte_merge_ast.command_span;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(alloc, data_cte_merge.items(), &data_cte_merge_ast, mismatched_data_cte_last_body),
+    );
+
+    var semijoin_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer semijoin_update.deinit(alloc);
+    var semijoin_update_tables = (try joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &semijoin_update)).?;
+    defer semijoin_update_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", semijoin_update_tables.target);
+    try std.testing.expectEqualStrings("archived_records", semijoin_update_tables.source);
+
+    var stale_semijoin_update_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer stale_semijoin_update_source.deinit(alloc);
+    if (stale_semijoin_update_source.generated_statement) |*generated_statement| {
+        switch (generated_statement.ast.?) {
+            .dml => |*dml| dml.semijoin_source_table_tokens = dml.target_table_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &stale_semijoin_update_source));
+
+    var semijoin_delete = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+    );
+    defer semijoin_delete.deinit(alloc);
+    var semijoin_delete_tables = (try joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &semijoin_delete)).?;
+    defer semijoin_delete_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", semijoin_delete_tables.target);
+    try std.testing.expectEqualStrings("archived_records", semijoin_delete_tables.source);
 }
 
 const MultiTableTestCatalog = struct {

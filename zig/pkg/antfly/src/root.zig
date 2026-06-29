@@ -97,6 +97,7 @@ pub const raft = @import("raft/mod.zig");
 pub const admin = @import("admin/mod.zig");
 pub const extensions = @import("extensions/mod.zig");
 pub const public_api = @import("api/mod.zig");
+pub const pgwire = @import("pgwire/mod.zig");
 pub const metadata = @import("metadata/mod.zig");
 pub const metadata_api = @import("metadata/api.zig");
 pub const metadata_admin = @import("metadata/admin.zig");
@@ -251,6 +252,7 @@ test {
 
     // Public API
     _ = public_api;
+    _ = pgwire;
     _ = public_api.http_server;
     _ = public_api.http_internal_group_read_routes;
     _ = public_api.http_internal_group_join_routes;

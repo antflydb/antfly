@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10622
+%expect 10406
 
 %start statement
 
@@ -36,11 +36,13 @@
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ACCESS ADD AGGREGATE ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC AUTHORIZATION BEGIN BETWEEN BY CASCADE CALL CASE CAST CHECK CHECKPOINT CLOSE CLUSTER COLLATION COMMIT COMMENT CONCURRENTLY CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
 %token CREATE COPY CROSS DATA DATABASE DATE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
-%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GENERATED GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
-%token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCAL LOCK LOCKED MATCH MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NATURAL NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OVERLAY OWNED PARTITION PLACING POLICY POSITION PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION IMPORT
+%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GENERATED GRANT GRAPH GROUP HASH HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
+%token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LIST LISTEN LOAD LOCAL LOCK LOCKED MATCH MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NATURAL NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OVERLAY OWNED PARTITION PLACING POLICY POSITION PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION IMPORT
 %token NEXT NOTHING OFFSET ONLY OPERATOR OVERRIDING OVERLAPS PERIOD PORTION PREPARED PRIVILEGES PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROUTINE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SEQUENCE STORED SUBSTRING SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USER USING VACUUM VALUE VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHIN WITHOUT
-%token CHARACTERISTICS COMMITTED DEFERRABLE ISOLATION LEVEL READ REPEATABLE SERIALIZABLE SESSION START TRANSACTION UNCOMMITTED WORK WRITE
+%token BINARY CURSOR HOLD SCROLL
+%token ANALYZE_VERBOSE SYSTEM_TIME_FOR
+%token CHARACTERISTICS COMMITTED CONSTRAINTS DEFERRABLE DEFERRED IMMEDIATE ISOLATION LEVEL READ REPEATABLE SERIALIZABLE SESSION START TRANSACTION UNCOMMITTED WORK WRITE
 %token EXCEPT INTERSECT UNBOUNDED
 %token ALWAYS BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
 
@@ -58,12 +60,15 @@ statement:
   ;
 
 session_statement:
-    SET qualified_name EQ expression
-  | SET qualified_name TO expression_list
-  | SET qualified_name expression_list
-  | SET LOCAL qualified_name EQ expression
-  | SET LOCAL qualified_name TO expression_list
-  | SET LOCAL qualified_name expression_list
+    SET qualified_name EQ session_value
+  | SET qualified_name TO session_value_list
+  | SET qualified_name session_value_list
+  | SET LOCAL qualified_name EQ session_value
+  | SET LOCAL qualified_name TO session_value_list
+  | SET LOCAL qualified_name session_value_list
+  | SET SESSION qualified_name EQ session_value
+  | SET SESSION qualified_name TO session_value_list
+  | SET SESSION qualified_name session_value_list
   | SET SESSION CHARACTERISTICS AS TRANSACTION transaction_mode_list
   | RESET qualified_name
   | RESET ALL
@@ -72,8 +77,19 @@ session_statement:
   | DISCARD ALL
   ;
 
+session_value_list:
+    session_value
+  | session_value_list COMMA session_value
+  ;
+
+session_value:
+    expression
+  | ON
+  ;
+
 transaction_statement:
     SET TRANSACTION transaction_mode_list
+  | SET CONSTRAINTS constraint_mode_target_list constraint_check_mode
   | START TRANSACTION start_transaction_tail_opt
   | BEGIN begin_transaction_tail_opt
   | COMMIT transaction_boundary_tail_opt
@@ -122,6 +138,16 @@ transaction_isolation_level:
   | REPEATABLE READ
   | READ COMMITTED
   | READ UNCOMMITTED
+  ;
+
+constraint_mode_target_list:
+    ALL
+  | qualified_name_list
+  ;
+
+constraint_check_mode:
+    DEFERRED
+  | IMMEDIATE
   ;
 
 savepoint_keyword_opt:
@@ -199,12 +225,44 @@ create_schema_statement:
   ;
 
 create_table_statement:
-    CREATE relation_lifetime_opt TABLE if_not_exists_opt qualified_name create_table_body
+    CREATE relation_lifetime_opt TABLE if_not_exists_opt qualified_name create_table_body create_table_partition_opt create_table_option_list_opt
   ;
 
 create_table_body:
     LPAREN column_definition_list RPAREN
+  | PARTITION OF qualified_name table_partition_bound
   | AS read_statement create_table_as_data_opt
+  ;
+
+create_table_partition_opt:
+    /* empty */
+  | PARTITION BY table_partition_strategy LPAREN expression_list RPAREN
+  ;
+
+table_partition_strategy:
+    RANGE
+  | LIST
+  | HASH
+  ;
+
+table_partition_bound:
+    FOR VALUES FROM LPAREN expression_list RPAREN TO LPAREN expression_list RPAREN
+  | FOR VALUES IN LPAREN expression_list RPAREN
+  | DEFAULT
+  ;
+
+create_table_option_list_opt:
+    /* empty */
+  | create_table_option_list
+  ;
+
+create_table_option_list:
+    create_table_option
+  | create_table_option_list create_table_option
+  ;
+
+create_table_option:
+    WITH SYSTEM IDENT
   ;
 
 create_view_statement:
@@ -250,7 +308,31 @@ create_subscription_statement:
   ;
 
 create_policy_statement:
-    CREATE POLICY identifier_name ON qualified_name diagnostic_tail_opt
+    CREATE POLICY identifier_name ON qualified_name policy_tail_opt
+  ;
+
+policy_tail_opt:
+    /* empty */
+  | policy_tail
+  ;
+
+policy_tail:
+    policy_to_opt policy_using_opt policy_with_check_opt
+  ;
+
+policy_to_opt:
+    /* empty */
+  | TO qualified_name_list
+  ;
+
+policy_using_opt:
+    /* empty */
+  | USING LPAREN expression RPAREN
+  ;
+
+policy_with_check_opt:
+    /* empty */
+  | WITH CHECK LPAREN expression RPAREN
   ;
 
 create_routine_statement:
@@ -341,13 +423,24 @@ create_table_as_data_opt:
   ;
 
 create_index_statement:
-    CREATE create_index_unique_opt INDEX if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_include_opt index_options_opt index_where_opt
-  | CREATE create_index_unique_opt INDEX CONCURRENTLY if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_include_opt index_options_opt index_where_opt
+    CREATE create_index_unique_opt INDEX if_not_exists_opt qualified_name ON index_target_relation_prefix_opt qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_nulls_distinct_opt index_include_opt index_options_opt index_where_opt
+  | CREATE create_index_unique_opt INDEX CONCURRENTLY if_not_exists_opt qualified_name ON index_target_relation_prefix_opt qualified_name index_method_opt LPAREN index_element_list_opt RPAREN index_nulls_distinct_opt index_include_opt index_options_opt index_where_opt
   ;
 
 create_index_unique_opt:
     /* empty */
   | UNIQUE
+  ;
+
+index_nulls_distinct_opt:
+    /* empty */
+  | NULLS DISTINCT
+  | NULLS NOT DISTINCT
+  ;
+
+index_target_relation_prefix_opt:
+    /* empty */
+  | ONLY
   ;
 
 create_extension_statement:
@@ -366,7 +459,14 @@ extension_version_opt:
   ;
 
 alter_table_statement:
-    ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
+    ALTER TABLE alter_table_relation_prefix_opt qualified_name alter_table_partition_action
+  | ALTER TABLE alter_table_relation_prefix_opt qualified_name ADD table_constraint table_constraint_attribute_list_opt
+  | ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
+  ;
+
+alter_table_partition_action:
+    IDENT PARTITION qualified_name table_partition_bound
+  | IDENT PARTITION qualified_name
   ;
 
 alter_database_statement:
@@ -453,8 +553,11 @@ drop_statement:
   | DROP role_keyword if_exists_opt identifier_name drop_behavior_opt
   | DROP COLLATION if_exists_opt identifier_name
   | DROP OPERATOR operator_symbol diagnostic_tail_opt
+  | DROP OPERATOR IF EXISTS operator_symbol diagnostic_tail_opt
   | DROP AGGREGATE identifier_name diagnostic_tail
+  | DROP AGGREGATE IF EXISTS identifier_name diagnostic_tail
   | DROP CAST diagnostic_tail
+  | DROP CAST IF EXISTS diagnostic_tail
   ;
 
 role_keyword:
@@ -641,13 +744,39 @@ graph_statement:
 
 cursor_statement:
     CLOSE diagnostic_tail
+  | DECLARE identifier_name declare_cursor_options_opt CURSOR declare_cursor_hold_opt FOR read_statement
   | DECLARE diagnostic_tail
   | FETCH diagnostic_tail
   | MOVE diagnostic_tail
   ;
 
+declare_cursor_options_opt:
+    /* empty */
+  | declare_cursor_options
+  ;
+
+declare_cursor_options:
+    declare_cursor_option
+  | declare_cursor_options declare_cursor_option
+  ;
+
+declare_cursor_option:
+    BINARY
+  | SCROLL
+  | NO SCROLL
+  ;
+
+declare_cursor_hold_opt:
+    /* empty */
+  | WITH HOLD
+  | WITHOUT HOLD
+  ;
+
 unsupported_statement:
-    ANALYZE unsupported_tail_opt
+    ANALYZE
+  | ANALYZE ANALYZE_VERBOSE
+  | ANALYZE qualified_name analyze_column_list_opt
+  | ANALYZE ANALYZE_VERBOSE qualified_name analyze_column_list_opt
   | EXPLAIN explain_options_opt explain_subject_opt
   | DO diagnostic_tail_opt
   | INSERT INTO insert_target OVERRIDING SYSTEM VALUE diagnostic_tail
@@ -708,7 +837,8 @@ unsupported_statement:
   | IMPORT FOREIGN SCHEMA identifier_name FROM SERVER identifier_name INTO identifier_name diagnostic_tail_opt
   | CALL diagnostic_tail_opt
   | CHECKPOINT diagnostic_tail_opt
-  | COPY diagnostic_tail_opt
+  | COPY
+  | COPY diagnostic_tail
   | CLUSTER diagnostic_tail_opt
   | COMMENT diagnostic_tail_opt
   | DISCARD discard_unsupported_target
@@ -784,6 +914,23 @@ table_definition:
     column_definition
   | table_constraint
   | period_table_constraint
+  | LIKE qualified_name table_like_options_opt
+  ;
+
+table_like_options_opt:
+    /* empty */
+  | table_like_options
+  ;
+
+table_like_options:
+    table_like_option
+  | table_like_options table_like_option
+  ;
+
+table_like_option:
+    IDENT ALL
+  | IDENT IDENT
+  | IDENT UPDATE IDENT
   ;
 
 column_definition:
@@ -791,11 +938,80 @@ column_definition:
   ;
 
 table_constraint:
-    PRIMARY KEY diagnostic_tail
-  | UNIQUE diagnostic_tail
-  | FOREIGN KEY diagnostic_tail
+    PRIMARY KEY LPAREN constraint_key_list RPAREN index_include_opt
+  | UNIQUE index_nulls_distinct_opt LPAREN constraint_key_list RPAREN index_include_opt
+  | FOREIGN KEY LPAREN referential_key_list RPAREN IDENT qualified_name LPAREN referential_key_list RPAREN foreign_key_match_opt foreign_key_action_list_opt
   | CHECK LPAREN expression RPAREN
   | CONSTRAINT identifier_name table_constraint
+  ;
+
+table_constraint_attribute_list_opt:
+    /* empty */
+  | table_constraint_attribute_list
+  ;
+
+table_constraint_attribute_list:
+    table_constraint_attribute
+  | table_constraint_attribute_list table_constraint_attribute
+  ;
+
+table_constraint_attribute:
+    NOT IDENT
+  | IDENT
+  | IDENT IDENT
+  ;
+
+constraint_key_list:
+    constraint_key
+  | constraint_key_list COMMA constraint_key
+  ;
+
+constraint_key:
+    identifier_name constraint_key_temporal_opt
+  ;
+
+constraint_key_temporal_opt:
+    /* empty */
+  | WITHOUT OVERLAPS
+  ;
+
+referential_key_list:
+    referential_key
+  | referential_key_list COMMA referential_key
+  ;
+
+referential_key:
+    identifier_name
+  | PERIOD identifier_name
+  ;
+
+foreign_key_match_opt:
+    /* empty */
+  | MATCH FULL
+  | MATCH IDENT
+  ;
+
+foreign_key_action_list_opt:
+    /* empty */
+  | foreign_key_action_list
+  ;
+
+foreign_key_action_list:
+    foreign_key_action
+  | foreign_key_action_list foreign_key_action
+  ;
+
+foreign_key_action:
+    ON DELETE foreign_key_action_kind
+  | ON UPDATE foreign_key_action_kind
+  ;
+
+foreign_key_action_kind:
+    CASCADE
+  | RESTRICT
+  | NO IDENT
+  | SET NULL
+  | SET DEFAULT
   ;
 
 period_table_constraint:
@@ -814,21 +1030,31 @@ column_constraint_list:
 
 column_constraint:
     PRIMARY KEY
+  | UNIQUE
   | NOT NULL
   | DEFAULT expression
+  | CHECK LPAREN expression RPAREN
+  | IDENT qualified_name LPAREN identifier_list RPAREN foreign_key_action_list_opt
+  | CONSTRAINT identifier_name column_constraint
+  | IDENT identifier_name
   | generated_column_constraint
   ;
 
 generated_column_constraint:
     GENERATED ALWAYS AS LPAREN expression RPAREN generated_column_storage_opt
-  | GENERATED ALWAYS AS IDENTITY diagnostic_tail_opt
-  | GENERATED BY DEFAULT AS IDENTITY diagnostic_tail_opt
+  | GENERATED ALWAYS AS IDENTITY identity_options_opt
+  | GENERATED BY DEFAULT AS IDENTITY identity_options_opt
   ;
 
 generated_column_storage_opt:
     /* empty */
   | STORED
   | VIRTUAL
+  ;
+
+identity_options_opt:
+    /* empty */
+  | LPAREN diagnostic_tail RPAREN
   ;
 
 insert_columns_opt:
@@ -953,7 +1179,7 @@ table_relation_source:
 
 system_time_as_of_opt:
     /* empty */
-  | FOR IDENT AS OF NUMBER
+  | SYSTEM_TIME_FOR IDENT AS OF NUMBER
   ;
 
 table_function_alias_opt:
@@ -1577,8 +1803,13 @@ identifier_name:
   ;
 
 type_name:
-    qualified_name array_type_suffix_opt
-  | type_keyword_name array_type_suffix_opt
+    qualified_name type_modifier_opt array_type_suffix_opt
+  | type_keyword_name type_modifier_opt array_type_suffix_opt
+  ;
+
+type_modifier_opt:
+    /* empty */
+  | LPAREN expression_list RPAREN
   ;
 
 type_keyword_name:
@@ -1592,8 +1823,9 @@ array_type_suffix_opt:
   | LBRACKET RBRACKET
   ;
 
-unsupported_tail_opt:
+analyze_column_list_opt:
     /* empty */
+  | LPAREN identifier_list RPAREN
   ;
 
 diagnostic_tail_opt:
@@ -1675,6 +1907,7 @@ diagnostic_token:
   | EXISTS
   | FALSE
   | FETCH
+  | FIRST
   | FOR
   | FOREIGN
   | FROM
@@ -1691,6 +1924,7 @@ diagnostic_token:
   | INSERT
   | IS
   | LABEL
+  | LAST
   | KEY
   | LISTEN
   | LOAD

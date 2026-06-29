@@ -212,6 +212,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn recursiveCteParserHooks(ptr: *ParserType) plan.RecursiveCteParserHooks {
             return .{
                 .ptr = ptr,
+                .generated_read_ast = ptr.generated_read_ast,
                 .parse_select_with_set_boundary = Accessors.parseRecursiveCteSelectWithSetBoundaryHook,
                 .select_output_columns = Accessors.selectOutputColumnsHook,
                 .parse_recursive_member = Accessors.parseRecursiveCteMemberHook,
@@ -221,6 +222,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn recursiveCteMemberParserHooks(ptr: *ParserType) plan.RecursiveCteMemberParserHooks {
             return .{
                 .ptr = ptr,
+                .generated_read_ast = ptr.generated_read_ast,
                 .parse_projection_expression = Accessors.parseRecursiveCteMemberProjectionExpressionHook,
                 .parse_join_on = Accessors.parseRecursiveCteMemberJoinOnHook,
             };
@@ -1343,35 +1345,15 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return error.UnsupportedSqlShape;
         }
 
-        fn parseGeneratedReadAstForTokensAlloc(
-            ptr: *ParserType,
-            tokens: []const Token,
-        ) !generated_parser.GeneratedSqlReadAst {
-            var result = (try generated_parser.parseGeneratedGateTokensStrictAlloc(ptr.alloc, tokens)) orelse return error.UnsupportedSqlShape;
-            errdefer result.deinit(ptr.alloc);
-            if (result.kind != .read) return error.UnsupportedSqlShape;
-            const ast = result.ast orelse return error.UnsupportedSqlShape;
-            return switch (ast) {
-                .read => |read| blk: {
-                    const transferred = read.*;
-                    ptr.alloc.destroy(read);
-                    result.ast = null;
-                    try lower_expr.validateGeneratedReadAstPayloads(tokens, transferred);
-                    break :blk transferred;
-                },
-                else => error.UnsupportedSqlShape,
-            };
-        }
-
         fn generatedChildReadAstForTokensAlloc(
             ptr: *ParserType,
             tokens: []const Token,
         ) !?generated_parser.GeneratedSqlReadAst {
             if (ptr.generated_read_ast) |parent| {
                 if (parent.kind == .cte) return try Accessors.generatedCteBodyReadAstForTokensAlloc(ptr, tokens);
+                if (tokens.len != ptr.tokens.len) return error.UnsupportedSqlShape;
             }
-            if (tokens.len == ptr.tokens.len) return null;
-            return try Accessors.parseGeneratedReadAstForTokensAlloc(ptr, tokens);
+            return null;
         }
 
         pub fn parseCteSelectHook(
@@ -1486,6 +1468,8 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             cte_name: []const u8,
         ) anyerror!plan.LoweredRecursiveCteMemberPlan {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast = try Accessors.generatedChildReadAstForTokensAlloc(self, tokens);
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1495,6 +1479,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .function_bindings = self.function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = available_ctes,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
             };
             const member = try plan.parseRecursiveCteMemberPlanAlloc(
                 self.alloc,
@@ -1503,7 +1488,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 self.schema,
                 available_ctes,
                 cte_name,
-                Accessors.recursiveCteMemberParserHooks(self),
+                Accessors.recursiveCteMemberParserHooks(&sub),
             );
             pos.* = sub.pos;
             return member;

@@ -951,6 +951,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
     }
 
+    pub fn stop(self: *@This()) void {
+        _ = self;
+    }
+
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
@@ -1179,16 +1183,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        self.stop();
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -1199,7 +1194,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn stop(self: *EnrichmentRuntime) void {
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            self.shutdown = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+
+            if (self.future) |*future| _ = future.await(io);
+        }
+        self.future = null;
+        self.shutdown = false;
+        self.ownership.release();
+    }
+
     pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
@@ -9336,7 +9347,7 @@ test "db enrichment runtime managed dense remains searchable after transient rat
     while (attempts < 200) : (attempts += 1) {
         const snapshot = gated.snapshot();
         if (snapshot.rate_limited_requests > 0 and snapshot.successful_requests >= 1) break;
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
 
     const before_release = gated.snapshot();
@@ -9358,7 +9369,7 @@ test "db enrichment runtime managed dense remains searchable after transient rat
             ready = true;
             break;
         }
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     try std.testing.expect(ready);
 

@@ -248,7 +248,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
         for (document_schema.properties) |property| {
             const field_type = runtimeRelationalColumnType(property) orelse continue;
             const nullable = !requiredFieldsContain(document_schema.required_fields, property.name);
-            if (property.collation != null and !runtimeRelationalColumnSupportsCollation(field_type)) return error.InvalidSchemaUpdateRequest;
+            if (property.collation != null and !runtimeRelationalPropertySupportsCollation(property, field_type)) return error.InvalidSchemaUpdateRequest;
             try validateRuntimeRelationalDefault(alloc, property.default_value, field_type);
             try validateRuntimeRelationalOnUpdate(property.on_update_value, field_type);
             const name = try alloc.dupe(u8, property.name);
@@ -274,6 +274,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
             errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
             column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
             column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
+            column.index_keys = try cloneRelationalIndexKeys(alloc, property.index_keys);
             column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
             column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
             column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
@@ -292,6 +293,13 @@ fn runtimeRelationalColumnSupportsCollation(field_type: storage_schema.AntflyTyp
         .keyword, .text => true,
         else => false,
     };
+}
+
+fn runtimeRelationalPropertySupportsCollation(property: anytype, field_type: storage_schema.AntflyType) bool {
+    if (runtimeRelationalColumnSupportsCollation(field_type)) return true;
+    if (field_type != .array) return false;
+    const item_type = runtimeRelationalArrayItemType(property) orelse return false;
+    return runtimeRelationalColumnSupportsCollation(item_type);
 }
 
 fn validateRuntimeRelationalDefault(
@@ -373,6 +381,7 @@ fn freeRuntimeRelationalColumn(alloc: std.mem.Allocator, column: storage_schema.
     if (column.index_name) |index_name| alloc.free(index_name);
     for (column.index_include_columns) |field_name| alloc.free(field_name);
     if (column.index_include_columns.len > 0) alloc.free(column.index_include_columns);
+    storage_schema.freeRelationalIndexKeySlice(alloc, column.index_keys);
     if (column.default_value) |value| alloc.free(value.value_json);
     if (column.on_update_value) |value| alloc.free(value.value_json);
     if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);
@@ -582,6 +591,7 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .columns = try cloneStringSlice(alloc, constraint.columns),
             .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
             .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
+            .index_keys = try cloneRelationalIndexKeys(alloc, constraint.index_keys),
             .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
             .nulls_not_distinct = constraint.nulls_not_distinct,
             .deferrable = constraint.deferrable,
@@ -615,6 +625,7 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
         if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
         for (constraint.include_columns) |column| alloc.free(column);
         if (constraint.include_columns.len > 0) alloc.free(constraint.include_columns);
+        storage_schema.freeRelationalIndexKeySlice(alloc, constraint.index_keys);
         if (constraint.without_overlaps_period) |period| alloc.free(period);
         for (constraint.where) |predicate| {
             alloc.free(predicate.field);
@@ -654,6 +665,7 @@ fn deriveRuntimeRelationalChecks(alloc: std.mem.Allocator, schema: ParsedTableSc
                 .lte => .lte,
             },
             .value_json = if (check.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+            .collation = if (check.collation) |collation| try alloc.dupe(u8, collation) else null,
             .validation_state = switch (check.validation_state) {
                 .enforced => .enforced,
                 .unvalidated => .unvalidated,
@@ -672,6 +684,7 @@ fn freeRuntimeRelationalChecks(alloc: std.mem.Allocator, checks: []storage_schem
         alloc.free(check.name);
         alloc.free(check.field);
         if (check.value_json) |value_json| alloc.free(value_json);
+        if (check.collation) |collation| alloc.free(collation);
         if (check.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
     }
     if (checks.len > 0) alloc.free(checks);
@@ -898,6 +911,25 @@ fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]con
     }
     for (values) |value| {
         out[initialized] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRelationalIndexKeys(alloc: std.mem.Allocator, values: []const storage_schema.RelationalIndexKey) ![]const storage_schema.RelationalIndexKey {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndexKey, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value.column);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .column = try alloc.dupe(u8, value.column),
+            .direction = value.direction,
+            .nulls = value.nulls,
+        };
         initialized += 1;
     }
     return out;
@@ -1602,7 +1634,7 @@ test "deriveRuntimeTableSchema carries relational system-versioned marker" {
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-name":"customer_idx","x-antfly-index-keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1619,6 +1651,14 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(!id.nullable); // required
     try std.testing.expect(id.indexed);
     const customer_id = findRuntimeColumn(runtime, "customer_id").?;
+    try std.testing.expectEqualStrings("customer_idx", customer_id.index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), customer_id.index_keys.len);
+    try std.testing.expectEqualStrings("customer_id", customer_id.index_keys[0].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.desc, customer_id.index_keys[0].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.last, customer_id.index_keys[0].nulls);
+    try std.testing.expectEqualStrings("tenant_id", customer_id.index_keys[1].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.asc, customer_id.index_keys[1].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.first, customer_id.index_keys[1].nulls);
     try std.testing.expectEqual(@as(usize, 1), customer_id.index_where.len);
     try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_id.index_lifecycle);
     try std.testing.expectEqual(@as(u64, 99), customer_id.index_generation);
@@ -1650,6 +1690,9 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqualStrings("_id", runtime.foreign_keys[0].parent_columns[0]);
     try std.testing.expectEqual(storage_schema.ForeignKeyAction.no_action, runtime.foreign_keys[0].on_update);
     try std.testing.expectEqual(storage_schema.ForeignKeyMatch.simple, runtime.foreign_keys[0].match);
+    try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
+    try std.testing.expectEqualStrings("tenant_case_match", runtime.checks[0].name);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", runtime.checks[0].collation.?);
 }
 
 test "deriveRuntimeTableSchema rejects relational collation on non text columns" {
@@ -1660,6 +1703,22 @@ test "deriveRuntimeTableSchema rejects relational collation on non text columns"
     defer parsed.deinit(alloc);
 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, parsed));
+}
+
+test "deriveRuntimeTableSchema carries relational array item collation" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"},"collation":"antfly.case_insensitive"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const tags = findRuntimeColumn(runtime, "tags") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(storage_schema.AntflyType.array, tags.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, tags.array_item_type.?);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", tags.collation.?);
 }
 
 test "deriveRuntimeTableSchema validates relational literal default types" {

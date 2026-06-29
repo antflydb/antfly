@@ -33,6 +33,7 @@ const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const relational_collation = @import("relational_collation.zig");
 const relational_store_mod = @import("relational_store.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
@@ -2919,9 +2920,19 @@ pub fn Impl(comptime DB: type) type {
             column: schema_mod.RelationalColumn,
             implications: relational_store_mod.PredicateImplications,
         ) !bool {
+            return try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, &.{column});
+        }
+
+        fn relationalColumnIndexUsableForQueryWithColumns(
+            self: *DB,
+            alloc: Allocator,
+            column: schema_mod.RelationalColumn,
+            implications: relational_store_mod.PredicateImplications,
+            columns: []const schema_mod.RelationalColumn,
+        ) !bool {
             if (!column.indexed) return false;
             if (column.index_lifecycle != .ready) return false;
-            if (!relational_store_mod.predicatesImplyUniqueWhere(implications.predicates, column.index_where)) return false;
+            if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, column.index_where, columns))) return false;
             return try self.relationalRowsExpressionPredicatesImply(alloc, implications, column.index_where_expressions);
         }
 
@@ -2972,13 +2983,14 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, term.field) orelse return null;
             if (column.field_type != .keyword) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 wanted: []const u8,
+                collation: ?[]const u8,
 
                 fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
-                    return value.value_type == .bytes_val and !value.is_json and std.mem.eql(u8, value.value.bytes_val, ctx.wanted);
+                    return value.value_type == .bytes_val and !value.is_json and relational_collation.textEqual(value.value.bytes_val, ctx.wanted, ctx.collation);
                 }
-            }{ .wanted = term.term });
+            }{ .wanted = term.term, .collation = term.collation });
         }
 
         fn resolveRelationalArrayAnyFilterDocSetAlloc(
@@ -2998,7 +3010,7 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if (try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) {
+            if (try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) {
                 const element_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, array_any.value);
                 defer alloc.free(element_key);
                 const indexed_doc_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, self.core.store, column.path, element_key, "", "");
@@ -3048,7 +3060,7 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if ((try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)) {
+            if ((try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)) {
                 const indexed_doc_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, self.core.store, column.path, json_contains.value, "", "");
                 defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
                 for (indexed_doc_ids) |doc_id| {
@@ -3083,22 +3095,23 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .keyword) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 min: ?[]const u8,
                 max: ?[]const u8,
                 inclusive_min: bool,
                 inclusive_max: bool,
+                collation: ?[]const u8,
 
                 fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
                     if (value.value_type != .bytes_val or value.is_json) return false;
                     const bytes = value.value.bytes_val;
                     const above_min = if (ctx.min) |min| blk: {
-                        const order = std.mem.order(u8, bytes, min);
-                        break :blk order == .gt or (ctx.inclusive_min and order == .eq);
+                        const comparison = relational_collation.compareTextForScalar(bytes, min, ctx.collation);
+                        break :blk comparison == .gt or (ctx.inclusive_min and comparison == .eq);
                     } else true;
                     const below_max = if (ctx.max) |max| blk: {
-                        const order = std.mem.order(u8, bytes, max);
-                        break :blk order == .lt or (ctx.inclusive_max and order == .eq);
+                        const comparison = relational_collation.compareTextForScalar(bytes, max, ctx.collation);
+                        break :blk comparison == .lt or (ctx.inclusive_max and comparison == .eq);
                     } else true;
                     return above_min and below_max;
                 }
@@ -3107,6 +3120,7 @@ pub fn Impl(comptime DB: type) type {
                 .max = range.max,
                 .inclusive_min = range.inclusive_min,
                 .inclusive_max = range.inclusive_max,
+                .collation = range.collation,
             });
         }
 
@@ -3120,7 +3134,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .numeric) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 min: ?f64,
                 max: ?f64,
                 inclusive_min: bool,
@@ -3151,7 +3165,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .datetime) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 start_ns: ?u64,
                 end_ns: ?u64,
                 inclusive_start: bool,
@@ -3182,7 +3196,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, bool_query.field) orelse return null;
             if (column.field_type != .boolean) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 wanted: bool,
 
                 fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
@@ -3201,7 +3215,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 center: search_mod.GeoPoint,
                 radius_meters: f64,
 
@@ -3229,7 +3243,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
                 min_lat: f64,
                 min_lon: f64,
                 max_lat: f64,
@@ -3308,12 +3322,13 @@ pub fn Impl(comptime DB: type) type {
         fn scanRelationalColumnFilterDocSetAlloc(
             self: *DB,
             alloc: Allocator,
+            columns: []const schema_mod.RelationalColumn,
             column: schema_mod.RelationalColumn,
             implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
             matcher: anytype,
         ) !doc_set.ResolvedDocSet {
-            if (!(try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications))) {
+            if (!(try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, columns))) {
                 return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
             }
 

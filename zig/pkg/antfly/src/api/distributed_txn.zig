@@ -868,12 +868,20 @@ fn addForeignKeyUpdateActionPageDownstreamParticipants(
         defer lookup.deinit(alloc);
         try appendInjectedVersionPredicate(alloc, child_participant, child.child_key, lookup.version);
 
-        const child_row = try document_mapper.buildRelationalRowValueAlloc(alloc, lookup.json, child_runtime_schema.relational_columns);
-        defer alloc.free(child_row);
-        const current_parent = (try relational_store.foreignKeyReferenceValueAlloc(alloc, child_row, foreign_key)) orelse continue;
+        const current_parent = (try foreignKeyParentReferenceFromJsonAlloc(
+            alloc,
+            catalog,
+            child_table_name,
+            child_runtime_schema.default_type,
+            child_runtime_schema.relational_columns,
+            foreign_key,
+            lookup.json,
+        )) orelse continue;
         defer alloc.free(current_parent);
         if (!std.mem.eql(u8, current_parent, old_parent_key)) continue;
 
+        const child_row = try document_mapper.buildRelationalRowValueAlloc(alloc, lookup.json, child_runtime_schema.relational_columns);
+        defer alloc.free(child_row);
         const rewritten_row = if (std.mem.eql(u8, action, "update_cascade")) blk: {
             const next_parent_key = updated_parent_key orelse return error.UnsupportedOperation;
             break :blk try relational_store.relationalRowWithForeignKeyColumnsFromParentKeyAlloc(alloc, child_row, next_parent_key, foreign_key);
@@ -1795,7 +1803,7 @@ fn addForeignKeyParentParticipants(
         if (try keyHasForeignKeyReferenceTransform(alloc, runtime_schema.foreign_keys, write.key, transforms)) continue;
         for (runtime_schema.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
-            const maybe_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, write.value);
+            const maybe_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, catalog, table_name, runtime_schema.default_type, runtime_schema.relational_columns, foreign_key, write.value);
             defer if (maybe_parent_key) |parent_key| alloc.free(parent_key);
             if (maybe_parent_key) |parent_key| {
                 var child_period_bounds = try foreignKeyChildPeriodBoundsFromJsonAlloc(alloc, runtime_schema.periods, foreign_key, write.value);
@@ -1813,7 +1821,7 @@ fn addForeignKeyParentParticipants(
 
             var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, write.key, predicates);
             defer if (old_row) |*row| row.deinit(alloc);
-            const maybe_old_parent_key = if (old_row) |old| try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, old.json) else null;
+            const maybe_old_parent_key = if (old_row) |old| try foreignKeyParentReferenceFromJsonAlloc(alloc, catalog, table_name, runtime_schema.default_type, runtime_schema.relational_columns, foreign_key, old.json) else null;
             defer if (maybe_old_parent_key) |old_parent_key| alloc.free(old_parent_key);
 
             if (maybe_old_parent_key) |old_parent_key| {
@@ -2032,9 +2040,9 @@ fn addForeignKeyTransformParticipants(
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!try keyTouchesForeignKeyReferenceTransform(alloc, foreign_key, transform.key, transforms)) continue;
 
-            const maybe_old_parent_key = if (old_row) |row| try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, row.json) else null;
+            const maybe_old_parent_key = if (old_row) |row| try foreignKeyParentReferenceFromJsonAlloc(alloc, catalog, table_name, runtime_schema.default_type, runtime_schema.relational_columns, foreign_key, row.json) else null;
             defer if (maybe_old_parent_key) |old_parent_key| alloc.free(old_parent_key);
-            const maybe_new_parent_key = if (final_json) |body| try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, body) else null;
+            const maybe_new_parent_key = if (final_json) |body| try foreignKeyParentReferenceFromJsonAlloc(alloc, catalog, table_name, runtime_schema.default_type, runtime_schema.relational_columns, foreign_key, body) else null;
             defer if (maybe_new_parent_key) |new_parent_key| alloc.free(new_parent_key);
 
             if (maybe_new_parent_key) |parent_key| {
@@ -2211,9 +2219,9 @@ fn addForeignKeyParentUpdateParticipantsForWrite(
 
     for (parent_runtime_schema.unique_constraints) |constraint| {
         if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
-        const old_value = try relational_store.uniqueConstraintTupleValueAlloc(alloc, old_row, constraint);
+        const old_value = try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, old_row, constraint, parent_runtime_schema.relational_columns);
         defer if (old_value) |value| alloc.free(value);
-        const new_value = try relational_store.uniqueConstraintTupleValueAlloc(alloc, new_row, constraint);
+        const new_value = try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, new_row, constraint, parent_runtime_schema.relational_columns);
         defer if (new_value) |value| alloc.free(value);
         if (old_value == null) continue;
         if (new_value != null and std.mem.eql(u8, old_value.?, new_value.?)) continue;
@@ -2487,7 +2495,7 @@ fn addForeignKeyChildDeleteParticipants(
             var old_row = try lookupDeleteRowForConstraintProof(alloc, catalog, worker, participants, table_name, key, predicates);
             defer if (old_row) |*row| row.deinit(alloc);
             const old = old_row orelse continue;
-            const maybe_old_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, old.json);
+            const maybe_old_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, catalog, table_name, runtime_schema.default_type, runtime_schema.relational_columns, foreign_key, old.json);
             defer if (maybe_old_parent_key) |old_parent_key| alloc.free(old_parent_key);
             if (maybe_old_parent_key) |old_parent_key| {
                 try addForeignKeyRefOwnerDeleteParticipant(alloc, catalog, participants, table_name, runtime_schema.default_type, foreign_key, key, old_parent_key);
@@ -3048,9 +3056,9 @@ fn addUniqueConstraintOwnerMutationsForWrite(
     defer if (new_row) |row| alloc.free(row);
 
     for (constraints) |constraint| {
-        const old_value = if (old_row) |row| try relational_store.uniqueConstraintTupleValueAlloc(alloc, row, constraint) else null;
+        const old_value = if (old_row) |row| try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, constraint, runtime_schema.relational_columns) else null;
         defer if (old_value) |value| alloc.free(value);
-        const new_value = if (new_row) |row| try relational_store.uniqueConstraintTupleValueAlloc(alloc, row, constraint) else null;
+        const new_value = if (new_row) |row| try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, constraint, runtime_schema.relational_columns) else null;
         defer if (new_value) |value| alloc.free(value);
         var old_span = if (old_json) |json| if (constraint.without_overlaps_period) |period_name|
             try temporalUniquePeriodSpanBytesFromJsonAlloc(alloc, runtime_schema, json, period_name)
@@ -3293,7 +3301,7 @@ fn parentTupleValueAlloc(
             return try relational_store.primaryKeyTupleValueAlloc(alloc, row, primary_key);
         }
     }
-    return (try relational_store.uniqueConstraintTupleValueAlloc(alloc, row, constraint)) orelse return error.UnsupportedOperation;
+    return (try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, constraint, runtime_schema.relational_columns)) orelse return error.UnsupportedOperation;
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -3647,6 +3655,9 @@ fn foreignKeyActionScheduleIdAlloc(
 
 fn foreignKeyParentReferenceFromJsonAlloc(
     alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    child_table_name: []const u8,
+    child_runtime_table: []const u8,
     columns: []const storage_schema.RelationalColumn,
     foreign_key: storage_schema.ForeignKey,
     value: []const u8,
@@ -3654,7 +3665,25 @@ fn foreignKeyParentReferenceFromJsonAlloc(
     if (foreign_key.validation_state != .enforced) return null;
     const row = try document_mapper.buildRelationalRowValueAlloc(alloc, value, columns);
     defer alloc.free(row);
-    return try relational_store.foreignKeyReferenceValueAlloc(alloc, row, foreign_key);
+    if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+        return try relational_store.foreignKeyReferenceValueAlloc(alloc, row, foreign_key);
+    }
+
+    const parent_table_name = foreignKeyParentCatalogTableName(child_table_name, child_runtime_table, foreign_key);
+    const parent_schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, parent_table_name)) orelse return error.TableNotFound;
+    defer alloc.free(parent_schema_json);
+    var parsed_parent_schema = try schema_mod.parseValidatedTableSchema(alloc, parent_schema_json);
+    defer parsed_parent_schema.deinit(alloc);
+    const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_parent_schema);
+    defer storage_schema.freeSchema(alloc, parent_runtime_schema);
+    if (parent_runtime_schema.storage_mode != .relational) return error.UnsupportedOperation;
+    return try relational_store.foreignKeyReferenceValueWithColumnsAlloc(
+        alloc,
+        row,
+        foreign_key,
+        parent_runtime_schema.primary_key,
+        parent_runtime_schema.relational_columns,
+    );
 }
 
 const ForeignKeyChildPeriodBounds = struct {
@@ -7222,7 +7251,7 @@ test "distributed txn coordinator routes unique-touching transforms with row pro
 
 test "distributed txn coordinator routes unique constraint writes through owner ranges" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword","collation":"antfly.case_insensitive"}},"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
     ;
     var parsed_schema = try schema_mod.parseValidatedTableSchema(std.testing.allocator, schema_json);
     defer parsed_schema.deinit(std.testing.allocator);
@@ -7230,7 +7259,7 @@ test "distributed txn coordinator routes unique constraint writes through owner 
     defer storage_schema.freeSchema(std.testing.allocator, runtime_schema);
     const expected_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
     defer std.testing.allocator.free(expected_row);
-    const expected_value = try relational_store.uniqueConstraintTupleValueAlloc(std.testing.allocator, expected_row, runtime_schema.unique_constraints[0]);
+    const expected_value = try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(std.testing.allocator, expected_row, runtime_schema.unique_constraints[0], runtime_schema.relational_columns);
     defer if (expected_value) |value| std.testing.allocator.free(value);
     const expected_encoded_value = expected_value orelse unreachable;
 
@@ -7371,7 +7400,7 @@ test "distributed txn coordinator routes unique constraint writes through owner 
         30_000,
         30_001,
         .{
-            .writes = &.{.{ .key = "user:z", .value = "{\"email\":\"ada@example.test\"}" }},
+            .writes = &.{.{ .key = "user:z", .value = "{\"email\":\"Ada@Example.Test\"}" }},
         },
         null,
     );

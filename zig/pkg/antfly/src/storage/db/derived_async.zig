@@ -2039,6 +2039,11 @@ pub fn Impl(comptime DB: type) type {
                     ctx.applied_sequence_checkpoint_path,
                     index_ref.name,
                 );
+                const target_sequence = try ctx.replay_source.latestMatchingSequence(
+                    ctx.alloc,
+                    applied,
+                    derived_worker.targetHintForManagedIndex(index_ref),
+                );
                 const use_dense_maintenance = index_ref.kind == .dense_vector;
                 const stats = try derived_worker.catchUpIndexWithOptions(
                     ctx.alloc,
@@ -2052,6 +2057,7 @@ pub fn Impl(comptime DB: type) type {
                         .window_ctx = &replay_ctx,
                         .begin_window_fn = beginDerivedCatchUpWindowContext,
                         .finish_window_fn = finishDerivedCatchUpWindowContext,
+                        .target_sequence = target_sequence,
                     },
                 );
                 if (DB.DerivedAsyncCallbacks.open_profile_enabled()) DB.DerivedAsyncCallbacks.log_replay_catch_up_profile(index_ref, applied, stats);
@@ -2065,10 +2071,43 @@ pub fn Impl(comptime DB: type) type {
                         .index_name = index_ref.name,
                         .sequence = stats.last_sequence,
                     });
+                } else if (stats.scanned_entries == 0 and target_sequence > applied and
+                    try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
+                {
+                    try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+                    try updates.append(ctx.alloc, .{
+                        .index_name = index_ref.name,
+                        .sequence = target_sequence,
+                    });
                 }
             }
             try saveAppliedSequencesBatchContext(ctx, updates.items);
             try truncateReplayJournalIfSafeContext(ctx);
+        }
+
+        fn canAdvanceDerivedReplayTargetContext(
+            ctx: *const BatchExecutionContext,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            from_sequence: u64,
+            target_sequence: u64,
+        ) !bool {
+            if (target_sequence <= from_sequence) return true;
+            if (ctx.async_context) |async_ctx| {
+                return try canAdvanceDerivedToTargetAsync(async_ctx, index_ref, from_sequence, target_sequence);
+            }
+            var async_ctx = AsyncContext{
+                .alloc = ctx.alloc,
+                .io = ctx.io,
+                .store = ctx.store,
+                .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
+                .index_manager = ctx.index_manager,
+                .apply_mutex = ctx.apply_mutex,
+                .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+                .resolution_runtime = ctx.resolution_runtime,
+                .promotion_runtime = ctx.promotion_runtime,
+            };
+            defer async_ctx.deinit(ctx.alloc);
+            return try canAdvanceDerivedToTargetAsync(&async_ctx, index_ref, from_sequence, target_sequence);
         }
 
         pub fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_hook: ?db_internal.ReplayProgressHook) !void {
@@ -2278,6 +2317,7 @@ pub fn Impl(comptime DB: type) type {
                         .persist_progress_fn = PersistReplayProgress.run,
                         .max_records_per_window = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
                         .max_chunk_bytes = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
+                        .target_sequence = target_sequence,
                     },
                 );
                 if (DB.DerivedAsyncCallbacks.open_profile_enabled()) DB.DerivedAsyncCallbacks.log_replay_catch_up_profile(index_ref, applied, stats);
@@ -2298,6 +2338,11 @@ pub fn Impl(comptime DB: type) type {
                 }
                 if (stats.last_sequence > applied) {
                     try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+                    try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+                } else if (stats.scanned_entries == 0 and target_sequence > applied and
+                    try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
+                {
+                    try self.core.saveAppliedSequence(index_ref.name, target_sequence);
                     try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
                 }
             }
@@ -4716,7 +4761,7 @@ test "db derived async replay batch truncates replay logs after managed indexes 
         }
         remaining_journal_entries = journal_entries.len;
         if (remaining_journal_entries == 0) break;
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     try std.testing.expectEqual(@as(usize, 0), remaining_journal_entries);
 }

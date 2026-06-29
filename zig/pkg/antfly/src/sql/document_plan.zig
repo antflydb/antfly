@@ -14,9 +14,11 @@
 
 const std = @import("std");
 
+const lowering_context = @import("lowering_context.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const source_binding = @import("source_binding.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -43,6 +45,19 @@ const DocumentWhereClauseRange = struct {
     start: usize,
     end: usize,
 };
+
+fn validatedDocumentReadStatementKind(parsed_sql: *const tokenized.ParsedSql) !sql_statement_kind.SqlReadStatementKind {
+    const kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    if (parsed_sql.generatedStatementKind() == .read) {
+        const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+        const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
+        switch (generated_ast) {
+            .read => |read| try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read),
+            else => return error.UnsupportedSqlShape,
+        }
+    }
+    return kind;
+}
 
 const DocumentProducerCapabilities = struct {
     indexed_scalar_filters: bool = true,
@@ -485,7 +500,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
 
     var from_binding = try parseDocumentFromTailAlloc(alloc, tokens[from_index + 1].text, tokens[from_index + 2 .. tail_start], schema);
     errdefer from_binding.deinit(alloc);
-    switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
+    switch (try validatedDocumentReadStatementKind(parsed_sql)) {
         .query => {},
         .join, .lateral => if (from_binding.unnest == null) return error.UnsupportedSqlShape,
         else => return error.UnsupportedSqlShape,
@@ -619,7 +634,7 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     attach_unfiltered_scan: bool,
 ) !DocumentAlgebraicAggregatePlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
-    if ((parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) != .aggregate) return error.UnsupportedSqlShape;
+    if ((try validatedDocumentReadStatementKind(parsed_sql)) != .aggregate) return error.UnsupportedSqlShape;
 
     const tokens = parsed_sql.items();
     if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
@@ -642,7 +657,8 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     if (from_index + 1 >= statement_end or tokens[from_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
     try rejectDocumentSelectProjectionModifier(tokens[1..from_index]);
     const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
-    errdefer alloc.free(table_name);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
 
     const source_ref = DocumentSourceRef{
         .table_name = tokens[from_index + 1].text,
@@ -650,17 +666,20 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     };
 
     var aggregate = try parseDocumentAggregateSpecAlloc(alloc, tokens[1..from_index], schema, virtual_schema, source_ref);
-    errdefer aggregate.deinit(alloc);
+    var aggregate_transferred = false;
+    errdefer if (!aggregate_transferred) aggregate.deinit(alloc);
 
     const limit = if (limit_index) |idx| try parseLimit(tokens, idx) else null;
     var group_by = if (group_index) |idx|
         try parseDocumentAggregateGroupByAlloc(alloc, tokens, idx, limit_index orelse statement_end, schema, virtual_schema, source_ref, bounded_scan_policy == null)
     else
         null;
-    errdefer if (group_by) |*group| group.deinit(alloc);
+    var group_by_transferred = false;
+    errdefer if (!group_by_transferred) if (group_by) |*group| group.deinit(alloc);
 
     var candidate_producer: ?DocumentProducer = null;
-    errdefer if (candidate_producer) |*producer| producer.deinit(alloc);
+    var candidate_producer_transferred = false;
+    errdefer if (!candidate_producer_transferred) if (candidate_producer) |*producer| producer.deinit(alloc);
     const filter_query_json: ?[]const u8 = if (where_index) |idx| blk: {
         const end_index = group_index orelse limit_index orelse statement_end;
         var producer = parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, null) catch |err| switch (err) {
@@ -702,7 +721,8 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
             },
         };
     } else null;
-    errdefer if (filter_query_json) |filter| alloc.free(@constCast(filter));
+    var filter_query_json_transferred = false;
+    errdefer if (!filter_query_json_transferred) if (filter_query_json) |filter| alloc.free(@constCast(filter));
 
     var plan = DocumentAlgebraicAggregatePlan{
         .table_name = table_name,
@@ -712,6 +732,11 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
         .aggregate = aggregate,
         .limit = limit,
     };
+    table_name_transferred = true;
+    candidate_producer_transferred = true;
+    filter_query_json_transferred = true;
+    group_by_transferred = true;
+    aggregate_transferred = true;
     errdefer plan.deinit(alloc);
     if (attach_unfiltered_scan and where_index == null) {
         try attachDocumentAggregateUnfilteredBoundedScanFallback(&plan, bounded_scan_policy);
@@ -2827,6 +2852,31 @@ test "document SQL lowers id lookup projection" {
     try std.testing.expectEqual(DocumentProjectionKind.id, lowered.projection[0].kind);
     try std.testing.expectEqualStrings("title", lowered.projection[1].field);
     try std.testing.expectEqualStrings("doc:a", lowered.producer.id_lookup.ids[0]);
+}
+
+test "document SQL validates retained generated read ast before token planning" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE _id = 'doc:a'");
+    defer parsed.deinit(alloc);
+
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.source_tokens = null,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, parsed.readStatementKindIncludingGeneratedAst().?);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
 }
 
 test "document SQL expands star projection with document virtual columns" {

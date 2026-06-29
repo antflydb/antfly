@@ -599,6 +599,33 @@ pub fn tableEmptyingJobComplete(record: TableEmptyingJobRecord) bool {
     return std.mem.eql(u8, record.state, table_emptying_ready);
 }
 
+pub fn tableEmptyingAffectedTableIdsValid(primary_table_id: u64, affected_table_ids: []const u64) bool {
+    if (primary_table_id == 0 or affected_table_ids.len == 0) return false;
+    var includes_primary = false;
+    for (affected_table_ids, 0..) |table_id, i| {
+        if (table_id == 0) return false;
+        if (table_id == primary_table_id) includes_primary = true;
+        for (affected_table_ids[0..i]) |prior| {
+            if (prior == table_id) return false;
+        }
+    }
+    return includes_primary;
+}
+
+pub fn tableEmptyingAffectedTableIdsCanonicalSetValid(affected_table_ids: []const u64) bool {
+    if (affected_table_ids.len == 0) return false;
+    for (affected_table_ids, 0..) |table_id, i| {
+        if (table_id == 0) return false;
+        if (i != 0 and affected_table_ids[i - 1] >= table_id) return false;
+    }
+    return true;
+}
+
+pub fn tableEmptyingAffectedTableIdsCanonicalValid(primary_table_id: u64, affected_table_ids: []const u64) bool {
+    return tableEmptyingAffectedTableIdsCanonicalSetValid(affected_table_ids) and
+        tableEmptyingAffectedTableIdsValid(primary_table_id, affected_table_ids);
+}
+
 fn hashTableEmptyingJobU64(hasher: *std.hash.Wyhash, value: u64) void {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, value, .little);
@@ -1032,7 +1059,7 @@ pub const TableManager = struct {
         var reset_count: usize = 0;
         for (targets) |target| {
             const record = self.sequences.getPtr(target.sequence_id) orelse return error.SequenceNotFound;
-            if (record.last_value != target.reset_last_value) {
+            if (record.last_value != target.reset_last_value or record.last_allocation_id != 0) {
                 record.last_value = target.reset_last_value;
                 record.last_allocation_id = 0;
                 reset_count += 1;
@@ -1377,19 +1404,13 @@ pub const TableManager = struct {
         if (record.job_id == 0) return error.InvalidTableEmptyingJob;
         if (record.schema_generation == 0) return error.InvalidTableEmptyingGeneration;
         if (!tableEmptyingJobStateValid(record.state)) return error.InvalidTableEmptyingJobState;
-        if (record.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
         if (record.end_row_key) |end_row_key| {
             if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidTableEmptyingJob;
         }
-        var includes_primary = false;
-        for (record.affected_table_ids, 0..) |table_id, i| {
+        if (!tableEmptyingAffectedTableIdsCanonicalValid(record.table_id, record.affected_table_ids)) return error.InvalidTableEmptyingJob;
+        for (record.affected_table_ids) |table_id| {
             if (!self.tables.contains(table_id)) return error.UnknownTable;
-            if (table_id == record.table_id) includes_primary = true;
-            for (record.affected_table_ids[0..i]) |prior| {
-                if (prior == table_id) return error.InvalidTableEmptyingJob;
-            }
         }
-        if (!includes_primary) return error.InvalidTableEmptyingJob;
 
         const owned = try cloneTableEmptyingJob(self.alloc, record);
         errdefer freeTableEmptyingJob(self.alloc, owned);
@@ -1905,6 +1926,7 @@ pub const TableManager = struct {
 
         const first_record = self.findTableEmptyingJob(request.job_ids[0]) orelse return error.UnknownTableEmptyingJob;
         if (first_record.barrier_id == 0 or first_record.affected_table_ids.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+        if (!tableEmptyingAffectedTableIdsCanonicalValid(first_record.table_id, first_record.affected_table_ids)) return error.InvalidTableEmptyingBarrierPromotion;
         if (request.promotions.len != first_record.affected_table_ids.len) return error.InvalidTableEmptyingBarrierPromotion;
 
         for (request.job_ids, 0..) |job_id, i| {
@@ -1938,6 +1960,15 @@ pub const TableManager = struct {
             try self.validateCompleteTableEmptyingBarrierTable(first_record.*, request.job_ids, table_id);
         }
 
+        if (first_record.restart_identity) {
+            _ = try self.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, .{
+                .barrier_id = first_record.barrier_id,
+                .affected_table_ids = first_record.affected_table_ids,
+                .job_ids = request.job_ids,
+                .cascade = first_record.cascade,
+            });
+        }
+
         for (request.promotions) |promotion| {
             const table = self.tables.getPtr(promotion.table_id).?;
             if (table.data_generation < promotion.target_generation) {
@@ -1951,7 +1982,9 @@ pub const TableManager = struct {
     }
 
     pub fn validateTableEmptyingIdentityAllocatorReset(self: *TableManager, request: TableEmptyingIdentityAllocatorResetRequest) !void {
-        if (request.barrier_id == 0 or request.affected_table_ids.len == 0 or request.job_ids.len == 0) {
+        if (request.barrier_id == 0 or request.job_ids.len == 0 or
+            !tableEmptyingAffectedTableIdsCanonicalSetValid(request.affected_table_ids))
+        {
             return error.InvalidTableEmptyingIdentityAllocatorReset;
         }
 
@@ -1959,17 +1992,14 @@ pub const TableManager = struct {
         if (first_record.barrier_id != request.barrier_id or
             !first_record.restart_identity or
             first_record.cascade != request.cascade or
+            !tableEmptyingAffectedTableIdsCanonicalValid(first_record.table_id, first_record.affected_table_ids) or
             !u64SlicesEqual(first_record.affected_table_ids, request.affected_table_ids))
         {
             return error.InvalidTableEmptyingIdentityAllocatorReset;
         }
 
-        for (request.affected_table_ids, 0..) |table_id, i| {
-            if (table_id == 0) return error.InvalidTableEmptyingIdentityAllocatorReset;
+        for (request.affected_table_ids) |table_id| {
             if (self.tables.get(table_id) == null) return error.UnknownTable;
-            for (request.affected_table_ids[0..i]) |previous| {
-                if (previous == table_id) return error.InvalidTableEmptyingIdentityAllocatorReset;
-            }
         }
 
         for (request.job_ids, 0..) |job_id, i| {
@@ -4982,6 +5012,20 @@ test "table manager applies schema rewrite job lifecycle operations" {
     }));
 }
 
+test "table emptying affected table ids require primary nonzero unique membership" {
+    try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{7}));
+    try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{ 8, 7, 9 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(0, &.{7}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{0}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{8}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{ 7, 8, 7 }));
+    try std.testing.expect(tableEmptyingAffectedTableIdsCanonicalSetValid(&.{ 7, 8, 9 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsCanonicalSetValid(&.{ 8, 7, 9 }));
+    try std.testing.expect(tableEmptyingAffectedTableIdsCanonicalValid(7, &.{ 7, 8 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsCanonicalValid(7, &.{ 8, 7, 9 }));
+}
+
 test "table manager owns table emptying jobs" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -5067,6 +5111,13 @@ test "table manager owns table emptying jobs" {
         .group_id = 9001,
         .schema_generation = 42,
         .affected_table_ids = &.{ 7, 7 },
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 8, 7 },
     }));
 
     try manager.upsertTableEmptyingJob(.{
@@ -5453,6 +5504,65 @@ test "table manager promotes table-emptying barriers atomically" {
     }
 }
 
+test "table manager promotes restart identity barrier by resetting sequence allocation markers" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .schema_json = schema_json,
+        .data_generation = 4,
+    });
+    try manager.upsertRange(.{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    });
+    const sequence_id = deriveSequenceId("tenant", "billing", "usage_id_seq");
+    try manager.upsertSequence(.{
+        .sequence_id = sequence_id,
+        .name = "usage_id_seq",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .options_json = "{\"start_with\":10,\"increment_by\":5}",
+        .last_value = 5,
+        .last_allocation_id = 1234,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .range_id = 9101,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    try manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{7101},
+        .promotions = &.{.{ .table_id = 7, .target_generation = 5 }},
+    });
+
+    try std.testing.expectEqual(@as(u64, 5), manager.tables.get(7).?.data_generation);
+    try std.testing.expectEqual(@as(i64, 5), manager.sequences.get(sequence_id).?.last_value);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
+    const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 0), jobs.len);
+}
+
 test "table manager validates table-emptying identity allocator reset barriers" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -5517,6 +5627,12 @@ test "table manager validates table-emptying identity allocator reset barriers" 
         .barrier_id = 77,
         .affected_table_ids = &.{ 7, 8 },
         .job_ids = &.{ 7101, 7102 },
+        .cascade = true,
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingIdentityAllocatorReset, manager.validateTableEmptyingIdentityAllocatorReset(.{
+        .barrier_id = 77,
+        .affected_table_ids = &.{ 8, 7 },
+        .job_ids = &.{ 7101, 7102, 8101 },
         .cascade = true,
     }));
 
@@ -5693,6 +5809,12 @@ test "table manager resets table-owned sequence defaults for restart identity ba
     try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
     try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(owned_sequence_id).?.last_allocation_id);
     try std.testing.expectEqual(@as(usize, 0), try manager.resetIdentityAllocatorsForTableEmptyingBarrier(std.testing.allocator, request));
+
+    manager.sequences.getPtr(sequence_id).?.last_allocation_id = 9001;
+    manager.sequences.getPtr(owned_sequence_id).?.last_allocation_id = 9002;
+    try std.testing.expectEqual(@as(usize, 2), try manager.resetIdentityAllocatorsForTableEmptyingBarrier(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(owned_sequence_id).?.last_allocation_id);
 }
 
 fn expectIdentityAllocatorResetTarget(targets: []const SequenceIdentityAllocatorReset, sequence_id: u64, reset_last_value: i64) !void {

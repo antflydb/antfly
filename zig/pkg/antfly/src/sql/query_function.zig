@@ -16,6 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
+const lowering_context = @import("lowering_context.zig");
 const query_contract = @import("../query/contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
@@ -531,7 +532,10 @@ fn generatedAntflyQueryFunctionReadAst(parsed_sql: *const tokenized.ParsedSql) !
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.source_antfly_function_items.len != 0 or read.source_antfly_function_count != 0) read else null,
+                .read => |read| blk: {
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk if (read.source_antfly_function_items.len != 0 or read.source_antfly_function_count != 0) read else null;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -542,10 +546,10 @@ fn generatedAntflyQueryFunctionReadAst(parsed_sql: *const tokenized.ParsedSql) !
 pub fn parsedSqlHasGeneratedAntflyReadSource(parsed_sql: *const tokenized.ParsedSql) bool {
     const generated_statement = parsed_sql.generated_statement orelse return false;
     if (generated_statement.kind() != .read) return false;
-    const generated_ast = generated_statement.ast orelse return true;
+    const generated_ast = generated_statement.ast orelse return false;
     return switch (generated_ast) {
         .read => |read| read.source_antfly_function_items.len != 0 or read.source_antfly_function_count != 0,
-        else => true,
+        else => false,
     };
 }
 
@@ -2368,7 +2372,21 @@ test "sql adapter query function read accepts projected hit columns" {
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expect(parsedSqlHasGeneratedAntflyReadSource(&parsed_sql));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &parsed_sql));
+
+    var missing_ast = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5);",
+    );
+    defer missing_ast.deinit(alloc);
+    if (missing_ast.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            generated_ast.deinit(alloc);
+            generated_statement.ast = null;
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(!parsedSqlHasGeneratedAntflyReadSource(&missing_ast));
 }
 
 test "sql adapter query function read keeps projected columns for derived search functions" {

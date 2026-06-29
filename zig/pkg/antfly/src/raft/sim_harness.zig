@@ -906,6 +906,16 @@ pub const ManagedHostSimulation = struct {
     }
 };
 
+fn appliedChangeFromTransitionCommand(command: metadata_mod.TransitionCommand) !metadata_apply.AppliedMetadataChange {
+    return switch (command) {
+        .upsert_split_transition => |record| .{ .upsert_split_transition = record },
+        .remove_split_transition => |record| .{ .remove_split_transition = .{ .transition_id = record.transition_id } },
+        .upsert_merge_transition => |record| .{ .upsert_merge_transition = record },
+        .remove_merge_transition => |record| .{ .remove_merge_transition = .{ .transition_id = record.transition_id } },
+        else => error.UnsupportedCommittedTransitionCommand,
+    };
+}
+
 pub const ManagedHttpHostSimulation = struct {
     alloc: std.mem.Allocator,
     updates: *runtime_loop.MemoryUpdateSource,
@@ -1003,6 +1013,48 @@ pub const ManagedHttpHostSimulation = struct {
     }
 
     pub fn applyBatch(self: *ManagedHttpHostSimulation, changes: []const metadata_apply.AppliedMetadataChange) !void {
+        try self.applier.applyBatch(changes);
+    }
+
+    fn applyCommittedTransitionCommands(
+        self: *ManagedHttpHostSimulation,
+        group_id: u64,
+        start_index: u64,
+        commands: []const metadata_mod.TransitionCommand,
+    ) !void {
+        const metadata_store = self.runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        if (commands.len == 0) return;
+
+        var encoded_commands = try self.alloc.alloc([]u8, commands.len);
+        defer self.alloc.free(encoded_commands);
+        var encoded_count: usize = 0;
+        defer for (encoded_commands[0..encoded_count]) |encoded| self.alloc.free(encoded);
+
+        var entries = try self.alloc.alloc(raft_engine.core.Entry, commands.len);
+        defer self.alloc.free(entries);
+        for (commands, 0..) |command, i| {
+            const encoded = try metadata_mod.encodeTransitionCommand(self.alloc, command);
+            encoded_commands[i] = encoded;
+            encoded_count += 1;
+            entries[i] = .{
+                .term = 1,
+                .index = start_index + i,
+                .entry_type = .normal,
+                .data = encoded,
+            };
+        }
+
+        const entries_bytes = try raft_state_machine.encodeCommittedEntries(self.alloc, entries);
+        defer self.alloc.free(entries_bytes);
+        try metadata_store.snapshotBuilder().applyBatch(.{
+            .group_id = group_id,
+            .commit_index = start_index + commands.len - 1,
+            .entries_bytes = entries_bytes,
+        });
+
+        var changes = try self.alloc.alloc(metadata_apply.AppliedMetadataChange, commands.len);
+        defer self.alloc.free(changes);
+        for (commands, 0..) |command, i| changes[i] = try appliedChangeFromTransitionCommand(command);
         try self.applier.applyBatch(changes);
     }
 
@@ -4846,7 +4898,7 @@ test "http host simulation drives queued split transitions through the service l
     try std.testing.expectEqual(@as(usize, 0), metrics.split_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), metrics.split_ready_to_finalize);
 
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
     defer dest.deinit();
     const range = dest.getRange();
     try std.testing.expectEqualStrings("doc:m", range.start);
@@ -5250,7 +5302,7 @@ test "cluster simulation drives queued split transitions through service-owned m
     try std.testing.expectEqual(@as(usize, 0), metrics.split_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), metrics.split_ready_to_finalize);
 
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
     defer dest.deinit();
     const range = dest.getRange();
     try std.testing.expectEqualStrings("doc:m", range.start);
@@ -5411,7 +5463,7 @@ test "cluster simulation resumes queued split transitions after node restart wit
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_split_transitions);
 
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
     defer dest.deinit();
     const range = dest.getRange();
     try std.testing.expectEqualStrings("doc:m", range.start);
@@ -5545,24 +5597,9 @@ test "cluster simulation removes queued split transition mid-flight across node 
     const before_remove = (try cluster.node(0).describeSplitTransition(9501)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_remove.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .remove_split_transition = .{ .transition_id = 9501 },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{ .remove_split_transition = .{ .transition_id = 9501 } });
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .remove_split_transition = .{ .transition_id = 9501 } },
+    });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_split_transitions);
@@ -5574,38 +5611,27 @@ test "cluster simulation removes queued split transition mid-flight across node 
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_split_transitions);
     try std.testing.expectEqual(@as(?metadata_mod.SplitObservation, null), try cluster.node(0).observeSplitTransition(9501));
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
-    defer dest.deinit();
-    try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
-
     {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9502,
-                .source_group_id = 1901,
-                .destination_group_id = 1902,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
+        var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
+        defer dest.deinit();
+        try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
     }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+
+    split.deinit();
+    split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 1901,
+        .dest_group_id = 1902,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9502,
             .source_group_id = 1901,
             .destination_group_id = 1902,
-        },
+            .phase = .prepare,
+        } },
     });
 
     rounds = 0;
@@ -5744,36 +5770,14 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     const before_rollback = (try cluster.node(0).describeSplitTransition(9511)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_rollback.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9511,
-                .source_group_id = 1911,
-                .destination_group_id = 1912,
-                .phase = .prepare,
-                .rollback_reason = "operator abort",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9511,
             .source_group_id = 1911,
             .destination_group_id = 1912,
+            .phase = .prepare,
             .rollback_reason = "operator abort",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
@@ -5791,7 +5795,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     try expectSplitTransitionInactive(&cluster, 0, 9511);
 
     {
-        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root, .read_only = true });
         defer source.deinit();
         const source_range = try source.currentRange(std.testing.allocator, 1911);
         defer {
@@ -5808,45 +5812,32 @@ test "cluster simulation rolls back queued split transition mid-flight across no
         try std.testing.expect(source_split == null);
     }
 
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
-    defer dest.deinit();
-    try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
-    const range = dest.getRange();
-    try std.testing.expectEqualStrings("", range.start);
-    try std.testing.expectEqualStrings("", range.end);
-
     {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9511,
-                .source_group_id = 1911,
-                .destination_group_id = 1912,
-                .phase = .prepare,
-                .split_key = "doc:m",
-                .source_range_end = "doc:z",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
+        var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
+        defer dest.deinit();
+        try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
+        const range = dest.getRange();
+        try std.testing.expectEqualStrings("", range.start);
+        try std.testing.expectEqualStrings("", range.end);
     }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+
+    split.deinit();
+    split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 1911,
+        .dest_group_id = 1912,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9511,
             .source_group_id = 1911,
             .destination_group_id = 1912,
+            .phase = .prepare,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
-        },
+        } },
     });
 
     rounds = 0;
@@ -5985,70 +5976,26 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     const before_rollback = (try cluster.node(0).describeSplitTransition(9521)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_rollback.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9521,
-                .source_group_id = 1921,
-                .destination_group_id = 1922,
-                .phase = .prepare,
-                .rollback_reason = "operator abort 1",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9521,
             .source_group_id = 1921,
             .destination_group_id = 1922,
+            .phase = .prepare,
             .rollback_reason = "operator abort 1",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9521,
-                .source_group_id = 1921,
-                .destination_group_id = 1922,
-                .phase = .prepare,
-                .rollback_reason = "operator abort 2",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9521,
             .source_group_id = 1921,
             .destination_group_id = 1922,
+            .phase = .prepare,
             .rollback_reason = "operator abort 2",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
@@ -6057,38 +6004,23 @@ test "cluster simulation survives repeated same-id split overwrites across resta
 
     try cluster.restartNode(0);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9521,
-                .source_group_id = 1921,
-                .destination_group_id = 1922,
-                .phase = .prepare,
-                .split_key = "doc:m",
-                .source_range_end = "doc:z",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 4,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    split.deinit();
+    split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 1921,
+        .dest_group_id = 1922,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9521,
             .source_group_id = 1921,
             .destination_group_id = 1922,
+            .phase = .prepare,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
-        },
+        } },
     });
 
     rounds = 0;
@@ -6101,7 +6033,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try expectSplitTransitionInactive(&cluster, 0, 9521);
 
     {
-        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root, .read_only = true });
         defer source.deinit();
         const source_range = try source.currentRange(std.testing.allocator, 1921);
         defer {
@@ -6123,7 +6055,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
         try std.testing.expectEqualStrings("{\"v\":\"left-0\"}", source_state[0].value);
     }
 
-    var dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    var dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
     defer dest.deinit();
     const dest_range = dest.getRange();
     try std.testing.expectEqualStrings("doc:m", dest_range.start);
@@ -6384,12 +6316,9 @@ test "http host simulation drives queued merge transitions through the service l
     try std.testing.expectEqual(@as(usize, 0), metrics.merge_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), metrics.merge_ready_to_finalize);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{
-        .root_dir = receiver_root,
-        .db = .{
-            .identity_namespace = target_receiver_namespace,
-            .prefer_existing_identity_namespace = true,
-        },
+    var receiver = try data_mod.SplitDestination.initQueryReadOnlyWithOptions(std.testing.allocator, receiver_root, .{
+        .identity_namespace = target_receiver_namespace,
+        .prefer_existing_identity_namespace = true,
     });
     defer receiver.deinit();
     const range = receiver.getRange();
@@ -6887,7 +6816,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
     try std.testing.expectEqual(@as(usize, 0), metrics.merge_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), metrics.merge_ready_to_finalize);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -7057,7 +6986,7 @@ test "cluster simulation resumes queued merge transitions after node restart wit
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -7200,36 +7129,14 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     const before_rollback = (try cluster.node(0).describeMergeTransition(9601)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_rollback.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9601,
-                .donor_group_id = 1951,
-                .receiver_group_id = 1952,
-                .phase = .prepare,
-                .rollback_reason = "operator abort",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9601,
             .donor_group_id = 1951,
             .receiver_group_id = 1952,
+            .phase = .prepare,
             .rollback_reason = "operator abort",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
@@ -7246,41 +7153,30 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9601);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
-    defer receiver.deinit();
-    const range = receiver.getRange();
-    try std.testing.expectEqualStrings("doc:a", range.start);
-    try std.testing.expectEqualStrings("doc:m", range.end);
-    try std.testing.expectEqual(@as(?[]u8, null), try receiver.get(std.testing.allocator, "doc:t"));
-
     {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9601,
-                .donor_group_id = 1951,
-                .receiver_group_id = 1952,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
+        var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
+        defer receiver.deinit();
+        const range = receiver.getRange();
+        try std.testing.expectEqualStrings("doc:a", range.start);
+        try std.testing.expectEqualStrings("doc:m", range.end);
+        try std.testing.expectEqual(@as(?[]u8, null), try receiver.get(std.testing.allocator, "doc:t"));
     }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+
+    merge.deinit();
+    merge = try transition_runtime_mod.MergeCoordinatorRuntime.init(std.testing.allocator, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 1951,
+        .receiver_group_id = 1952,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9601,
             .donor_group_id = 1951,
             .receiver_group_id = 1952,
-        },
+            .phase = .prepare,
+        } },
     });
 
     rounds = 0;
@@ -7428,70 +7324,26 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     const before_rollback = (try cluster.node(0).describeMergeTransition(9621)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_rollback.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9621,
-                .donor_group_id = 1971,
-                .receiver_group_id = 1972,
-                .phase = .prepare,
-                .rollback_reason = "operator abort 1",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
+            .phase = .prepare,
             .rollback_reason = "operator abort 1",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9621,
-                .donor_group_id = 1971,
-                .receiver_group_id = 1972,
-                .phase = .prepare,
-                .rollback_reason = "operator abort 2",
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
+            .phase = .prepare,
             .rollback_reason = "operator abort 2",
-        },
+        } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
@@ -7500,34 +7352,21 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
 
     try cluster.restartNode(0);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9621,
-                .donor_group_id = 1971,
-                .receiver_group_id = 1972,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 4,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    merge.deinit();
+    merge = try transition_runtime_mod.MergeCoordinatorRuntime.init(std.testing.allocator, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 1971,
+        .receiver_group_id = 1972,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
-        },
+            .phase = .prepare,
+        } },
     });
 
     rounds = 0;
@@ -7539,7 +7378,7 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9621);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -7733,15 +7572,9 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try std.testing.expect(split_before.tag == .bootstrapping_destination or split_before.tag == .ready_to_finalize);
     try std.testing.expect(merge_before.tag == .bootstrapping_receiver or merge_before.tag == .ready_to_finalize);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-
-        const remove_split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .remove_split_transition = .{ .transition_id = 9701 },
-        });
-        defer std.testing.allocator.free(remove_split_cmd);
-        const rollback_merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .remove_split_transition = .{ .transition_id = 9701 } },
+        .{
             .upsert_merge_transition = .{
                 .transition_id = 9702,
                 .donor_group_id = 1983,
@@ -7749,26 +7582,6 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
                 .phase = .prepare,
                 .rollback_reason = "operator abort concurrent",
             },
-        });
-        defer std.testing.allocator.free(rollback_merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = remove_split_cmd },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = rollback_merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 4,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{ .remove_split_transition = .{ .transition_id = 9701 } });
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
-            .transition_id = 9702,
-            .donor_group_id = 1983,
-            .receiver_group_id = 1984,
-            .rollback_reason = "operator abort concurrent",
         },
     });
 
@@ -7797,34 +7610,21 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9702);
     const merge_completions_before_retry = cluster.node(0).serviceMetrics().completed_merge_transitions;
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9702,
-                .donor_group_id = 1983,
-                .receiver_group_id = 1984,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 5,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    merge.deinit();
+    merge = try transition_runtime_mod.MergeCoordinatorRuntime.init(std.testing.allocator, .{
+        .donor_root_dir = merge_donor_root,
+        .receiver_root_dir = merge_receiver_root,
+        .donor_group_id = 1983,
+        .receiver_group_id = 1984,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9702,
             .donor_group_id = 1983,
             .receiver_group_id = 1984,
-        },
+            .phase = .prepare,
+        } },
     });
 
     rounds = 0;
@@ -7840,7 +7640,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9702);
 
     {
-        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = split_src_root });
+        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = split_src_root, .read_only = true });
         defer source.deinit();
         const source_range = try source.currentRange(std.testing.allocator, 1981);
         defer {
@@ -7864,11 +7664,11 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
         try std.testing.expectEqualStrings("{\"v\":\"right-0\"}", source_state[1].value);
     }
 
-    var split_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_dst_root });
+    var split_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_dst_root);
     defer split_dest.deinit();
     try std.testing.expectEqual(@as(?[]u8, null), try split_dest.get(std.testing.allocator, "doc:t"));
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = merge_receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, merge_receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -8062,11 +7862,8 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try std.testing.expect(split_before.tag == .bootstrapping_destination or split_before.tag == .ready_to_finalize);
     try std.testing.expect(merge_before.tag == .bootstrapping_receiver or merge_before.tag == .ready_to_finalize);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-
-        const rollback_split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{
             .upsert_split_transition = .{
                 .transition_id = 9711,
                 .source_group_id = 1991,
@@ -8074,32 +7871,9 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
                 .phase = .prepare,
                 .rollback_reason = "operator abort concurrent reverse",
             },
-        });
-        defer std.testing.allocator.free(rollback_split_cmd);
-        const remove_merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .remove_merge_transition = .{ .transition_id = 9712 },
-        });
-        defer std.testing.allocator.free(remove_merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = rollback_split_cmd },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = remove_merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 4,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
-            .transition_id = 9711,
-            .source_group_id = 1991,
-            .destination_group_id = 1992,
-            .rollback_reason = "operator abort concurrent reverse",
         },
+        .{ .remove_merge_transition = .{ .transition_id = 9712 } },
     });
-    try cluster.node(0).apply(.{ .remove_merge_transition = .{ .transition_id = 9712 } });
 
     rounds = 0;
     while (rounds < 24) : (rounds += 1) {
@@ -8126,38 +7900,23 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9712);
     const split_completions_before_retry = cluster.node(0).serviceMetrics().completed_split_transitions;
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9711,
-                .source_group_id = 1991,
-                .destination_group_id = 1992,
-                .phase = .prepare,
-                .split_key = "doc:m",
-                .source_range_end = "doc:z",
-            },
-        });
-        defer std.testing.allocator.free(split_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = split_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 5,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    split.deinit();
+    split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = split_src_root,
+        .dest_root_dir = split_dst_root,
+        .source_group_id = 1991,
+        .dest_group_id = 1992,
+    });
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9711,
             .source_group_id = 1991,
             .destination_group_id = 1992,
+            .phase = .prepare,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
-        },
+        } },
     });
 
     rounds = 0;
@@ -8173,7 +7932,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9712);
 
     {
-        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = split_src_root });
+        var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = split_src_root, .read_only = true });
         defer source.deinit();
         const source_range = try source.currentRange(std.testing.allocator, 1991);
         defer {
@@ -8184,7 +7943,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         try std.testing.expectEqualStrings("doc:m", source_range.end);
     }
 
-    var split_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_dst_root });
+    var split_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_dst_root);
     defer split_dest.deinit();
     const split_range = split_dest.getRange();
     try std.testing.expectEqualStrings("doc:m", split_range.start);
@@ -8193,7 +7952,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     defer std.testing.allocator.free(right);
     try std.testing.expectEqualStrings("{\"v\":\"right-1\"}", right);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = merge_receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, merge_receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -8421,14 +8180,9 @@ test "cluster simulation drives multiple concurrent real transition ids through 
         }
     }
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const remove_split_a_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .remove_split_transition = .{ .transition_id = 9801 },
-        });
-        defer std.testing.allocator.free(remove_split_a_cmd);
-        const rollback_split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+        .{ .remove_split_transition = .{ .transition_id = 9801 } },
+        .{
             .upsert_split_transition = .{
                 .transition_id = 9802,
                 .source_group_id = 2003,
@@ -8436,26 +8190,6 @@ test "cluster simulation drives multiple concurrent real transition ids through 
                 .phase = .prepare,
                 .rollback_reason = "operator abort multi",
             },
-        });
-        defer std.testing.allocator.free(rollback_split_b_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = remove_split_a_cmd },
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = rollback_split_b_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 5,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{ .remove_split_transition = .{ .transition_id = 9801 } });
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
-            .transition_id = 9802,
-            .source_group_id = 2003,
-            .destination_group_id = 2004,
-            .rollback_reason = "operator abort multi",
         },
     });
 
@@ -8478,38 +8212,24 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     const split_completions_before_retry = cluster.node(0).serviceMetrics().completed_split_transitions;
     const merge_completions_before_retry = cluster.node(0).serviceMetrics().completed_merge_transitions;
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9802,
-                .source_group_id = 2003,
-                .destination_group_id = 2004,
-                .phase = .prepare,
-                .split_key = "doc:p",
-                .source_range_end = "doc:z",
-            },
-        });
-        defer std.testing.allocator.free(split_b_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 6, .entry_type = .normal, .data = split_b_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 6,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    split_b.deinit();
+    split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = split_b_src_root,
+        .dest_root_dir = split_b_dst_root,
+        .source_group_id = 2003,
+        .dest_group_id = 2004,
+    });
+    try multiplex.addSplit(2003, 2004, split_b.runtime());
+
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9802,
             .source_group_id = 2003,
             .destination_group_id = 2004,
+            .phase = .prepare,
             .split_key = "doc:p",
             .source_range_end = "doc:z",
-        },
+        } },
     });
 
     rounds = 0;
@@ -8529,11 +8249,11 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     try expectSplitTransitionInactive(&cluster, 0, 9802);
     try expectMergeTransitionInactive(&cluster, 0, 9803);
 
-    var split_a_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_a_dst_root });
+    var split_a_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_a_dst_root);
     defer split_a_dest.deinit();
     try std.testing.expectEqual(@as(?[]u8, null), try split_a_dest.get(std.testing.allocator, "doc:t"));
 
-    var split_b_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_b_dst_root });
+    var split_b_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_b_dst_root);
     defer split_b_dest.deinit();
     const split_b_range = split_b_dest.getRange();
     try std.testing.expectEqualStrings("doc:p", split_b_range.start);
@@ -8542,7 +8262,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     defer std.testing.allocator.free(split_b_doc);
     try std.testing.expectEqualStrings("{\"v\":\"right-b\"}", split_b_doc);
 
-    var merge_receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = merge_receiver_root });
+    var merge_receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, merge_receiver_root);
     defer merge_receiver.deinit();
     const merge_range = merge_receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", merge_range.start);
@@ -8772,69 +8492,25 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
         }
     }
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const rollback_split_b_cmd_1 = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9812,
-                .source_group_id = 2013,
-                .destination_group_id = 2014,
-                .phase = .prepare,
-                .rollback_reason = "operator abort overlap 1",
-            },
-        });
-        defer std.testing.allocator.free(rollback_split_b_cmd_1);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = rollback_split_b_cmd_1 },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 4,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9812,
             .source_group_id = 2013,
             .destination_group_id = 2014,
+            .phase = .prepare,
             .rollback_reason = "operator abort overlap 1",
-        },
+        } },
     });
     try cluster.stepAll();
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const rollback_split_b_cmd_2 = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9812,
-                .source_group_id = 2013,
-                .destination_group_id = 2014,
-                .phase = .prepare,
-                .rollback_reason = "operator abort overlap 2",
-            },
-        });
-        defer std.testing.allocator.free(rollback_split_b_cmd_2);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = rollback_split_b_cmd_2 },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 5,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_split_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+        .{ .upsert_split_transition = .{
             .transition_id = 9812,
             .source_group_id = 2013,
             .destination_group_id = 2014,
+            .phase = .prepare,
             .rollback_reason = "operator abort overlap 2",
-        },
+        } },
     });
 
     rounds = 0;
@@ -8851,35 +8527,38 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
 
     try cluster.restartNode(0);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9812,
-                .source_group_id = 2013,
-                .destination_group_id = 2014,
-                .phase = .prepare,
-                .split_key = "doc:p",
-                .source_range_end = "doc:z",
-            },
-        });
-        defer std.testing.allocator.free(split_b_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 6, .entry_type = .normal, .data = split_b_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 6,
-            .entries_bytes = entries,
-        });
-    }
+    split_b.deinit();
+    split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = split_b_src_root,
+        .dest_root_dir = split_b_dst_root,
+        .source_group_id = 2013,
+        .dest_group_id = 2014,
+    });
+    try multiplex.addSplit(2013, 2014, split_b.runtime());
 
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+        .{ .upsert_split_transition = .{
+            .transition_id = 9812,
+            .source_group_id = 2013,
+            .destination_group_id = 2014,
+            .phase = .prepare,
+            .split_key = "doc:p",
+            .source_range_end = "doc:z",
+        } },
+    });
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try cluster.stepAll();
     const split_completions_before_retry = cluster.node(0).serviceMetrics().completed_split_transitions;
     const merge_completions_before_retry = cluster.node(0).serviceMetrics().completed_merge_transitions;
+
+    split_b.deinit();
+    split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+        .source_root_dir = split_b_src_root,
+        .dest_root_dir = split_b_dst_root,
+        .source_group_id = 2013,
+        .dest_group_id = 2014,
+    });
+    try multiplex.addSplit(2013, 2014, split_b.runtime());
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
@@ -8905,7 +8584,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     try expectSplitTransitionInactive(&cluster, 0, 9812);
     try expectMergeTransitionInactive(&cluster, 0, 9813);
 
-    var split_a_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_a_dst_root });
+    var split_a_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_a_dst_root);
     defer split_a_dest.deinit();
     const split_a_range = split_a_dest.getRange();
     try std.testing.expectEqualStrings("doc:m", split_a_range.start);
@@ -8914,7 +8593,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     defer std.testing.allocator.free(split_a_doc);
     try std.testing.expectEqualStrings("{\"v\":\"right-a2\"}", split_a_doc);
 
-    var split_b_dest = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = split_b_dst_root });
+    var split_b_dest = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, split_b_dst_root);
     defer split_b_dest.deinit();
     const split_b_range = split_b_dest.getRange();
     try std.testing.expectEqualStrings("doc:p", split_b_range.start);
@@ -8923,7 +8602,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     defer std.testing.allocator.free(split_b_doc);
     try std.testing.expectEqualStrings("{\"v\":\"right-b2\"}", split_b_doc);
 
-    var merge_receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = merge_receiver_root });
+    var merge_receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, merge_receiver_root);
     defer merge_receiver.deinit();
     const merge_range = merge_receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", merge_range.start);
@@ -9066,24 +8745,9 @@ test "cluster simulation removes queued merge transition mid-flight across node 
     const before_remove = (try cluster.node(0).describeMergeTransition(9611)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_remove.tag);
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .remove_merge_transition = .{ .transition_id = 9611 },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{ .remove_merge_transition = .{ .transition_id = 9611 } });
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+        .{ .remove_merge_transition = .{ .transition_id = 9611 } },
+    });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_merge_transitions);
@@ -9095,41 +8759,20 @@ test "cluster simulation removes queued merge transition mid-flight across node 
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9611);
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
     try std.testing.expectEqualStrings("doc:m", range.end);
     try std.testing.expectEqual(@as(?[]u8, null), try receiver.get(std.testing.allocator, "doc:t"));
 
-    {
-        var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
-        defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9612,
-                .donor_group_id = 1961,
-                .receiver_group_id = 1962,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
-        });
-    }
-    try cluster.node(0).apply(.{
-        .upsert_merge_transition = .{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_merge_transition = .{
             .transition_id = 9612,
             .donor_group_id = 1961,
             .receiver_group_id = 1962,
-        },
+            .phase = .prepare,
+        } },
     });
 
     rounds = 0;

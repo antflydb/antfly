@@ -2903,6 +2903,17 @@ pub const DB = struct {
         return try relational_rows_impl.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, target_candidates, source_rows);
     }
 
+    pub fn buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsWithColumnsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        target_candidates: *[]RelationalRowsMutationSourceCandidate,
+        target_columns: []const schema_mod.RelationalColumn,
+        source_rows: []const []const u8,
+        source_columns: []const schema_mod.RelationalColumn,
+    ) ![]RelationalRowsJoinedMutationSourceCandidate {
+        return try relational_rows_impl.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsWithColumnsAlloc(alloc, req, target_candidates, target_columns, source_rows, source_columns);
+    }
+
     pub fn selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(
         alloc: Allocator,
         req: types.RelationalRowsJoinedMutationSourceRequest,
@@ -3087,6 +3098,15 @@ pub const DB = struct {
         source_rows: []const []const u8,
     ) !types.RelationalRowsAggregateResult {
         return try relational_rows_impl.aggregateRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows);
+    }
+
+    pub fn aggregateRelationalRowsFromSourceRowsWithColumnsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsAggregateRequest,
+        source_rows: []const []const u8,
+        source_columns: []const schema_mod.RelationalColumn,
+    ) !types.RelationalRowsAggregateResult {
+        return try relational_rows_impl.aggregateRelationalRowsFromSourceRowsWithColumnsAlloc(alloc, req, source_rows, source_columns);
     }
 
     pub fn joinRelationalRows(

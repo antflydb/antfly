@@ -795,7 +795,7 @@ test "db stats expose ttl cleanup activity" {
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
@@ -844,7 +844,7 @@ test "db ttl cleanup can run under lease ownership" {
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
@@ -896,7 +896,7 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
@@ -951,7 +951,7 @@ test "db ttl cleanup can run with manual clock" {
             break;
         }
         clock.advanceMs(10);
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     try std.testing.expect(deleted);
 
@@ -960,7 +960,7 @@ test "db ttl cleanup can run with manual clock" {
     attempts = 0;
     while ((stats.ttl_cleanup.runs == 0 or stats.ttl_cleanup.deleted_docs == 0) and attempts < 32) : (attempts += 1) {
         clock.advanceMs(10);
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }

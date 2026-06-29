@@ -1666,6 +1666,7 @@ fn applyCreateIndexPlanAlloc(
             .columns = plan.columns,
             .expressions = plan.expressions,
             .include_columns = plan.include_columns,
+            .index_keys = plan.index_keys,
             .without_overlaps_period = plan.without_overlaps_period,
             .nulls_not_distinct = plan.nulls_not_distinct,
             .where = plan.where,
@@ -1707,7 +1708,7 @@ fn applyCreateIndexPlanAlloc(
     try lower_expr.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     try lower_expr.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
     try lower_expr.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
-    try ddl_plan.markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.include_columns, plan.where, plan.where_expressions, index_generation);
+    try ddl_plan.markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.include_columns, plan.index_keys, plan.where, plan.where_expressions, index_generation);
     return schema;
 }
 
@@ -2030,6 +2031,12 @@ test "catalog apply applies SQL session catalog plans" {
     defer runtime_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("1ms", runtime_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("tenant-a", runtime_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+    var set_default_read_only = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, "SET default_transaction_read_only = on;");
+    defer set_default_read_only.deinit(alloc);
+    const set_default_read_only_plan = try sessionCatalogPlanForCatalogApplyTest(set_default_read_only);
+    var default_read_only_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), set_default_read_only_plan);
+    defer default_read_only_session.deinit(alloc);
+    try std.testing.expect(try sqlDefaultTransactionReadOnlyFromSession(default_read_only_session.session()));
     try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1"));
     try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1ms"));
     try std.testing.expectEqual(@as(u64, std.time.ns_per_us), try parseSqlStatementTimeoutNs("1us"));
@@ -3664,6 +3671,10 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(status.index_generation != 0);
     try std.testing.expect(status.index_name != null);
     try std.testing.expectEqualStrings("users_status_active_idx", status.index_name.?);
+    try std.testing.expectEqual(@as(usize, 1), status.index_keys.len);
+    try std.testing.expectEqualStrings("status", status.index_keys[0].column);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, status.index_keys[0].direction);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, status.index_keys[0].nulls);
     try std.testing.expectEqual(@as(usize, 1), status.index_where.len);
     try std.testing.expectEqualStrings("deleted_at", status.index_where[0].field);
 
@@ -3702,6 +3713,7 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 2), covered_email.index_include_columns.len);
     try std.testing.expectEqualStrings("tenant_id", covered_email.index_include_columns[0]);
     try std.testing.expectEqualStrings("amount", covered_email.index_include_columns[1]);
+    try std.testing.expectEqual(@as(usize, 0), covered_email.index_keys.len);
     const covered_tenant = binder.relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
 
@@ -3713,6 +3725,7 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(!dropped_email_cover.indexed);
     try std.testing.expect(dropped_email_cover.index_name == null);
     try std.testing.expectEqual(@as(usize, 0), dropped_email_cover.index_include_columns.len);
+    try std.testing.expectEqual(@as(usize, 0), dropped_email_cover.index_keys.len);
 
     var generated_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,

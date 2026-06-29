@@ -148,7 +148,7 @@ pub fn exportPortableBackupShard(
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
-    try portable_backup.exportPortable(alloc, db.core.store, &out);
+    try portable_backup.exportPortableDb(alloc, db, &out);
 
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
     defer alloc.free(dest_path);
@@ -221,7 +221,7 @@ pub fn restoreLocalTable(
     if (std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb")) {
         const body = try readBackupFileAlloc(alloc, snapshot_root);
         defer alloc.free(body);
-        try portable_backup.importPortable(alloc, db.core.store, body);
+        try portable_backup.importPortableDb(alloc, db, body);
         return;
     }
 

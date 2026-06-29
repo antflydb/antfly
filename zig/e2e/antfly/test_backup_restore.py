@@ -552,8 +552,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -610,10 +609,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         assert restored_doc is not None
         assert restored_doc["title"] == "Alpha backup"
 
-        ready_after_restore = backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=180.0, interval_s=1.0)
-        if ready_after_restore is None:
-            after_status = backup_api.get_index(table_name, "semantic_chunked_idx")
-            raise AssertionError(f"semantic restore index did not become query-ready; status={after_status}")
+        backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=180.0, interval_s=1.0)
 
         semantic_after = wait_until(
             lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),

@@ -205,6 +205,34 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
     return status
 
 
+def _index_ready_timeout_message(
+    table_name: str,
+    index_name: str,
+    timeout_s: float,
+    last_info: dict[str, Any] | None,
+    last_error: BaseException | None,
+    server: Any,
+) -> str:
+    parts = [
+        f"index did not become ready within {timeout_s}s table={table_name!r} index={index_name!r}",
+    ]
+    if last_info is not None:
+        parts.append("[last index response]")
+        parts.append(json.dumps(last_info, indent=2, sort_keys=True)[:12000])
+    if last_error is not None:
+        parts.append("[last poll error]")
+        parts.append(repr(last_error))
+    if server is not None:
+        try:
+            logs = server.debug_logs().strip()
+        except Exception as exc:  # pragma: no cover - diagnostic best effort
+            logs = f"<failed to read server logs: {exc!r}>"
+        if logs:
+            parts.append("[server logs tail]")
+            parts.append(logs[-12000:])
+    return "\n".join(parts)
+
+
 def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | None:
     if status.get("head_version", 0) < 1 or status.get("published_wal_end_lsn", 0) < 1:
         return None
@@ -1397,17 +1425,29 @@ def serverless_api(serverless_runtime):
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
+        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
             deadline = time.monotonic() + timeout_s
+            last_info: dict[str, Any] | None = None
+            last_error: BaseException | None = None
             while True:
                 try:
-                    ready = ready_index_status(self.get(f"/tables/{table_name}/indexes/{index_name}"))
+                    last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
+                    ready = ready_index_status(last_info)
                     if ready is not None:
                         return ready
-                except requests.RequestException:
-                    pass
+                except requests.RequestException as exc:
+                    last_error = exc
                 if time.monotonic() >= deadline:
-                    return None
+                    raise AssertionError(
+                        _index_ready_timeout_message(
+                            table_name,
+                            index_name,
+                            timeout_s,
+                            last_info,
+                            last_error,
+                            self._server,
+                        )
+                    )
                 time.sleep(interval_s)
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
@@ -2275,17 +2315,29 @@ def backup_api():
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
+        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
             deadline = time.monotonic() + timeout_s
+            last_info: dict[str, Any] | None = None
+            last_error: BaseException | None = None
             while True:
                 try:
-                    ready = ready_index_status(self.get(f"/tables/{table_name}/indexes/{index_name}"))
+                    last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
+                    ready = ready_index_status(last_info)
                     if ready is not None:
                         return ready
-                except requests.RequestException:
-                    pass
+                except requests.RequestException as exc:
+                    last_error = exc
                 if time.monotonic() >= deadline:
-                    return None
+                    raise AssertionError(
+                        _index_ready_timeout_message(
+                            table_name,
+                            index_name,
+                            timeout_s,
+                            last_info,
+                            last_error,
+                            self._server,
+                        )
+                    )
                 time.sleep(interval_s)
 
         def delete_index(self, table_name: str, index_name: str) -> dict:

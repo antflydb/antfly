@@ -39,7 +39,7 @@ fn waitForSearchResult(alloc: std.mem.Allocator, db: *DB, req: types.SearchReque
     var attempts: usize = 0;
     while (last.total_hits < min_hits and attempts < 100) : (attempts += 1) {
         last.deinit();
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         last = try db.search(alloc, req);
     }
     if (last.total_hits < min_hits) {
@@ -58,7 +58,7 @@ fn waitForAppliedSequenceAdvance(
     var applied = try db.core.loadAppliedSequence(alloc, index_name);
     var attempts: usize = 0;
     while (applied <= previous and attempts < 100) : (attempts += 1) {
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         applied = try db.core.loadAppliedSequence(alloc, index_name);
     }
     if (applied <= previous) return error.Timeout;

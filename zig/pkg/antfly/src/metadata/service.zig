@@ -109,13 +109,13 @@ fn resetIdentityAllocatorsForTableEmptyingBarrierWithCas(
         const observed = service.captureLifecycleSignal(null);
         for (targets) |target| {
             const record = findSequenceRecord(snapshot.sequences, target.sequence_id) orelse return error.SequenceNotFound;
-            if (record.last_value == target.reset_last_value) continue;
+            if (record.last_value == target.reset_last_value and record.last_allocation_id == 0) continue;
             needs_reset = true;
             try service.proposeTransitionCommand(.{ .compare_and_swap_sequence = .{
                 .sequence_id = target.sequence_id,
                 .expected_last_value = record.last_value,
                 .next_last_value = target.reset_last_value,
-                .allocation_id = freshSequenceAllocationId(),
+                .allocation_id = 0,
             } });
         }
         if (!needs_reset) return;
@@ -128,7 +128,7 @@ fn resetIdentityAllocatorsForTableEmptyingBarrierWithCas(
         var all_reset = true;
         for (after_targets) |target| {
             const record = findSequenceRecord(after.sequences, target.sequence_id) orelse return error.SequenceNotFound;
-            if (record.last_value != target.reset_last_value) {
+            if (record.last_value != target.reset_last_value or record.last_allocation_id != 0) {
                 all_reset = false;
                 break;
             }
@@ -136,6 +136,134 @@ fn resetIdentityAllocatorsForTableEmptyingBarrierWithCas(
         if (all_reset) return;
     }
     return error.SequenceAllocationConflict;
+}
+
+test "metadata service table-emptying identity reset clears durable allocation marker" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"owned_id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+    const default_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_id_seq");
+    const owned_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_owned_id_seq");
+
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        tables: [1]metadata_table_manager.TableRecord,
+        ranges: [1]metadata_table_manager.RangeRecord,
+        sequences: [2]metadata_table_manager.SequenceRecord,
+        jobs: [1]metadata_table_manager.TableEmptyingJobRecord,
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .sequences = self.sequences[0..],
+                .table_emptying_jobs = self.jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn captureLifecycleSignal(_: *@This(), _: ?[]const u8) void {}
+
+        fn waitForLifecycleSignal(_: *@This(), _: void, _: u64) void {}
+
+        fn proposeTransitionCommand(self: *@This(), command: metadata_storage.TransitionCommand) !void {
+            switch (command) {
+                .compare_and_swap_sequence => |request| {
+                    for (&self.sequences) |*sequence| {
+                        if (sequence.sequence_id != request.sequence_id) continue;
+                        if (sequence.last_value != request.expected_last_value) return;
+                        sequence.last_value = request.next_last_value;
+                        sequence.last_allocation_id = request.allocation_id;
+                        return;
+                    }
+                    return error.SequenceNotFound;
+                },
+                else => return error.UnsupportedOperation,
+            }
+        }
+    };
+
+    var service = FakeService{
+        .alloc = std.testing.allocator,
+        .tables = .{.{
+            .table_id = 7,
+            .name = "usage_records",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .schema_json = schema_json,
+            .data_generation = 4,
+        }},
+        .ranges = .{.{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }},
+        .sequences = .{
+            .{
+                .sequence_id = default_sequence_id,
+                .name = "usage_id_seq",
+                .database_name = "tenant",
+                .namespace_name = "billing",
+                .options_json = "{\"start_with\":10,\"increment_by\":5}",
+                .last_value = 100,
+                .last_allocation_id = 1234,
+            },
+            .{
+                .sequence_id = owned_sequence_id,
+                .name = "usage_owned_id_seq",
+                .database_name = "tenant",
+                .namespace_name = "billing",
+                .options_json = "{\"start_with\":50,\"increment_by\":10,\"owned_by\":{\"table_name\":\"usage_records\",\"column_name\":\"owned_id\"}}",
+                .last_value = 200,
+                .last_allocation_id = 5678,
+            },
+        },
+        .jobs = .{.{
+            .job_id = 7101,
+            .table_id = 7,
+            .group_id = 9001,
+            .schema_generation = schema_generation,
+            .data_generation = 4,
+            .barrier_id = 77,
+            .state = metadata_table_manager.table_emptying_ready,
+            .affected_table_ids = &.{7},
+            .restart_identity = true,
+        }},
+    };
+
+    try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(&service, std.testing.allocator, .{
+        .barrier_id = 77,
+        .affected_table_ids = &.{7},
+        .job_ids = &.{7101},
+    });
+
+    try std.testing.expectEqual(@as(i64, 5), service.sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[0].last_allocation_id);
+    try std.testing.expectEqual(@as(i64, 40), service.sequences[1].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[1].last_allocation_id);
+
+    service.sequences[0].last_allocation_id = 9001;
+    service.sequences[1].last_allocation_id = 9002;
+    try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(&service, std.testing.allocator, .{
+        .barrier_id = 77,
+        .affected_table_ids = &.{7},
+        .job_ids = &.{7101},
+    });
+    try std.testing.expectEqual(@as(i64, 5), service.sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[0].last_allocation_id);
+    try std.testing.expectEqual(@as(i64, 40), service.sequences[1].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[1].last_allocation_id);
 }
 
 fn allocateSequenceValueWithCas(

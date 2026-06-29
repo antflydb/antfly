@@ -13,9 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const http_server = @import("http_server.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_sync = @import("antfly_platform").sync;
+const sql_backend = @import("sql_backend.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
@@ -32,8 +32,13 @@ const int2_oid: i32 = 21;
 const int4_oid: i32 = 23;
 const text_oid: i32 = 25;
 const text_type_size: i16 = -1;
+const bool_array_oid: i32 = 1000;
+const text_array_oid: i32 = 1009;
+const timestamptz_array_oid: i32 = 1185;
+const numeric_array_oid: i32 = 1231;
 const numeric_oid: i32 = 1700;
 const jsonb_oid: i32 = 3802;
+const jsonb_array_oid: i32 = 3807;
 const timestamptz_oid: i32 = 1184;
 const timestamptz_type_size: i16 = 8;
 const postgres_epoch_unix_seconds: i64 = 946_684_800;
@@ -46,6 +51,11 @@ const PgwireColumn = struct {
     type_size: i16 = text_type_size,
     antfly_type: ?runtime_schema.AntflyType = null,
     array_item_type: ?runtime_schema.AntflyType = null,
+};
+
+const PgwireType = struct {
+    oid: i32,
+    size: i16,
 };
 
 const PreparedStatement = struct {
@@ -72,7 +82,7 @@ const CancelEntry = struct {
 pub const Config = struct {
     bind_host: []const u8,
     bind_port: u16,
-    api_server: *http_server.ApiHttpServer,
+    backend: sql_backend.Backend,
 };
 
 pub const Server = struct {
@@ -89,7 +99,7 @@ const State = struct {
     alloc: std.mem.Allocator,
     owned_host: []u8,
     bind_port: u16,
-    api_server: *http_server.ApiHttpServer,
+    backend: sql_backend.Backend,
     io_impl: std.Io.Threaded,
     listener: ?std.Io.net.Server = null,
     thread: ?std.Thread = null,
@@ -192,7 +202,7 @@ pub fn start(alloc: std.mem.Allocator, cfg: Config) !Server {
         .alloc = alloc,
         .owned_host = owned_host,
         .bind_port = cfg.bind_port,
-        .api_server = cfg.api_server,
+        .backend = cfg.backend,
         .io_impl = std.Io.Threaded.init(alloc, .{}),
     };
     errdefer state.io_impl.deinit();
@@ -261,7 +271,7 @@ fn serveConnection(
     var conn = Connection{
         .alloc = alloc,
         .state = state,
-        .api_server = state.api_server,
+        .backend = state.backend,
         .reader = &reader_state.interface,
         .writer = &writer_state.interface,
     };
@@ -275,12 +285,12 @@ fn serveConnection(
 const Connection = struct {
     alloc: std.mem.Allocator,
     state: *State,
-    api_server: *http_server.ApiHttpServer,
+    backend: sql_backend.Backend,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     session_id: ?u64 = null,
     startup_user: ?[]u8 = null,
-    authenticated_identity: ?http_server.AuthenticatedIdentity = null,
+    authenticated_identity: ?sql_backend.AuthenticatedIdentity = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
     ready_for_query_status: u8 = 'I',
@@ -297,7 +307,7 @@ const Connection = struct {
 
     fn deinit(self: *Connection) void {
         self.state.unregisterCancelHandle(self);
-        if (self.authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (self.authenticated_identity) |*identity| identity.deinit(self.backend.allocator());
         if (self.startup_user) |startup_user| self.alloc.free(startup_user);
         if (self.database) |database| self.alloc.free(database);
         if (self.namespace) |namespace| self.alloc.free(namespace);
@@ -393,7 +403,7 @@ const Connection = struct {
             try self.writer.flush();
             return error.PgwireAuthenticationFailed;
         }
-        if (self.api_server.cfg.user_manager == null) {
+        if (!self.backend.canAuthenticatePassword()) {
             try self.sendError("0A000", "pgwire password authentication requires user manager");
             try self.writer.flush();
             return error.PgwireAuthNotSupported;
@@ -413,7 +423,7 @@ const Connection = struct {
             try self.writer.flush();
             return error.InvalidPgwireMessage;
         };
-        var identity = self.api_server.authenticateUserPassword(username, message.payload[0..password_end]) catch |err| switch (err) {
+        var identity = self.backend.authenticateUserPassword(username, message.payload[0..password_end]) catch |err| switch (err) {
             error.InvalidPassword, error.UserNotFound, error.Unauthorized => {
                 try self.sendError("28P01", "password authentication failed");
                 try self.writer.flush();
@@ -421,12 +431,12 @@ const Connection = struct {
             },
             else => return err,
         };
-        errdefer identity.deinit(self.api_server.alloc);
+        errdefer identity.deinit(self.backend.allocator());
         self.authenticated_identity = identity;
     }
 
     fn pgwireAuthenticationRequired(self: *Connection) bool {
-        return self.api_server.cfg.auth_enabled or self.api_server.cfg.trusted_principal_secret != null;
+        return self.backend.authenticationRequired();
     }
 
     fn handleCancelRequest(self: *Connection, payload: []const u8) !void {
@@ -551,7 +561,7 @@ const Connection = struct {
         var params_transferred = false;
         errdefer {
             if (!params_transferred) {
-                for (params[0..initialized_params]) |value| http_server.ApiHttpServer.freePublicSqlParam(self.alloc, value);
+                for (params[0..initialized_params]) |value| sql_backend.freeParam(self.alloc, value);
                 if (params.len > 0) self.alloc.free(params);
             }
         }
@@ -792,18 +802,18 @@ const Connection = struct {
 
     fn encodeDescribeOutcome(
         self: *Connection,
-        outcome: *http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse,
+        outcome: *sql_backend.PublicSqlDescribeResultOrResponse,
         result_formats: []const i16,
     ) !bool {
         switch (outcome.*) {
             .response => |*response| {
-                defer response.deinit(self.api_server.alloc);
+                defer response.deinit(self.backend.allocator());
                 self.markTransactionError();
                 try self.sendError(pgwire_module.sqlstateForHttpResponse(response.status, response.body), response.body);
                 return false;
             },
             .result => |*result| {
-                defer result.deinit(self.api_server.alloc);
+                defer result.deinit(self.backend.allocator());
                 self.session_id = result.session_id;
                 self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
                 if (!result.has_row_description) {
@@ -842,7 +852,7 @@ const Connection = struct {
         };
         self.active_execution.store(false, .release);
         if (self.consumeCancelRequested()) {
-            outcome.deinit(self.api_server.alloc);
+            outcome.deinit(self.backend.allocator());
             self.markTransactionError();
             try self.sendError("57014", "canceling statement due to user request");
             if (send_ready_on_error) try self.sendReadyForQuery();
@@ -853,21 +863,21 @@ const Connection = struct {
 
     fn encodeExecutionOutcome(
         self: *Connection,
-        outcome: *http_server.ApiHttpServer.PublicSqlResultOrResponse,
+        outcome: *sql_backend.PublicSqlResultOrResponse,
         result_formats: []const i16,
         send_ready_on_error: bool,
         include_row_description: bool,
     ) !bool {
         switch (outcome.*) {
             .response => |*response| {
-                defer response.deinit(self.api_server.alloc);
+                defer response.deinit(self.backend.allocator());
                 self.markTransactionError();
                 try self.sendError(pgwire_module.sqlstateForHttpResponse(response.status, response.body), response.body);
                 if (send_ready_on_error) try self.sendReadyForQuery();
                 return false;
             },
             .result => |*result| {
-                defer result.deinit(self.api_server.alloc);
+                defer result.deinit(self.backend.allocator());
                 self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
                 try self.encodeSqlResult(result, result_formats, include_row_description);
                 return true;
@@ -875,8 +885,8 @@ const Connection = struct {
         }
     }
 
-    fn describeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse {
-        return try self.api_server.handlePublicParsedSqlExternalDescribeRequestResult(.{
+    fn describeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !sql_backend.PublicSqlDescribeResultOrResponse {
+        return try self.backend.describeParsedSql(.{
             .parsed_sql = parsed_sql,
             .session_id = self.session_id,
             .database = self.database,
@@ -886,8 +896,8 @@ const Connection = struct {
         }, self.authenticated_identity);
     }
 
-    fn executeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
-        return try self.api_server.executePublicParsedSqlExternalRequestResult(.{
+    fn executeParsedSql(self: *Connection, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue) !sql_backend.PublicSqlResultOrResponse {
+        return try self.backend.executeParsedSql(.{
             .parsed_sql = parsed_sql,
             .session_id = self.session_id,
             .database = self.database,
@@ -899,7 +909,7 @@ const Connection = struct {
 
     fn encodeSqlResult(
         self: *Connection,
-        result: *const http_server.ApiHttpServer.PublicSqlResult,
+        result: *const sql_backend.PublicSqlResult,
         result_formats: []const i16,
         include_row_description: bool,
     ) !void {
@@ -1307,7 +1317,7 @@ fn freePortal(alloc: std.mem.Allocator, portal: Portal) void {
     const source = owned_portal.parsed_sql.sql();
     owned_portal.parsed_sql.deinit(alloc);
     alloc.free(@constCast(source));
-    for (portal.params) |value| http_server.ApiHttpServer.freePublicSqlParam(alloc, value);
+    for (portal.params) |value| sql_backend.freeParam(alloc, value);
     if (portal.params.len > 0) alloc.free(portal.params);
     if (portal.result_formats.len > 0) alloc.free(portal.result_formats);
 }
@@ -1602,19 +1612,33 @@ fn pgwireColumnForRelationalColumn(column: runtime_schema.RelationalColumn) Pgwi
 fn pgwireTypeForAntflyType(
     field_type: runtime_schema.AntflyType,
     array_item_type: ?runtime_schema.AntflyType,
-) struct { oid: i32, size: i16 } {
-    _ = array_item_type;
+) PgwireType {
     return switch (field_type) {
         .keyword, .text, .link, .html, .search_as_you_type => .{ .oid = text_oid, .size = text_type_size },
         .numeric => .{ .oid = numeric_oid, .size = text_type_size },
         .boolean => .{ .oid = bool_oid, .size = bool_type_size },
         .datetime => .{ .oid = timestamptz_oid, .size = timestamptz_type_size },
-        .json, .array => .{ .oid = jsonb_oid, .size = text_type_size },
+        .json => .{ .oid = jsonb_oid, .size = text_type_size },
+        .array => pgwireArrayTypeForAntflyType(array_item_type),
         .embedding, .geopoint, .geoshape, .blob => .{ .oid = text_oid, .size = text_type_size },
     };
 }
 
-fn readyForQueryStatus(status: http_server.ApiHttpServer.PublicSqlTransactionStatus) u8 {
+fn pgwireArrayTypeForAntflyType(array_item_type: ?runtime_schema.AntflyType) PgwireType {
+    return switch (array_item_type orelse .json) {
+        .keyword, .text, .link, .html, .search_as_you_type, .embedding, .geopoint, .geoshape, .blob => .{ .oid = text_array_oid, .size = text_type_size },
+        .numeric => .{ .oid = numeric_array_oid, .size = text_type_size },
+        .boolean => .{ .oid = bool_array_oid, .size = text_type_size },
+        .datetime => .{ .oid = timestamptz_array_oid, .size = text_type_size },
+        .json, .array => .{ .oid = jsonb_array_oid, .size = text_type_size },
+    };
+}
+
+fn pgwireElementTypeForArrayItem(array_item_type: ?runtime_schema.AntflyType) PgwireType {
+    return pgwireTypeForAntflyType(array_item_type orelse .json, null);
+}
+
+fn readyForQueryStatus(status: sql_backend.PublicSqlTransactionStatus) u8 {
     return switch (status) {
         .idle => 'I',
         .in_transaction => 'T',
@@ -1654,7 +1678,7 @@ fn commandTagForMutationSource(alloc: std.mem.Allocator, statement_kind: []const
     return try std.fmt.allocPrint(alloc, "{s} {d}", .{ commandVerb(statement_kind), count });
 }
 
-fn commandTagForBulkIo(alloc: std.mem.Allocator, bulk_io: http_server.ApiHttpServer.PublicSqlResult.BulkIo) ![]u8 {
+fn commandTagForBulkIo(alloc: std.mem.Allocator, bulk_io: sql_backend.PublicSqlResult.BulkIo) ![]u8 {
     const verb = switch (bulk_io.operation) {
         .import_rows, .export_rows => "COPY",
     };
@@ -1698,6 +1722,7 @@ fn pgwireValueBinaryAlloc(alloc: std.mem.Allocator, value: std.json.Value, colum
             try out.writer.writeByte(1);
             try out.writer.writeAll(text);
         },
+        bool_array_oid, text_array_oid, timestamptz_array_oid, numeric_array_oid, jsonb_array_oid => try appendPgBinaryArray(alloc, &out.writer, value, column.array_item_type),
         else => {
             const text = try pgwireValueTextAlloc(alloc, value, column);
             defer alloc.free(text);
@@ -1719,7 +1744,122 @@ fn pgwireValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value, column:
     if (column.antfly_type == .datetime) {
         if (try jsonValueNanoseconds(value)) |ns| return try timestampNsTextAlloc(alloc, ns);
     }
+    if (column.antfly_type == .array) {
+        return try pgwireArrayTextAlloc(alloc, value, column.array_item_type);
+    }
     return try jsonValueTextAlloc(alloc, value);
+}
+
+fn pgwireArrayTextAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    array_item_type: ?runtime_schema.AntflyType,
+) ![]u8 {
+    if (value != .array) return error.InvalidPgwireValue;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (value.array.items, 0..) |item, i| {
+        if (i != 0) try writer.writeByte(',');
+        try appendPgArrayTextElement(alloc, writer, item, array_item_type);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn appendPgArrayTextElement(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+    array_item_type: ?runtime_schema.AntflyType,
+) !void {
+    if (value == .null) {
+        try writer.writeAll("NULL");
+        return;
+    }
+    const text = if ((array_item_type orelse .json) == .datetime)
+        if (try jsonValueNanoseconds(value)) |ns| try timestampNsTextAlloc(alloc, ns) else try jsonValueTextAlloc(alloc, value)
+    else
+        try jsonValueTextAlloc(alloc, value);
+    defer alloc.free(text);
+    try writer.writeByte('"');
+    for (text) |ch| {
+        if (ch == '"' or ch == '\\') try writer.writeByte('\\');
+        try writer.writeByte(ch);
+    }
+    try writer.writeByte('"');
+}
+
+fn appendPgBinaryArray(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+    array_item_type: ?runtime_schema.AntflyType,
+) !void {
+    if (value != .array) return error.InvalidPgwireValue;
+    const element_type = pgwireElementTypeForArrayItem(array_item_type);
+    var has_null: i32 = 0;
+    for (value.array.items) |item| {
+        if (item == .null) {
+            has_null = 1;
+            break;
+        }
+    }
+    try writer.writeInt(i32, 1, .big);
+    try writer.writeInt(i32, has_null, .big);
+    try writer.writeInt(i32, element_type.oid, .big);
+    try writer.writeInt(i32, @intCast(value.array.items.len), .big);
+    try writer.writeInt(i32, 1, .big);
+    for (value.array.items) |item| {
+        if (item == .null) {
+            try writer.writeInt(i32, -1, .big);
+            continue;
+        }
+        var encoded = try pgwireArrayElementBinaryAlloc(alloc, item, element_type.oid, array_item_type);
+        defer encoded.deinit();
+        try writer.writeInt(i32, @intCast(encoded.written().len), .big);
+        try writer.writeAll(encoded.written());
+    }
+}
+
+fn pgwireArrayElementBinaryAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    element_oid: i32,
+    array_item_type: ?runtime_schema.AntflyType,
+) !std.Io.Writer.Allocating {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    switch (element_oid) {
+        bool_oid => try out.writer.writeByte(if (jsonValueBool(value) orelse return error.InvalidPgwireValue) 1 else 0),
+        numeric_oid => {
+            const text = try jsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            try appendPgBinaryNumeric(alloc, &out.writer, text);
+        },
+        timestamptz_oid => {
+            const ns = (try jsonValueNanoseconds(value)) orelse return error.InvalidPgwireValue;
+            const unix_micros: i64 = @intCast(@divFloor(ns, std.time.ns_per_us));
+            const pg_micros = unix_micros - postgres_epoch_unix_seconds * std.time.us_per_s;
+            try out.writer.writeInt(i64, pg_micros, .big);
+        },
+        jsonb_oid => {
+            const text = try jsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            try out.writer.writeByte(1);
+            try out.writer.writeAll(text);
+        },
+        else => {
+            const text = if ((array_item_type orelse .json) == .datetime)
+                if (try jsonValueNanoseconds(value)) |ns| try timestampNsTextAlloc(alloc, ns) else try jsonValueTextAlloc(alloc, value)
+            else
+                try jsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            try out.writer.writeAll(text);
+        },
+    }
+    return out;
 }
 
 fn jsonValueBool(value: std.json.Value) ?bool {
@@ -1969,7 +2109,7 @@ test "pgwire cancel registry matches backend key data" {
         .alloc = alloc,
         .owned_host = try alloc.dupe(u8, "127.0.0.1"),
         .bind_port = 0,
-        .api_server = undefined,
+        .backend = undefined,
         .io_impl = std.Io.Threaded.init(alloc, .{}),
     };
     defer {
@@ -1981,7 +2121,7 @@ test "pgwire cancel registry matches backend key data" {
     var conn = Connection{
         .alloc = alloc,
         .state = &state,
-        .api_server = undefined,
+        .backend = undefined,
         .reader = undefined,
         .writer = undefined,
     };
@@ -2023,27 +2163,27 @@ test "pgwire text parameters decode to typed sql values without rewriting sql" {
     const alloc = std.testing.allocator;
 
     const text_value = try sqlValueFromTextParameterAlloc(alloc, text_oid, "10");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, text_value);
+    defer sql_backend.freeParam(alloc, text_value);
     try std.testing.expect(text_value == .string);
     try std.testing.expectEqualStrings("10", text_value.string);
 
     const numeric_integer = try sqlValueFromTextParameterAlloc(alloc, numeric_oid, "10");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, numeric_integer);
+    defer sql_backend.freeParam(alloc, numeric_integer);
     try std.testing.expect(numeric_integer == .integer);
     try std.testing.expectEqual(@as(i64, 10), numeric_integer.integer);
 
     const numeric_float = try sqlValueFromTextParameterAlloc(alloc, numeric_oid, "10.5");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, numeric_float);
+    defer sql_backend.freeParam(alloc, numeric_float);
     try std.testing.expect(numeric_float == .float);
     try std.testing.expectEqual(@as(f64, 10.5), numeric_float.float);
 
     const bool_value = try sqlValueFromTextParameterAlloc(alloc, bool_oid, "t");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, bool_value);
+    defer sql_backend.freeParam(alloc, bool_value);
     try std.testing.expect(bool_value == .bool);
     try std.testing.expect(bool_value.bool);
 
     const json_value = try sqlValueFromTextParameterAlloc(alloc, jsonb_oid, "{\"ok\":true}");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, json_value);
+    defer sql_backend.freeParam(alloc, json_value);
     try std.testing.expect(json_value == .json);
     try std.testing.expectEqualStrings("{\"ok\":true}", json_value.json);
 
@@ -2054,26 +2194,26 @@ test "pgwire binary parameters decode to typed sql values" {
     const alloc = std.testing.allocator;
 
     const bool_value = try sqlValueFromPgwireParameterAlloc(alloc, bool_oid, binary_format, &.{1});
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, bool_value);
+    defer sql_backend.freeParam(alloc, bool_value);
     try std.testing.expect(bool_value == .bool);
     try std.testing.expect(bool_value.bool);
 
     var int4_bytes: [4]u8 = undefined;
     std.mem.writeInt(i32, &int4_bytes, 42, .big);
     const int4_value = try sqlValueFromPgwireParameterAlloc(alloc, int4_oid, binary_format, &int4_bytes);
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, int4_value);
+    defer sql_backend.freeParam(alloc, int4_value);
     try std.testing.expect(int4_value == .integer);
     try std.testing.expectEqual(@as(i64, 42), int4_value.integer);
 
     var ts_bytes: [8]u8 = undefined;
     std.mem.writeInt(i64, &ts_bytes, 1_000_000, .big);
     const ts_value = try sqlValueFromPgwireParameterAlloc(alloc, timestamptz_oid, binary_format, &ts_bytes);
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, ts_value);
+    defer sql_backend.freeParam(alloc, ts_value);
     try std.testing.expect(ts_value == .integer);
     try std.testing.expectEqual(@as(i64, (postgres_epoch_unix_seconds + 1) * std.time.ns_per_s), ts_value.integer);
 
     const json_value = try sqlValueFromPgwireParameterAlloc(alloc, jsonb_oid, binary_format, "\x01{\"ok\":true}");
-    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, json_value);
+    defer sql_backend.freeParam(alloc, json_value);
     try std.testing.expect(json_value == .json);
     try std.testing.expectEqualStrings("{\"ok\":true}", json_value.json);
 }
@@ -2082,7 +2222,7 @@ test "pgwire binary result encoders use postgres wire layouts" {
     const alloc = std.testing.allocator;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"active":true,"amount":12.5,"created_at":946684800000000000,"attrs":{"tier":"gold"}}
+        \\{"active":true,"amount":12.5,"created_at":946684800000000000,"attrs":{"tier":"gold"},"tags":["hot","new"],"flags":[true,false]}
     , .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const row = parsed.value;
@@ -2104,6 +2244,23 @@ test "pgwire binary result encoders use postgres wire layouts" {
     try std.testing.expect(json_binary.written().len > 1);
     try std.testing.expectEqual(@as(u8, 1), json_binary.written()[0]);
     try std.testing.expect(std.mem.indexOf(u8, json_binary.written()[1..], "\"tier\"") != null);
+
+    const tags_text = try pgwireValueTextAlloc(alloc, row.object.get("tags").?, .{ .name = "tags", .type_oid = text_array_oid, .type_size = text_type_size, .antfly_type = .array, .array_item_type = .keyword });
+    defer alloc.free(tags_text);
+    try std.testing.expectEqualStrings("{\"hot\",\"new\"}", tags_text);
+
+    var flags_binary = try pgwireValueBinaryAlloc(alloc, row.object.get("flags").?, .{ .name = "flags", .type_oid = bool_array_oid, .type_size = text_type_size, .antfly_type = .array, .array_item_type = .boolean });
+    defer flags_binary.deinit();
+    const expected_flags_binary = [_]u8{
+        0, 0, 0, 1, // dimensions
+        0, 0, 0, 0, // has null
+        0, 0, 0, bool_oid, // element oid
+        0, 0, 0, 2, // length
+        0, 0, 0, 1, // lower bound
+        0, 0, 0, 1, 1, // true
+        0, 0, 0, 1, 0, // false
+    };
+    try std.testing.expectEqualSlices(u8, &expected_flags_binary, flags_binary.written());
 }
 
 test "pgwire relational column descriptions use postgres-compatible text types" {
@@ -2114,6 +2271,10 @@ test "pgwire relational column descriptions use postgres-compatible text types" 
         .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
         .{ .name = "attrs", .path = "attrs", .field_type = .json },
         .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword },
+        .{ .name = "amounts", .path = "amounts", .field_type = .array, .array_item_type = .numeric },
+        .{ .name = "flags", .path = "flags", .field_type = .array, .array_item_type = .boolean },
+        .{ .name = "timestamps", .path = "timestamps", .field_type = .array, .array_item_type = .datetime },
+        .{ .name = "events", .path = "events", .field_type = .array, .array_item_type = .json },
     };
     const expected_oids = [_]i32{
         text_oid,
@@ -2121,13 +2282,21 @@ test "pgwire relational column descriptions use postgres-compatible text types" 
         bool_oid,
         timestamptz_oid,
         jsonb_oid,
-        jsonb_oid,
+        text_array_oid,
+        numeric_array_oid,
+        bool_array_oid,
+        timestamptz_array_oid,
+        jsonb_array_oid,
     };
     const expected_sizes = [_]i16{
         text_type_size,
         text_type_size,
         bool_type_size,
         timestamptz_type_size,
+        text_type_size,
+        text_type_size,
+        text_type_size,
+        text_type_size,
         text_type_size,
         text_type_size,
     };

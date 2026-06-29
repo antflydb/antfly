@@ -22,6 +22,8 @@ const platform_time = @import("../platform/time.zig");
 const regex_mod = @import("antfly_regex");
 const runtime_schema = @import("../storage/schema.zig");
 const rowsource = @import("../storage/rowsource/mod.zig");
+const row_spill = @import("row_spill.zig");
+const relational_collation = db_mod.relational_collation;
 
 const physical_primary_key_prefix = "\x00antfly-rel-pk:";
 
@@ -503,9 +505,17 @@ pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
     var final_source_rows: []const []const u8 = base_source_rows;
     var final_source_schema = base_source_schema;
     var final_source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = plan.ranges;
+    var loaded_final_source: ?OwnedRowsQueryResult = null;
+    defer if (loaded_final_source) |*loaded| loaded.deinit(alloc);
     if (plan.insert_source.source.source_cte.len != 0) {
         const cte = findRowsJsonMaterializedCte(materialized_ctes.items, plan.insert_source.source.source_cte) orelse return error.InvalidRowsRequest;
-        final_source_rows = cte.result.rows;
+        switch (cte.rows) {
+            .memory => |result| final_source_rows = result.rows,
+            .spilled => |spill| {
+                loaded_final_source = try loadRowsJsonSpilledCteAlloc(alloc, spill);
+                final_source_rows = loaded_final_source.?.rows;
+            },
+        }
         final_source_schema = cte.schema;
         final_source_ranges = &.{};
     }
@@ -579,9 +589,17 @@ pub fn executeRowsQueryPlanOnJsonRowsAlloc(
     var query_rows: []const []const u8 = base_rows;
     var query_schema = base_schema;
     var query_ranges: []const db_mod.types.RelationalRowsDocKeyRange = plan.ranges;
+    var loaded_query_source: ?OwnedRowsQueryResult = null;
+    defer if (loaded_query_source) |*loaded| loaded.deinit(alloc);
     if (plan.query.source_cte.len != 0) {
         const cte = findRowsJsonMaterializedCte(materialized_ctes.items, plan.query.source_cte) orelse return error.InvalidRowsRequest;
-        query_rows = cte.result.rows;
+        switch (cte.rows) {
+            .memory => |result| query_rows = result.rows,
+            .spilled => |spill| {
+                loaded_query_source = try loadRowsJsonSpilledCteAlloc(alloc, spill);
+                query_rows = loaded_query_source.?.rows;
+            },
+        }
         query_schema = cte.schema;
         query_ranges = &.{};
     }
@@ -615,19 +633,17 @@ pub fn executeRowsAggregatePlanOnJsonRowsAlloc(
     try validateRowsAggregatePlanCteOutputAlloc(alloc, base_schema, plan);
 
     var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, base_schema, base_rows, plan.ranges, plan.ctes);
-    defer {
-        for (materialized_ctes.items) |*cte| cte.deinit(alloc);
-        materialized_ctes.deinit(alloc);
-    }
+    defer materialized_ctes.deinit(alloc);
 
-    const source = rowsJsonSourceForQuery(materialized_ctes.items, "aggregate_source", base_schema, base_rows, plan.aggregate.source.source_cte) orelse return error.InvalidRowsRequest;
+    var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "aggregate_source", base_schema, base_rows, plan.aggregate.source.source_cte)) orelse return error.InvalidRowsRequest;
+    defer source.deinit(alloc);
     var source_query = rowsAggregateSourceQuery(plan.aggregate.source);
     source_query.source_cte = "";
     const source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.aggregate.source.source_cte.len == 0) plan.ranges else &.{};
     var source_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source.schema, source_query, source.rows, source_ranges);
     defer source_result.deinit(alloc);
 
-    return try db_mod.DB.aggregateRelationalRowsFromSourceRowsAlloc(alloc, plan.aggregate, source_result.rows);
+    return try db_mod.DB.aggregateRelationalRowsFromSourceRowsWithColumnsAlloc(alloc, plan.aggregate, source_result.rows, source.schema.relational_columns);
 }
 
 pub fn executeRowsAggregatePlanFromDbAlloc(
@@ -654,12 +670,10 @@ pub fn executeRowsWindowPlanOnJsonRowsAlloc(
     try validateRowsWindowPlanCteOutputAlloc(alloc, base_schema, plan);
 
     var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, base_schema, base_rows, plan.ranges, plan.ctes);
-    defer {
-        for (materialized_ctes.items) |*cte| cte.deinit(alloc);
-        materialized_ctes.deinit(alloc);
-    }
+    defer materialized_ctes.deinit(alloc);
 
-    const source = rowsJsonSourceForQuery(materialized_ctes.items, "window_source", base_schema, base_rows, plan.window.source.source_cte) orelse return error.InvalidRowsRequest;
+    var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "window_source", base_schema, base_rows, plan.window.source.source_cte)) orelse return error.InvalidRowsRequest;
+    defer source.deinit(alloc);
     var window = plan.window;
     window.source.source_cte = "";
     const source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.window.source.source_cte.len == 0) plan.ranges else &.{};
@@ -718,19 +732,18 @@ pub fn executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(
     try validateRowsJoinPlanCteOutputAlloc(alloc, cte_base_schema, plan);
 
     var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, cte_base_schema, cte_base_rows, cte_ranges, plan.ctes);
-    defer {
-        for (materialized_ctes.items) |*cte| cte.deinit(alloc);
-        materialized_ctes.deinit(alloc);
-    }
+    defer materialized_ctes.deinit(alloc);
 
-    const left_source = rowsJsonSourceForQuery(materialized_ctes.items, "join_left", left_schema, left_base_rows, plan.join.left.source_cte) orelse return error.InvalidRowsRequest;
+    var left_source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "join_left", left_schema, left_base_rows, plan.join.left.source_cte)) orelse return error.InvalidRowsRequest;
+    defer left_source.deinit(alloc);
     var left_query = rowsJoinSideSourceQuery(plan.join.left);
     left_query.source_cte = "";
     const left_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.join.left.source_cte.len == 0) plan.left_ranges else &.{};
     var left_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, left_source.schema, left_query, left_source.rows, left_ranges);
     defer left_result.deinit(alloc);
 
-    const right_source = rowsJsonSourceForQuery(materialized_ctes.items, "join_right", right_schema, right_base_rows, plan.join.right.source_cte) orelse return error.InvalidRowsRequest;
+    var right_source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "join_right", right_schema, right_base_rows, plan.join.right.source_cte)) orelse return error.InvalidRowsRequest;
+    defer right_source.deinit(alloc);
     var right_query = rowsJoinSideSourceQuery(plan.join.right);
     right_query.source_cte = "";
     const right_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.join.right.source_cte.len == 0) plan.right_ranges else &.{};
@@ -806,19 +819,18 @@ pub fn executeRowsLateralPlanOnJsonRowsWithSchemasAlloc(
     try validateRowsLateralPlanCteOutputAlloc(alloc, cte_base_schema, plan);
 
     var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, cte_base_schema, cte_base_rows, cte_ranges, plan.ctes);
-    defer {
-        for (materialized_ctes.items) |*cte| cte.deinit(alloc);
-        materialized_ctes.deinit(alloc);
-    }
+    defer materialized_ctes.deinit(alloc);
 
-    const left_source = rowsJsonSourceForQuery(materialized_ctes.items, "lateral_left", left_schema, left_base_rows, plan.lateral.left.source_cte) orelse return error.InvalidRowsRequest;
+    var left_source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "lateral_left", left_schema, left_base_rows, plan.lateral.left.source_cte)) orelse return error.InvalidRowsRequest;
+    defer left_source.deinit(alloc);
     var left_query = rowsLateralLeftSourceQuery(plan.lateral.left);
     left_query.source_cte = "";
     const left_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.lateral.left.source_cte.len == 0) plan.left_ranges else &.{};
     var left_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, left_source.schema, left_query, left_source.rows, left_ranges);
     defer left_result.deinit(alloc);
 
-    const right_source = rowsJsonSourceForQuery(materialized_ctes.items, "lateral_right", right_schema, right_base_rows, plan.lateral.right.source_cte) orelse return error.InvalidRowsRequest;
+    var right_source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.ctes.items, "lateral_right", right_schema, right_base_rows, plan.lateral.right.source_cte)) orelse return error.InvalidRowsRequest;
+    defer right_source.deinit(alloc);
     var lateral = plan.lateral;
     lateral.left.source_cte = "";
     lateral.right.source_cte = "";
@@ -913,10 +925,35 @@ fn collectRowsPlanCteRowsFromDbAlloc(
 const RowsJsonMaterializedCte = struct {
     name: []const u8,
     schema: runtime_schema.TableSchema,
-    result: OwnedRowsQueryResult,
+    rows: RowsJsonMaterializedCteRows,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.result.deinit(alloc);
+        self.rows.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const RowsJsonMaterializedCteRows = union(enum) {
+    memory: OwnedRowsQueryResult,
+    spilled: row_spill.SpilledRows,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .memory => |*result| result.deinit(alloc),
+            .spilled => |*spill| spill.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+const RowsJsonMaterializedCtes = struct {
+    planned: []RowsPlannedCte,
+    ctes: std.ArrayListUnmanaged(RowsJsonMaterializedCte),
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.ctes.items) |*cte| cte.deinit(alloc);
+        self.ctes.deinit(alloc);
+        freeRowsPlannedCtes(alloc, self.planned);
         self.* = undefined;
     }
 };
@@ -927,9 +964,10 @@ fn materializeRowsJsonPlanCtesAlloc(
     base_rows: []const []const u8,
     ranges: []const db_mod.types.RelationalRowsDocKeyRange,
     ctes: []const db_mod.types.RelationalRowsCte,
-) !std.ArrayListUnmanaged(RowsJsonMaterializedCte) {
+) !RowsJsonMaterializedCtes {
     const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, ctes);
-    defer freeRowsPlannedCtes(alloc, planned_ctes);
+    var planned_ctes_transferred = false;
+    errdefer if (!planned_ctes_transferred) freeRowsPlannedCtes(alloc, planned_ctes);
 
     var materialized_ctes = std.ArrayListUnmanaged(RowsJsonMaterializedCte).empty;
     errdefer {
@@ -937,25 +975,57 @@ fn materializeRowsJsonPlanCtesAlloc(
         materialized_ctes.deinit(alloc);
     }
     try materializeRowsJsonCtesAlloc(alloc, base_schema, base_rows, ranges, ctes, planned_ctes, &materialized_ctes);
-    return materialized_ctes;
+    planned_ctes_transferred = true;
+    return .{
+        .planned = planned_ctes,
+        .ctes = materialized_ctes,
+    };
 }
 
 const RowsJsonSource = struct {
     name: []const u8,
     schema: runtime_schema.TableSchema,
     rows: []const []const u8,
+    loaded: ?OwnedRowsQueryResult = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.loaded) |*loaded| loaded.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
-fn rowsJsonSourceForQuery(
+fn rowsJsonSourceForQueryAlloc(
+    alloc: std.mem.Allocator,
     materialized_ctes: []RowsJsonMaterializedCte,
     base_name: []const u8,
     base_schema: runtime_schema.TableSchema,
     base_rows: []const []const u8,
     source_cte: []const u8,
-) ?RowsJsonSource {
+) !?RowsJsonSource {
     if (source_cte.len == 0) return .{ .name = base_name, .schema = base_schema, .rows = base_rows };
     const cte = findRowsJsonMaterializedCte(materialized_ctes, source_cte) orelse return null;
-    return .{ .name = cte.name, .schema = cte.schema, .rows = cte.result.rows };
+    return switch (cte.rows) {
+        .memory => |result| .{ .name = cte.name, .schema = cte.schema, .rows = result.rows },
+        .spilled => |spill| blk: {
+            const loaded = try loadRowsJsonSpilledCteAlloc(alloc, spill);
+            break :blk .{ .name = cte.name, .schema = cte.schema, .rows = loaded.rows, .loaded = loaded };
+        },
+    };
+}
+
+fn spillRowsJsonCteResultAlloc(
+    alloc: std.mem.Allocator,
+    result: OwnedRowsQueryResult,
+    materialized_bytes: u64,
+) !row_spill.SpilledRows {
+    return try row_spill.spillJsonRowsAlloc(alloc, result.rows, materialized_bytes, "rows-json-cte");
+}
+
+fn loadRowsJsonSpilledCteAlloc(alloc: std.mem.Allocator, spill: row_spill.SpilledRows) !OwnedRowsQueryResult {
+    const rows = try row_spill.loadJsonRowsAlloc(alloc, spill);
+    errdefer row_spill.freeJsonRows(alloc, rows);
+    const total = std.math.cast(u32, spill.row_count) orelse return error.InvalidRowsRequest;
+    return .{ .rows = rows, .total = total };
 }
 
 fn rowsAggregateSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
@@ -1049,26 +1119,37 @@ fn materializeRowsJsonCtesAlloc(
     for (ctes, 0..) |cte, cte_index| {
         if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.InvalidRowsRequest;
         const source_schema = rowsPlannedQuerySourceSchema(base_schema, planned_ctes[0..cte_index], cte.query) orelse return error.InvalidRowsRequest;
-        var source_rows: []const []const u8 = base_rows;
-        if (cte.query.source_cte.len != 0) {
-            const source_cte = findRowsJsonMaterializedCte(materialized_ctes.items, cte.query.source_cte) orelse return error.InvalidRowsRequest;
-            source_rows = source_cte.result.rows;
-        }
+        var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.items, "cte_source", base_schema, base_rows, cte.query.source_cte)) orelse return error.InvalidRowsRequest;
+        defer source.deinit(alloc);
 
         var query = cte.query;
         query.source_cte = "";
         const source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (cte.query.source_cte.len == 0) ranges else &.{};
-        var result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source_schema, query, source_rows, source_ranges);
+        var result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source_schema, query, source.rows, source_ranges);
         var result_transferred = false;
         errdefer if (!result_transferred) result.deinit(alloc);
         const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedRowsQuery;
-        try db_mod.DB.admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
+        var materialized_rows: RowsJsonMaterializedCteRows = switch (db_mod.types.relationalRowsCteMaterializationDecision(cte, result.rows.len, materialized_bytes)) {
+            .memory => blk: {
+                result_transferred = true;
+                break :blk .{ .memory = result };
+            },
+            .spill => blk: {
+                const spill = try spillRowsJsonCteResultAlloc(alloc, result, materialized_bytes);
+                result.deinit(alloc);
+                result_transferred = true;
+                break :blk .{ .spilled = spill };
+            },
+            .reject => return error.RelationalRowsCteMaterializationRejected,
+        };
+        var materialized_rows_transferred = false;
+        errdefer if (!materialized_rows_transferred) materialized_rows.deinit(alloc);
         try materialized_ctes.append(alloc, .{
             .name = cte.name,
             .schema = rowsSchemaFromPlannedCte(planned_ctes[cte_index]),
-            .result = result,
+            .rows = materialized_rows,
         });
-        result_transferred = true;
+        materialized_rows_transferred = true;
     }
 }
 
@@ -1676,6 +1757,7 @@ fn freeRowsQueryAccessPredicateGroups(alloc: std.mem.Allocator, groups: []const 
         for (group.in_predicates) |predicate| {
             alloc.free(predicate.field);
             alloc.free(predicate.values_json);
+            if (predicate.collation) |collation| alloc.free(collation);
         }
         if (group.in_predicates.len > 0) alloc.free(group.in_predicates);
         for (group.json_contains) |predicate| {
@@ -1731,7 +1813,7 @@ fn parseRowsQueryStreamRequest(
     errdefer if (source_cte.len > 0) alloc.free(source_cte);
 
     const predicates = try parseRowsQueryPredicatesAlloc(alloc, schema, parsed.value.object.get("where"));
-    errdefer freeQueryPredicates(alloc, predicates);
+    errdefer freeOwnedQueryPredicates(alloc, predicates);
 
     const or_predicates = try parseRowsQueryOrPredicateGroupsAlloc(alloc, schema, parsed.value.object.get("where"));
     errdefer freeRowsQueryPredicateGroups(alloc, or_predicates);
@@ -3038,7 +3120,7 @@ pub fn executeRowsQueryOnJsonRowsAlloc(
     var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
     defer candidate_indexes.deinit(alloc);
     if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0) {
-        try appendRowsQueryDistinctOnIndexesAlloc(alloc, candidates.items, request.distinct_on, request.distinct_on_expressions, &candidate_indexes);
+        try appendRowsQueryDistinctOnIndexesAlloc(alloc, candidates.items, schema.relational_columns, request.distinct_on, request.distinct_on_expressions, &candidate_indexes);
     } else {
         try candidate_indexes.ensureUnusedCapacity(alloc, candidates.items.len);
         for (0..candidates.items.len) |i| candidate_indexes.appendAssumeCapacity(i);
@@ -3269,7 +3351,8 @@ pub fn buildRowsQueryResultFromLakeRowsWithSchemaAlloc(
     var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
     defer candidate_indexes.deinit(alloc);
     if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0) {
-        try appendLakeRowsQueryDistinctOnIndexesAlloc(alloc, candidates.items, request.distinct_on, request.distinct_on_expressions, &candidate_indexes);
+        const distinct_columns = if (maybe_schema) |schema| schema.relational_columns else &.{};
+        try appendLakeRowsQueryDistinctOnIndexesAlloc(alloc, candidates.items, distinct_columns, request.distinct_on, request.distinct_on_expressions, &candidate_indexes);
     } else {
         try candidate_indexes.ensureUnusedCapacity(alloc, candidates.items.len);
         for (0..candidates.items.len) |i| candidate_indexes.appendAssumeCapacity(i);
@@ -5832,6 +5915,7 @@ fn singleRowsDocKeyRangeFromRowsAlloc(
 fn appendRowsQueryDistinctOnIndexesAlloc(
     alloc: std.mem.Allocator,
     candidates: []const QueryCandidate,
+    distinct_columns: []const runtime_schema.RelationalColumn,
     distinct_on: []const []const u8,
     distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
     out: *std.ArrayListUnmanaged(usize),
@@ -5844,7 +5928,7 @@ fn appendRowsQueryDistinctOnIndexesAlloc(
     }
 
     for (candidates, 0..) |candidate, i| {
-        const key = try rowsQueryDistinctOnKeyJsonAlloc(alloc, candidate.row_json, distinct_on, distinct_on_expressions);
+        const key = try rowsQueryDistinctOnKeyJsonAlloc(alloc, candidate.row_json, distinct_columns, distinct_on, distinct_on_expressions);
         var key_transferred = false;
         errdefer if (!key_transferred) alloc.free(key);
         if (seen.contains(key)) {
@@ -5864,6 +5948,7 @@ fn appendRowsQueryDistinctOnIndexesAlloc(
 fn rowsQueryDistinctOnKeyJsonAlloc(
     alloc: std.mem.Allocator,
     row_json: []const u8,
+    distinct_columns: []const runtime_schema.RelationalColumn,
     distinct_on: []const []const u8,
     distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
 ) ![]u8 {
@@ -5882,7 +5967,7 @@ fn rowsQueryDistinctOnKeyJsonAlloc(
             wrote_key = true;
             continue;
         };
-        try std.json.Stringify.value(selected.*, .{}, writer);
+        try writeDistinctOnJsonValueWithCollation(alloc, writer, selected.*, distinctFieldCollation(distinct_columns, field));
         wrote_key = true;
     }
     for (distinct_on_expressions) |expression| {
@@ -5899,6 +5984,7 @@ fn rowsQueryDistinctOnKeyJsonAlloc(
 fn appendLakeRowsQueryDistinctOnIndexesAlloc(
     alloc: std.mem.Allocator,
     candidates: []const LakeRowsQueryOrderCandidate,
+    distinct_columns: []const runtime_schema.RelationalColumn,
     distinct_on: []const []const u8,
     distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
     out: *std.ArrayListUnmanaged(usize),
@@ -5911,7 +5997,7 @@ fn appendLakeRowsQueryDistinctOnIndexesAlloc(
     }
 
     for (candidates, 0..) |candidate, i| {
-        const key = try lakeRowsQueryDistinctOnKeyJsonAlloc(alloc, candidate.row, distinct_on, distinct_on_expressions);
+        const key = try lakeRowsQueryDistinctOnKeyJsonAlloc(alloc, candidate.row, distinct_columns, distinct_on, distinct_on_expressions);
         var key_transferred = false;
         errdefer if (!key_transferred) alloc.free(key);
         if (seen.contains(key)) {
@@ -5931,6 +6017,7 @@ fn appendLakeRowsQueryDistinctOnIndexesAlloc(
 fn lakeRowsQueryDistinctOnKeyJsonAlloc(
     alloc: std.mem.Allocator,
     row: lake_rows.ProjectedRow,
+    distinct_columns: []const runtime_schema.RelationalColumn,
     distinct_on: []const []const u8,
     distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
 ) ![]u8 {
@@ -5943,7 +6030,7 @@ fn lakeRowsQueryDistinctOnKeyJsonAlloc(
         if (i > 0) try writer.writeByte(',');
         const maybe_cell = row.find(field);
         if (maybe_cell) |cell| {
-            try writeLakeRowsCellJson(writer, cell.value);
+            try writeLakeRowsCellJsonWithCollation(alloc, writer, cell.value, distinctFieldCollation(distinct_columns, field));
         } else {
             try writer.writeAll("null");
         }
@@ -5958,6 +6045,61 @@ fn lakeRowsQueryDistinctOnKeyJsonAlloc(
     }
     try writer.writeByte(']');
     return try out.toOwnedSlice();
+}
+
+fn distinctFieldCollation(columns: []const runtime_schema.RelationalColumn, field: []const u8) ?[]const u8 {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.path, field) or std.mem.eql(u8, column.name, field)) return column.collation;
+    }
+    return null;
+}
+
+fn writeDistinctOnJsonValueWithCollation(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+    collation: ?[]const u8,
+) !void {
+    if (value == .string) {
+        if (collation) |name| {
+            if (relational_collation.isCaseInsensitive(name)) {
+                const folded = try asciiLowerAlloc(alloc, value.string);
+                defer alloc.free(folded);
+                try writer.print("{f}", .{std.json.fmt(folded, .{})});
+                return;
+            }
+        }
+    }
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeLakeRowsCellJsonWithCollation(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    maybe_value: ?lake_rows.CellValue,
+    collation: ?[]const u8,
+) !void {
+    const value = maybe_value orelse {
+        try writer.writeAll("null");
+        return;
+    };
+    if (value == .bytes) {
+        if (collation) |name| {
+            if (relational_collation.isCaseInsensitive(name)) {
+                const folded = try asciiLowerAlloc(alloc, value.bytes);
+                defer alloc.free(folded);
+                try writer.print("{f}", .{std.json.fmt(folded, .{})});
+                return;
+            }
+        }
+    }
+    try writeLakeRowsCellJson(writer, maybe_value);
+}
+
+fn asciiLowerAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    const folded = try alloc.dupe(u8, value);
+    for (folded) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return folded;
 }
 
 pub fn encodeRowsBatchResponseAlloc(alloc: std.mem.Allocator, req: OwnedRowsBatchRequest) ![]u8 {
@@ -10310,9 +10452,13 @@ fn parseRowsQueryInPredicateAtomAlloc(
     const values_json = try jsonValueStringifyAlloc(alloc, value);
     var values_transferred = false;
     errdefer if (!values_transferred) alloc.free(values_json);
+    const collation = if (column.collation) |source| try alloc.dupe(u8, source) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |owned| alloc.free(owned);
     field_transferred = true;
     values_transferred = true;
-    return .{ .field = field, .values_json = values_json, .negated = negated };
+    collation_transferred = true;
+    return .{ .field = field, .values_json = values_json, .negated = negated, .collation = collation };
 }
 
 fn rowsScalarValueMatches(field_type: runtime_schema.AntflyType, value: std.json.Value) bool {
@@ -10782,7 +10928,7 @@ fn parseRowsQueryPredicateAtomAlloc(
     const op_value = atom.object.get("op") orelse return error.InvalidRowsRequest;
     if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
     if (op_value != .string) return error.InvalidRowsRequest;
-    _ = findRelationalColumn(schema.relational_columns, field_value.string) orelse return error.InvalidRowsRequest;
+    const column = findRelationalColumn(schema.relational_columns, field_value.string) orelse return error.InvalidRowsRequest;
     const op = try parseRowsQueryPredicateOp(op_value.string);
     const value_json: ?[]const u8 = if (rowsQueryPredicateNeedsValue(op)) blk: {
         const value = atom.object.get("value") orelse return error.InvalidRowsRequest;
@@ -10793,11 +10939,15 @@ fn parseRowsQueryPredicateAtomAlloc(
     };
     errdefer if (value_json) |value| alloc.free(value);
     const field = try alloc.dupe(u8, field_value.string);
+    errdefer alloc.free(field);
+    const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (collation) |value| alloc.free(value);
     return .{
         .name = "",
         .field = field,
         .op = op,
         .value_json = value_json,
+        .collation = collation,
     };
 }
 
@@ -11712,9 +11862,9 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         }
     }
     const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands, .cast_type = cast_type, .json_path = json_path, .json_as_text = json_as_text };
-    if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .array_position or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .array_position or expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr or expression_kind == .concat_ws) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_bin) try validateRowsDateBinExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_part) try validateRowsDatePartExpressionWithSources(alloc, schema, source_schema, expression);
@@ -12442,13 +12592,17 @@ fn parseRowsQueryOrderAlloc(
         const field_value = item.object.get("field");
         const expression_value = item.object.get("expr");
         if ((field_value == null) == (expression_value == null)) return error.InvalidRowsRequest;
+        var field_collation: ?[]const u8 = null;
         const field = if (field_value) |value| blk: {
             if (value != .string or value.string.len == 0) return error.InvalidRowsRequest;
-            _ = findRelationalColumn(schema.relational_columns, value.string) orelse return error.InvalidRowsRequest;
+            const column = findRelationalColumn(schema.relational_columns, value.string) orelse return error.InvalidRowsRequest;
+            field_collation = if (column.collation) |collation| try alloc.dupe(u8, collation) else null;
             break :blk try alloc.dupe(u8, value.string);
         } else "";
         var field_transferred = false;
         errdefer if (!field_transferred and field.len > 0) alloc.free(field);
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (field_collation) |collation| alloc.free(collation);
         const expression = if (expression_value) |value| try parseRowsQueryExpressionAlloc(alloc, schema, value) else null;
         var expression_transferred = false;
         errdefer if (!expression_transferred) if (expression) |owned| freeRowsQueryExpression(alloc, owned);
@@ -12469,8 +12623,10 @@ fn parseRowsQueryOrderAlloc(
             .expression = expression,
             .direction = direction,
             .null_test = null_test,
+            .collation = field_collation,
         };
         field_transferred = true;
+        collation_transferred = true;
         expression_transferred = true;
         initialized += 1;
     }
@@ -13188,7 +13344,7 @@ fn writeCanonicalJsonOrderKey(alloc: std.mem.Allocator, writer: *std.Io.Writer, 
 
 fn queryCandidateLessThan(ctx: QuerySortContext, lhs: QueryCandidate, rhs: QueryCandidate) bool {
     for (ctx.order_by, 0..) |order, i| {
-        const comparison = compareQueryOrderKeys(lhs.order_keys[i], rhs.order_keys[i]);
+        const comparison = compareQueryOrderKeysWithCollation(lhs.order_keys[i], rhs.order_keys[i], order.collation);
         if (comparison == .eq) continue;
         return switch (order.direction) {
             .asc => comparison == .lt,
@@ -13199,6 +13355,10 @@ fn queryCandidateLessThan(ctx: QuerySortContext, lhs: QueryCandidate, rhs: Query
 }
 
 fn compareQueryOrderKeys(lhs: QueryOrderKey, rhs: QueryOrderKey) ScalarComparison {
+    return compareQueryOrderKeysWithCollation(lhs, rhs, null);
+}
+
+fn compareQueryOrderKeysWithCollation(lhs: QueryOrderKey, rhs: QueryOrderKey, collation: ?[]const u8) ScalarComparison {
     const left_rank = queryOrderKeyRank(lhs);
     const right_rank = queryOrderKeyRank(rhs);
     if (left_rank != right_rank) return if (left_rank < right_rank) .lt else .gt;
@@ -13215,17 +13375,17 @@ fn compareQueryOrderKeys(lhs: QueryOrderKey, rhs: QueryOrderKey) ScalarCompariso
             if (left > right) break :blk .gt;
             break :blk .eq;
         },
-        .string => |left| switch (std.mem.order(u8, left, rhs.string)) {
-            .lt => .lt,
-            .eq => .eq,
-            .gt => .gt,
-        },
+        .string => |left| compareTextOrderKeys(left, rhs.string, collation),
         .json => |left| switch (std.mem.order(u8, left, rhs.json)) {
             .lt => .lt,
             .eq => .eq,
             .gt => .gt,
         },
     };
+}
+
+fn compareTextOrderKeys(lhs: []const u8, rhs: []const u8, collation: ?[]const u8) ScalarComparison {
+    return scalarComparisonFromTextComparison(relational_collation.compareTextForOrdering(lhs, rhs, collation));
 }
 
 fn queryOrderKeyRank(key: QueryOrderKey) u8 {
@@ -15031,7 +15191,10 @@ fn expressionConditionMatchesWithExplicitSource(
             defer alloc.free(rhs_json);
             var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidRowsRequest;
             defer rhs.deinit();
-            const comparison = compareJsonScalars(lhs.value, rhs.value) orelse return error.InvalidRowsRequest;
+            const comparison = compareJsonScalars(lhs.value, rhs.value) orelse {
+                if (lhs.value == .null or rhs.value == .null) break :blk false;
+                return error.InvalidRowsRequest;
+            };
             break :blk switch (condition.op) {
                 .gt => comparison == .gt,
                 .gte => comparison == .gt or comparison == .eq,
@@ -15253,7 +15416,13 @@ fn freeQueryPredicates(alloc: std.mem.Allocator, predicates: []const runtime_sch
     for (predicates) |predicate| {
         alloc.free(predicate.field);
         if (predicate.value_json) |value_json| alloc.free(value_json);
+        if (predicate.collation) |collation| alloc.free(collation);
     }
+}
+
+fn freeOwnedQueryPredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.RelationalCheck) void {
+    freeQueryPredicates(alloc, predicates);
+    if (predicates.len > 0) alloc.free(predicates);
 }
 
 fn freeRowsQueryPredicateGroups(alloc: std.mem.Allocator, groups: []const db_mod.types.RelationalRowsPredicateGroup) void {
@@ -15325,6 +15494,7 @@ fn freeRowsQueryInPredicatesNoSlice(alloc: std.mem.Allocator, predicates: []cons
     for (predicates) |predicate| {
         alloc.free(predicate.field);
         alloc.free(predicate.values_json);
+        if (predicate.collation) |collation| alloc.free(collation);
     }
 }
 
@@ -15457,6 +15627,7 @@ fn freeRowsQueryOrder(alloc: std.mem.Allocator, orders: []const RowsQueryOrder) 
     for (orders) |order| {
         if (order.field.len > 0) alloc.free(order.field);
         if (order.expression) |expression| freeRowsQueryExpression(alloc, expression);
+        if (order.collation) |collation| alloc.free(collation);
     }
 }
 
@@ -16337,7 +16508,7 @@ fn relationalCheckPasses(
             var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidRowsRequest;
             defer expected.deinit();
             const actual: std.json.Value = if (value) |selected| selected.* else .null;
-            const not_distinct = jsonValuesNotDistinct(actual, expected.value) orelse return error.InvalidRowsRequest;
+            const not_distinct = jsonValuesNotDistinctWithCollation(actual, expected.value, check.collation) orelse return error.InvalidRowsRequest;
             break :blk if (check.op == .is_not_distinct) not_distinct else !not_distinct;
         },
         .eq, .ne, .gt, .gte, .lt, .lte => blk: {
@@ -16345,7 +16516,7 @@ fn relationalCheckPasses(
             var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidRowsRequest;
             defer expected.deinit();
             const actual = value orelse break :blk false;
-            const comparison = compareJsonScalars(actual.*, expected.value) orelse return error.InvalidRowsRequest;
+            const comparison = compareJsonScalarsWithCollation(actual.*, expected.value, check.collation) orelse return error.InvalidRowsRequest;
             break :blk switch (check.op) {
                 .eq => comparison == .eq,
                 .ne => comparison != .eq,
@@ -16362,10 +16533,14 @@ fn relationalCheckPasses(
 const ScalarComparison = enum { lt, eq, gt };
 
 fn jsonValuesNotDistinct(actual: std.json.Value, expected: std.json.Value) ?bool {
+    return jsonValuesNotDistinctWithCollation(actual, expected, null);
+}
+
+fn jsonValuesNotDistinctWithCollation(actual: std.json.Value, expected: std.json.Value, collation: ?[]const u8) ?bool {
     if (jsonScalarKind(actual) != null and jsonScalarKind(expected) != null) {
         if (jsonScalarKind(actual) != jsonScalarKind(expected)) return false;
     }
-    const comparison = compareJsonScalars(actual, expected) orelse return null;
+    const comparison = compareJsonScalarsWithCollation(actual, expected, collation) orelse return null;
     return comparison == .eq;
 }
 
@@ -16382,6 +16557,10 @@ fn jsonScalarKind(value: std.json.Value) ?JsonScalarKind {
 }
 
 fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?ScalarComparison {
+    return compareJsonScalarsWithCollation(actual, expected, null);
+}
+
+fn compareJsonScalarsWithCollation(actual: std.json.Value, expected: std.json.Value, collation: ?[]const u8) ?ScalarComparison {
     if (jsonNumericValue(actual)) |left| {
         const right = jsonNumericValue(expected) orelse return null;
         if (left < right) return .lt;
@@ -16389,12 +16568,7 @@ fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?ScalarC
         return .eq;
     }
     if (actual == .string and expected == .string) {
-        const order = std.mem.order(u8, actual.string, expected.string);
-        return switch (order) {
-            .lt => .lt,
-            .eq => .eq,
-            .gt => .gt,
-        };
+        return compareTextScalars(actual.string, expected.string, collation);
     }
     if (actual == .bool and expected == .bool) {
         if (actual.bool == expected.bool) return .eq;
@@ -16402,6 +16576,18 @@ fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?ScalarC
     }
     if (actual == .null and expected == .null) return .eq;
     return null;
+}
+
+fn compareTextScalars(lhs: []const u8, rhs: []const u8, collation: ?[]const u8) ScalarComparison {
+    return scalarComparisonFromTextComparison(relational_collation.compareTextForScalar(lhs, rhs, collation));
+}
+
+fn scalarComparisonFromTextComparison(comparison: relational_collation.TextComparison) ScalarComparison {
+    return switch (comparison) {
+        .lt => .lt,
+        .eq => .eq,
+        .gt => .gt,
+    };
 }
 
 fn jsonNumericValue(value: std.json.Value) ?f64 {
@@ -17412,7 +17598,7 @@ fn uniqueConstraintValueFromValuesAlloc(
     defer alloc.free(values_json);
     const row_value = db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, values_json, selected_columns) catch return error.InvalidRowsRequest;
     defer alloc.free(row_value);
-    const tuple = (db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, row_value, constraint) catch return error.InvalidRowsRequest) orelse return error.InvalidRowsRequest;
+    const tuple = (db_mod.relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, selected_columns) catch return error.InvalidRowsRequest) orelse return error.InvalidRowsRequest;
     return tuple;
 }
 
@@ -17424,7 +17610,7 @@ fn uniqueConstraintValueFromRowAlloc(
 ) !?[]u8 {
     const row_value = db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, row_json, schema.relational_columns) catch return error.InvalidRowsRequest;
     defer alloc.free(row_value);
-    return (db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, row_value, constraint) catch return error.InvalidRowsRequest);
+    return (db_mod.relational_store.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, schema.relational_columns) catch return error.InvalidRowsRequest);
 }
 
 fn updateTransformOperationsAlloc(
@@ -21633,6 +21819,66 @@ test "relational rows conflict target upsert resolves expression unique owner" {
     try std.testing.expectEqualStrings("\"Digest\"", md5_update_req.transforms[0].operations[0].value_json.?);
 }
 
+test "relational rows conflict target upsert honors unique column collation" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        calls: usize = 0,
+        existing: bool = true,
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings("users_email_key", constraint_name);
+            try std.testing.expect(std.mem.indexOf(u8, encoded_value, "ada@example.test") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded_value, "Ada@Example.Test") == null);
+            self.calls += 1;
+            if (!self.existing) return null;
+            return try std.testing.allocator.dupe(u8, "\x00antfly-rel-pk:existing");
+        }
+    };
+
+    var resolver = Resolver{};
+    var nothing_req = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"email\":\"Ada@Example.Test\",\"name\":\"Noop\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_email_key\"}},\"action\":\"nothing\"}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer nothing_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 0), nothing_req.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), nothing_req.transforms.len);
+
+    resolver.existing = false;
+    resolver.calls = 0;
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"email\":\"Ada@Example.Test\",\"name\":\"First\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_email_key\"}},\"action\":\"update\",\"patch\":{\"name\":\"First\"}}},{\"op\":\"insert\",\"row\":{\"id\":\"u4\",\"email\":\"ada@example.test\",\"name\":\"Second\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_email_key\"}},\"action\":\"update\",\"patch\":{\"name\":\"Second\"}}}]}",
+        schema,
+        resolver.iface(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+}
+
 test "relational rows conflict target upsert rejects unvalidated unique owner" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}],"validation_state":"unvalidated"}]}
@@ -22636,7 +22882,7 @@ test "relational rows query contract filters orders paginates and projects rows"
 
     const response = try encodeRowsQueryResponseAlloc(std.testing.allocator, result);
     defer std.testing.allocator.free(response);
-    try std.testing.expectEqualStrings("{\"total\":3,\"rows\":[{\"id\":\"u1\",\"status\":\"open\",\"created_at\":20},{\"id\":\"u4\",\"status\":\"open\",\"created_at\":10}]}", response);
+    try std.testing.expectEqualStrings("{\"total\":3,\"result_schema\":[],\"rows\":[{\"id\":\"u1\",\"status\":\"open\",\"created_at\":20},{\"id\":\"u4\",\"status\":\"open\",\"created_at\":10}]}", response);
 
     var distinct_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, distinct_request, rows[0..]);
     defer distinct_result.deinit(std.testing.allocator);
@@ -24251,7 +24497,13 @@ test "relational rows cte plan contract executes derived outputs across read sta
         schema,
     );
     defer spill_required_query_plan.deinit(alloc);
-    try std.testing.expectError(error.RelationalRowsCteSpillRequired, executeRowsQueryPlanOnJsonRowsAlloc(alloc, schema, spill_required_query_plan, rows[0..]));
+    var spill_query_result = try executeRowsQueryPlanOnJsonRowsAlloc(alloc, schema, spill_required_query_plan, rows[0..]);
+    defer spill_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), spill_query_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", spill_query_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", spill_query_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", spill_query_result.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", spill_query_result.rows[3]);
 
     var ranged_query_plan = try parseRowsQueryPlanRequest(
         alloc,
@@ -24869,14 +25121,14 @@ test "relational rows query contract rejects shorthand equality and validates ty
 
     var ranged_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"tenant_id\",\"id\"],\"order_by\":[{\"field\":\"id\"}],\"limit\":10}",
+        "{\"select\":[\"id\"],\"order_by\":[{\"field\":\"id\"}],\"limit\":10}",
         schema,
     );
     defer ranged_request.deinit(std.testing.allocator);
     const range_start = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, rows[1]);
     var range_start_transferred = false;
     errdefer if (!range_start_transferred) std.testing.allocator.free(range_start);
-    const range_end = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, "{\"tenant_id\":\"t1\",\"id\":\"u4\",\"status\":\"active\",\"rank\":4}");
+    const range_end = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, "{\"id\":\"d\",\"status\":\"active\",\"rank\":4}");
     var range_end_transferred = false;
     errdefer if (!range_end_transferred) std.testing.allocator.free(range_end);
     ranged_request.doc_key_range = .{ .start = range_start, .end = range_end };
@@ -24885,8 +25137,8 @@ test "relational rows query contract rejects shorthand equality and validates ty
     var ranged_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, ranged_request, rows[0..]);
     defer ranged_result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), ranged_result.total);
-    try std.testing.expectEqualStrings("{\"tenant_id\":\"t1\",\"id\":\"u2\"}", ranged_result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant_id\":\"t1\",\"id\":\"u3\"}", ranged_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", ranged_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", ranged_result.rows[1]);
 
     var cte_request = try parseRowsQueryRequest(
         std.testing.allocator,
@@ -25011,7 +25263,7 @@ test "relational rows query contract projects array lengths" {
 
     var array_to_string_where_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"array_to_string\",\"args\":[{\"field\":\"tags\"},{\"value\":\",\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"hot,new\"}}],\"order_by\":[{\"field\":\"id\"}]}",
+        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"array_to_string\",\"args\":[{\"field\":\"tags\"},{\"value\":\",\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"hot,new,new\"}}],\"order_by\":[{\"field\":\"id\"}]}",
         schema,
     );
     defer array_to_string_where_request.deinit(std.testing.allocator);
@@ -26140,8 +26392,9 @@ test "relational rows query contract projects overlay expressions" {
     };
     var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"patched_label\":\"hYYlo\",\"inserted_label\":\"heXlo\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"patched_label\":\"hZZlo\",\"inserted_label\":\"héXlo\"}", result.rows[1]);
 
     var utf8_request = try parseRowsQueryRequest(
         std.testing.allocator,
@@ -27721,4 +27974,159 @@ test "relational rows api query contract parses typed json filters" {
         "{\"json_extract\":[{\"as\":\"plan\",\"field\":\"attrs\",\"path\":[]}]}",
         schema,
     ));
+}
+
+test "relational rows query order resolves field collation from schema" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\",\"name\"],\"order_by\":[{\"field\":\"name\"}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.order_by.len);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", request.order_by[0].collation.?);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"b\",\"name\":\"Beta\"}",
+        "{\"id\":\"a\",\"name\":\"alpha\"}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name\":\"alpha\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name\":\"Beta\"}", result.rows[1]);
+}
+
+test "relational rows distinct on resolves field collation from schema" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\",\"name\"],\"distinct_on\":[\"name\"],\"order_by\":[{\"field\":\"name\"},{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"b\",\"name\":\"Beta\"}",
+        "{\"id\":\"c\",\"name\":\"beta\"}",
+        "{\"id\":\"a\",\"name\":\"alpha\"}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name\":\"alpha\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name\":\"Beta\"}", result.rows[1]);
+}
+
+test "relational rows scalar predicates resolve field collation from schema" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"where\":{\"field\":\"name\",\"op\":\"eq\",\"value\":\"beta\"}}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.predicates.len);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", request.predicates[0].collation.?);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"b\",\"name\":\"Beta\"}",
+        "{\"id\":\"a\",\"name\":\"alpha\"}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
+}
+
+test "relational rows aggregate array order honors field collation" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"names\",\"op\":\"array_agg\",\"field\":\"name\",\"array_max_items\":8,\"array_order_by\":[{\"field\":\"name\"}]}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), request.aggregations[0].array_order_by.len);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", request.aggregations[0].array_order_by[0].collation.?);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"b\",\"name\":\"Beta\"}",
+        "{\"id\":\"a\",\"name\":\"alpha\"}",
+    };
+    var result = try db_mod.DB.aggregateRelationalRowsFromSourceRowsAlloc(std.testing.allocator, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_groups);
+    try std.testing.expectEqualStrings("{\"names\":[\"alpha\",\"Beta\"]}", result.rows[0]);
+}
+
+test "relational rows aggregate grouping resolves field collation from schema" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "status", .path = "status", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var plan = try parseRowsAggregatePlanRequest(
+        std.testing.allocator,
+        "{\"aggregate\":{\"group_by\":[\"status\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"distinct_status\",\"op\":\"count\",\"field\":\"status\",\"distinct\":true},{\"name\":\"status_min\",\"op\":\"min\",\"field\":\"status\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
+        schema,
+    );
+    defer plan.deinit(std.testing.allocator);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"a\",\"status\":\"Open\",\"amount\":10}",
+        "{\"id\":\"b\",\"status\":\"open\",\"amount\":15}",
+        "{\"id\":\"c\",\"status\":\"Closed\",\"amount\":7}",
+    };
+    var result = try executeRowsAggregatePlanOnJsonRowsAlloc(std.testing.allocator, schema, plan, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"Closed\",\"row_count\":1,\"distinct_status\":1,\"status_min\":\"Closed\",\"amount_sum\":7}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"Open\",\"row_count\":2,\"distinct_status\":1,\"status_min\":\"Open\",\"amount_sum\":25}", result.rows[1]);
 }

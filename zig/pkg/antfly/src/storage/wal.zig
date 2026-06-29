@@ -33,6 +33,7 @@ const backend_types = @import("backend_types.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
 const lmdb_backend = @import("lmdb_backend.zig");
+const platform = @import("antfly_platform");
 const platform_time = @import("../platform/time.zig");
 const lmdb = @import("lmdb.zig");
 const storage_sim = @import("sim_runtime.zig");
@@ -44,8 +45,7 @@ const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
 
 fn lsmOpenDebugLogsEnabled() bool {
-    if (builtin.os.tag == .freestanding) return false;
-    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
 fn nextWalTmpNonce() u64 {
@@ -171,6 +171,17 @@ const StoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+        }
+        self.* = undefined;
+    }
+
+    fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
     }
@@ -388,6 +399,12 @@ pub const WAL = struct {
     pub fn close(self: *WAL) void {
         self.store.deinit();
         self.store_owner.close(std.heap.page_allocator);
+        self.* = undefined;
+    }
+
+    fn abandonAfterModeledCrash(self: *WAL) void {
+        self.store.deinit();
+        self.store_owner.abandonAfterCrash(std.heap.page_allocator);
         self.* = undefined;
     }
 
@@ -922,20 +939,25 @@ pub const WAL = struct {
 fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !StoreOwner {
     return switch (opts.resolvedBackend()) {
         .lmdb => blk: {
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+            if (!opts.read_only) {
+                var io_impl = std.Io.Threaded.init(alloc, .{});
+                defer io_impl.deinit();
+                try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+            }
 
             const backend = try alloc.create(lmdb_backend.Backend);
             errdefer alloc.destroy(backend);
             backend.* = try lmdb_backend.Backend.open(alloc, path, .{
                 .backend = .{
+                    .read_only = opts.read_only,
                     .durability = if (opts.no_sync) .none else .full,
+                    .create_if_missing = !opts.read_only,
                 },
                 .env = .{
                     .max_dbs = 1,
                     .map_size = opts.map_size,
                     .no_sync = opts.no_sync,
+                    .read_only = opts.read_only,
                     .artificial_sync_delay_ns = opts.artificial_sync_delay_ns,
                     .commit_backend = opts.commit_backend,
                 },
@@ -961,7 +983,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
                     },
                 );
             }
-            if (opts.storage == null) {
+            if (opts.storage == null and !opts.read_only) {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
@@ -1336,6 +1358,18 @@ fn verifyWalSimState(
 fn reopenWalSim(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOptions) !void {
     wal.close();
     wal_open.* = false;
+    wal.* = try WAL.open(path, opts);
+    wal_open.* = true;
+}
+
+fn abandonWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool) void {
+    if (!wal_open.*) return;
+    wal.abandonAfterModeledCrash();
+    wal_open.* = false;
+}
+
+fn reopenWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOptions) !void {
+    abandonWalSimAfterModeledCrash(wal, wal_open);
     wal.* = try WAL.open(path, opts);
     wal_open.* = true;
 }
@@ -1821,13 +1855,11 @@ fn replayModeledWalCrashAfterAck(
         &runtime_next_lsn,
     );
     try device_model.device().crash();
+    abandonWalSimAfterModeledCrash(&wal, &wal_open);
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
     try verifyWalSimState(allocator, &reopened, model.items, runtime_next_lsn, 1);
-
-    wal_open = false;
-    wal = undefined;
 }
 
 fn replayModeledWalCrashFixture(
@@ -1894,8 +1926,7 @@ fn replayModeledWalCrashFixture(
     };
 
     try device_model.device().crash();
-    wal_open = false;
-    wal = undefined;
+    abandonWalSimAfterModeledCrash(&wal, &wal_open);
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2528,7 +2559,7 @@ fn runModeledWalSimCase(
     }
 
     try device_model.device().crash();
-    try reopenWalSim(&wal, &wal_open, path, opts);
+    try reopenWalSimAfterModeledCrash(&wal, &wal_open, path, opts);
     try verifyWalSimState(allocator, &wal, model.items, runtime_next_lsn, 1);
 }
 
@@ -2713,6 +2744,7 @@ test "wal modeled storage survives crash before close after acknowledged append"
     var crashed_wal = try WAL.open(path, opts);
     try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed-before-crash"));
     try device_model.device().crash();
+    crashed_wal.abandonAfterModeledCrash();
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2726,8 +2758,6 @@ test "wal modeled storage survives crash before close after acknowledged append"
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 1), entries[0].lsn);
     try std.testing.expectEqualStrings("committed-before-crash", entries[0].data);
-
-    crashed_wal = undefined;
 }
 
 test "wal modeled replay runner uses virtual storage and time" {
@@ -3870,6 +3900,27 @@ test "wal can use lsm backend for append reopen and truncate" {
         try std.testing.expectEqual(@as(u64, 3), entries[0].lsn);
         try std.testing.expectEqualStrings("gamma", entries[0].data);
     }
+}
+
+test "wal read-only lsm backend does not create missing root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path_raw = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-readonly-lsm-missing", .{tmp.sub_path});
+    defer std.testing.allocator.free(path_raw);
+    const path = try std.testing.allocator.dupeZ(u8, path_raw);
+    defer std.testing.allocator.free(path);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
+    var wal = try WAL.open(path, .{
+        .backend = .lsm,
+        .read_only = true,
+    });
+    defer wal.close();
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
 }
 
 test "wal can use in-memory lsm backend without creating durable state" {

@@ -448,6 +448,7 @@ pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
+    read_only: bool = false,
     // Metadata apply traffic is many tiny durable WAL-backed writes. Flushing
     // every commit amplifies manifest churn and makes simulation/runtime costs
     // pathological without improving durability.
@@ -545,15 +546,17 @@ pub const RaftApplyStore = struct {
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
         errdefer alloc.free(root_dir);
-        try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
 
         const path = try std.fmt.allocPrint(alloc, "{s}/metadata-apply-store", .{root_dir});
         errdefer alloc.free(path);
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), path);
 
         var backend = try lsm_backend.BackendHandle.open(alloc, path, .{
             .backend = .{
                 .durability = if (cfg.no_sync) .none else .full,
+                .read_only = cfg.read_only,
+                .create_if_missing = !cfg.read_only,
             },
             .flush_threshold = cfg.flush_threshold,
         });
@@ -3537,6 +3540,21 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.TableEmptyingJobRecord,
     ) !void {
+        if (record.job_id == 0) return error.InvalidTableEmptyingJob;
+        if (record.schema_generation == 0) return error.InvalidTableEmptyingGeneration;
+        if (!metadata_table_manager.tableEmptyingJobStateValid(record.state)) return error.InvalidTableEmptyingJobState;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidTableEmptyingJob;
+        }
+        if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(record.table_id, record.affected_table_ids)) {
+            return error.InvalidTableEmptyingJob;
+        }
+        const table = (try self.loadTableRecordTxn(txn, group_id, record.table_id)) orelse return error.UnknownTable;
+        metadata_table_manager.freeTable(self.alloc, table);
+        for (record.affected_table_ids) |table_id| {
+            const affected = (try self.loadTableRecordTxn(txn, group_id, table_id)) orelse return error.UnknownTable;
+            metadata_table_manager.freeTable(self.alloc, affected);
+        }
         var key_buf: [160]u8 = undefined;
         const key = try tableEmptyingJobKeyForGroup(&key_buf, group_id, record.job_id);
         const value = try encodeTableEmptyingJobRecord(self.alloc, record);
@@ -3620,6 +3638,7 @@ pub const RaftApplyStore = struct {
             if (record.barrier_id != barrier.barrier_id) continue;
             if (record.table_id != table.table_id) continue;
             if (record.group_id != range.group_id) continue;
+            if (record.range_id != 0 and record.range_id != range.range_id) continue;
             if (record.schema_generation != schema_generation) continue;
             if (record.data_generation != table.data_generation) continue;
             if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
@@ -3662,6 +3681,82 @@ pub const RaftApplyStore = struct {
         if (range_count == 0) return error.InvalidTableEmptyingBarrierPromotion;
     }
 
+    fn tableEmptyingIdentityAllocatorResetTargetsTxnAlloc(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+    ) ![]metadata_table_manager.SequenceIdentityAllocatorReset {
+        var manager = metadata_table_manager.TableManager.init(alloc);
+        defer manager.deinit();
+
+        for (request.affected_table_ids) |table_id| {
+            const table = (try self.loadTableRecordTxn(txn, group_id, table_id)) orelse return error.UnknownTable;
+            defer metadata_table_manager.freeTable(self.alloc, table);
+            try manager.upsertTable(table);
+        }
+
+        var range_prefix_buf: [128]u8 = undefined;
+        const range_prefix = try rangePrefixForGroup(&range_prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var range_entry = try cur.seekAtOrAfter(range_prefix);
+        while (range_entry) |kv| : (range_entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, range_prefix)) break;
+            const range = try decodeRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (!tableEmptyingPromotionAffectedTablesContain(request.affected_table_ids, range.table_id)) continue;
+            try manager.upsertRange(range);
+        }
+
+        for (request.job_ids) |job_id| {
+            const record = (try self.loadTableEmptyingJobTxn(txn, group_id, job_id)) orelse return error.UnknownTableEmptyingJob;
+            defer metadata_table_manager.freeTableEmptyingJob(self.alloc, record);
+            try manager.upsertTableEmptyingJob(record);
+        }
+
+        var sequence_prefix_buf: [128]u8 = undefined;
+        const sequence_prefix = try sequencePrefixForGroup(&sequence_prefix_buf, group_id);
+        var sequence_entry = try cur.seekAtOrAfter(sequence_prefix);
+        while (sequence_entry) |kv| : (sequence_entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, sequence_prefix)) break;
+            const sequence = try decodeSequenceRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeSequence(self.alloc, sequence);
+            try manager.upsertSequence(sequence);
+        }
+
+        return try manager.tableEmptyingIdentityAllocatorResetTargetsAlloc(alloc, request);
+    }
+
+    fn resetIdentityAllocatorsForTableEmptyingBarrierTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+    ) !void {
+        const targets = try self.tableEmptyingIdentityAllocatorResetTargetsTxnAlloc(self.alloc, txn, group_id, request);
+        defer self.alloc.free(targets);
+
+        for (targets) |target| {
+            var key_buf: [160]u8 = undefined;
+            const key = try sequenceKeyForGroup(&key_buf, group_id, target.sequence_id);
+            const encoded = txn.get(key) catch |err| switch (err) {
+                error.NotFound => return error.SequenceNotFound,
+                else => return err,
+            };
+            var current = try decodeSequenceRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeSequence(self.alloc, current);
+            if (current.last_value == target.reset_last_value and current.last_allocation_id == 0) continue;
+            current.last_value = target.reset_last_value;
+            current.last_allocation_id = 0;
+            const value = try encodeSequenceRecord(self.alloc, current);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+    }
+
     fn applyTableEmptyingBarrierPromotionTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3673,6 +3768,7 @@ pub const RaftApplyStore = struct {
         const first_record = (try self.loadTableEmptyingJobTxn(txn, group_id, request.job_ids[0])) orelse return error.UnknownTableEmptyingJob;
         defer metadata_table_manager.freeTableEmptyingJob(self.alloc, first_record);
         if (first_record.barrier_id == 0 or first_record.affected_table_ids.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+        if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(first_record.table_id, first_record.affected_table_ids)) return error.InvalidTableEmptyingBarrierPromotion;
         if (request.promotions.len != first_record.affected_table_ids.len) return error.InvalidTableEmptyingBarrierPromotion;
 
         for (request.job_ids, 0..) |job_id, i| {
@@ -3713,6 +3809,15 @@ pub const RaftApplyStore = struct {
             }
             if (!has_promotion) return error.InvalidTableEmptyingBarrierPromotion;
             try self.validateCompleteTableEmptyingBarrierTableTxn(txn, group_id, first_record, request.job_ids, table_id);
+        }
+
+        if (first_record.restart_identity) {
+            try self.resetIdentityAllocatorsForTableEmptyingBarrierTxn(txn, group_id, .{
+                .barrier_id = first_record.barrier_id,
+                .affected_table_ids = first_record.affected_table_ids,
+                .job_ids = request.job_ids,
+                .cascade = first_record.cascade,
+            });
         }
 
         for (request.promotions) |promotion| {
@@ -9719,6 +9824,115 @@ test "metadata raft apply store persists table emptying jobs across reopen" {
     try std.testing.expect(saw_ready and saw_invalid);
 }
 
+test "metadata raft apply store rejects noncanonical table emptying affected tables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-noncanonical", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9201,
+            .table_id = 41,
+            .group_id = 9001,
+            .schema_generation = 42,
+            .data_generation = 7,
+            .barrier_id = 7007,
+            .affected_table_ids = &.{ 42, 41 },
+        },
+    });
+    defer std.testing.allocator.free(empty_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = empty_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidTableEmptyingJob, store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 1,
+        .entries_bytes = encoded_entries,
+    }));
+}
+
+test "metadata raft apply store rejects malformed table emptying jobs before storage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-unknown-table", .{tmp.sub_path});
+        defer std.testing.allocator.free(root);
+
+        const empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+            .upsert_table_emptying_job = .{
+                .job_id = 9201,
+                .table_id = 41,
+                .group_id = 9001,
+                .schema_generation = 42,
+                .data_generation = 7,
+                .barrier_id = 7007,
+                .affected_table_ids = &.{41},
+            },
+        });
+        defer std.testing.allocator.free(empty_cmd);
+        const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = empty_cmd },
+        });
+        defer std.testing.allocator.free(encoded_entries);
+
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try std.testing.expectError(error.UnknownTable, store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 1,
+            .entries_bytes = encoded_entries,
+        }));
+    }
+
+    {
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-invalid-state", .{tmp.sub_path});
+        defer std.testing.allocator.free(root);
+
+        const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+            .upsert_table = .{
+                .table_id = 41,
+                .name = "orders",
+                .schema_json = "{\"type\":\"object\"}",
+            },
+        });
+        defer std.testing.allocator.free(table_cmd);
+        const empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+            .upsert_table_emptying_job = .{
+                .job_id = 9201,
+                .table_id = 41,
+                .group_id = 9001,
+                .schema_generation = 42,
+                .data_generation = 7,
+                .barrier_id = 7007,
+                .affected_table_ids = &.{41},
+                .state = "queued",
+            },
+        });
+        defer std.testing.allocator.free(empty_cmd);
+        const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = empty_cmd },
+        });
+        defer std.testing.allocator.free(encoded_entries);
+
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try std.testing.expectError(error.InvalidTableEmptyingJobState, store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 2,
+            .entries_bytes = encoded_entries,
+        }));
+    }
+}
+
 test "metadata raft apply store promotes table emptying barriers atomically" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9799,6 +10013,113 @@ test "metadata raft apply store promotes table emptying barriers atomically" {
     try std.testing.expectEqual(@as(usize, 0), jobs.len);
 }
 
+test "metadata raft apply store promotes restart identity barrier atomically resets sequences" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-restart-identity-promotion", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+    const sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_id_seq");
+    const sequence_options_json = "{\"start_with\":10,\"increment_by\":5}";
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "usage_records",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .schema_json = schema_json,
+            .data_generation = 3,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 41,
+            .start_key = "",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(range_cmd);
+    const sequence_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_sequence = .{
+            .sequence_id = sequence_id,
+            .name = "usage_id_seq",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .options_json = sequence_options_json,
+            .last_value = 5,
+            .last_allocation_id = 1234,
+        },
+    });
+    defer std.testing.allocator.free(sequence_cmd);
+    const empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9201,
+            .table_id = 41,
+            .group_id = 9001,
+            .range_id = 9101,
+            .schema_generation = schema_generation,
+            .data_generation = 3,
+            .barrier_id = 7007,
+            .start_row_key = "",
+            .end_row_key = null,
+            .affected_table_ids = &.{41},
+            .restart_identity = true,
+            .state = metadata_table_manager.table_emptying_ready,
+        },
+    });
+    defer std.testing.allocator.free(empty_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .promote_table_emptying_barrier = .{
+            .job_ids = &.{9201},
+            .promotions = &.{.{ .table_id = 41, .target_generation = 4 }},
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = sequence_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = empty_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 41,
+            .commit_index = 5,
+            .entries_bytes = encoded_entries,
+        });
+    }
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer reopened.deinit();
+    const tables = try reopened.listTables(std.testing.allocator, 41);
+    defer reopened.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqual(@as(u64, 4), tables[0].data_generation);
+
+    const sequences = try reopened.listSequences(std.testing.allocator, 41);
+    defer reopened.freeSequences(std.testing.allocator, sequences);
+    try std.testing.expectEqual(@as(usize, 1), sequences.len);
+    try std.testing.expectEqual(@as(i64, 5), sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), sequences[0].last_allocation_id);
+
+    const jobs = try reopened.listTableEmptyingJobs(std.testing.allocator, 41);
+    defer reopened.freeTableEmptyingJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 0), jobs.len);
+}
+
 test "metadata raft apply store rejects incomplete table emptying barrier promotion" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9873,6 +10194,74 @@ test "metadata raft apply store rejects incomplete table emptying barrier promot
     try std.testing.expectError(error.InvalidTableEmptyingBarrierPromotion, store.snapshotBuilder().applyBatch(.{
         .group_id = 41,
         .commit_index = 5,
+        .entries_bytes = encoded_entries,
+    }));
+}
+
+test "metadata raft apply store rejects stale range id table emptying barrier promotion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-emptying-stale-range-id-promotion", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const schema_json = "{\"type\":\"object\"}";
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = schema_json,
+            .data_generation = 3,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = 9001,
+            .range_id = 9102,
+            .table_id = 41,
+            .start_key = "",
+            .end_key = null,
+        },
+    });
+    defer std.testing.allocator.free(range_cmd);
+    const stale_range_empty_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table_emptying_job = .{
+            .job_id = 9201,
+            .table_id = 41,
+            .group_id = 9001,
+            .range_id = 9101,
+            .schema_generation = schema_generation,
+            .data_generation = 3,
+            .barrier_id = 7007,
+            .start_row_key = "",
+            .end_row_key = null,
+            .affected_table_ids = &.{41},
+            .state = metadata_table_manager.table_emptying_ready,
+        },
+    });
+    defer std.testing.allocator.free(stale_range_empty_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .promote_table_emptying_barrier = .{
+            .job_ids = &.{9201},
+            .promotions = &.{.{ .table_id = 41, .target_generation = 4 }},
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = stale_range_empty_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidTableEmptyingBarrierPromotion, store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 4,
         .entries_bytes = encoded_entries,
     }));
 }

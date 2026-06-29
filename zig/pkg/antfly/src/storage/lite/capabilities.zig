@@ -74,7 +74,7 @@ pub const Capabilities = struct {
         tables: bool = true,
         closed_schema_validation: bool = true,
         local_schema_rewrite_jobs: bool = true,
-        portable_backup: bool = false,
+        portable_backup: bool = true,
         transactions: []const u8 = "local",
     };
 

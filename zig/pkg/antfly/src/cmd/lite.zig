@@ -436,8 +436,8 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    try portable_backup.exportPortable(allocator, lite.db.core.store, &out);
-    try portable_backup.validatePortable(allocator, out.items);
+    try portable_backup.exportPortableDb(allocator, &lite.db, &out);
+    try portable_backup.validatePortableDb(allocator, out.items);
     try writeFileAtomically(allocator, io, out_path, out.items);
 
     cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
@@ -638,7 +638,7 @@ fn publishRestoreFromSourceFileLocked(
 
     const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
     defer allocator.free(body);
-    try portable_backup.validatePortable(allocator, body);
+    try portable_backup.validatePortableDb(allocator, body);
 
     const tmp_path = try restoreTempPathAlloc(allocator, out_path);
     defer allocator.free(tmp_path);
@@ -2013,7 +2013,7 @@ test "lite backup command exports stable data while writer has open transaction"
 
     const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(body);
-    try portable_backup.validatePortable(allocator, body);
+    try portable_backup.validatePortableDb(allocator, body);
 
     try restoreFromSourceFile(allocator, io, backup_path, restored_path, false);
 
@@ -2027,6 +2027,55 @@ test "lite backup command exports stable data while writer has open transaction"
     const pending_lookup = try lookupJson(allocator, &restored.db, "doc:backup-pending", "");
     defer allocator.free(pending_lookup);
     try std.testing.expect(std.mem.indexOf(u8, pending_lookup, "\"found\":false") != null);
+}
+
+test "lite backup command round trips relational stores through portable output" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-relational.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-relational.afb", .{tmp.sub_path});
+    defer allocator.free(backup_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-relational-restored.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    defer allocator.free(backup_path_z);
+
+    {
+        var lite = try LiteDb.create(allocator, path, true);
+        defer lite.close();
+
+        try lite.db.setSchemaJson(allocator,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"keyword"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        );
+        try lite.db.batch(.{ .writes = &.{.{ .key = "row:lite", .value = "{\"id\":\"row:lite\",\"title\":\"portable\"}" }} });
+    }
+
+    const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try backup(allocator, io, &args);
+    try std.testing.expect(pathExists(io, backup_path));
+
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
+    defer allocator.free(body);
+    try portable_backup.validatePortableDb(allocator, body);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, portable_backup.validatePortable(allocator, body));
+
+    try restoreFromSourceFile(allocator, io, backup_path, restored_path, false);
+    var restored = try LiteDb.open(allocator, restored_path, .query_readonly);
+    defer restored.close();
+    var row = (try restored.db.lookup(allocator, "row:lite", .{})) orelse return error.TestExpectedEqual;
+    defer row.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, row.json, "\"title\":\"portable\"") != null);
 }
 
 test "lite export subcommand dispatches portable backup alias" {
@@ -2067,7 +2116,7 @@ test "lite export subcommand dispatches portable backup alias" {
 
     const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(body);
-    try portable_backup.validatePortable(allocator, body);
+    try portable_backup.validatePortableDb(allocator, body);
 
     try restoreFromSourceFile(allocator, io, backup_path, restored_path, false);
 

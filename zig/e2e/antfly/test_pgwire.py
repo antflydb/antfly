@@ -44,6 +44,10 @@ from conftest import (
 PG_BOOL_OID = 16
 PG_INT4_OID = 23
 PG_TEXT_OID = 25
+PG_BOOL_ARRAY_OID = 1000
+PG_TEXT_ARRAY_OID = 1009
+PG_TIMESTAMPTZ_ARRAY_OID = 1185
+PG_NUMERIC_ARRAY_OID = 1231
 PG_TIMESTAMPTZ_OID = 1184
 PG_NUMERIC_OID = 1700
 PG_JSONB_OID = 3802
@@ -583,7 +587,11 @@ def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
             "amount numeric, "
             "active boolean, "
             "created_at timestamptz, "
-            "attrs jsonb"
+            "attrs jsonb, "
+            "tags text[], "
+            "amounts numeric[], "
+            "flags boolean[], "
+            "timestamps timestamptz[]"
             ");",
         )
         _pgwire_simple_query(
@@ -591,14 +599,24 @@ def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
             f"INSERT INTO {table} (id, amount, active, created_at, attrs) "
             "VALUES ('row:typed', 12.5, true, '2026-06-25T12:34:56Z', '{\"tier\":\"gold\"}'::jsonb);",
         )
-        messages = _pgwire_simple_query(sock, f"SELECT id, amount, active, created_at, attrs FROM {table} WHERE id = 'row:typed';")
+        messages = _pgwire_simple_query(sock, f"SELECT id, amount, active, created_at, attrs, tags, amounts, flags, timestamps FROM {table} WHERE id = 'row:typed';")
 
     column_messages = [message for message in messages if message["type"] == "columns"]
     assert column_messages == [
         {
             "type": "columns",
-            "columns": ["id", "amount", "active", "created_at", "attrs"],
-            "oids": [PG_TEXT_OID, PG_NUMERIC_OID, PG_BOOL_OID, PG_TIMESTAMPTZ_OID, PG_JSONB_OID],
+            "columns": ["id", "amount", "active", "created_at", "attrs", "tags", "amounts", "flags", "timestamps"],
+            "oids": [
+                PG_TEXT_OID,
+                PG_NUMERIC_OID,
+                PG_BOOL_OID,
+                PG_TIMESTAMPTZ_OID,
+                PG_JSONB_OID,
+                PG_TEXT_ARRAY_OID,
+                PG_NUMERIC_ARRAY_OID,
+                PG_BOOL_ARRAY_OID,
+                PG_TIMESTAMPTZ_ARRAY_OID,
+            ],
         }
     ]
     rows = [message["values"] for message in messages if message["type"] == "row"]
@@ -606,6 +624,7 @@ def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
     assert rows[0][0:3] == ["row:typed", "12.5", "true"]
     assert rows[0][3].startswith("2026-06-25T12:34:56")
     assert json.loads(rows[0][4]) == {"tier": "gold"}
+    assert rows[0][5:] == [None, None, None, None]
 
 
 def test_pgwire_returning_row_description_uses_relational_type_oids(pgwire_server):

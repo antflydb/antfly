@@ -1002,7 +1002,6 @@ fn validateDerivedIndexFieldRefJson(schema: runtime_schema_mod.TableSchema, valu
 
 fn validateOptionalDerivedIndexFieldRefJson(schema: runtime_schema_mod.TableSchema, value: std.json.Value) !void {
     if (value != .string) return error.InvalidTableIndexMetadata;
-    if (std.mem.indexOfScalar(u8, value.string, '.') == null) return;
     try validateDerivedIndexFieldRef(schema, value.string);
 }
 
@@ -2364,6 +2363,7 @@ fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_sch
         stringSlicesEqual(a.columns, b.columns) and
         uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
         stringSlicesEqual(a.include_columns, b.include_columns) and
+        runtime_schema_mod.relationalIndexKeySlicesEqual(a.index_keys, b.index_keys) and
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
         a.nulls_not_distinct == b.nulls_not_distinct and
         a.deferrable == b.deferrable and
@@ -5328,8 +5328,11 @@ test "public algebraic index definitions cannot declare internal materialization
 test "derived index field refs validate against relational and embedded json schema" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"embedding":{"type":"embedding"},"source_doc":{"type":"keyword"},"target_doc":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"},"source":{"type":"keyword"},"target":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"}},"additionalProperties":true}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}}
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"embedding":{"type":"embedding"},"source_doc":{"type":"keyword"},"target_doc":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"},"source":{"type":"keyword"},"target":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
 
     try validateDerivedIndexFieldRefsForSchemaAlloc(
         alloc,

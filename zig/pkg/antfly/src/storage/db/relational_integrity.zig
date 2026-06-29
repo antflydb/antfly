@@ -1088,7 +1088,7 @@ pub fn Impl(comptime DB: type) type {
                     if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
                     for (runtime_schema.foreign_keys) |foreign_key| {
                         if (!foreignKeyNeedsRestrictConflictKey(foreign_key)) continue;
-                        const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
+                        const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema, foreign_key, write.value)) orelse continue;
                         defer self.alloc.free(parent_key);
                         try appendForeignKeyConflictIntent(self.alloc, intents, owned_keys, foreign_key.name, foreign_key.parent_table, parent_key);
                     }
@@ -1185,7 +1185,7 @@ pub fn Impl(comptime DB: type) type {
                 if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
                 for (runtime_schema.foreign_keys) |foreign_key| {
                     if (foreign_key.validation_state != .enforced) continue;
-                    const parent_key = try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value);
+                    const parent_key = try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema, foreign_key, write.value);
                     defer if (parent_key) |value| self.alloc.free(value);
                 }
             }
@@ -1375,7 +1375,7 @@ pub fn Impl(comptime DB: type) type {
                 if (foreign_key.validation_state != .enforced or effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides) != .deferred) continue;
                 for (writes) |write| {
                     if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
-                    const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
+                    const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema, foreign_key, write.value)) orelse continue;
                     defer self.alloc.free(parent_key);
                     var child_period_bounds = try foreignKeyChildPeriodBoundsFromJsonAlloc(self.alloc, runtime_schema, foreign_key, write.value);
                     defer child_period_bounds.deinit(self.alloc);
@@ -1472,7 +1472,7 @@ pub fn Impl(comptime DB: type) type {
 
                 for (writes) |write| {
                     if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
-                    if (try foreignKeyWriteReferencesParent(self.alloc, runtime_schema.relational_columns, foreign_key, write.value, check.parent_key)) return error.ForeignKeyViolation;
+                    if (try foreignKeyWriteReferencesParent(self.alloc, runtime_schema, foreign_key, write.value, check.parent_key)) return error.ForeignKeyViolation;
                 }
                 for (ref_writes) |mutation| {
                     if (foreignKeyRefMutationMatchesParentDeleteCheck(mutation, check)) return error.ForeignKeyViolation;
@@ -1491,7 +1491,7 @@ pub fn Impl(comptime DB: type) type {
                     if (containsString(deletes, decoded.child_key)) continue;
                     if (containsForeignKeyRefDelete(ref_deletes, decoded, check)) continue;
                     if (findTransactionWrite(writes, decoded.child_key)) |write| {
-                        if (!try foreignKeyWriteReferencesParent(self.alloc, runtime_schema.relational_columns, foreign_key, write.value, check.parent_key)) continue;
+                        if (!try foreignKeyWriteReferencesParent(self.alloc, runtime_schema, foreign_key, write.value, check.parent_key)) continue;
                     }
                     return error.ForeignKeyViolation;
                 }
@@ -1527,25 +1527,25 @@ pub fn Impl(comptime DB: type) type {
 
         fn foreignKeyWriteReferencesParent(
             alloc: Allocator,
-            relational_columns: []const schema_mod.RelationalColumn,
+            runtime_schema: schema_mod.TableSchema,
             foreign_key: schema_mod.ForeignKey,
             value: []const u8,
             parent_key: []const u8,
         ) !bool {
-            const actual_parent_key = (try foreignKeyParentKeyFromJsonAlloc(alloc, relational_columns, foreign_key, value)) orelse return false;
+            const actual_parent_key = (try foreignKeyParentKeyFromJsonAlloc(alloc, runtime_schema, foreign_key, value)) orelse return false;
             defer alloc.free(actual_parent_key);
             return std.mem.eql(u8, actual_parent_key, parent_key);
         }
 
         fn foreignKeyParentKeyFromJsonAlloc(
             alloc: Allocator,
-            relational_columns: []const schema_mod.RelationalColumn,
+            runtime_schema: schema_mod.TableSchema,
             foreign_key: schema_mod.ForeignKey,
             value: []const u8,
         ) !?[]u8 {
-            const row = try mapper.buildRelationalRowValueAlloc(alloc, value, relational_columns);
+            const row = try mapper.buildRelationalRowValueAlloc(alloc, value, runtime_schema.relational_columns);
             defer alloc.free(row);
-            return try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, row, foreign_key);
+            return try relational_store_mod.foreignKeyReferenceValueWithColumnsAlloc(alloc, row, foreign_key, runtime_schema.primary_key, runtime_schema.relational_columns);
         }
 
         const ForeignKeyChildPeriodJsonBounds = struct {

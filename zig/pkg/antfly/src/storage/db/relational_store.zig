@@ -26,6 +26,7 @@ const docstore_mod = @import("../docstore.zig");
 const doc_set = @import("doc_set.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+const relational_collation = @import("relational_collation.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const regex_mod = @import("antfly_regex");
 const schema_mod = @import("../schema.zig");
@@ -100,6 +101,18 @@ pub fn predicatesImplyUniqueWhere(
     return true;
 }
 
+pub fn predicatesImplyUniqueWhereWithColumns(
+    alloc: Allocator,
+    predicates: []const schema_mod.RelationalCheck,
+    where_predicates: []const schema_mod.UniquePredicate,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
+    for (where_predicates) |where_predicate| {
+        if (!(try predicatesImplyUniquePredicateWithColumns(alloc, predicates, where_predicate, columns))) return false;
+    }
+    return true;
+}
+
 fn predicatesImplyUniquePredicate(
     predicates: []const schema_mod.RelationalCheck,
     where_predicate: schema_mod.UniquePredicate,
@@ -108,9 +121,29 @@ fn predicatesImplyUniquePredicate(
         if (!std.mem.eql(u8, predicate.field, where_predicate.field)) continue;
         switch (where_predicate.op) {
             .is_null => if (predicate.op == .is_null) return true,
-            .is_not_null => if (predicate.op == .is_not_null or (predicate.op == .eq and predicate.value_json != null and !std.mem.eql(u8, predicate.value_json.?, "null"))) return true,
+            .is_not_null => if (predicate.op == .is_not_null or (predicate.op == .eq and predicate.value_json != null and jsonTextIsNonNull(predicate.value_json.?))) return true,
             .eq => if (predicate.op == .eq and optionalJsonTextEqual(predicate.value_json, where_predicate.value_json)) return true,
             .ne => if (predicate.op == .ne and optionalJsonTextEqual(predicate.value_json, where_predicate.value_json)) return true,
+        }
+    }
+    return false;
+}
+
+fn predicatesImplyUniquePredicateWithColumns(
+    alloc: Allocator,
+    predicates: []const schema_mod.RelationalCheck,
+    where_predicate: schema_mod.UniquePredicate,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
+    const column = findRelationalColumn(columns, where_predicate.field);
+    const collation = if (column) |resolved| resolved.collation else null;
+    for (predicates) |predicate| {
+        if (!std.mem.eql(u8, predicate.field, where_predicate.field)) continue;
+        switch (where_predicate.op) {
+            .is_null => if (predicate.op == .is_null) return true,
+            .is_not_null => if (predicate.op == .is_not_null or (predicate.op == .eq and predicate.value_json != null and (try jsonTextIsNonNullAlloc(alloc, predicate.value_json.?)))) return true,
+            .eq => if (predicate.op == .eq and (try optionalJsonTextEqualWithCollation(alloc, predicate.value_json, where_predicate.value_json, collation))) return true,
+            .ne => if (predicate.op == .ne and (try optionalJsonTextEqualWithCollation(alloc, predicate.value_json, where_predicate.value_json, collation))) return true,
         }
     }
     return false;
@@ -120,6 +153,31 @@ fn optionalJsonTextEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn jsonTextIsNonNull(raw: []const u8) bool {
+    return !std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "null");
+}
+
+fn jsonTextIsNonNullAlloc(alloc: Allocator, raw: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value != .null;
+}
+
+fn optionalJsonTextEqualWithCollation(alloc: Allocator, a: ?[]const u8, b: ?[]const u8, collation: ?[]const u8) !bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    if (collation) |name| {
+        if (relational_collation.isCaseInsensitive(name)) {
+            var parsed_a = std.json.parseFromSlice(std.json.Value, alloc, a.?, .{}) catch return false;
+            defer parsed_a.deinit();
+            var parsed_b = std.json.parseFromSlice(std.json.Value, alloc, b.?, .{}) catch return false;
+            defer parsed_b.deinit();
+            if (parsed_a.value == .string and parsed_b.value == .string) return std.ascii.eqlIgnoreCase(parsed_a.value.string, parsed_b.value.string);
+        }
+    }
+    return optionalJsonTextEqual(a, b);
 }
 
 pub const relational_identity_rewrite_intent_key_prefix = "\x00\x00__metadata__:txn_rel_identity_rewrite:";
@@ -1086,8 +1144,8 @@ pub const ColumnIndexPolicy = struct {
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (!column.indexed) return false;
-            if (column.index_where.len != 0 and !(try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where))) return false;
-            if (column.index_where_expressions.len != 0 and !(try rowMatchesExpressionConditions(alloc, row_value, column.index_where_expressions))) return false;
+            if (column.index_where.len != 0 and !(try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where, self.columns))) return false;
+            if (column.index_where_expressions.len != 0 and !(try rowMatchesExpressionConditionsWithColumns(alloc, row_value, column.index_where_expressions, self.columns))) return false;
             return true;
         }
         return false;
@@ -1260,6 +1318,14 @@ pub const WriteParticipant = struct {
         self.relational_columns = relational_columns;
     }
 
+    fn uniqueConstraintTupleValueForRowAlloc(
+        self: *const WriteParticipant,
+        row_value: []const u8,
+        constraint: schema_mod.UniqueConstraint,
+    ) !?[]u8 {
+        return try uniqueConstraintTupleValueWithColumnsAlloc(self.alloc, row_value, constraint, self.relational_columns);
+    }
+
     pub fn prepareUpsert(
         self: *WriteParticipant,
         table: []const u8,
@@ -1400,9 +1466,9 @@ pub const WriteParticipant = struct {
                 try self.prepareTemporalUniqueConstraintUpsert(constraint, doc_key, old_row, new_row, final_state_deleted);
                 continue;
             }
-            const old_value = if (old_row) |row| try uniqueConstraintTupleValueAlloc(self.alloc, row, constraint) else null;
+            const old_value = if (old_row) |row| try self.uniqueConstraintTupleValueForRowAlloc(row, constraint) else null;
             defer if (old_value) |value| self.alloc.free(value);
-            const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
+            const new_value = if (final_state_deleted) null else try self.uniqueConstraintTupleValueForRowAlloc(new_row, constraint);
             defer if (new_value) |value| self.alloc.free(value);
             if (optionalBytesEqual(old_value, new_value)) continue;
             var new_value_written = false;
@@ -1500,9 +1566,9 @@ pub const WriteParticipant = struct {
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
             if (constraint.without_overlaps_period != null) return error.UnsupportedOperation;
-            const old_value = try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint);
+            const old_value = try self.uniqueConstraintTupleValueForRowAlloc(old_row, constraint);
             defer if (old_value) |value| self.alloc.free(value);
-            const new_value = try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
+            const new_value = try self.uniqueConstraintTupleValueForRowAlloc(new_row, constraint);
             defer if (new_value) |value| self.alloc.free(value);
             if (old_value == null and new_value == null) continue;
             if (old_value == null) {
@@ -1550,7 +1616,7 @@ pub const WriteParticipant = struct {
         defer self.alloc.free(old_row);
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
-            const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
+            const value = (try self.uniqueConstraintTupleValueForRowAlloc(old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             if (constraint.without_overlaps_period) |period_name| {
                 const span = try self.periodSpanForRow(old_row, period_name);
@@ -1599,10 +1665,10 @@ pub const WriteParticipant = struct {
         final_state_deleted: bool,
     ) !void {
         const period_name = constraint.without_overlaps_period orelse return;
-        const old_value = if (old_row) |row| try uniqueConstraintTupleValueAlloc(self.alloc, row, constraint) else null;
+        const old_value = if (old_row) |row| try self.uniqueConstraintTupleValueForRowAlloc(row, constraint) else null;
         defer if (old_value) |value| self.alloc.free(value);
         const old_span = if (old_row != null and old_value != null) try self.periodSpanForRow(old_row.?, period_name) else null;
-        const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
+        const new_value = if (final_state_deleted) null else try self.uniqueConstraintTupleValueForRowAlloc(new_row, constraint);
         defer if (new_value) |value| self.alloc.free(value);
         const new_span = if (new_value != null) try self.periodSpanForRow(new_row, period_name) else null;
         if (optionalBytesEqual(old_value, new_value) and optionalPeriodSpanEqual(old_span, new_span)) return;
@@ -1843,7 +1909,7 @@ pub const WriteParticipant = struct {
         }
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
-            const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
+            const value = (try self.uniqueConstraintTupleValueForRowAlloc(old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.applySetNullUniqueForeignKeyRefs(constraint, value);
         }
@@ -1855,7 +1921,7 @@ pub const WriteParticipant = struct {
         }
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
-            const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
+            const value = (try self.uniqueConstraintTupleValueForRowAlloc(old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.applyCascadeUniqueForeignKeyRefs(constraint, value);
         }
@@ -1867,7 +1933,7 @@ pub const WriteParticipant = struct {
         }
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
-            const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
+            const value = (try self.uniqueConstraintTupleValueForRowAlloc(old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.requireNoRestrictingUniqueForeignKeyRefs(constraint, value);
         }
@@ -2561,7 +2627,7 @@ pub const WriteParticipant = struct {
     }
 
     fn foreignKeyReferenceValueAlloc(self: *const WriteParticipant, row_value: []const u8, foreign_key: schema_mod.ForeignKey) !?[]u8 {
-        return try foreignKeyReferenceValueWithPrimaryKeyAlloc(self.alloc, row_value, foreign_key, self.primary_key);
+        return try foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(self.alloc, row_value, foreign_key, self.primary_key, self.relational_columns);
     }
 };
 
@@ -2733,15 +2799,35 @@ pub fn foreignKeyReferenceValueAlloc(alloc: Allocator, row_value: []const u8, fo
     return try foreignKeyReferenceValueWithPrimaryKeyAlloc(alloc, row_value, foreign_key, null);
 }
 
+pub fn foreignKeyReferenceValueWithColumnsAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+    primary_key: ?schema_mod.PrimaryKey,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
+    return try foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(alloc, row_value, foreign_key, primary_key, columns);
+}
+
 fn foreignKeyReferenceValueWithPrimaryKeyAlloc(
     alloc: Allocator,
     row_value: []const u8,
     foreign_key: schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
 ) !?[]u8 {
+    return try foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(alloc, row_value, foreign_key, primary_key, &.{});
+}
+
+fn foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+    primary_key: ?schema_mod.PrimaryKey,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
     if (!foreignKeyReferencesPrimaryKey(foreign_key)) {
         const parent_is_primary_key = if (primary_key) |key| stringSlicesEqual(key.columns, foreign_key.parent_columns) else false;
-        return try foreignKeyCompositeReferenceValueAlloc(alloc, row_value, foreign_key, parent_is_primary_key);
+        return try foreignKeyCompositeReferenceValueAlloc(alloc, row_value, foreign_key, parent_is_primary_key, columns);
     }
     return try foreignKeyPrimaryKeyValueAlloc(alloc, row_value, foreign_key.child_columns[0]);
 }
@@ -2751,13 +2837,16 @@ fn foreignKeyCompositeReferenceValueAlloc(
     row_value: []const u8,
     foreign_key: schema_mod.ForeignKey,
     allow_partial_primary_key_reference_absence: bool,
+    columns: []const schema_mod.RelationalColumn,
 ) !?[]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
     var present_components: usize = 0;
-    for (foreign_key.child_columns) |column_path| {
-        const component = (try uniqueConstraintColumnValueAlloc(alloc, row_value, column_path)) orelse continue;
+    for (foreign_key.child_columns, 0..) |column_path, index| {
+        const parent_column = if (!allow_partial_primary_key_reference_absence and index < foreign_key.parent_columns.len) findRelationalColumn(columns, foreign_key.parent_columns[index]) else null;
+        const collation = if (parent_column) |column| column.collation else null;
+        const component = (try uniqueConstraintColumnValueWithCollationAlloc(alloc, row_value, column_path, collation)) orelse continue;
         defer alloc.free(component);
         present_components += 1;
         try internal_keys.appendEncodedComponent(&out, alloc, component);
@@ -3502,32 +3591,54 @@ pub fn temporalPeriodEndBoundBytesFromJsonAlloc(
 }
 
 pub fn uniqueConstraintTupleValueAlloc(alloc: Allocator, row_value: []const u8, constraint: schema_mod.UniqueConstraint) !?[]u8 {
-    if (!(try rowMatchesUniqueConstraintPredicates(alloc, row_value, constraint.where))) return null;
-    if (!(try rowMatchesExpressionConditions(alloc, row_value, constraint.where_expressions))) return null;
-    return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions, constraint.nulls_not_distinct);
+    return try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, &.{});
 }
 
-fn rowMatchesUniqueConstraintPredicates(alloc: Allocator, row_value: []const u8, predicates: []const schema_mod.UniquePredicate) !bool {
+pub fn uniqueConstraintTupleValueWithColumnsAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    constraint: schema_mod.UniqueConstraint,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
+    if (!(try rowMatchesUniqueConstraintPredicates(alloc, row_value, constraint.where, columns))) return null;
+    if (!(try rowMatchesExpressionConditionsWithColumns(alloc, row_value, constraint.where_expressions, columns))) return null;
+    const key_columns = if (std.mem.eql(u8, constraint.name, primary_key_constraint_name)) &.{} else columns;
+    return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions, constraint.nulls_not_distinct, key_columns);
+}
+
+fn rowMatchesUniqueConstraintPredicates(
+    alloc: Allocator,
+    row_value: []const u8,
+    predicates: []const schema_mod.UniquePredicate,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
     for (predicates) |predicate| {
-        if (!(try rowMatchesUniqueConstraintPredicate(alloc, row_value, predicate))) return false;
+        if (!(try rowMatchesUniqueConstraintPredicate(alloc, row_value, predicate, columns))) return false;
     }
     return true;
 }
 
-fn rowMatchesUniqueConstraintPredicate(alloc: Allocator, row_value: []const u8, predicate: schema_mod.UniquePredicate) !bool {
+fn rowMatchesUniqueConstraintPredicate(
+    alloc: Allocator,
+    row_value: []const u8,
+    predicate: schema_mod.UniquePredicate,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
     const cell = try relational_row_codec.findCellByPath(row_value, predicate.field);
+    const column = findRelationalColumn(columns, predicate.field);
+    const collation = if (column) |resolved| resolved.collation else null;
     return switch (predicate.op) {
         .is_null => cell == null,
         .is_not_null => cell != null,
         .eq => blk: {
             const present = cell orelse break :blk false;
             const value_json = predicate.value_json orelse return error.InvalidColumnValue;
-            break :blk try cellEqualsJsonLiteral(alloc, present, value_json);
+            break :blk try cellEqualsJsonLiteralWithCollation(alloc, present, value_json, collation);
         },
         .ne => blk: {
             const present = cell orelse break :blk false;
             const value_json = predicate.value_json orelse return error.InvalidColumnValue;
-            break :blk !(try cellEqualsJsonLiteral(alloc, present, value_json));
+            break :blk !(try cellEqualsJsonLiteralWithCollation(alloc, present, value_json, collation));
         },
     };
 }
@@ -3537,8 +3648,17 @@ fn rowMatchesExpressionConditions(
     row_value: []const u8,
     conditions: []const schema_mod.RelationalRowsExpressionCondition,
 ) !bool {
+    return try rowMatchesExpressionConditionsWithColumns(alloc, row_value, conditions, &.{});
+}
+
+fn rowMatchesExpressionConditionsWithColumns(
+    alloc: Allocator,
+    row_value: []const u8,
+    conditions: []const schema_mod.RelationalRowsExpressionCondition,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
     for (conditions) |condition| {
-        if (!(try rowMatchesExpressionCondition(alloc, row_value, condition))) return false;
+        if (!(try rowMatchesExpressionConditionWithColumns(alloc, row_value, condition, columns))) return false;
     }
     return true;
 }
@@ -3548,10 +3668,20 @@ fn rowMatchesExpressionCondition(
     row_value: []const u8,
     condition: schema_mod.RelationalRowsExpressionCondition,
 ) !bool {
+    return try rowMatchesExpressionConditionWithColumns(alloc, row_value, condition, &.{});
+}
+
+fn rowMatchesExpressionConditionWithColumns(
+    alloc: Allocator,
+    row_value: []const u8,
+    condition: schema_mod.RelationalRowsExpressionCondition,
+    columns: []const schema_mod.RelationalColumn,
+) !bool {
     const lhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, condition.lhs);
     defer alloc.free(lhs_json);
     var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidColumnValue;
     defer lhs.deinit();
+    const condition_collation = expressionConditionDirectFieldCollation(columns, condition);
     return switch (condition.op) {
         .is_null => lhs.value == .null,
         .is_not_null => lhs.value != .null,
@@ -3561,7 +3691,7 @@ fn rowMatchesExpressionCondition(
             defer alloc.free(rhs_json);
             var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
             defer rhs.deinit();
-            const equal = jsonValuesEqualExact(lhs.value, rhs.value);
+            const equal = jsonValuesEqualWithCollation(lhs.value, rhs.value, condition_collation);
             break :blk switch (condition.op) {
                 .eq, .is_not_distinct => equal,
                 .ne, .is_distinct => !equal,
@@ -3575,7 +3705,7 @@ fn rowMatchesExpressionCondition(
             var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
             defer rhs.deinit();
             if (lhs.value == .null or rhs.value == .null) break :blk false;
-            const comparison = compareJsonScalars(lhs.value, rhs.value) orelse return error.InvalidColumnValue;
+            const comparison = compareJsonScalarsWithCollation(lhs.value, rhs.value, condition_collation) orelse return error.InvalidColumnValue;
             break :blk switch (condition.op) {
                 .gt => comparison == .gt,
                 .gte => comparison == .gt or comparison == .eq,
@@ -3585,6 +3715,25 @@ fn rowMatchesExpressionCondition(
             };
         },
     };
+}
+
+fn expressionConditionDirectFieldCollation(
+    columns: []const schema_mod.RelationalColumn,
+    condition: schema_mod.RelationalRowsExpressionCondition,
+) ?[]const u8 {
+    if (condition.rhs.len != 1) return null;
+    if (condition.lhs.kind == .field and condition.lhs.field_source == .row and condition.rhs[0].kind == .value) {
+        return relationalColumnCollation(columns, condition.lhs.field);
+    }
+    if (condition.rhs[0].kind == .field and condition.rhs[0].field_source == .row and condition.lhs.kind == .value) {
+        return relationalColumnCollation(columns, condition.rhs[0].field);
+    }
+    return null;
+}
+
+fn relationalColumnCollation(columns: []const schema_mod.RelationalColumn, field: []const u8) ?[]const u8 {
+    const column = findRelationalColumn(columns, field) orelse return null;
+    return column.collation;
 }
 
 fn rowExpressionValueJsonAlloc(
@@ -5231,10 +5380,20 @@ fn md5HexTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
 }
 
 fn cellEqualsJsonLiteral(alloc: Allocator, cell: relational_row_codec.Cell, value_json: []const u8) !bool {
+    return try cellEqualsJsonLiteralWithCollation(alloc, cell, value_json, null);
+}
+
+fn cellEqualsJsonLiteralWithCollation(alloc: Allocator, cell: relational_row_codec.Cell, value_json: []const u8, collation: ?[]const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
     defer parsed.deinit();
     switch (cell.value) {
-        .bytes_val => |bytes| return parsed.value == .string and std.mem.eql(u8, bytes, parsed.value.string),
+        .bytes_val => |bytes| {
+            if (parsed.value != .string) return false;
+            if (collation) |name| {
+                if (relational_collation.isCaseInsensitive(name)) return std.ascii.eqlIgnoreCase(bytes, parsed.value.string);
+            }
+            return std.mem.eql(u8, bytes, parsed.value.string);
+        },
         .bool_val => |value| return parsed.value == .bool and value == parsed.value.bool,
         .u64_val => |value| switch (parsed.value) {
             .integer => |parsed_int| return parsed_int >= 0 and value == @as(u64, @intCast(parsed_int)),
@@ -5255,11 +5414,12 @@ fn uniqueConstraintKeysTupleValueAlloc(
     columns: []const []const u8,
     expressions: []const schema_mod.UniqueExpression,
     include_nulls: bool,
+    relational_columns: []const schema_mod.RelationalColumn,
 ) !?[]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (columns) |column_path| {
-        const component = (try uniqueConstraintColumnValueAlloc(alloc, row_value, column_path)) orelse {
+        const component = (try uniqueConstraintColumnValueWithColumnsAlloc(alloc, row_value, column_path, relational_columns)) orelse {
             if (!include_nulls) {
                 out.deinit(alloc);
                 return null;
@@ -5386,9 +5546,29 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
 }
 
 fn uniqueConstraintColumnValueAlloc(alloc: Allocator, row_value: []const u8, column_path: []const u8) !?[]u8 {
+    return try uniqueConstraintColumnValueWithColumnsAlloc(alloc, row_value, column_path, &.{});
+}
+
+fn uniqueConstraintColumnValueWithColumnsAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    column_path: []const u8,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
+    const column = findRelationalColumn(columns, column_path);
+    const collation = if (column) |resolved| resolved.collation else null;
+    return try uniqueConstraintColumnValueWithCollationAlloc(alloc, row_value, column_path, collation);
+}
+
+fn uniqueConstraintColumnValueWithCollationAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    column_path: []const u8,
+    collation: ?[]const u8,
+) !?[]u8 {
     const cell = (try relational_row_codec.findCellByPath(row_value, column_path)) orelse return null;
     if (cell.is_json) return error.InvalidColumnValue;
-    return try uniqueConstraintCellValueAlloc(alloc, cell);
+    return try uniqueConstraintCellValueWithCollationAlloc(alloc, cell, collation);
 }
 
 fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8, expression: schema_mod.UniqueExpression) !?[]u8 {
@@ -5482,6 +5662,14 @@ fn uniqueConstraintJsonValueAlloc(alloc: Allocator, value_json: []const u8) !?[]
 }
 
 fn uniqueConstraintCellValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
+    return try uniqueConstraintCellValueWithCollationAlloc(alloc, cell, null);
+}
+
+fn uniqueConstraintCellValueWithCollationAlloc(
+    alloc: Allocator,
+    cell: relational_row_codec.Cell,
+    collation: ?[]const u8,
+) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, @intFromEnum(cell.value_type));
@@ -5505,7 +5693,15 @@ fn uniqueConstraintCellValueAlloc(alloc: Allocator, cell: relational_row_codec.C
             try out.appendSlice(alloc, &lat_buf);
             try out.appendSlice(alloc, &lon_buf);
         },
-        .bytes_val => |value| try out.appendSlice(alloc, value),
+        .bytes_val => |value| {
+            if (collation) |name| {
+                if (relational_collation.isCaseInsensitive(name)) {
+                    for (value) |ch| try out.append(alloc, std.ascii.toLower(ch));
+                    return try out.toOwnedSlice(alloc);
+                }
+            }
+            try out.appendSlice(alloc, value);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -6240,6 +6436,10 @@ pub fn jsonValuesEqualExact(lhs: std.json.Value, rhs: std.json.Value) bool {
 const JsonScalarOrder = enum { lt, eq, gt };
 
 fn compareJsonScalars(lhs: std.json.Value, rhs: std.json.Value) ?JsonScalarOrder {
+    return compareJsonScalarsWithCollation(lhs, rhs, null);
+}
+
+fn compareJsonScalarsWithCollation(lhs: std.json.Value, rhs: std.json.Value, collation: ?[]const u8) ?JsonScalarOrder {
     if (jsonValueAsFloat(lhs)) |left| {
         if (jsonValueAsFloat(rhs)) |right| {
             if (left < right) return .lt;
@@ -6248,6 +6448,16 @@ fn compareJsonScalars(lhs: std.json.Value, rhs: std.json.Value) ?JsonScalarOrder
         }
     }
     if (lhs == .string and rhs == .string) {
+        if (collation) |name| {
+            if (relational_collation.isCaseInsensitive(name)) {
+                const folded = std.ascii.orderIgnoreCase(lhs.string, rhs.string);
+                return switch (folded) {
+                    .lt => .lt,
+                    .eq => .eq,
+                    .gt => .gt,
+                };
+            }
+        }
         return switch (std.mem.order(u8, lhs.string, rhs.string)) {
             .lt => .lt,
             .eq => .eq,
@@ -6255,6 +6465,15 @@ fn compareJsonScalars(lhs: std.json.Value, rhs: std.json.Value) ?JsonScalarOrder
         };
     }
     return null;
+}
+
+fn jsonValuesEqualWithCollation(lhs: std.json.Value, rhs: std.json.Value, collation: ?[]const u8) bool {
+    if (lhs == .string and rhs == .string) {
+        if (collation) |name| {
+            if (relational_collation.isCaseInsensitive(name)) return std.ascii.eqlIgnoreCase(lhs.string, rhs.string);
+        }
+    }
+    return jsonValuesEqualExact(lhs, rhs);
 }
 
 fn jsonValueAsFloat(value: std.json.Value) ?f64 {
@@ -7165,7 +7384,7 @@ pub fn rebuildUniqueConstraintRowsInRange(
 
     for (rows) |row| {
         for (unique_constraints) |constraint| {
-            const encoded_value = (try uniqueConstraintTupleValueAlloc(alloc, row.row_value, constraint)) orelse continue;
+            const encoded_value = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row.row_value, constraint, columns)) orelse continue;
             defer alloc.free(encoded_value);
 
             const key = if (constraint.without_overlaps_period) |period_name| blk: {
@@ -7237,7 +7456,7 @@ pub fn reconcileUniqueConstraintRowsInRange(
     for (rows) |row| {
         report.scanned_rows += 1;
         for (unique_constraints) |constraint| {
-            const encoded_value = (try uniqueConstraintTupleValueAlloc(alloc, row.row_value, constraint)) orelse continue;
+            const encoded_value = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row.row_value, constraint, columns)) orelse continue;
             defer alloc.free(encoded_value);
             const key = if (constraint.without_overlaps_period) |period_name| blk: {
                 const span = try periodSpanForRowWithCatalog(alloc, columns, periods, row.row_value, period_name);
@@ -7753,7 +7972,7 @@ fn reconcileForeignKeyRefsInRangeWithViolations(
     for (rows) |row| {
         report.scanned_child_rows += 1;
         for (foreign_keys) |foreign_key| {
-            const parent_key = (try foreignKeyReferenceValueWithPrimaryKeyAlloc(alloc, row.row_value, foreign_key, primary_key)) orelse continue;
+            const parent_key = (try foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(alloc, row.row_value, foreign_key, primary_key, columns)) orelse continue;
             defer alloc.free(parent_key);
             report.referenced_child_rows += 1;
 
@@ -7819,6 +8038,7 @@ fn reconcileForeignKeyRefsInRangeWithViolations(
         alloc,
         store,
         table_name,
+        columns,
         foreign_keys,
         primary_key,
         lower_doc_key,
@@ -7840,6 +8060,7 @@ fn pruneStaleForeignKeyRefsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     table_name: []const u8,
+    columns: []const schema_mod.RelationalColumn,
     foreign_keys: []const schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
     lower_doc_key: []const u8,
@@ -7875,7 +8096,7 @@ fn pruneStaleForeignKeyRefsInRange(
         const child_row = try getRawAlloc(alloc, store, decoded.child_key);
         if (child_row) |raw| {
             defer alloc.free(raw);
-            if (try foreignKeyReferenceValueWithPrimaryKeyAlloc(alloc, raw, foreign_key, primary_key)) |current_parent| {
+            if (try foreignKeyReferenceValueWithColumnsAndPrimaryKeyAlloc(alloc, raw, foreign_key, primary_key, columns)) |current_parent| {
                 stale = !std.mem.eql(u8, current_parent, decoded.parent_key);
                 if (stale) observed_parent_key = current_parent;
                 if (!stale) alloc.free(current_parent);
@@ -8762,6 +8983,222 @@ test "relational unique constraints optionally treat null components as not dist
         error.UniqueConstraintViolation,
         strict_participant.prepareUpsert("events", "doc:d", row_b, null),
     );
+}
+
+test "relational unique constraints honor case-insensitive column collation" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row_a = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "Alice@Example.test" },
+        },
+    });
+    defer alloc.free(row_a);
+    const row_b = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "alice@example.test" },
+        },
+    });
+    defer alloc.free(row_b);
+
+    const columns = [_]schema_mod.RelationalColumn{.{
+        .name = "email",
+        .path = "email",
+        .field_type = .keyword,
+        .collation = "antfly.case_insensitive",
+    }};
+    const unique = [_]schema_mod.UniqueConstraint{.{
+        .name = "events_email_key",
+        .columns = &.{"email"},
+    }};
+
+    const tuple_a = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_a, unique[0], &columns)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(tuple_a);
+    const tuple_b = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_b, unique[0], &columns)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(tuple_b);
+    try std.testing.expectEqualSlices(u8, tuple_a, tuple_b);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    participant.configureUniqueConstraints(&unique);
+    participant.configurePeriods(&.{}, &columns);
+    try participant.prepareUpsert("events", "doc:a", row_a, null);
+    try std.testing.expectError(
+        error.UniqueConstraintViolation,
+        participant.prepareUpsert("events", "doc:b", row_b, null),
+    );
+}
+
+test "relational partial unique predicates honor case-insensitive column collation" {
+    const alloc = std.testing.allocator;
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "ada@example.test" } },
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "ACTIVE" } },
+    });
+    defer alloc.free(row);
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "email", .path = "email", .field_type = .keyword },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+    };
+    const matching = schema_mod.UniqueConstraint{
+        .name = "users_active_email_key",
+        .columns = &.{"email"},
+        .where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }},
+    };
+    const tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, matching, columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(tuple);
+
+    const not_matching = schema_mod.UniqueConstraint{
+        .name = "users_non_active_email_key",
+        .columns = &.{"email"},
+        .where = &.{.{ .field = "status", .op = .ne, .value_json = "\"active\"" }},
+    };
+    try std.testing.expect((try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, not_matching, columns[0..])) == null);
+
+    const predicates = [_]schema_mod.RelationalCheck{.{ .name = "", .field = "status", .op = .eq, .value_json = "\"ACTIVE\"" }};
+    try std.testing.expect(try predicatesImplyUniqueWhereWithColumns(alloc, predicates[0..], matching.where, columns[0..]));
+    try std.testing.expect(!try predicatesImplyUniqueWhereWithColumns(alloc, predicates[0..], not_matching.where, columns[0..]));
+}
+
+test "relational partial unique is-not-null implication parses json null literals" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    const where = [_]schema_mod.UniquePredicate{.{
+        .field = "status",
+        .op = .is_not_null,
+    }};
+    const pretty_null = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = " null ",
+    }};
+    const string_null = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"null\"",
+    }};
+    const number_value = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "42",
+    }};
+    const invalid_json = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "not json",
+    }};
+
+    try std.testing.expect(!try predicatesImplyUniqueWhereWithColumns(alloc, pretty_null[0..], where[0..], columns[0..]));
+    try std.testing.expect(try predicatesImplyUniqueWhereWithColumns(alloc, string_null[0..], where[0..], columns[0..]));
+    try std.testing.expect(try predicatesImplyUniqueWhereWithColumns(alloc, number_value[0..], where[0..], columns[0..]));
+    try std.testing.expect(!try predicatesImplyUniqueWhereWithColumns(alloc, invalid_json[0..], where[0..], columns[0..]));
+}
+
+test "relational expression partial unique predicates honor case-insensitive column collation" {
+    const alloc = std.testing.allocator;
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "ada@example.test" } },
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "ACTIVE" } },
+    });
+    defer alloc.free(row);
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "email", .path = "email", .field_type = .keyword },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+    };
+    const rhs = [_]schema_mod.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"active\"" }};
+    const matching = schema_mod.UniqueConstraint{
+        .name = "users_active_email_key",
+        .columns = &.{"email"},
+        .where_expressions = &.{.{
+            .lhs = .{ .kind = .field, .field = "status" },
+            .op = .eq,
+            .rhs = rhs[0..],
+        }},
+    };
+    const tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, matching, columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(tuple);
+
+    const exact_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "email", .path = "email", .field_type = .keyword },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    try std.testing.expect((try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row, matching, exact_columns[0..])) == null);
+}
+
+test "relational foreign key unique reference values honor parent column collation" {
+    const alloc = std.testing.allocator;
+
+    const child_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "ref_email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "Ada@Example.test" },
+        },
+    });
+    defer alloc.free(child_row);
+    const matching_child_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "ref_email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "ada@example.test" },
+        },
+    });
+    defer alloc.free(matching_child_row);
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "email", .path = "email", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        .{ .name = "ref_email", .path = "ref_email", .field_type = .keyword },
+    };
+    const foreign_key = schema_mod.ForeignKey{
+        .name = "users_ref_email_fkey",
+        .child_columns = &.{"ref_email"},
+        .parent_table = "row",
+        .parent_columns = &.{"email"},
+    };
+
+    const parent_key = (try foreignKeyReferenceValueWithColumnsAlloc(alloc, child_row, foreign_key, null, &columns)) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent_key);
+    const matching_parent_key = (try foreignKeyReferenceValueWithColumnsAlloc(alloc, matching_child_row, foreign_key, null, &columns)) orelse return error.TestExpectedEqual;
+    defer alloc.free(matching_parent_key);
+    try std.testing.expectEqualSlices(u8, parent_key, matching_parent_key);
+
+    const raw_parent_key = (try foreignKeyReferenceValueAlloc(alloc, child_row, foreign_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw_parent_key);
+    try std.testing.expect(!std.mem.eql(u8, parent_key, raw_parent_key));
 }
 
 test "relational unique constraints encode ast expression tuple components" {
@@ -10040,12 +10477,12 @@ test "relational partial column index policy writes only predicate-matching rows
     defer store.close();
 
     const active_row = try relational_row_codec.serialize(alloc, &.{
-        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "active" } },
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "ACTIVE" } },
         .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "ada@example.test" } },
     });
     defer alloc.free(active_row);
     const inactive_row = try relational_row_codec.serialize(alloc, &.{
-        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "inactive" } },
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "INACTIVE" } },
         .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "grace@example.test" } },
     });
     defer alloc.free(inactive_row);
@@ -10066,7 +10503,7 @@ test "relational partial column index policy writes only predicate-matching rows
     }
 
     const columns = [_]schema_mod.RelationalColumn{
-        .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .collation = "antfly.case_insensitive", .indexed = true },
         .{ .name = "email", .path = "email", .field_type = .keyword, .indexed = true, .index_lifecycle = .building, .index_where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }} },
     };
     try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:active", active_row, ColumnIndexPolicy.fromColumns(columns[0..]));

@@ -235,9 +235,13 @@ const LocalSwarmMetadata = struct {
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .upsert_table_emptying_job = statusUpsertTableEmptyingJob,
                 .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
                 .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
                 .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
+                .promote_table_emptying_barrier = statusPromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = statusResetIdentityAllocatorsForTableEmptyingBarrier,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = statusSupportsIdentityAllocatorResetForTableEmptyingBarrier,
             },
         };
     }
@@ -260,6 +264,10 @@ const LocalSwarmMetadata = struct {
                 .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
                 .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
                 .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
+                .upsert_table_emptying_job = statusUpsertTableEmptyingJob,
+                .promote_table_emptying_barrier = statusPromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = statusResetIdentityAllocatorsForTableEmptyingBarrier,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = statusSupportsIdentityAllocatorResetForTableEmptyingBarrier,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
@@ -508,6 +516,41 @@ const LocalSwarmMetadata = struct {
         try self.manager.promoteTableEmptyingBarrier(request);
         self.epoch +|= 1;
         try self.persistLocked();
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        _ = try self.manager.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn upsertTableEmptyingJob(self: *LocalSwarmMetadata, record: antfly.metadata.TableEmptyingJobRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertTableEmptyingJob(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn statusUpsertTableEmptyingJob(ptr: *anyopaque, record: antfly.metadata.TableEmptyingJobRecord) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.upsertTableEmptyingJob(record);
+    }
+
+    fn statusPromoteTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.TableEmptyingBarrierPromotionRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.promoteTableEmptyingBarrier(request);
+    }
+
+    fn statusResetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+    }
+
+    fn statusSupportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+        return true;
     }
 
     pub fn upsertRange(self: *LocalSwarmMetadata, record: antfly.metadata.RangeRecord) !void {
@@ -2137,16 +2180,31 @@ fn hasUnsafeStaticPath(path: []const u8) bool {
 fn isAntfarmReservedPath(path: []const u8) bool {
     const reserved = [_][]const u8{
         "/api",
+        "/a2a",
+        "/agents",
+        "/auth",
+        "/backup",
+        "/backups",
+        "/connections",
+        "/databases",
+        "/db",
+        "/eval",
         "/ml",
         "/antfly",
         "/metadata",
         "/admin",
+        "/ai",
         "/internal",
         "/mcp",
         "/extensions",
         "/healthz",
         "/readyz",
         "/registry",
+        "/restore",
+        "/secrets",
+        "/tables",
+        "/tablespaces",
+        "/transactions",
     };
     for (reserved) |prefix| {
         if (std.mem.eql(u8, path, prefix)) return true;
@@ -4746,12 +4804,26 @@ test "swarm runtime data dir overrides common storage base dir" {
 
     const local_base = try resolveLocalBaseDir(alloc, .{ .data_dir = "/tmp/from-cli" }, &cfg);
     defer alloc.free(local_base);
-    try std.testing.expectEqualStrings("/tmp/from-cli", local_base);
+    const expected_local_base = try normalizeResolvedPathAlloc(alloc, "/tmp/from-cli");
+    defer alloc.free(expected_local_base);
+    try std.testing.expectEqualStrings(expected_local_base, local_base);
 
     const resolved = try resolvePaths(alloc, .{ .data_dir = "/tmp/from-cli" }, &cfg);
     defer resolved.deinit(alloc);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/replicas", resolved.replica_root_dir);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
+    const expected_data_base = try std.fs.path.join(alloc, &.{ expected_local_base, "data" });
+    defer alloc.free(expected_data_base);
+    const expected_metadata_base = try std.fs.path.join(alloc, &.{ expected_local_base, "metadata" });
+    defer alloc.free(expected_metadata_base);
+    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_data_base, "replicas" });
+    defer alloc.free(expected_replica_root);
+    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_data_base, "catalog.txt" });
+    defer alloc.free(expected_replica_catalog);
+    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_metadata_base, "local-metadata.json" });
+    defer alloc.free(expected_local_metadata);
+    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_data_base, "snapshots" });
+    defer alloc.free(expected_snapshot_root);
+    try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
+    try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
+    try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
+    try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
 }

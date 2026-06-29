@@ -175,6 +175,53 @@ pub fn appliedDdlHasSchemaRewriteWork(applied: table_ddl.AppliedRelationalSqlDdl
     return false;
 }
 
+pub fn promoteCompletedSchemaRewriteForTableIdAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_id: u64,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = findTableById(&snapshot, table_id) orelse return error.TableNotFound;
+    if (table.read_schema_json.len == 0) return false;
+    try validateSchemaRewriteGenerationReadyForPromotion(&snapshot, table);
+
+    var promoted = try metadata_table_manager.cloneTable(alloc, table);
+    defer metadata_table_manager.freeTable(alloc, promoted);
+    alloc.free(@constCast(promoted.read_schema_json));
+    promoted.read_schema_json = try alloc.dupe(u8, "");
+
+    try catalog.compareAndSwapTableSchema(.{
+        .table_id = table.table_id,
+        .expected_schema_json = table.schema_json,
+        .promoted_table = promoted,
+    });
+    return true;
+}
+
+fn validateSchemaRewriteGenerationReadyForPromotion(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+    for (snapshot.schema_rewrite_jobs) |record| {
+        if (record.table_id != table.table_id) continue;
+        if (record.schema_generation != schema_generation) continue;
+        if (!metadata_table_manager.schemaRewriteJobComplete(record)) return error.SchemaRewriteJobsIncomplete;
+    }
+}
+
+pub fn promoteCompletedSchemaRewriteForTableNameAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    return try promoteCompletedSchemaRewriteForTableIdAlloc(alloc, catalog, table.table_id);
+}
+
 fn hashTableEmptyingBarrierU64(hasher: *std.hash.Wyhash, value: u64) void {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, value, .little);
@@ -185,12 +232,22 @@ fn hashTableEmptyingBarrierBool(hasher: *std.hash.Wyhash, value: bool) void {
     hasher.update(if (value) "\x01" else "\x00");
 }
 
+fn validateTableEmptyingAffectedTableIdsForTable(
+    table: metadata_table_manager.TableRecord,
+    affected_table_ids: []const u64,
+) !void {
+    if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(table.table_id, affected_table_ids)) {
+        return error.InvalidTableEmptyingJob;
+    }
+}
+
 pub fn tableEmptyingBarrierIdForSnapshot(
     snapshot: *const metadata_api.AdminSnapshot,
     affected_table_ids: []const u64,
     restart_identity: bool,
     cascade: bool,
 ) !u64 {
+    if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalSetValid(affected_table_ids)) return error.InvalidTableEmptyingJob;
     var hasher = std.hash.Wyhash.init(0x5445_4241_5252_2026);
     hashTableEmptyingBarrierU64(&hasher, @intCast(affected_table_ids.len));
     for (affected_table_ids) |affected_table_id| {
@@ -270,6 +327,7 @@ pub fn scheduleTableEmptyingJobsForTableOnService(
     }
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
+    try validateTableEmptyingAffectedTableIdsForTable(table, affected_table_ids);
     const barrier_id = try tableEmptyingBarrierIdForSnapshot(&snapshot, affected_table_ids, restart_identity, cascade);
     return try scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(svc, snapshot.ranges, table, affected_table_ids, restart_identity, cascade, barrier_id);
 }
@@ -282,6 +340,7 @@ pub fn scheduleTableEmptyingJobsForTableSnapshot(
     restart_identity: bool,
     cascade: bool,
 ) !usize {
+    try validateTableEmptyingAffectedTableIdsForTable(table, affected_table_ids);
     var scheduled: usize = 0;
     for (ranges) |range| {
         if (range.table_id != table.table_id) continue;
@@ -301,6 +360,8 @@ pub fn scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(
     cascade: bool,
     barrier_id: u64,
 ) !usize {
+    if (barrier_id == 0) return error.InvalidTableEmptyingJob;
+    try validateTableEmptyingAffectedTableIdsForTable(table, affected_table_ids);
     var scheduled: usize = 0;
     for (ranges) |range| {
         if (range.table_id != table.table_id) continue;
@@ -593,6 +654,7 @@ fn tableEmptyingJobMatchesBarrierRange(
     if (candidate.barrier_id == 0 or record.barrier_id != candidate.barrier_id) return false;
     if (record.table_id != range.table_id) return false;
     if (record.group_id != range.group_id) return false;
+    if (record.range_id != 0 and record.range_id != range.range_id) return false;
     if (record.schema_generation != metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json)) return false;
     if (record.data_generation != table.data_generation) return false;
     if (!std.mem.eql(u8, record.start_row_key, range.start_key)) return false;
@@ -630,7 +692,9 @@ fn repairMissingTableEmptyingBarrierRangeJobsForCandidate(
     candidate: metadata_table_manager.TableEmptyingJobRecord,
 ) !usize {
     if (!tableEmptyingRepairCandidateActive(candidate)) return 0;
-    if (candidate.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
+    if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(candidate.table_id, candidate.affected_table_ids)) {
+        return error.InvalidTableEmptyingJob;
+    }
     if (candidate.barrier_id == 0) return error.InvalidTableEmptyingJob;
 
     const current_barrier_id = tableEmptyingBarrierIdForSnapshot(
@@ -714,7 +778,9 @@ fn completedTableEmptyingBarrierJobIdsForCandidateAlloc(
     candidate: metadata_table_manager.TableEmptyingJobRecord,
 ) !?[]u64 {
     if (!metadata_table_manager.tableEmptyingJobComplete(candidate)) return null;
-    if (candidate.affected_table_ids.len == 0) return error.InvalidTableEmptyingJob;
+    if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(candidate.table_id, candidate.affected_table_ids)) {
+        return error.InvalidTableEmptyingJob;
+    }
     if (candidate.barrier_id == 0) return error.InvalidTableEmptyingJob;
 
     var completed_job_ids = std.ArrayListUnmanaged(u64).empty;
@@ -803,27 +869,6 @@ fn tableEmptyingBarrierAlreadyPromoted(barrier_ids: []const u64, barrier_id: u64
     return false;
 }
 
-fn resetIdentityAllocatorsForTableEmptyingBarrierOnService(
-    service: anytype,
-    candidate: metadata_table_manager.TableEmptyingJobRecord,
-    job_ids: []const u64,
-) !void {
-    const ServiceType = @TypeOf(service);
-    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
-        .pointer => |pointer| pointer.child,
-        else => ServiceType,
-    };
-    if (comptime !@hasDecl(ServiceDeclType, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
-        return error.UnsupportedOperation;
-    }
-    return try service.resetIdentityAllocatorsForTableEmptyingBarrier(.{
-        .barrier_id = candidate.barrier_id,
-        .affected_table_ids = candidate.affected_table_ids,
-        .job_ids = job_ids,
-        .cascade = candidate.cascade,
-    });
-}
-
 pub fn promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(
     alloc: std.mem.Allocator,
     service: anytype,
@@ -890,8 +935,8 @@ pub fn promoteCompletedTableEmptyingBarriersForTableIdOnServiceAlloc(
             defer alloc.free(promotions);
             if (job_ids.len == 0 or promotions.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
 
-            if (candidate.restart_identity) {
-                try resetIdentityAllocatorsForTableEmptyingBarrierOnService(service, candidate, job_ids);
+            if (candidate.restart_identity and !serviceSupportsTableEmptyingIdentityAllocatorReset(service)) {
+                return error.UnsupportedOperation;
             }
             try service.promoteTableEmptyingBarrier(.{
                 .job_ids = job_ids,
@@ -1366,6 +1411,131 @@ test "catalog jobs detects schema rewrite wakeable applied DDL work" {
     try std.testing.expect(!appliedDdlHasSchemaRewriteWork(applied));
 }
 
+test "catalog jobs promotes completed schema rewrite through table schema CAS" {
+    const FakeCatalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
+        },
+        job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 7701,
+            .table_id = 77,
+            .group_id = 1,
+            .schema_generation = 2,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .state = metadata_table_manager.schema_rewrite_ready,
+        },
+        compare_count: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.job.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(self.table.schema_json);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.compare_count += 1;
+            try std.testing.expectEqual(@as(u64, 77), request.table_id);
+            try std.testing.expectEqualStrings(self.table.schema_json, request.expected_schema_json);
+            try std.testing.expectEqualStrings(self.table.schema_json, request.promoted_table.schema_json);
+            try std.testing.expectEqualStrings("", request.promoted_table.read_schema_json);
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    try std.testing.expect(try promoteCompletedSchemaRewriteForTableIdAlloc(std.testing.allocator, catalog.iface(), 77));
+    try std.testing.expectEqual(@as(usize, 1), catalog.compare_count);
+}
+
+test "catalog jobs rejects schema rewrite promotion while durable jobs are incomplete" {
+    const FakeCatalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
+        },
+        job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 7701,
+            .table_id = 77,
+            .group_id = 1,
+            .schema_generation = 2,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .state = metadata_table_manager.schema_rewrite_declared,
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.job.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(self.table.schema_json);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(_: *anyopaque, _: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    try std.testing.expectError(
+        error.SchemaRewriteJobsIncomplete,
+        promoteCompletedSchemaRewriteForTableIdAlloc(std.testing.allocator, catalog.iface(), 77),
+    );
+}
+
 test "catalog jobs builds deterministic table emptying jobs for ranges" {
     const table = metadata_table_manager.TableRecord{
         .table_id = 77,
@@ -1440,6 +1610,68 @@ test "catalog jobs schedules table emptying jobs from snapshot ranges" {
         try std.testing.expect(job.cascade);
         try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
     }
+}
+
+test "catalog jobs rejects malformed table emptying affected tables before scheduling" {
+    const Scheduler = struct {
+        called: bool = false,
+
+        fn upsertTableEmptyingJob(self: *@This(), _: metadata_table_manager.TableEmptyingJobRecord) !void {
+            self.called = true;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 91,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+    };
+    const archive_table = metadata_table_manager.TableRecord{
+        .table_id = 92,
+        .name = "events_archive",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"name\":\"archive\"}",
+    };
+    var ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 8101, .range_id = 8102, .table_id = 91, .start_key = "", .end_key = null },
+    };
+    var tables = [_]metadata_table_manager.TableRecord{ table, archive_table };
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    try std.testing.expectError(error.InvalidTableEmptyingJob, tableEmptyingBarrierIdForSnapshot(&snapshot, &.{ 91, 91 }, false, false));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, tableEmptyingBarrierIdForSnapshot(&snapshot, &.{0}, false, false));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, tableEmptyingBarrierIdForSnapshot(&snapshot, &.{ 92, 91 }, false, false));
+
+    var scheduler = Scheduler{};
+    try std.testing.expectError(
+        error.InvalidTableEmptyingJob,
+        scheduleTableEmptyingJobsForTableSnapshot(&scheduler, ranges[0..], table, &.{92}, false, false),
+    );
+    try std.testing.expect(!scheduler.called);
+
+    try std.testing.expectError(
+        error.InvalidTableEmptyingJob,
+        scheduleTableEmptyingJobsForTableSnapshot(&scheduler, ranges[0..], table, &.{ 91, 91 }, false, false),
+    );
+    try std.testing.expect(!scheduler.called);
+
+    try std.testing.expectError(
+        error.InvalidTableEmptyingJob,
+        scheduleTableEmptyingJobsForTableSnapshot(&scheduler, ranges[0..], table, &.{ 92, 91 }, false, false),
+    );
+    try std.testing.expect(!scheduler.called);
+
+    try std.testing.expectError(
+        error.InvalidTableEmptyingJob,
+        scheduleTableEmptyingJobsForTableSnapshotWithBarrierId(&scheduler, ranges[0..], table, &.{91}, false, false, 0),
+    );
+    try std.testing.expect(!scheduler.called);
 }
 
 test "catalog jobs admits session qualified table emptying barrier with cascade" {
@@ -1765,7 +1997,6 @@ test "catalog jobs promotes completed table emptying barrier by removing durable
         jobs: [2]metadata_table_manager.TableEmptyingJobRecord = undefined,
         job_count: usize = 2,
         reset_calls: usize = 0,
-        reset_before_promote: bool = false,
 
         fn seed(self: *@This()) !void {
             const barrier_snapshot = metadata_api.AdminSnapshot{
@@ -1806,12 +2037,10 @@ test "catalog jobs promotes completed table emptying barrier by removing durable
             if (request.affected_table_ids.len != self.affected.len) return error.InvalidTableEmptyingBarrierPromotion;
             if (request.job_ids.len != self.job_count) return error.InvalidTableEmptyingBarrierPromotion;
             if (!request.cascade) return error.InvalidTableEmptyingBarrierPromotion;
-            self.reset_calls += 1;
-            self.reset_before_promote = true;
         }
 
         pub fn promoteTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
-            if (!self.reset_before_promote) return error.TestUnexpectedResult;
+            if (self.job_count > 0 and self.jobs[0].restart_identity) self.reset_calls += 1;
             for (request.promotions) |promotion| {
                 for (&self.tables) |*table| {
                     if (table.table_id != promotion.table_id) continue;
@@ -1905,7 +2134,7 @@ test "catalog jobs rejects restart identity promotion without allocator reset ow
     try std.testing.expectEqual(@as(u64, 4), service.tables[0].data_generation);
 }
 
-test "catalog jobs promotes restart identity barrier through catalog source reset hook" {
+test "catalog jobs promotes restart identity barrier through catalog source promotion hook" {
     const alloc = std.testing.allocator;
     const FakeCatalogOwner = struct {
         tables: [1]metadata_table_manager.TableRecord = .{
@@ -1919,7 +2148,6 @@ test "catalog jobs promotes restart identity barrier through catalog source rese
         job_count: usize = 1,
         reset_calls: usize = 0,
         promote_calls: usize = 0,
-        reset_before_promote: bool = false,
 
         fn seed(self: *@This()) !void {
             const barrier_snapshot = metadata_api.AdminSnapshot{
@@ -1974,8 +2202,6 @@ test "catalog jobs promotes restart identity barrier through catalog source rese
             try std.testing.expectEqual(@as(usize, 1), request.job_ids.len);
             try std.testing.expectEqual(self.jobs[0].job_id, request.job_ids[0]);
             try std.testing.expect(!request.cascade);
-            self.reset_calls += 1;
-            self.reset_before_promote = true;
         }
 
         fn promoteTableEmptyingBarrier(
@@ -1983,9 +2209,9 @@ test "catalog jobs promotes restart identity barrier through catalog source rese
             request: metadata_table_manager.TableEmptyingBarrierPromotionRequest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(self.reset_before_promote);
             try std.testing.expectEqual(@as(usize, 1), request.job_ids.len);
             try std.testing.expectEqual(@as(usize, 1), request.promotions.len);
+            if (self.job_count > 0 and self.jobs[0].restart_identity) self.reset_calls += 1;
             self.promote_calls += 1;
             self.tables[0].data_generation = request.promotions[0].target_generation;
             self.job_count = 0;

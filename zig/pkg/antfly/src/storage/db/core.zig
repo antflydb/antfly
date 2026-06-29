@@ -1458,6 +1458,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     backend_override: ?change_journal_mod.StorageBackend,
     storage_override: ?lsm_backend_mod.Storage,
+    read_only: bool,
 ) change_journal_mod.OpenOptions {
     const backend: change_journal_mod.StorageBackend = backend_override orelse switch (primary_backend_kind) {
         .mem, .lsm_memory => .lsm_memory,
@@ -1467,6 +1468,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
         .map_size = map_size,
         .no_sync = no_sync,
         .backend = backend,
+        .read_only = read_only,
         .storage = storage_override orelse if (backend == .lsm and primary_backend_kind == .lsm) primary_lsm_storage else null,
     };
 }
@@ -1487,6 +1489,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
     external_derived_checkpoints: bool,
+    read_only: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
@@ -1549,6 +1552,7 @@ pub fn openCoreResourcesFromPrimaryStore(
             primary_lsm_storage,
             change_journal_backend,
             change_journal_storage,
+            read_only,
         ),
     );
     errdefer {

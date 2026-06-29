@@ -5568,7 +5568,7 @@ test "postgres sql adapter insert source temporal unique conflict executes throu
 test "postgres sql adapter typed read plans execute through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"scope":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword","collation":"antfly.case_insensitive"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"scope":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -5606,6 +5606,54 @@ test "postgres sql adapter typed read plans execute through relational storage" 
         },
         .sync_level = .write,
     });
+
+    var collated_predicate_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'customer' AND name = 'alice' ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer collated_predicate_plan.deinit(alloc);
+
+    switch (collated_predicate_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.predicates.len);
+            const name_predicate = for (lowered.plan.query.predicates) |predicate| {
+                if (std.mem.eql(u8, predicate.field, "name")) break predicate;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("antfly.case_insensitive", name_predicate.collation.?);
+            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 1), result.total);
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"c1\"}", result.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var collated_in_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'customer' AND name IN ('alice') ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer collated_in_plan.deinit(alloc);
+
+    switch (collated_in_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.in_predicates.len);
+            try std.testing.expectEqualStrings("name", lowered.plan.query.in_predicates[0].field);
+            try std.testing.expectEqualStrings("antfly.case_insensitive", lowered.plan.query.in_predicates[0].collation.?);
+            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 1), result.total);
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"c1\"}", result.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var escaped_pattern_plan = try lowerReadPlanAlloc(
         alloc,

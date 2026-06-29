@@ -13,16 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const http_server = @import("http_server.zig");
-const pgwire = @import("pgwire.zig");
+const pgwire = @import("mod.zig");
+const sql_backend = @import("sql_backend.zig");
 
 pub const OptionalListenerConfig = struct {
     bind_host: ?[]const u8 = null,
     default_bind_host: []const u8,
     bind_port: ?u16 = null,
-    auth_enabled: bool = false,
-    auth_error_message: []const u8 = "pgwire password authentication requires a public API user manager",
-    api_server: ?*http_server.ApiHttpServer = null,
+    backend: ?sql_backend.Backend = null,
 };
 
 fn validateOptionalListenerConfig(cfg: OptionalListenerConfig) !void {
@@ -39,18 +37,14 @@ pub fn startOptional(alloc: std.mem.Allocator, cfg: OptionalListenerConfig) !?pg
     const bind_port = cfg.bind_port orelse {
         return null;
     };
-    const api_server = cfg.api_server orelse {
-        std.log.err("pgwire listener requires a public API server; omit --pgwire-port", .{});
+    const backend = cfg.backend orelse {
+        std.log.err("pgwire listener requires a SQL backend; omit --pgwire-port", .{});
         return error.InvalidArguments;
     };
-    if ((cfg.auth_enabled or api_server.cfg.trusted_principal_secret != null) and api_server.cfg.user_manager == null) {
-        std.log.err("{s}", .{cfg.auth_error_message});
-        return error.InvalidArguments;
-    }
     return try pgwire.start(alloc, .{
         .bind_host = cfg.bind_host orelse cfg.default_bind_host,
         .bind_port = bind_port,
-        .api_server = api_server,
+        .backend = backend,
     });
 }
 

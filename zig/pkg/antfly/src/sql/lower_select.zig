@@ -82,7 +82,11 @@ fn generatedReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if (read.kind != expected_kind or read.cte_tokens != null or (expected_kind != .set_operation and read.set_operation_tokens != null)) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -98,7 +102,11 @@ fn generatedQueryPlanReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if ((read.kind != .query and read.kind != .set_operation) or read.cte_tokens != null) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -114,7 +122,11 @@ fn generatedCteReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == .cte and read.cte_tokens != null) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if (read.kind != .cte or read.cte_tokens == null) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -1159,5 +1171,38 @@ test "recursive cte lowerer validates retained generated ast before token fallba
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerRecursiveCtePlanParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
+    );
+}
+
+test "read lowerers validate retained generated ast before typed planning" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records WHERE kind = 'order') SELECT id FROM source_rows",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    var lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.cte_final_kind = .join,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
     );
 }

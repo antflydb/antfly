@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const document_mapper = @import("../storage/db/document_mapper.zig");
+const tables = @import("../metadata/catalog/table_ddl.zig");
 
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
@@ -57,8 +59,7 @@ pub const http_internal_group_join_routes = @import("http_internal_group_join_ro
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
-pub const pgwire = @import("pgwire.zig");
-pub const pgwire_runtime = @import("pgwire_runtime.zig");
+pub const pgwire_backend = @import("pgwire_backend.zig");
 pub const public_runtime = @import("public_runtime.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const openapi_contract = @import("openapi_contract.zig");
@@ -104,9 +105,8 @@ test {
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "getNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "createNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "dropNamespaceTableIndex"));
-    _ = pgwire;
-    _ = pgwire_runtime;
     _ = public_runtime;
+    _ = pgwire_backend;
     _ = protocol_adapters;
 }
 
@@ -129,6 +129,36 @@ test "linear merge request parser accepts raw payload value under public request
 
     try std.testing.expectEqual(@as(usize, 1), req.writes.len);
     try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
+    const alloc = std.testing.allocator;
+
+    var reserved_type = try batch.parseBatchRequest(alloc,
+        \\{"inserts":{"sample.pdf:page:1":{"id":"sample.pdf:page:1","file_path":"sample.pdf","title":"sample.pdf - Page 1","content":"Montessori classroom notes","_type":"pdf_page","metadata":{"page_number":1,"total_pages":14,"source_pdf":"sample.pdf","extraction_method":"text_stream"},"url":"https://example.com/sample.pdf#page=1"}},"sync_level":"write"}
+    );
+    defer reserved_type.deinit(alloc);
+
+    var parsed_schema = try tables.parseValidatedTableSchema(alloc, tables.default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    try std.testing.expectError(error.InvalidBatchRequest, tables.validateWritesAgainstTableSchema(alloc, parsed_schema, reserved_type.req.writes));
+
+    var docsaf_row = try batch.parseBatchRequest(alloc,
+        \\{"inserts":{"sample.pdf:page:1":{"id":"sample.pdf:page:1","file_path":"sample.pdf","title":"sample.pdf - Page 1","content":"Montessori classroom notes","doc_type":"pdf_page","metadata":{"page_number":1,"total_pages":14,"source_pdf":"sample.pdf","extraction_method":"text_stream"},"url":"https://example.com/sample.pdf#page=1"}},"sync_level":"write"}
+    );
+    defer docsaf_row.deinit(alloc);
+
+    try tables.validateWritesAgainstTableSchema(alloc, parsed_schema, docsaf_row.req.writes);
+
+    var extracted = try document_mapper.extractWrite(alloc, docsaf_row.writes[0].key, docsaf_row.writes[0].value);
+    defer extracted.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), extracted.dense_embeddings.len);
+    try std.testing.expectEqual(@as(usize, 0), extracted.sparse_embeddings.len);
+    try std.testing.expectEqual(@as(usize, 0), extracted.graph_writes.len);
+    try std.testing.expect(extracted.cleaned_value != null);
+    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"doc_type\":\"pdf_page\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"_type\"") == null);
 }
 
 test "join inequality: jsonValuesCompare all six operators on integers" {

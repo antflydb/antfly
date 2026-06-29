@@ -31,6 +31,11 @@ pub fn sleepNs(ns: u64) void {
     };
 }
 
+pub fn sleepMs(ms: u64) void {
+    const ns = std.math.mul(u64, ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    sleepNs(ns);
+}
+
 pub fn yieldBriefly() void {
     if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return;
     sleepNs(100_000);

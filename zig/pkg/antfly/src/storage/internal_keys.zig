@@ -50,6 +50,8 @@ pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
+pub const relational_cte_spill_kind: u8 = 0x40;
+pub const relational_aggregate_spill_kind: u8 = 0x41;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -68,7 +70,12 @@ pub fn isInternalUserKey(key: []const u8) bool {
 }
 
 pub fn isInternalPhysicalTableDataKey(key: []const u8) bool {
-    return isInternalUserKey(key) or
+    return isInternalUserKey(key) or isRelationalPhysicalTableDataKey(key);
+}
+
+pub fn isRelationalPhysicalTableDataKey(key: []const u8) bool {
+    return isRelationalRowKey(key) or
+        isRelationalColumnKey(key) or
         isRelationalColumnIndexKey(key) or
         isRelationalArrayElementIndexKey(key) or
         isRelationalArrayValueIndexKey(key) or
@@ -198,6 +205,46 @@ pub fn ttlKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     defer list.deinit(alloc);
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, ttl_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalCteSpillPrefixAlloc(alloc: Allocator, spill_id: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_cte_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalCteSpillRowKeyAlloc(alloc: Allocator, spill_id: []const u8, row_index: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_cte_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    const start = list.items.len;
+    try list.resize(alloc, start + @sizeOf(u64));
+    std.mem.writeInt(u64, list.items[start..][0..@sizeOf(u64)], row_index, .big);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalAggregateSpillPrefixAlloc(alloc: Allocator, spill_id: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_aggregate_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalAggregateDistinctSpillKeyAlloc(alloc: Allocator, spill_id: []const u8, distinct_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_aggregate_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    try appendEncodedComponent(&list, alloc, distinct_key);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -1753,12 +1800,20 @@ test "relational row key shares document range but is not primary" {
     defer alloc.free(relational_column_index);
     const relational_array_element_index = try relationalArrayElementIndexKeyAlloc(alloc, column_path, "hot\x00tag", raw);
     defer alloc.free(relational_array_element_index);
+    const relational_array_value_index = try relationalArrayValueIndexKeyAlloc(alloc, column_path, "[hot\x00tag]", raw);
+    defer alloc.free(relational_array_value_index);
     const relational_json_value_index = try relationalJsonValueIndexKeyAlloc(alloc, column_path, "attrs.plan", "\"pro\"", raw);
     defer alloc.free(relational_json_value_index);
+    const relational_json_path_index = try relationalJsonPathIndexKeyAlloc(alloc, column_path, "attrs.plan", raw);
+    defer alloc.free(relational_json_path_index);
     const relational_column_index_by_doc = try relationalColumnIndexByDocKeyAlloc(alloc, raw, column_path);
     defer alloc.free(relational_column_index_by_doc);
     const fk_ref = try relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a", "orders", raw);
     defer alloc.free(fk_ref);
+    const unique = try relationalUniqueKeyAlloc(alloc, "orders_external_id_key", "external\x00a");
+    defer alloc.free(unique);
+    const temporal_unique = try relationalTemporalUniqueKeyAlloc(alloc, "prices_sku_valid_time_key", "sku\x00a", "10", "20", raw);
+    defer alloc.free(temporal_unique);
     const fk_conflict = try relationalForeignKeyConflictKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a");
     defer alloc.free(fk_conflict);
     const fk_ref_prefix = try relationalForeignKeyRefParentPrefixAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a");
@@ -1777,28 +1832,42 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(isRelationalColumnKey(relational_column));
     try std.testing.expect(isRelationalColumnIndexKey(relational_column_index));
     try std.testing.expect(isRelationalArrayElementIndexKey(relational_array_element_index));
+    try std.testing.expect(isRelationalArrayValueIndexKey(relational_array_value_index));
     try std.testing.expect(isRelationalJsonValueIndexKey(relational_json_value_index));
+    try std.testing.expect(isRelationalJsonPathIndexKey(relational_json_path_index));
     try std.testing.expect(isRelationalColumnIndexByDocKey(relational_column_index_by_doc));
     try std.testing.expect(isRelationalForeignKeyRefKey(fk_ref));
+    try std.testing.expect(isRelationalUniqueKey(unique));
+    try std.testing.expect(isRelationalTemporalUniqueKey(temporal_unique));
     try std.testing.expect(isRelationalForeignKeyConflictKey(fk_conflict));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_array_element_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_array_value_index));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_json_value_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_json_path_index));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index_by_doc));
     try std.testing.expect(isInternalPhysicalTableDataKey(fk_ref));
+    try std.testing.expect(isInternalPhysicalTableDataKey(unique));
+    try std.testing.expect(isInternalPhysicalTableDataKey(temporal_unique));
     try std.testing.expect(isInternalPhysicalTableDataKey(fk_conflict));
     try std.testing.expect(!isInternalMetadataKey(relational_column_index));
     try std.testing.expect(!isInternalMetadataKey(relational_array_element_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_array_value_index));
     try std.testing.expect(!isInternalMetadataKey(relational_json_value_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_json_path_index));
     try std.testing.expect(!isInternalMetadataKey(relational_column_index_by_doc));
     try std.testing.expect(!isInternalMetadataKey(fk_ref));
+    try std.testing.expect(!isInternalMetadataKey(unique));
+    try std.testing.expect(!isInternalMetadataKey(temporal_unique));
     try std.testing.expect(!isInternalMetadataKey(fk_conflict));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column_index));
     try std.testing.expect(!isStoredDocumentRowKey(relational_array_element_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_array_value_index));
     try std.testing.expect(!isStoredDocumentRowKey(relational_json_value_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_json_path_index));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column_index_by_doc));
     const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
     defer alloc.free(decoded_relational);

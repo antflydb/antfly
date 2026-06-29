@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const provisioned_storage = @import("api/provisioned_storage.zig");
 const table_writes = @import("api/table_writes.zig");
 const table_writes_bulk_ingest = @import("api/table_writes/bulk_ingest.zig");
 const table_writes_cache = @import("api/table_writes/cache.zig");
@@ -27,6 +28,7 @@ const table_writes_remote_wire = @import("api/table_writes/remote_wire.zig");
 const table_writes_sources = @import("api/table_writes/sources.zig");
 
 test {
+    _ = provisioned_storage;
     _ = table_writes;
     _ = table_writes_bulk_ingest;
     _ = table_writes_cache;

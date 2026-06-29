@@ -1799,7 +1799,7 @@ test "db transactions row claim lease expiry aborts stale owner and lets next cl
         .lease_ms = 1,
         .txn_id = stale_txn,
     });
-    platform.time.sleepNs(10 * std.time.ns_per_ms);
+    platform.time.sleepMs(10);
 
     const next_txn = try db.beginTransaction(2_001);
     try db.claimRowsForTransaction(next_txn, &.{"doc:claim"}, .{
@@ -1852,7 +1852,7 @@ test "db transactions row claim lease expiry lets direct mutation reclaim stale 
         .lease_ms = 1,
         .txn_id = stale_txn,
     });
-    platform.time.sleepNs(10 * std.time.ns_per_ms);
+    platform.time.sleepMs(10);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},
@@ -2135,7 +2135,7 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
             }
             return err;
         }
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     if (!cleared) return error.TransactionRecoveryCleanupTimeout;
 
@@ -2152,7 +2152,7 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
     attempts = 0;
     while ((!stats_ready or !resolver_called) and attempts < 500) : (attempts += 1) {
         types.freeDBStats(alloc, stats);
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
         stats = try db.stats(alloc);
         stats_ready = stats.transaction_recovery.runs > 0 and
             stats.transaction_recovery.notification_attempts > 0 and
@@ -2227,7 +2227,7 @@ test "db transactions recovery runtime appends identity rows for committed orpha
             }
             return err;
         }
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
 
@@ -2312,7 +2312,7 @@ test "db transactions relational recovery resolves orphaned intents into base ro
             }
             return err;
         }
-        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        platform.time.sleepMs(10);
     }
     if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
 

@@ -726,6 +726,7 @@ pub const DBTestFilters = struct {
     };
 
     pub const split_restore_lifecycle = [_][]const u8{
+        "storage.db.split_restore.test.",
         "storage.db.split_restore_test.test.",
     };
 

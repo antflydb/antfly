@@ -599,6 +599,7 @@ pub fn Impl(comptime DB: type) type {
                     false,
                     if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                     opts.external_derived_checkpoints,
+                    openModeRequiresReadOnlyBackends(opts.open_mode),
                 );
                 profile.core_resources_ns = elapsedSince(core_resources_started_ns);
 
@@ -1255,6 +1256,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             {
                 self.core.lockApply();
                 defer self.core.unlockApply();
@@ -1273,6 +1275,7 @@ pub fn Impl(comptime DB: type) type {
             cfg: index_manager_mod.ResolverConfig,
             options: ResolverUpsertOptions,
         ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             const upsert_result = blk: {
                 self.core.lockApply();
                 defer self.core.unlockApply();
@@ -1320,6 +1323,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn removeResolver(self: *DB, name: []const u8) !bool {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             try Self.retireResolverReplayBeforeCatalogRemoval(self);
 
             const retirement_sequence = blk: {
@@ -1892,24 +1896,28 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn compactTextIndexes(self: *DB) !void {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.compactTextIndexes();
         }
 
         pub fn drainScheduledTextMerges(self: *DB) !void {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.drainScheduledTextMerges();
         }
 
         pub fn forceCompactTextIndexes(self: *DB) !void {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.forceCompactTextIndexes();
         }
 
         pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.bestEffortForceCompactTextIndexes();
@@ -4973,7 +4981,7 @@ test "db lifecycle open writer_no_replay starts workers without resuming pending
     });
     defer reopened.close();
 
-    platform.time.sleepNs(50 * std.time.ns_per_ms);
+    platform.time.sleepMs(50);
 
     {
         const replay_debt = try reopened.listDerivedReplayDebt(alloc);

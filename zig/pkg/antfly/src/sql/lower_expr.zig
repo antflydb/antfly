@@ -21,10 +21,12 @@ const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
+const lowering_context = @import("lowering_context.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../platform/time.zig");
 const query_function = @import("query_function.zig");
+const relational_rows_executor = @import("../storage/db/relational_rows.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const strings = @import("strings.zig");
@@ -875,12 +877,15 @@ fn validateGeneratedSetOperationPayloads(
         try validateGeneratedOptionalRangeInside(set_operation.right_source_system_time_tokens, source_range);
         try validateGeneratedOptionalRangeInside(set_operation.right_source_system_time_sequence_tokens, source_range);
         try validateGeneratedReadSystemTimePayloads(tokens, set_operation.right_source_tokens, set_operation.right_source_system_time_tokens, set_operation.right_source_system_time_sequence_tokens);
-        try validateGeneratedSetOperationRightSingleSourcePayload(tokens, set_operation);
+        try validateGeneratedSetOperationRightSourcePayload(tokens, set_operation);
     } else if (set_operation.right_source_table_tokens != null or
         set_operation.right_source_alias_tokens != null or
         set_operation.right_source_alias_name_tokens != null or
         set_operation.right_source_system_time_tokens != null or
-        set_operation.right_source_system_time_sequence_tokens != null)
+        set_operation.right_source_system_time_sequence_tokens != null or
+        set_operation.right_join_items.len != 0 or
+        set_operation.right_join_tree_root_index != null or
+        set_operation.right_join_tree_depth != 0)
     {
         return error.UnsupportedSqlShape;
     }
@@ -893,10 +898,40 @@ fn validateGeneratedSetOperationPayloads(
     }
 }
 
-fn validateGeneratedSetOperationRightSingleSourcePayload(
+fn validateGeneratedSetOperationRightSourcePayload(
     tokens: []const Token,
     set_operation: generated_parser.GeneratedSqlSetOperationAst,
 ) !void {
+    if (set_operation.right_join_items.len != 0 or set_operation.right_join_tree_root_index != null or set_operation.right_join_tree_depth != 0) {
+        const source = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
+        if (set_operation.right_source_table_tokens != null or
+            set_operation.right_source_alias_tokens != null or
+            set_operation.right_source_alias_name_tokens != null or
+            set_operation.right_source_system_time_tokens != null or
+            set_operation.right_source_system_time_sequence_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        var read = generated_parser.GeneratedSqlReadAst{
+            .kind = .join,
+            .statement_span = .{ .start = source.start, .end = source.end },
+            .command_span = .{ .start = source.start, .end = source.end },
+            .source_tokens = source,
+            .join_tokens = source,
+            .join_items = set_operation.right_join_items,
+            .join_tree_root_index = set_operation.right_join_tree_root_index,
+            .join_tree_depth = set_operation.right_join_tree_depth,
+        };
+        if (set_operation.right_join_items.len == 0) return error.UnsupportedSqlShape;
+        const first = set_operation.right_join_items[0];
+        read.join_operator_tokens = first.operator_tokens;
+        read.join_kind = first.kind;
+        read.join_left_tokens = first.left_tokens;
+        read.join_right_tokens = first.right_tokens;
+        read.join_predicate_tokens = first.predicate_tokens;
+        try validateGeneratedJoinItemsMetadata(tokens, read);
+        return;
+    }
     const source_table = set_operation.right_source_table_tokens orelse {
         if (set_operation.right_source_alias_tokens != null or
             set_operation.right_source_alias_name_tokens != null or
@@ -2089,7 +2124,7 @@ fn generatedTableAliasFromSetOperationRightSourceMetadataAlloc(
     tokens: []const Token,
     read: *const generated_parser.GeneratedSqlReadAst,
 ) !?GeneratedReadTableAlias {
-    if (read.set_operation_tokens == null) return null;
+    if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
     return try generatedTableAliasFromSourceMetadataAlloc(
         alloc,
         tokens,
@@ -2099,6 +2134,17 @@ fn generatedTableAliasFromSetOperationRightSourceMetadataAlloc(
         read.set_operation.right_source_alias_name_tokens,
         read.set_operation.right_source_system_time_tokens,
     );
+}
+
+fn generatedReadSourceRangeForSide(
+    read: *const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
+) !?generated_parser.GeneratedSqlTokenRange {
+    if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        return read.set_operation.right_source_tokens orelse error.UnsupportedSqlShape;
+    }
+    return read.source_tokens;
 }
 
 fn generatedTableAliasFromJoinSideMetadataAlloc(
@@ -2192,10 +2238,7 @@ fn generatedTableAliasFromReadSourceAlloc(
     use_set_operation_right_side: bool,
 ) !?plan_mod.TableAlias {
     const read = generated_read_ast orelse return null;
-    const source = if (use_set_operation_right_side)
-        read.set_operation.right_source_tokens orelse return null
-    else
-        read.source_tokens orelse return null;
+    const source = (try generatedReadSourceRangeForSide(read, use_set_operation_right_side)) orelse return null;
     if (source.start != pos.*) return error.UnsupportedSqlShape;
     const generated = if (use_set_operation_right_side)
         (try generatedTableAliasFromSetOperationRightSourceMetadataAlloc(alloc, tokens, read)) orelse return null
@@ -2217,10 +2260,7 @@ fn inferGeneratedTableAliasFromReadSourceAlloc(
     use_set_operation_right_side: bool,
 ) !?plan_mod.TableAlias {
     const read = generated_read_ast orelse return null;
-    const source = if (use_set_operation_right_side)
-        read.set_operation.right_source_tokens orelse return null
-    else
-        read.source_tokens orelse return null;
+    const source = (try generatedReadSourceRangeForSide(read, use_set_operation_right_side)) orelse return null;
     if (source.start <= select_body_pos) return error.UnsupportedSqlShape;
     const generated = if (use_set_operation_right_side)
         (try generatedTableAliasFromSetOperationRightSourceMetadataAlloc(alloc, tokens, read)) orelse return null
@@ -3053,9 +3093,10 @@ fn generatedWhereExpressionForClause(
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
     use_set_operation_right_side: bool,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
+) !?*const generated_parser.GeneratedSqlExpressionAst {
     const read = generated_read_ast orelse return null;
     if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
         if (read.set_operation.right_where_tokens) |right_range| {
             if (right_range.start == pos) return &read.set_operation.right_where_expression;
         }
@@ -3070,6 +3111,17 @@ fn generatedWhereExpressionForClause(
         }
     }
     return null;
+}
+
+fn requireGeneratedWhereExpressionForClause(
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
+    generated_where_end: ?usize,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const expression = try generatedWhereExpressionForClause(pos, generated_read_ast, use_set_operation_right_side);
+    if (generated_where_end != null and expression == null) return error.UnsupportedSqlShape;
+    return expression;
 }
 
 fn parseGeneratedLimitValueForClause(
@@ -3364,7 +3416,10 @@ fn generatedSingleJoinPredicateExpression(
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
-    if (join.condition_kind != .on or join.predicate_tokens == null) return error.UnsupportedSqlShape;
+    if (join.condition_kind != .on) return error.UnsupportedSqlShape;
+    const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+    const predicate_expression_tokens = join.predicate_expression.tokens orelse return null;
+    if (!generatedTokenRangeEqual(predicate_expression_tokens, predicate_tokens)) return error.UnsupportedSqlShape;
     return &join.predicate_expression;
 }
 
@@ -3427,6 +3482,7 @@ fn validateGeneratedJoinItemsMetadata(tokens: []const Token, read: generated_par
         if (join.tokens.end > join_tokens.end or join.tokens.start >= join.tokens.end) return error.UnsupportedSqlShape;
         if (join.left_tokens.start != join.tokens.start or join.left_tokens.end != join.operator_tokens.start) return error.UnsupportedSqlShape;
         if (join.right_tokens.start < join.operator_tokens.end or join.right_tokens.end > join.condition_tokens.start or join.right_tokens.start >= join.right_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinLateralSubqueryMetadata(tokens, join);
         try validateGeneratedJoinSideSourceMetadata(
             tokens,
             join.left_tokens,
@@ -3482,6 +3538,82 @@ fn validateGeneratedJoinItemsMetadata(tokens: []const Token, read: generated_par
     }
 }
 
+fn validateGeneratedJoinLateralSubqueryMetadata(
+    tokens: []const Token,
+    join: generated_parser.GeneratedSqlJoinAst,
+) anyerror!void {
+    if (join.right_tokens.start >= join.right_tokens.end or join.right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[join.right_tokens.start].matchesKeywordTag(.lateral)) {
+        if (join.right_lateral_subquery_tokens != null or join.right_lateral_subquery_read_ast != null) return error.UnsupportedSqlShape;
+        return;
+    }
+    const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
+    const subquery_read = join.right_lateral_subquery_read_ast orelse return error.UnsupportedSqlShape;
+    if (join.right_tokens.start + 2 != subquery_tokens.start) return error.UnsupportedSqlShape;
+    if (subquery_tokens.start >= subquery_tokens.end or subquery_tokens.end >= join.right_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[join.right_tokens.start + 1].kind != .lparen) return error.UnsupportedSqlShape;
+    if (tokens[subquery_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+    try validateGeneratedLateralSubqueryAlias(
+        tokens,
+        subquery_tokens.end + 1,
+        join.right_tokens.end,
+        join.right_lateral_alias_tokens,
+        join.right_lateral_alias_name_tokens,
+    );
+    try validateGeneratedReadAstPayloads(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read.*);
+}
+
+fn validateGeneratedLateralSubqueryAlias(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    maybe_alias_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const alias_tokens = maybe_alias_tokens orelse return error.UnsupportedSqlShape;
+    const alias_name_tokens = maybe_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (start >= end or end > tokens.len) return error.UnsupportedSqlShape;
+    if (alias_tokens.start != start or alias_tokens.end != end) return error.UnsupportedSqlShape;
+    if (alias_name_tokens.end != alias_name_tokens.start + 1 or alias_name_tokens.end > end) return error.UnsupportedSqlShape;
+    if (tokens[alias_name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    if (start + 2 == end) {
+        if (!tokens[start].matchesKeywordTag(.as) or alias_name_tokens.start != start + 1) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (start + 1 == end and tokens[start].kind == .identifier) {
+        if (alias_name_tokens.start != start) return error.UnsupportedSqlShape;
+        return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedLateralAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?[]const u8 {
+    const read = generated_read_ast orelse return null;
+    if (read.join_items.len != 1) return error.UnsupportedSqlShape;
+    const join = read.join_items[0];
+    const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
+    if (pos.* != subquery_tokens.end + 1) return error.UnsupportedSqlShape;
+    const alias_tokens = join.right_lateral_alias_tokens orelse return error.UnsupportedSqlShape;
+    const alias_name_tokens = join.right_lateral_alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias_tokens.start != pos.* or alias_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (alias_name_tokens.end != alias_name_tokens.start + 1 or alias_name_tokens.end > alias_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[alias_name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    if (alias_tokens.end == alias_tokens.start + 2) {
+        if (!tokens[alias_tokens.start].matchesKeywordTag(.as) or alias_name_tokens.start != alias_tokens.start + 1) return error.UnsupportedSqlShape;
+    } else if (alias_tokens.end == alias_tokens.start + 1) {
+        if (alias_name_tokens.start != alias_tokens.start) return error.UnsupportedSqlShape;
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = alias_tokens.end;
+    return try alloc.dupe(u8, tokens[alias_name_tokens.start].text);
+}
+
 fn validateGeneratedJoinSideSourceMetadata(
     tokens: []const Token,
     source: generated_parser.GeneratedSqlTokenRange,
@@ -3524,6 +3656,19 @@ fn validateGeneratedJoinExecutableContract(
         .on => if (join.predicate_tokens == null) return error.UnsupportedSqlShape,
         .using => if (join.using_tokens == null or join.using_column_tokens == null or join.using_columns.count == 0) return error.UnsupportedSqlShape,
     }
+}
+
+fn generatedLateralSubqueryReadAstForRange(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    start: usize,
+    end: usize,
+) !?*const generated_parser.GeneratedSqlReadAst {
+    const read = generated_read_ast orelse return null;
+    if (read.join_items.len != 1) return error.UnsupportedSqlShape;
+    const join = read.join_items[0];
+    const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
+    if (subquery_tokens.start != start or subquery_tokens.end != end) return error.UnsupportedSqlShape;
+    return join.right_lateral_subquery_read_ast orelse error.UnsupportedSqlShape;
 }
 
 pub const WindowParserOptions = struct {
@@ -6012,14 +6157,14 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
-        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne);
+        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne, column.collation);
         return true;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
         try validateGeneratedSetOrBetweenPredicateExpression(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
-        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq);
+        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq, column.collation);
         return true;
     }
 
@@ -6031,7 +6176,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
-        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq);
+        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq, column.collation);
         return true;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
@@ -6040,7 +6185,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
-        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .ne);
+        try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .ne, column.collation);
         return true;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
@@ -6049,7 +6194,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
-        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .eq);
+        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .eq, column.collation);
         return true;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
@@ -6058,7 +6203,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
-        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne);
+        try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne, column.collation);
         return true;
     }
     return error.UnsupportedSqlShape;
@@ -7126,6 +7271,7 @@ pub fn expandScalarValuesJsonIntoOrBranches(
     field: []const u8,
     values_json: []const u8,
     op: runtime_schema.RelationalCheckOp,
+    collation: ?[]const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, values_json, .{}) catch return error.UnsupportedSqlShape;
     defer parsed.deinit();
@@ -7145,7 +7291,7 @@ pub fn expandScalarValuesJsonIntoOrBranches(
             };
 
             try cloneScalarOrBranchInto(alloc, &expanded_branch, source_branch.*);
-            try appendScalarJsonValueCheckToBranch(alloc, &expanded_branch, field, value, op);
+            try appendScalarJsonValueCheckToBranch(alloc, &expanded_branch, field, value, op, collation);
 
             try expanded.append(alloc, expanded_branch);
             expanded_branch_transferred = true;
@@ -7162,6 +7308,7 @@ pub fn appendScalarValuesJsonToOrBranches(
     field: []const u8,
     values_json: []const u8,
     op: runtime_schema.RelationalCheckOp,
+    collation: ?[]const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, values_json, .{}) catch return error.UnsupportedSqlShape;
     defer parsed.deinit();
@@ -7171,7 +7318,7 @@ pub fn appendScalarValuesJsonToOrBranches(
     for (branches.items) |*branch| {
         for (parsed.value.array.items) |value| {
             if (op == .ne and value == .null) return error.UnsupportedSqlShape;
-            try appendScalarJsonValueCheckToBranch(alloc, branch, field, value, op);
+            try appendScalarJsonValueCheckToBranch(alloc, branch, field, value, op, collation);
         }
     }
 }
@@ -7182,6 +7329,7 @@ pub fn appendScalarJsonValueCheckToBranch(
     field: []const u8,
     value: std.json.Value,
     op: runtime_schema.RelationalCheckOp,
+    collation: ?[]const u8,
 ) !void {
     const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
     var value_transferred = false;
@@ -7189,14 +7337,19 @@ pub fn appendScalarJsonValueCheckToBranch(
     const owned_field = try alloc.dupe(u8, field);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(owned_field);
+    const owned_collation = if (collation) |source| try alloc.dupe(u8, source) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (owned_collation) |owned| alloc.free(owned);
     try branch.append(alloc, .{
         .name = "",
         .field = owned_field,
         .op = op,
         .value_json = value_json,
+        .collation = owned_collation,
     });
     value_transferred = true;
     field_transferred = true;
+    collation_transferred = true;
 }
 
 pub fn initRelationalBooleanCheck(
@@ -7318,6 +7471,7 @@ pub fn scalarCheckCloneAlloc(
     field: []const u8,
     op: runtime_schema.RelationalCheckOp,
     value_json: []const u8,
+    collation: ?[]const u8,
 ) !runtime_schema.RelationalCheck {
     const owned_field = try alloc.dupe(u8, field);
     var field_transferred = false;
@@ -7325,14 +7479,19 @@ pub fn scalarCheckCloneAlloc(
     const owned_value = try alloc.dupe(u8, value_json);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(owned_value);
+    const owned_collation = if (collation) |source| try alloc.dupe(u8, source) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (owned_collation) |owned| alloc.free(owned);
 
     field_transferred = true;
     value_transferred = true;
+    collation_transferred = true;
     return .{
         .name = "",
         .field = owned_field,
         .op = op,
         .value_json = owned_value,
+        .collation = owned_collation,
     };
 }
 
@@ -7344,6 +7503,7 @@ pub fn appendBetweenScalarGroup(
     first_value_json: []const u8,
     second_op: runtime_schema.RelationalCheckOp,
     second_value_json: []const u8,
+    collation: ?[]const u8,
 ) !void {
     const checks = try alloc.alloc(runtime_schema.RelationalCheck, 2);
     var checks_transferred = false;
@@ -7357,9 +7517,9 @@ pub fn appendBetweenScalarGroup(
         }
     }
 
-    checks[0] = try scalarCheckCloneAlloc(alloc, field, first_op, first_value_json);
+    checks[0] = try scalarCheckCloneAlloc(alloc, field, first_op, first_value_json, collation);
     first_initialized = true;
-    checks[1] = try scalarCheckCloneAlloc(alloc, field, second_op, second_value_json);
+    checks[1] = try scalarCheckCloneAlloc(alloc, field, second_op, second_value_json, collation);
     second_initialized = true;
 
     try or_predicates.append(alloc, .{ .predicates = checks });
@@ -7381,23 +7541,23 @@ pub fn appendBetweenPredicateValuesAlloc(
 
     if (symmetric) {
         if (!negated) {
-            try appendBetweenScalarGroup(alloc, or_predicates, field, .gte, lower_json, .lte, upper_json);
-            try appendBetweenScalarGroup(alloc, or_predicates, field, .gte, upper_json, .lte, lower_json);
+            try appendBetweenScalarGroup(alloc, or_predicates, field, .gte, lower_json, .lte, upper_json, column.collation);
+            try appendBetweenScalarGroup(alloc, or_predicates, field, .gte, upper_json, .lte, lower_json, column.collation);
         } else {
-            try appendBetweenScalarGroup(alloc, or_predicates, field, .lt, lower_json, .lt, upper_json);
-            try appendBetweenScalarGroup(alloc, or_predicates, field, .gt, lower_json, .gt, upper_json);
+            try appendBetweenScalarGroup(alloc, or_predicates, field, .lt, lower_json, .lt, upper_json, column.collation);
+            try appendBetweenScalarGroup(alloc, or_predicates, field, .gt, lower_json, .gt, upper_json, column.collation);
         }
         return;
     }
 
     if (!negated) {
-        const lower = try scalarCheckCloneAlloc(alloc, field, .gte, lower_json);
+        const lower = try scalarCheckCloneAlloc(alloc, field, .gte, lower_json, column.collation);
         var lower_transferred = false;
         errdefer if (!lower_transferred) plan_mod.freeRelationalCheck(alloc, lower);
         try predicates.append(alloc, lower);
         lower_transferred = true;
 
-        const upper = try scalarCheckCloneAlloc(alloc, field, .lte, upper_json);
+        const upper = try scalarCheckCloneAlloc(alloc, field, .lte, upper_json, column.collation);
         var upper_transferred = false;
         errdefer if (!upper_transferred) plan_mod.freeRelationalCheck(alloc, upper);
         try predicates.append(alloc, upper);
@@ -7408,14 +7568,14 @@ pub fn appendBetweenPredicateValuesAlloc(
     const lower_group = try alloc.alloc(runtime_schema.RelationalCheck, 1);
     var lower_group_transferred = false;
     errdefer if (!lower_group_transferred) alloc.free(lower_group);
-    lower_group[0] = try scalarCheckCloneAlloc(alloc, field, .lt, lower_json);
+    lower_group[0] = try scalarCheckCloneAlloc(alloc, field, .lt, lower_json, column.collation);
     var lower_initialized = true;
     errdefer if (!lower_group_transferred and lower_initialized) plan_mod.freeRelationalCheck(alloc, lower_group[0]);
 
     const upper_group = try alloc.alloc(runtime_schema.RelationalCheck, 1);
     var upper_group_transferred = false;
     errdefer if (!upper_group_transferred) alloc.free(upper_group);
-    upper_group[0] = try scalarCheckCloneAlloc(alloc, field, .gt, upper_json);
+    upper_group[0] = try scalarCheckCloneAlloc(alloc, field, .gt, upper_json, column.collation);
     var upper_initialized = true;
     errdefer if (!upper_group_transferred and upper_initialized) plan_mod.freeRelationalCheck(alloc, upper_group[0]);
 
@@ -7503,6 +7663,7 @@ pub fn appendScalarValuesJsonOrGroups(
     field: []const u8,
     values_json: []const u8,
     op: runtime_schema.RelationalCheckOp,
+    collation: ?[]const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, values_json, .{}) catch return error.UnsupportedSqlShape;
     defer parsed.deinit();
@@ -7524,16 +7685,21 @@ pub fn appendScalarValuesJsonOrGroups(
         const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
+        const owned_collation = if (collation) |source| try alloc.dupe(u8, source) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (owned_collation) |owned| alloc.free(owned);
 
         group[0] = .{
             .name = "",
             .field = owned_field,
             .op = op,
             .value_json = value_json,
+            .collation = owned_collation,
         };
         group_initialized = true;
         field_transferred = true;
         value_transferred = true;
+        collation_transferred = true;
 
         try or_predicates.append(alloc, .{ .predicates = group });
         group_transferred = true;
@@ -7643,6 +7809,7 @@ pub fn appendScalarAllEqualityPredicates(
     predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
     field: []const u8,
     values_json: []const u8,
+    collation: ?[]const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, values_json, .{}) catch return error.UnsupportedSqlShape;
     defer parsed.deinit();
@@ -7655,14 +7822,19 @@ pub fn appendScalarAllEqualityPredicates(
         const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
+        const owned_collation = if (collation) |source| try alloc.dupe(u8, source) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (owned_collation) |owned| alloc.free(owned);
         try predicates.append(alloc, .{
             .name = "",
             .field = owned_field,
             .op = .eq,
             .value_json = value_json,
+            .collation = owned_collation,
         });
         field_transferred = true;
         value_transferred = true;
+        collation_transferred = true;
     }
 }
 
@@ -7675,6 +7847,7 @@ pub fn appendJoinOnScalarPredicateAlloc(
     field: []const u8,
     op: runtime_schema.RelationalCheckOp,
     value_json: ?[]const u8,
+    collation: ?[]const u8,
 ) !void {
     if (join_type == .left and side == .left) {
         const lhs_field = try alloc.dupe(u8, field);
@@ -7716,13 +7889,18 @@ pub fn appendJoinOnScalarPredicateAlloc(
     const predicate_field = try alloc.dupe(u8, field);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(predicate_field);
+    const owned_collation = if (collation) |source| try alloc.dupe(u8, source) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (owned_collation) |owned| alloc.free(owned);
     try source_predicates.append(alloc, .{
         .name = "",
         .field = predicate_field,
         .op = op,
         .value_json = value_json,
+        .collation = owned_collation,
     });
     field_transferred = true;
+    collation_transferred = true;
 }
 
 pub fn accessPredicateGroupHasAnyPredicate(group: db_mod.types.RelationalRowsAccessPredicateGroup) bool {
@@ -8129,9 +8307,13 @@ pub fn appendInPredicateClone(
     const values_json = try alloc.dupe(u8, predicate.values_json);
     var values_transferred = false;
     errdefer if (!values_transferred) alloc.free(values_json);
-    try branch.append(alloc, .{ .field = field, .values_json = values_json, .negated = predicate.negated });
+    const collation = if (predicate.collation) |value| try alloc.dupe(u8, value) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+    try branch.append(alloc, .{ .field = field, .values_json = values_json, .negated = predicate.negated, .collation = collation });
     field_transferred = true;
     values_transferred = true;
+    collation_transferred = true;
 }
 
 pub fn appendJsonContainsClone(
@@ -12438,28 +12620,20 @@ pub fn windowOutputColumnsAlloc(
     if (total == 0) return &.{};
     const out = try alloc.alloc(runtime_schema.RelationalColumn, total);
     var initialized: usize = 0;
-    errdefer alloc.free(out);
+    errdefer {
+        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
     for (select.fields) |field| {
         if (aggregateOutputColumnExists(out[0..initialized], field)) return error.UnsupportedSqlShape;
         const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = .{
-            .name = field,
-            .path = field,
-            .field_type = column.field_type,
-            .array_item_type = column.array_item_type,
-            .nullable = column.nullable,
-        };
+        out[initialized] = try projectedSourceColumnAlloc(alloc, field, column);
         initialized += 1;
     }
     for (select.windows) |window| {
         if (aggregateOutputColumnExists(out[0..initialized], window.output)) return error.UnsupportedSqlShape;
         const value_type = if (window.value_expression) |expression| try type_context.rowExpressionOutputType(expression) else null;
-        out[initialized] = .{
-            .name = window.output,
-            .path = window.output,
-            .field_type = try windowOutputType(window.function, value_type),
-            .nullable = true,
-        };
+        out[initialized] = try projectedColumnAlloc(alloc, window.output, try windowOutputType(window.function, value_type), null, true);
         initialized += 1;
     }
     return out;
@@ -12475,9 +12649,9 @@ pub fn aggregateOutputColumnForFieldAlloc(
     field: []const u8,
 ) !runtime_schema.RelationalColumn {
     const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     for (output_columns) |column| {
-        if (std.mem.eql(u8, column.name, field)) return column;
+        if (std.mem.eql(u8, column.name, field)) return try projectedSourceColumnAlloc(alloc, column.name, column);
     }
     return error.UnsupportedSqlShape;
 }
@@ -12494,27 +12668,19 @@ pub fn aggregateOutputColumnsAlloc(
     if (total == 0) return &.{};
     const out = try alloc.alloc(runtime_schema.RelationalColumn, total);
     var initialized: usize = 0;
-    errdefer alloc.free(out);
+    errdefer {
+        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
     for (group_fields) |field| {
         if (aggregateOutputColumnExists(out[0..initialized], field)) return error.UnsupportedSqlShape;
         const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = .{
-            .name = field,
-            .path = field,
-            .field_type = column.field_type,
-            .array_item_type = column.array_item_type,
-            .nullable = column.nullable,
-        };
+        out[initialized] = try projectedSourceColumnAlloc(alloc, field, column);
         initialized += 1;
     }
     for (group_expressions) |projection| {
         if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
-        out[initialized] = .{
-            .name = projection.output,
-            .path = projection.output,
-            .field_type = try type_context.rowExpressionOutputType(projection.expression),
-            .nullable = true,
-        };
+        out[initialized] = try projectedColumnAlloc(alloc, projection.output, try type_context.rowExpressionOutputType(projection.expression), null, true);
         initialized += 1;
     }
     for (aggregations) |aggregation| {
@@ -12524,13 +12690,7 @@ pub fn aggregateOutputColumnsAlloc(
         else
             null;
         const projected_type = try aggregateOutputProjectedType(aggregation, input_type);
-        out[initialized] = .{
-            .name = aggregation.name,
-            .path = aggregation.name,
-            .field_type = projected_type.field_type,
-            .array_item_type = projected_type.array_item_type,
-            .nullable = false,
-        };
+        out[initialized] = try projectedColumnAlloc(alloc, aggregation.name, projected_type.field_type, projected_type.array_item_type, false);
         initialized += 1;
     }
     return out;
@@ -12740,7 +12900,7 @@ fn selectOutputColumnAlloc(
             if (output.index >= select.fields.len) return error.UnsupportedSqlShape;
             const field = select.fields[output.index];
             const source = binder.relationalColumnForField(type_context.schema, field, null) orelse return error.InvalidSqlCatalog;
-            break :blk try projectedColumnAlloc(alloc, field, source.field_type, source.array_item_type, source.nullable);
+            break :blk try projectedSourceColumnAlloc(alloc, field, source);
         },
         .json_extract => blk: {
             if (output.index >= select.json_extract.len) return error.UnsupportedSqlShape;
@@ -12763,7 +12923,7 @@ fn selectOutputColumnAlloc(
             if (output.index >= select.field_aliases.len) return error.UnsupportedSqlShape;
             const projection = select.field_aliases[output.index];
             const source = binder.relationalColumnForField(type_context.schema, projection.field, null) orelse return error.InvalidSqlCatalog;
-            break :blk try projectedColumnAlloc(alloc, projection.output, source.field_type, source.array_item_type, source.nullable);
+            break :blk try projectedSourceColumnAlloc(alloc, projection.output, source);
         },
         .expression => blk: {
             if (output.index >= select.expressions.len) return error.UnsupportedSqlShape;
@@ -13368,6 +13528,27 @@ pub fn projectedColumnAlloc(
     };
 }
 
+fn projectedSourceColumnAlloc(
+    alloc: std.mem.Allocator,
+    output_name: []const u8,
+    source: runtime_schema.RelationalColumn,
+) !runtime_schema.RelationalColumn {
+    const owned_name = try alloc.dupe(u8, output_name);
+    errdefer alloc.free(owned_name);
+    const owned_path = try alloc.dupe(u8, output_name);
+    errdefer alloc.free(owned_path);
+    const collation = if (source.collation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (collation) |value| alloc.free(value);
+    return .{
+        .name = owned_name,
+        .path = owned_path,
+        .field_type = source.field_type,
+        .array_item_type = source.array_item_type,
+        .nullable = source.nullable,
+        .collation = collation,
+    };
+}
+
 pub fn aggregateOutputFieldByOrdinalAlloc(
     alloc: std.mem.Allocator,
     group_fields: []const []const u8,
@@ -13420,7 +13601,7 @@ pub fn canParseBareBooleanAggregateHavingExpression(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
 ) !bool {
     const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13444,6 +13625,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
     errdefer if (!field_transferred) alloc.free(field);
     if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
     const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+    defer ddl_plan.freeDdlRelationalColumn(alloc, column);
 
     const op_token_index = pos.*;
     const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
@@ -13530,7 +13712,7 @@ pub fn parseAggregateOutputExpressionConditionAlloc(
     options: AggregateOutputExpressionConditionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
     const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13562,7 +13744,7 @@ pub fn parseAggregateOutputOrderExpressionAlloc(
     options: OutputOrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
     const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13588,7 +13770,7 @@ pub fn parseWindowOutputOrderExpressionAlloc(
     options: OutputOrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
     const output_columns = try windowOutputColumnsAlloc(alloc, schema, type_context, select);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const window_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13613,7 +13795,7 @@ pub fn parseJoinOutputOrderExpressionAlloc(
     options: OutputOrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
     const output_columns = try joinOutputColumnsAlloc(alloc, schema, select);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const join_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13642,7 +13824,7 @@ pub fn parseBareBooleanAggregateHavingExpression(
     options: BareBooleanAggregateHavingExpressionParserOptions,
 ) !void {
     const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer if (output_columns.len > 0) alloc.free(output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
         .relational_columns = output_columns,
@@ -13693,6 +13875,7 @@ pub fn parseAggregateHavingBooleanIsNotGroups(
     }
 
     const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+    defer ddl_plan.freeDdlRelationalColumn(alloc, column);
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
     const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
     try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, expected_kind);
@@ -14397,6 +14580,7 @@ pub fn parseAggregateHavingAlloc(
             errdefer if (!field_transferred) alloc.free(field);
             if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
             const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+            defer ddl_plan.freeDdlRelationalColumn(alloc, column);
             const op_token_index = pos.*;
             const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
                 .allow_boolean_unknown = true,
@@ -14707,6 +14891,7 @@ pub fn parseAggregateOrderByAlloc(
         errdefer if (!order_transferred) {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
         try validateGeneratedExpressionItemEnd(generated_item, pos.*);
@@ -14757,6 +14942,7 @@ pub fn parseWindowOutputOrderByAlloc(
         errdefer if (!order_transferred) {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
         try validateGeneratedExpressionItemEnd(generated_item, pos.*);
@@ -14806,6 +14992,7 @@ pub fn parseJoinOrderByAlloc(
         errdefer if (!order_transferred) {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
         try validateGeneratedExpressionItemEnd(generated_item, pos.*);
@@ -14959,6 +15146,7 @@ pub fn appendOrderWithNullPlacement(
         errdefer if (!null_order_transferred) {
             if (null_order.field.len > 0) alloc.free(null_order.field);
             if (null_order.expression) |expression| freeExpression(alloc, expression);
+            if (null_order.collation) |collation| alloc.free(collation);
         };
         null_order.direction = if (nulls_first) .desc else .asc;
         null_order.null_test = .is_null;
@@ -14976,23 +15164,31 @@ pub fn cloneOrderForNullTestAlloc(
         return .{ .expression = try cloneExpressionAlloc(alloc, expression) };
     }
     if (order.field.len == 0) return error.UnsupportedSqlShape;
-    return .{ .field = try alloc.dupe(u8, order.field) };
+    const field = try alloc.dupe(u8, order.field);
+    errdefer alloc.free(field);
+    const collation = if (order.collation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (collation) |value| alloc.free(value);
+    return .{
+        .field = field,
+        .collation = collation,
+    };
 }
 
 pub fn selectOutputOrderByRefAlloc(
     alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
     select: plan_mod.SelectList,
     output: ast.SelectOutputRef,
 ) !db_mod.types.RelationalRowsQueryOrder {
     return switch (output.kind) {
-        .field => .{ .field = try alloc.dupe(u8, select.fields[output.index]) },
+        .field => try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.fields[output.index])),
         .json_extract => .{ .expression = try expressionFromJsonExtractProjectionAlloc(alloc, select.json_extract[output.index]) },
         .array_length => .{ .expression = try expressionFromArrayLengthProjectionAlloc(alloc, select.array_length[output.index]) },
         .coalesce => .{ .expression = try expressionFromCoalesceProjectionAlloc(alloc, select.coalesce[output.index]) },
-        .field_alias => .{ .field = try alloc.dupe(u8, select.field_aliases[output.index].field) },
+        .field_alias => try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.field_aliases[output.index].field)),
         .expression => blk: {
             const expression = select.expressions[output.index].expression;
-            if (expression.kind == .field) break :blk .{ .field = try alloc.dupe(u8, expression.field) };
+            if (expression.kind == .field) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, expression.field));
             break :blk .{ .expression = try cloneExpressionAlloc(alloc, expression) };
         },
     };
@@ -15008,12 +15204,12 @@ pub fn selectOutputOrderByOrdinalAlloc(
     var index: usize = @intCast(ordinal - 1);
     if (select.select_all) {
         if (index < schema.relational_columns.len) {
-            return .{ .field = try alloc.dupe(u8, schema.relational_columns[index].name) };
+            return try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, schema.relational_columns[index].name));
         }
         index -= schema.relational_columns.len;
     }
     if (index >= select.outputs.len) return error.UnsupportedSqlShape;
-    return try selectOutputOrderByRefAlloc(alloc, select, select.outputs[index]);
+    return try selectOutputOrderByRefAlloc(alloc, schema, select, select.outputs[index]);
 }
 
 fn aggregateSpecNameCollision(
@@ -15259,6 +15455,7 @@ pub fn parseSelectOutputOrderByNameMaybeAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
+    schema: runtime_schema.TableSchema,
     select: plan_mod.SelectList,
 ) !?db_mod.types.RelationalRowsQueryOrder {
     if (!parser.peekKind(tokens, pos.*, .identifier)) return null;
@@ -15272,7 +15469,7 @@ pub fn parseSelectOutputOrderByNameMaybeAlloc(
     const name = tokens[pos.*].text;
     const output = (try plan_mod.selectOutputByName(name, select)) orelse return null;
     pos.* += 1;
-    return try selectOutputOrderByRefAlloc(alloc, select, output);
+    return try selectOutputOrderByRefAlloc(alloc, schema, select, output);
 }
 
 pub fn parseOrderByAlloc(
@@ -15335,6 +15532,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
         errdefer if (!order_transferred) {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
         try validateGeneratedExpressionItemEnd(generated_item, pos.*);
@@ -15363,12 +15561,13 @@ pub fn parseSelectOutputOrderByAlloc(
             try validateGeneratedSimpleOrderExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             break :blk try selectOutputOrderByOrdinalAlloc(alloc, options.schema, select, ordinal);
-        } else if (try parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, select)) |named_order| blk: {
+        } else if (try parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, options.schema, select)) |named_order| blk: {
             const order_candidate = named_order;
             var order_candidate_transferred = false;
             errdefer if (!order_candidate_transferred) {
                 if (order_candidate.field.len > 0) alloc.free(order_candidate.field);
                 if (order_candidate.expression) |expression| freeExpression(alloc, expression);
+                if (order_candidate.collation) |collation| alloc.free(collation);
             };
             try validateGeneratedSimpleOrderExpression(generated_expression);
             order_candidate_transferred = true;
@@ -15389,6 +15588,7 @@ pub fn parseSelectOutputOrderByAlloc(
         errdefer if (!order_transferred) {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeExpression(alloc, expression);
+            if (order.collation) |collation| alloc.free(collation);
         };
         const explicit_nulls_first = try parseOrderModifiers(tokens, pos, &order);
         try validateGeneratedExpressionItemEnd(generated_item, pos.*);
@@ -16286,17 +16486,21 @@ pub fn joinOutputColumnsAlloc(
     if (select.len == 0) return &.{};
     const out = try alloc.alloc(runtime_schema.RelationalColumn, select.len);
     var initialized: usize = 0;
-    errdefer alloc.free(out);
+    errdefer {
+        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
     for (select) |projection| {
         if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
         const column = binder.relationalColumnForField(schema, projection.field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = .{
-            .name = projection.output,
-            .path = projection.output,
+        out[initialized] = try projectedSourceColumnAlloc(alloc, projection.output, .{
+            .name = column.name,
+            .path = column.path,
             .field_type = column.field_type,
             .array_item_type = column.array_item_type,
             .nullable = true,
-        };
+            .collation = column.collation,
+        });
         initialized += 1;
     }
     return out;
@@ -16368,7 +16572,8 @@ fn relationalChecksEqual(lhs: []const runtime_schema.RelationalCheck, rhs: []con
         if (!std.mem.eql(u8, lhs_check.name, rhs_check.name) or
             !std.mem.eql(u8, lhs_check.field, rhs_check.field) or
             lhs_check.op != rhs_check.op or
-            !optionalStringEqual(lhs_check.value_json, rhs_check.value_json))
+            !optionalStringEqual(lhs_check.value_json, rhs_check.value_json) or
+            !optionalStringEqual(lhs_check.collation, rhs_check.collation))
         {
             return false;
         }
@@ -16396,7 +16601,8 @@ fn inPredicatesEqual(
     for (lhs, rhs) |lhs_predicate, rhs_predicate| {
         if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
             !std.mem.eql(u8, lhs_predicate.values_json, rhs_predicate.values_json) or
-            lhs_predicate.negated != rhs_predicate.negated)
+            lhs_predicate.negated != rhs_predicate.negated or
+            !optionalStringEqual(lhs_predicate.collation, rhs_predicate.collation))
         {
             return false;
         }
@@ -18186,7 +18392,7 @@ pub fn validateRelationalColumnCatalog(columns: []const runtime_schema.Relationa
     for (columns, 0..) |column, i| {
         if (binder.relationalColumnIndex(columns[0..i], column.name) != null) return error.InvalidSqlCatalog;
         if (!std.mem.eql(u8, column.name, column.path)) return error.InvalidSqlCatalog;
-        if (column.collation != null and !binder.relationalFieldTypeSupportsCollation(column.field_type)) return error.InvalidSqlCatalog;
+        if (column.collation != null and !binder.relationalColumnTypeSupportsCollation(column.field_type, column.array_item_type)) return error.InvalidSqlCatalog;
         if (column.generated) |_| try validateGeneratedColumnForColumns(columns, column);
         try validateUniquePredicatesForColumns(columns, column.index_where);
         try validateUniquePredicateExpressionsForColumns(columns, column.index_where_expressions);
@@ -19130,6 +19336,7 @@ fn inPredicateAndRelationalCheckProvablyDisjoint(
 ) !bool {
     if (check.expression != null) return false;
     if (!std.mem.eql(u8, in_predicate.field, check.field)) return false;
+    if (!optionalStringEqual(in_predicate.collation, check.collation)) return false;
 
     switch (check.op) {
         .eq, .is_not_distinct => {
@@ -19152,6 +19359,7 @@ fn inPredicatesProvablyDisjoint(
 ) !bool {
     if (lhs.negated or rhs.negated) return false;
     if (!std.mem.eql(u8, lhs.field, rhs.field)) return false;
+    if (!optionalStringEqual(lhs.collation, rhs.collation)) return false;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, lhs.values_json, .{}) catch return false;
     defer parsed.deinit();
@@ -19176,17 +19384,27 @@ fn inPredicateValuesContainJsonLiteralProof(
 ) !InPredicateContainmentProof {
     if (predicate.negated) return .unknown;
     if (!jsonIsSafeDisjointProofLiteral(value_json) and !jsonIsJsonNumberLiteral(value_json)) return .unknown;
+    var wanted = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return .unknown;
+    defer wanted.deinit();
+    if (!jsonValueIsSafeDisjointProofScalar(wanted.value)) return .unknown;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.values_json, .{}) catch return .unknown;
     defer parsed.deinit();
     if (parsed.value != .array) return .unknown;
 
     for (parsed.value.array.items) |value| {
-        const item_json = (try jsonValueScalarProofLiteralAlloc(alloc, value)) orelse return .unknown;
-        defer alloc.free(item_json);
-        if (std.mem.eql(u8, item_json, value_json)) return .contains;
+        if (!jsonValueIsSafeDisjointProofScalar(value)) return .unknown;
+        const not_distinct = relational_rows_executor.jsonValuesNotDistinctWithCollation(value, wanted.value, predicate.collation) orelse return .unknown;
+        if (not_distinct) return .contains;
     }
     return .does_not_contain;
+}
+
+fn jsonValueIsSafeDisjointProofScalar(value: std.json.Value) bool {
+    return switch (value) {
+        .null, .bool, .string, .integer, .float, .number_string => true,
+        else => false,
+    };
 }
 
 fn jsonValueScalarProofLiteralAlloc(alloc: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
@@ -19976,7 +20194,7 @@ pub fn parseSelectAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
-            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
+            const generated_where_expression = try requireGeneratedWhereExpressionForClause(pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary, generated_where_end);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -20373,7 +20591,7 @@ pub fn parseAggregateAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
-            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
+            const generated_where_expression = try requireGeneratedWhereExpressionForClause(pos.*, options.generated_read_ast, false, generated_where_end);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -20819,7 +21037,7 @@ pub fn parseWindowSelectAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
-            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
+            const generated_where_expression = try requireGeneratedWhereExpressionForClause(pos.*, options.generated_read_ast, false, generated_where_end);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -21367,7 +21585,7 @@ pub fn parseJoinAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
-            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
+            const generated_where_expression = try requireGeneratedWhereExpressionForClause(pos.*, options.generated_read_ast, false, generated_where_end);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &right_predicates,
@@ -21865,15 +22083,7 @@ pub fn parseLateralAlloc(
     try parser.expectKeyword(tokens, pos, "lateral");
     try parser.expectToken(tokens, pos, .lparen);
     const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
-    var generated_lateral_subquery: ?tokenized.ParsedSql = if (options.generated_read_ast != null)
-        try tokenized.ParsedSql.initFromTokenSliceAlloc(alloc, "", tokens[pos.*..close_index])
-    else
-        null;
-    defer if (generated_lateral_subquery) |*parsed| parsed.deinit(alloc);
-    const generated_lateral_subquery_read_ast = if (generated_lateral_subquery) |*parsed|
-        try generatedReadAstForParsedSql(parsed, .query)
-    else
-        null;
+    const generated_lateral_subquery_read_ast = try generatedLateralSubqueryReadAstForRange(options.generated_read_ast, pos.*, close_index);
     var lateral_subquery = try options.subquery_hooks.parse_subquery(
         options.subquery_hooks.ptr,
         tokens[pos.*..close_index],
@@ -21886,7 +22096,10 @@ pub fn parseLateralAlloc(
     errdefer plan_mod.freeLateralSubquery(alloc, lateral_subquery);
     pos.* = close_index + 1;
 
-    const lateral_alias = try grammar.parseRequiredAliasAlloc(alloc, tokens, pos);
+    const lateral_alias = if (try generatedLateralAliasAlloc(alloc, tokens, pos, options.generated_read_ast)) |generated_alias|
+        generated_alias
+    else
+        try grammar.parseRequiredAliasAlloc(alloc, tokens, pos);
     defer alloc.free(lateral_alias);
     const condition_tokens_start = pos.*;
 
@@ -22059,7 +22272,7 @@ pub fn parseLateralAlloc(
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
             const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
-            const generated_where_expression = generatedWhereExpressionForClause(pos.*, options.generated_read_ast, false);
+            const generated_where_expression = try requireGeneratedWhereExpressionForClause(pos.*, options.generated_read_ast, false, generated_where_end);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &unsupported_right_predicates,
@@ -24642,7 +24855,9 @@ pub fn parseOrderExpressionAlloc(
             };
             try parser.expectToken(tokens, pos, .rparen);
             field_transferred = true;
-            return .{ .field = field, .null_test = null_test };
+            var order = try orderForOwnedFieldAlloc(alloc, schema, field);
+            order.null_test = null_test;
+            return order;
         },
         .parenthesized => {
             const expression_start = pos.*;
@@ -24685,7 +24900,7 @@ pub fn parseOrderExpressionAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-            )) |field| return .{ .field = field };
+            )) |field| return try orderForOwnedFieldAlloc(alloc, schema, field);
             const expression_start = pos.*;
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
@@ -24710,7 +24925,7 @@ pub fn parseOrderExpressionAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-            )) |field| return .{ .field = field };
+            )) |field| return try orderForOwnedFieldAlloc(alloc, schema, field);
             const expression_start = pos.*;
             const expression = try parseCaseFoldRowExpressionAlloc(
                 alloc,
@@ -24735,7 +24950,7 @@ pub fn parseOrderExpressionAlloc(
             );
             if (expression.kind == .field and expression.field.len != 0) {
                 expression_transferred = true;
-                return .{ .field = expression.field };
+                return try orderForOwnedFieldAlloc(alloc, schema, expression.field);
             }
             expression_transferred = true;
             return .{ .expression = expression };
@@ -24808,7 +25023,37 @@ pub fn parseOrderExpressionAlloc(
         return .{ .expression = expression };
     }
     field_transferred = true;
-    return .{ .field = field };
+    return try orderForOwnedFieldAlloc(alloc, schema, field);
+}
+
+fn orderForOwnedFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+) !db_mod.types.RelationalRowsQueryOrder {
+    errdefer alloc.free(field);
+    const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+    const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (collation) |value| alloc.free(value);
+    return .{
+        .field = field,
+        .collation = collation,
+    };
+}
+
+fn orderForOwnedOutputFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+) !db_mod.types.RelationalRowsQueryOrder {
+    errdefer alloc.free(field);
+    const column = binder.relationalColumnForField(schema, field, null);
+    const collation = if (column) |resolved| if (resolved.collation) |value| try alloc.dupe(u8, value) else null else null;
+    errdefer if (collation) |value| alloc.free(value);
+    return .{
+        .field = field,
+        .collation = collation,
+    };
 }
 
 pub fn parseCaseExpressionConditionWithSelectSchemaAlloc(
@@ -27620,14 +27865,19 @@ pub fn parseWhereAtomAlloc(
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
+                const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+                var collation_transferred = false;
+                errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
                 try predicates.append(alloc, .{
                     .name = "",
                     .field = field,
                     .op = is_tail.op,
                     .value_json = value_json,
+                    .collation = collation,
                 });
                 value_transferred = true;
                 field_transferred = true;
+                collation_transferred = true;
                 return;
             },
             .boolean_unknown => {
@@ -27737,13 +27987,18 @@ pub fn parseWhereAtomAlloc(
         var values_transferred = false;
         errdefer if (!values_transferred) alloc.free(values_json);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
+        const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
         try in_predicates.append(alloc, .{
             .field = field,
             .values_json = values_json,
             .negated = true,
+            .collation = collation,
         });
         field_transferred = true;
         values_transferred = true;
+        collation_transferred = true;
         return;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
@@ -27753,13 +28008,18 @@ pub fn parseWhereAtomAlloc(
         var values_transferred = false;
         errdefer if (!values_transferred) alloc.free(values_json);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
+        const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
         try in_predicates.append(alloc, .{
             .field = field,
             .values_json = values_json,
             .negated = false,
+            .collation = collation,
         });
         field_transferred = true;
         values_transferred = true;
+        collation_transferred = true;
         return;
     }
 
@@ -27774,13 +28034,18 @@ pub fn parseWhereAtomAlloc(
         errdefer if (!values_transferred) alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
+        const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
         try in_predicates.append(alloc, .{
             .field = field,
             .values_json = values_json,
             .negated = negated,
+            .collation = collation,
         });
         field_transferred = true;
         values_transferred = true;
+        collation_transferred = true;
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
@@ -27792,9 +28057,9 @@ pub fn parseWhereAtomAlloc(
         try parser.expectToken(tokens, pos, .rparen);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
         if (negated) {
-            try appendScalarAllEqualityPredicates(alloc, predicates, field, values_json);
+            try appendScalarAllEqualityPredicates(alloc, predicates, field, values_json, column.collation);
         } else {
-            try appendScalarValuesJsonOrGroups(alloc, or_predicates, field, values_json, .ne);
+            try appendScalarValuesJsonOrGroups(alloc, or_predicates, field, values_json, .ne, column.collation);
         }
         return;
     }
@@ -27806,7 +28071,7 @@ pub fn parseWhereAtomAlloc(
         defer alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
-        try appendScalarAllEqualityPredicates(alloc, predicates, field, values_json);
+        try appendScalarAllEqualityPredicates(alloc, predicates, field, values_json, column.collation);
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
@@ -27818,13 +28083,18 @@ pub fn parseWhereAtomAlloc(
         errdefer if (!values_transferred) alloc.free(values_json);
         try parser.expectToken(tokens, pos, .rparen);
         try value_mod.validateSqlScalarValuesJson(alloc, column, values_json);
+        const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
         try in_predicates.append(alloc, .{
             .field = field,
             .values_json = values_json,
             .negated = !negated,
+            .collation = collation,
         });
         field_transferred = true;
         values_transferred = true;
+        collation_transferred = true;
         return;
     }
     if (negated) return error.UnsupportedSqlShape;
@@ -27846,14 +28116,19 @@ pub fn parseWhereAtomAlloc(
         value_transferred = true;
         return;
     }
+    const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
     try predicates.append(alloc, .{
         .name = "",
         .field = field,
         .op = op,
         .value_json = value_json,
+        .collation = collation,
     });
     field_transferred = true;
     value_transferred = true;
+    collation_transferred = true;
 }
 
 pub fn parseJoinWhereAlloc(
@@ -27971,9 +28246,13 @@ pub fn parseJoinWhereAlloc(
             const field = try alloc.dupe(u8, source.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = true });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = true, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -27987,9 +28266,13 @@ pub fn parseJoinWhereAlloc(
             const field = try alloc.dupe(u8, source.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -28045,9 +28328,13 @@ pub fn parseJoinWhereAlloc(
             const field = try alloc.dupe(u8, source.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try target_in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -28071,9 +28358,13 @@ pub fn parseJoinWhereAlloc(
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
-        try target.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json });
+        const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+        try target.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json, .collation = collation });
         field_transferred = true;
         value_transferred = true;
+        collation_transferred = true;
         if (!parser.matchKeyword(tokens, pos, "and")) break;
     }
 }
@@ -28218,6 +28509,7 @@ pub fn parseJoinOnAlloc(
                         lhs.field,
                         .eq,
                         value_json,
+                        lhs_column.collation,
                     );
                     value_transferred = true;
                     if (!parser.matchKeyword(tokens, pos, "and")) break;
@@ -28262,6 +28554,7 @@ pub fn parseJoinOnAlloc(
                 lhs.field,
                 op,
                 value_json,
+                lhs_column.collation,
             );
             value_transferred = true;
         }
@@ -28513,9 +28806,13 @@ pub fn parseLateralWhereAlloc(
             const field = try alloc.dupe(u8, lhs.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = true });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = true, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -28529,9 +28826,13 @@ pub fn parseLateralWhereAlloc(
             const field = try alloc.dupe(u8, lhs.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -28589,9 +28890,13 @@ pub fn parseLateralWhereAlloc(
             const field = try alloc.dupe(u8, lhs.field);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try targets.in_predicates.append(alloc, .{ .field = field, .values_json = values_json, .negated = false, .collation = collation });
             field_transferred = true;
             values_transferred = true;
+            collation_transferred = true;
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -28635,9 +28940,13 @@ pub fn parseLateralWhereAlloc(
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
-            try targets.predicates.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json });
+            const collation = if (column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try targets.predicates.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json, .collation = collation });
             field_transferred = true;
             value_transferred = true;
+            collation_transferred = true;
         }
         if (!parser.matchKeyword(tokens, pos, "and")) break;
     }
@@ -30200,7 +30509,11 @@ fn generatedReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if (read.kind != expected_kind or read.cte_tokens != null or (expected_kind != .set_operation and read.set_operation_tokens != null)) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -30216,7 +30529,11 @@ fn generatedQueryPlanReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if ((read.kind != .query and read.kind != .set_operation) or read.cte_tokens != null) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -30232,7 +30549,11 @@ fn generatedCteReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| if (read.kind == .cte and read.cte_tokens != null) read else error.UnsupportedSqlShape,
+                .read => |read| blk: {
+                    if (read.kind != .cte or read.cte_tokens == null) return error.UnsupportedSqlShape;
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -30770,7 +31091,9 @@ test "sql adapter lower expr lowers recursive cte stream contract" {
     try std.testing.expectEqualStrings("nodes", recursive.anchor.table_name);
     try std.testing.expectEqualStrings("parent_id", recursive.anchor.plan.query.predicates[0].field);
     try std.testing.expectEqualStrings("id", recursive.output_columns[0].name);
+    try std.testing.expectEqualStrings("id", recursive.output_columns[0].path);
     try std.testing.expectEqualStrings("depth", recursive.output_columns[1].name);
+    try std.testing.expectEqualStrings("depth", recursive.output_columns[1].path);
 
     const recursive_member_join = switch (recursive.recursive_member) {
         .join => |join| join,
@@ -30803,6 +31126,49 @@ test "sql adapter lower expr lowers recursive cte stream contract" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
         alloc,
         &malformed_generated_anchor,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_recursive_member_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer malformed_generated_recursive_member_join.deinit(alloc);
+    if (malformed_generated_recursive_member_join.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_set_operation.right_join_items.len != 1) return error.TestUnexpectedResult;
+                read.cte_items[0].body_set_operation.right_join_items[0].right_table_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_recursive_member_join,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_recursive_member_projection = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer malformed_generated_recursive_member_projection.deinit(alloc);
+    if (malformed_generated_recursive_member_projection.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_set_operation.right_projection_items.count < 2) return error.TestUnexpectedResult;
+                const projection = read.cte_items[0].body_set_operation.right_projection_tokens orelse return error.TestUnexpectedResult;
+                read.cte_items[0].body_set_operation.right_projection_items.items[0].end = projection.end;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_recursive_member_projection,
         schema,
         &.{},
     ));
@@ -30873,6 +31239,18 @@ test "sql adapter lower expr lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("[\"open\",\"pending\"]", disjoint_in_union.plan.query.access_or_predicates[0].in_predicates[0].values_json);
     try std.testing.expectEqual(@as(usize, 1), disjoint_in_union.plan.query.access_or_predicates[1].predicates.len);
     try std.testing.expectEqualStrings("\"closed\"", disjoint_in_union.plan.query.access_or_predicates[1].predicates[0].value_json.?);
+
+    const collated_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","collation":"antfly.case_insensitive"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const collated_schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, collated_schema_json);
+    defer runtime_schema.freeSchema(alloc, collated_schema);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open') UNION ALL SELECT id FROM usage_records WHERE status = 'OPEN'",
+        collated_schema,
+        &.{},
+    ));
 
     var disjoint_or_in_union = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -31337,7 +31715,7 @@ test "sql adapter lower expr lowers direct select set operation query plans" {
 test "sql adapter lower expr reconciles set operation output shape" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"body":{"type":"text"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","collation":"status_collation"},"title":{"type":"text","collation":"status_collation"},"other_title":{"type":"text","collation":"other_collation"},"body":{"type":"text"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -31365,9 +31743,36 @@ test "sql adapter lower expr reconciles set operation output shape" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, text_like.right.plan.query.expressions[0].expression.kind);
     try std.testing.expectEqualStrings("body", text_like.right.plan.query.expressions[0].expression.field);
 
+    var collated_text_like = try lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT status FROM usage_records WHERE status = 'open' UNION ALL SELECT title AS status FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer collated_text_like.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), collated_text_like.output_columns.len);
+    try std.testing.expectEqualStrings("status", collated_text_like.output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, collated_text_like.output_columns[0].field_type);
+    try std.testing.expectEqualStrings("status_collation", collated_text_like.output_columns[0].collation.?);
+
     if (lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE amount > 0",
+        schema,
+        &.{},
+        .{},
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+    if (lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT status FROM usage_records WHERE status = 'open' UNION ALL SELECT other_title AS status FROM usage_records WHERE status = 'closed'",
         schema,
         &.{},
         .{},
@@ -34417,6 +34822,91 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
         &.{},
         .{},
     ));
+
+    var malformed_generated_set_operation_source_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_source_table.deinit(alloc);
+    if (malformed_generated_set_operation_source_table.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.right_source_tokens == null or read.set_operation.right_source_table_tokens == null) return error.TestUnexpectedResult;
+                read.set_operation.right_source_table_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_source_table,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_right_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT accounts.id FROM accounts JOIN tenants ON accounts.tenant_id = tenants.id",
+    );
+    defer malformed_generated_set_operation_right_join.deinit(alloc);
+    if (malformed_generated_set_operation_right_join.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.right_join_items.len == 0) return error.TestUnexpectedResult;
+                read.set_operation.right_join_tree_root_index = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    if (malformed_generated_set_operation_right_join.generated_statement) |generated_statement| {
+        switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
+            .read => |read| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedReadAstPayloads(malformed_generated_set_operation_right_join.items(), read)),
+            else => return error.TestUnexpectedResult,
+        }
+    } else return error.TestUnexpectedResult;
+
+    var malformed_generated_set_operation_ownership = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_ownership.deinit(alloc);
+    if (malformed_generated_set_operation_ownership.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation_tokens == null or read.set_operation.right_source_tokens == null) return error.TestUnexpectedResult;
+                read.set_operation_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_ownership,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_where_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_where_expression.deinit(alloc);
+    if (malformed_generated_set_operation_where_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                const right_where = read.set_operation.right_where_tokens orelse return error.TestUnexpectedResult;
+                read.set_operation_tokens = null;
+                try std.testing.expectError(error.UnsupportedSqlShape, generatedWhereExpressionForClause(
+                    right_where.start,
+                    read,
+                    true,
+                ));
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
 
     var aggregate = try lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -38162,6 +38652,28 @@ test "sql adapter lower expr lowers bare boolean where expressions" {
     ));
 }
 
+test "sql adapter lower expr propagates field collation to scalar predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE name = 'beta'",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("name", lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"beta\"", lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", lowered.plan.query.predicates[0].collation.?);
+}
+
 test "sql adapter lower expr lowers text pattern predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -40689,10 +41201,10 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try scalar_branches.append(alloc, .empty);
     try appendScalarBooleanCheckToBranch(alloc, &scalar_branches.items[0], "enabled", .eq, true);
     try appendScalarNullCheckToBranch(alloc, &scalar_branches.items[0], "deleted_at", .is_null);
-    try appendScalarValuesJsonToOrBranches(alloc, &scalar_branches, "status", "[\"open\",\"queued\"]", .eq);
+    try appendScalarValuesJsonToOrBranches(alloc, &scalar_branches, "status", "[\"open\",\"queued\"]", .eq, null);
     try std.testing.expectEqual(@as(usize, 1), scalar_branches.items.len);
     try std.testing.expectEqual(@as(usize, 4), scalar_branches.items[0].items.len);
-    try expandScalarValuesJsonIntoOrBranches(alloc, &scalar_branches, "priority", "[1,2]", .eq);
+    try expandScalarValuesJsonIntoOrBranches(alloc, &scalar_branches, "priority", "[1,2]", .eq, null);
     try std.testing.expectEqual(@as(usize, 2), scalar_branches.items.len);
     try std.testing.expectEqual(@as(usize, 5), scalar_branches.items[0].items.len);
     try std.testing.expectEqual(@as(usize, 5), scalar_branches.items[1].items.len);
@@ -40716,9 +41228,9 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, scalar_between_checks.items[0].op);
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, scalar_between_checks.items[1].op);
     try appendBetweenPredicateValuesAlloc(alloc, &scalar_between_checks, &scalar_predicate_groups, "amount", numeric_column, "10", "20", true, false);
-    try appendBetweenScalarGroup(alloc, &scalar_predicate_groups, "amount", .gte, "10", .lte, "20");
+    try appendBetweenScalarGroup(alloc, &scalar_predicate_groups, "amount", .gte, "10", .lte, "20", null);
     try appendBooleanIsNotPredicateGroups(alloc, &scalar_predicate_groups, "enabled", true);
-    try appendScalarValuesJsonOrGroups(alloc, &scalar_predicate_groups, "status", "[\"open\",\"queued\"]", .ne);
+    try appendScalarValuesJsonOrGroups(alloc, &scalar_predicate_groups, "status", "[\"open\",\"queued\"]", .ne, null);
     try appendTemporalRangeContainsPredicateGroups(alloc, &scalar_predicate_groups, .{
         .name = "valid_at",
         .start_column = "valid_from",
@@ -40742,7 +41254,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         freeRelationalChecks(alloc, scalar_all_checks.items);
         scalar_all_checks.deinit(alloc);
     }
-    try appendScalarAllEqualityPredicates(alloc, &scalar_all_checks, "status", "[\"open\",\"queued\"]");
+    try appendScalarAllEqualityPredicates(alloc, &scalar_all_checks, "status", "[\"open\",\"queued\"]", null);
     try std.testing.expectEqual(@as(usize, 2), scalar_all_checks.items.len);
 
     var join_side_checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
@@ -40755,11 +41267,11 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         freeExpressionConditions(alloc, join_on_expressions.items);
         join_on_expressions.deinit(alloc);
     }
-    try appendJoinOnScalarPredicateAlloc(alloc, &join_side_checks, &join_on_expressions, .inner, .right, "status", .eq, try alloc.dupe(u8, "\"open\""));
+    try appendJoinOnScalarPredicateAlloc(alloc, &join_side_checks, &join_on_expressions, .inner, .right, "status", .eq, try alloc.dupe(u8, "\"open\""), null);
     try std.testing.expectEqual(@as(usize, 1), join_side_checks.items.len);
     try std.testing.expectEqualStrings("status", join_side_checks.items[0].field);
     try std.testing.expectEqualStrings("\"open\"", join_side_checks.items[0].value_json.?);
-    try appendJoinOnScalarPredicateAlloc(alloc, &join_side_checks, &join_on_expressions, .left, .left, "status", .eq, try alloc.dupe(u8, "\"queued\""));
+    try appendJoinOnScalarPredicateAlloc(alloc, &join_side_checks, &join_on_expressions, .left, .left, "status", .eq, try alloc.dupe(u8, "\"queued\""), null);
     try std.testing.expectEqual(@as(usize, 1), join_on_expressions.items.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, join_on_expressions.items[0].lhs.field_source);
     try std.testing.expectEqualStrings("status", join_on_expressions.items[0].lhs.field);
@@ -40873,7 +41385,8 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         .storage_mode = .relational,
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword },
-            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "status", .path = "status", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+            .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .collation = "tenant.case_insensitive" },
         },
     };
     const order_select: plan_mod.SelectList = .{
@@ -40897,13 +41410,14 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqualStrings("projected_status", ordinal_projected_order.field);
     var alias_pos: usize = 0;
     const alias_tokens = [_]Token{.{ .kind = .identifier, .text = "tenant", .source_start = 0, .source_end = 6 }};
-    var alias_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, alias_tokens[0..], &alias_pos, order_select)).?;
+    var alias_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, alias_tokens[0..], &alias_pos, order_schema, order_select)).?;
     defer freeOrderBy(alloc, (&alias_order)[0..1]);
     try std.testing.expectEqual(@as(usize, 1), alias_pos);
     try std.testing.expectEqualStrings("tenant_id", alias_order.field);
+    try std.testing.expectEqualStrings("tenant.case_insensitive", alias_order.collation.?);
     var expression_pos: usize = 0;
     const expression_tokens = [_]Token{.{ .kind = .identifier, .text = "always_true", .source_start = 0, .source_end = 11 }};
-    var expression_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, expression_tokens[0..], &expression_pos, order_select)).?;
+    var expression_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, expression_tokens[0..], &expression_pos, order_schema, order_select)).?;
     defer freeOrderBy(alloc, (&expression_order)[0..1]);
     try std.testing.expectEqual(@as(usize, 1), expression_pos);
     try std.testing.expect(expression_order.expression != null);
@@ -40913,7 +41427,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         .{ .kind = .identifier, .text = "tenant", .source_start = 0, .source_end = 6 },
         .{ .kind = .plus, .text = "+", .source_start = 7, .source_end = 8 },
     };
-    try std.testing.expect((try parseSelectOutputOrderByNameMaybeAlloc(alloc, operator_tokens[0..], &operator_pos, order_select)) == null);
+    try std.testing.expect((try parseSelectOutputOrderByNameMaybeAlloc(alloc, operator_tokens[0..], &operator_pos, order_schema, order_select)) == null);
     try std.testing.expectEqual(@as(usize, 0), operator_pos);
 
     var access_branches = std.ArrayListUnmanaged(AccessPredicateBranch).empty;
@@ -41110,7 +41624,7 @@ test "sql adapter lower expr compares aggregate specs" {
     try std.testing.expectEqual(@as(usize, 2), selectListOutputCount(&.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}, "status"));
     const select_schema = runtime_schema.TableSchema{
         .storage_mode = .relational,
-        .relational_columns = &.{.{ .name = "status", .path = "status", .field_type = .keyword }},
+        .relational_columns = &.{.{ .name = "status", .path = "status", .field_type = .keyword, .collation = "status_collation" }},
     };
     try validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{}, &.{});
     try validateSelectListOutputs(select_schema, false, &.{}, &.{.{
@@ -41161,6 +41675,7 @@ test "sql adapter lower expr compares aggregate specs" {
     try std.testing.expectEqual(@as(usize, 4), select_columns.len);
     try std.testing.expectEqualStrings("status", select_columns[0].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, select_columns[0].field_type);
+    try std.testing.expectEqualStrings("status_collation", select_columns[0].collation.?);
     try std.testing.expectEqualStrings("status_json", select_columns[1].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, select_columns[1].field_type);
     try std.testing.expectEqualStrings("tag_count", select_columns[2].name);
@@ -41244,16 +41759,18 @@ test "sql adapter lower expr compares aggregate specs" {
     try std.testing.expectEqualStrings("status", bound_group_fields.items[1]);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, try aggregateInputType(select_schema, .{ .alloc = alloc, .schema = select_schema }, lhs));
     const aggregate_output_columns = try aggregateOutputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs);
-    defer alloc.free(aggregate_output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, aggregate_output_columns);
     try std.testing.expectEqual(@as(usize, 3), aggregate_output_columns.len);
     try std.testing.expectEqualStrings("status", aggregate_output_columns[0].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_output_columns[0].field_type);
+    try std.testing.expectEqualStrings("status_collation", aggregate_output_columns[0].collation.?);
     try std.testing.expectEqualStrings("status_lower", aggregate_output_columns[1].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_output_columns[1].field_type);
     try std.testing.expectEqualStrings("statuses", aggregate_output_columns[2].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.array, aggregate_output_columns[2].field_type);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_output_columns[2].array_item_type.?);
     const aggregate_status_lower = try aggregateOutputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "status_lower");
+    defer ddl_plan.freeDdlRelationalColumn(alloc, aggregate_status_lower);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_status_lower.field_type);
     try std.testing.expectError(error.UnsupportedSqlShape, aggregateOutputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "missing"));
     const returning_schema = runtime_schema.TableSchema{
@@ -41346,12 +41863,23 @@ test "sql adapter lower expr compares aggregate specs" {
     defer alloc.free(window_ordinal_field);
     try std.testing.expectEqualStrings("ranked", window_ordinal_field);
     const window_output_columns = try windowOutputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, window_select);
-    defer alloc.free(window_output_columns);
+    defer ddl_plan.freeDdlRelationalColumns(alloc, window_output_columns);
     try std.testing.expectEqual(@as(usize, 2), window_output_columns.len);
     try std.testing.expectEqualStrings("status", window_output_columns[0].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, window_output_columns[0].field_type);
+    try std.testing.expectEqualStrings("status_collation", window_output_columns[0].collation.?);
     try std.testing.expectEqualStrings("ranked", window_output_columns[1].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, window_output_columns[1].field_type);
+    const join_output_columns = try joinOutputColumnsAlloc(alloc, select_schema, &.{.{
+        .output = "joined_status",
+        .side = .left,
+        .field = "status",
+    }});
+    defer ddl_plan.freeDdlRelationalColumns(alloc, join_output_columns);
+    try std.testing.expectEqual(@as(usize, 1), join_output_columns.len);
+    try std.testing.expectEqualStrings("joined_status", join_output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, join_output_columns[0].field_type);
+    try std.testing.expectEqualStrings("status_collation", join_output_columns[0].collation.?);
     try std.testing.expect(windowFunctionRequiresOrder(.lag));
     try std.testing.expect(!windowFunctionRequiresOrder(.count));
     try std.testing.expectEqualStrings("row_number", windowFunctionName(.row_number));
@@ -43168,6 +43696,49 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
         alloc,
         &malformed_generated_lateral_projection_alias,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_lateral_child = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+    );
+    defer malformed_generated_lateral_child.deinit(alloc);
+    if (malformed_generated_lateral_child.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                const child = read.join_items[0].right_lateral_subquery_read_ast orelse return error.TestUnexpectedResult;
+                child.source_alias_name_tokens = child.source_table_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_lateral_child,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_lateral_alias = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+    );
+    defer malformed_generated_lateral_alias.deinit(alloc);
+    if (malformed_generated_lateral_alias.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.join_items.len != 1) return error.TestUnexpectedResult;
+                const alias_tokens = read.join_items[0].right_lateral_alias_tokens orelse return error.TestUnexpectedResult;
+                read.join_items[0].right_lateral_alias_name_tokens = alias_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_lateral_alias,
         schema,
         &.{},
     ));

@@ -464,6 +464,7 @@ fn freeSetOperationOutputColumns(alloc: std.mem.Allocator, columns: []const runt
     for (columns) |column| {
         if (column.name.len > 0) alloc.free(column.name);
         if (column.path.len > 0) alloc.free(column.path);
+        if (column.collation) |collation| alloc.free(collation);
     }
     if (columns.len > 0) alloc.free(columns);
 }
@@ -1150,6 +1151,7 @@ pub const LateralPlanParserHooks = struct {
 
 pub const RecursiveCteParserHooks = struct {
     ptr: *anyopaque,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     parse_select_with_set_boundary: *const fn (
         *anyopaque,
         []const Token,
@@ -1171,6 +1173,7 @@ pub const RecursiveCteParserHooks = struct {
 
 pub const RecursiveCteMemberParserHooks = struct {
     ptr: *anyopaque,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     parse_projection_expression: *const fn (
         *anyopaque,
         []const Token,
@@ -1191,6 +1194,124 @@ pub const RecursiveCteMemberParserHooks = struct {
         []const u8,
     ) anyerror![]const db_mod.types.RelationalRowsJoinOn,
 };
+
+const GeneratedRecursiveCteMemberProjectionList = struct {
+    range: generated_parser.GeneratedSqlTokenRange,
+    items: *const generated_parser.GeneratedSqlListAst,
+};
+
+const GeneratedRecursiveCteMemberMetadata = struct {
+    projections: GeneratedRecursiveCteMemberProjectionList,
+    join: generated_parser.GeneratedSqlJoinAst,
+};
+
+fn generatedRecursiveCteMemberMetadata(
+    tokens: []const Token,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    projection_start: usize,
+    projection_end: usize,
+) !?GeneratedRecursiveCteMemberMetadata {
+    const read = generated_read_ast orelse return null;
+    return .{
+        .projections = try generatedRecursiveCteMemberProjectionList(tokens, read, projection_start, projection_end),
+        .join = try generatedRecursiveCteMemberJoin(read),
+    };
+}
+
+fn generatedRecursiveCteMemberProjectionList(
+    tokens: []const Token,
+    generated_read_ast: *const generated_parser.GeneratedSqlReadAst,
+    projection_start: usize,
+    projection_end: usize,
+) !GeneratedRecursiveCteMemberProjectionList {
+    const read = generated_read_ast;
+    if (read.kind != .set_operation or read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+    const range = read.set_operation.right_projection_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != projection_start or range.end != projection_end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const items = &read.set_operation.right_projection_items;
+    if (items.count == 0 or items.items.len != items.count or items.expression_items.len != items.count or items.expressions.len != items.count) return error.UnsupportedSqlShape;
+    if (items.first_tokens == null or !generatedTokenRangeEqual(items.first_tokens.?, items.items[0])) return error.UnsupportedSqlShape;
+    if (items.last_tokens == null or !generatedTokenRangeEqual(items.last_tokens.?, items.items[items.count - 1])) return error.UnsupportedSqlShape;
+    for (items.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = items.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == items.count and item.end != range.end) return error.UnsupportedSqlShape;
+        const expression_item = items.expression_items[index];
+        if (expression_item.start < item.start or expression_item.end > item.end or expression_item.start >= expression_item.end) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(items.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_item)) return error.UnsupportedSqlShape;
+    }
+    return .{ .range = range, .items = items };
+}
+
+fn generatedRecursiveCteMemberJoin(
+    generated_read_ast: *const generated_parser.GeneratedSqlReadAst,
+) !generated_parser.GeneratedSqlJoinAst {
+    const read = generated_read_ast;
+    if (read.kind != .set_operation or read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+    if (read.set_operation.right_join_items.len != 1 or read.set_operation.right_join_tree_root_index != 0 or read.set_operation.right_join_tree_depth != 1) return error.UnsupportedSqlShape;
+    const join = read.set_operation.right_join_items[0];
+    if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
+    if (join.kind != .inner or join.condition_kind != .on) return error.UnsupportedSqlShape;
+    return join;
+}
+
+fn generatedRecursiveCteMemberJoinSideAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    join: generated_parser.GeneratedSqlJoinAst,
+    side: enum { left, right },
+) !TableAlias {
+    const source_tokens = switch (side) {
+        .left => join.left_tokens,
+        .right => join.right_tokens,
+    };
+    if (source_tokens.start != pos.* or source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const table_tokens = switch (side) {
+        .left => join.left_table_tokens,
+        .right => join.right_table_tokens,
+    } orelse return error.UnsupportedSqlShape;
+    var expected_table_start = source_tokens.start;
+    if (tokens[expected_table_start].matchesKeywordTag(.only)) expected_table_start += 1;
+    if (table_tokens.start != expected_table_start or table_tokens.end != table_tokens.start + 1 or table_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[table_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+
+    const alias_tokens = switch (side) {
+        .left => join.left_alias_tokens,
+        .right => join.right_alias_tokens,
+    };
+    const alias_name_tokens = switch (side) {
+        .left => join.left_alias_name_tokens,
+        .right => join.right_alias_name_tokens,
+    };
+    const alias_name = if (alias_tokens) |alias_range| alias: {
+        const alias_name_range = alias_name_tokens orelse return error.UnsupportedSqlShape;
+        if (alias_range.start != table_tokens.end or alias_range.end > source_tokens.end) return error.UnsupportedSqlShape;
+        if (alias_range.start + 2 == alias_range.end and tokens[alias_range.start].matchesKeywordTag(.as)) {
+            if (alias_name_range.start != alias_range.start + 1 or alias_name_range.end != alias_range.end) return error.UnsupportedSqlShape;
+        } else if (alias_range.start + 1 == alias_range.end) {
+            if (alias_name_range.start != alias_range.start or alias_name_range.end != alias_range.end) return error.UnsupportedSqlShape;
+        } else return error.UnsupportedSqlShape;
+        if (tokens[alias_name_range.start].kind != .identifier) return error.UnsupportedSqlShape;
+        if (alias_range.end != source_tokens.end) return error.UnsupportedSqlShape;
+        break :alias tokens[alias_name_range.start].text;
+    } else alias: {
+        if (alias_name_tokens != null) return error.UnsupportedSqlShape;
+        if (table_tokens.end != source_tokens.end) return error.UnsupportedSqlShape;
+        break :alias tokens[table_tokens.start].text;
+    };
+
+    const name = try alloc.dupe(u8, tokens[table_tokens.start].text);
+    errdefer alloc.free(name);
+    const alias = try alloc.dupe(u8, alias_name);
+    pos.* = source_tokens.end;
+    return .{ .name = name, .alias = alias };
+}
 
 pub const RecursiveCteMemberProjectionExpression = struct {
     expression: db_mod.types.RelationalRowsExpression,
@@ -1364,20 +1485,43 @@ pub fn parseCtesForPlanAlloc(
         ctes.deinit(alloc);
     }
 
+    const generated_read_ast = hooks.generated_read_ast;
+    var generated_cte_index: usize = 0;
+    if (generated_read_ast) |read_ast| {
+        if (read_ast.cte_recursive) return error.UnsupportedSqlShape;
+        if (read_ast.cte_count == 0 or read_ast.cte_count != read_ast.cte_items.len) return error.UnsupportedSqlShape;
+    }
+
     while (true) {
-        const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        const generated_cte: ?generated_parser.GeneratedSqlCteAst = if (generated_read_ast) |read_ast| blk: {
+            if (generated_cte_index >= read_ast.cte_items.len) return error.UnsupportedSqlShape;
+            break :blk read_ast.cte_items[generated_cte_index];
+        } else null;
+
+        const cte_name = if (generated_cte) |cte|
+            try generatedReadCteNameAlloc(alloc, tokens, cte, pos)
+        else
+            try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
         var cte_name_transferred = false;
         errdefer if (!cte_name_transferred) alloc.free(cte_name);
         if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
-        const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+        const cte_column_aliases = if (generated_cte) |cte|
+            try generatedReadCteColumnAliasesAlloc(alloc, tokens, cte, pos)
+        else
+            try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
         defer strings.freeStringSlice(alloc, cte_column_aliases);
         try cursor.expectKeywordTag(.as);
-        try parser.consumeCteMaterializationHint(tokens, pos);
+        if (generated_cte) |cte| {
+            try consumeGeneratedReadCteMaterialization(tokens, cte, pos);
+        } else {
+            try parser.consumeCteMaterializationHint(tokens, pos);
+        }
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
-        if (hooks.generated_read_ast) |generated_read_ast| {
-            const generated_cte = generatedReadCteForBodyRange(generated_read_ast, pos.*, close_index) orelse return error.UnsupportedSqlShape;
-            if (try lowerGeneratedReadGraphTableFunctionCteAlloc(alloc, tokens, generated_cte)) |table_function| {
+        if (generated_cte) |cte| {
+            const body_tokens = cte.body_tokens orelse return error.UnsupportedSqlShape;
+            if (body_tokens.start != pos.* or body_tokens.end != close_index) return error.UnsupportedSqlShape;
+            if (try lowerGeneratedReadGraphTableFunctionCteAlloc(alloc, tokens, cte)) |table_function| {
                 pos.* = close_index + 1;
                 try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
                 try ctes.append(alloc, .{
@@ -1385,6 +1529,7 @@ pub fn parseCtesForPlanAlloc(
                     .table_function = table_function,
                 });
                 cte_name_transferred = true;
+                generated_cte_index += 1;
                 if (cursor.matchToken(.comma) == null) break;
                 continue;
             }
@@ -1418,22 +1563,105 @@ pub fn parseCtesForPlanAlloc(
         alloc.free(lowered.table_name);
         lowered.table_name = "";
         cte_name_transferred = true;
+        if (generated_cte != null) generated_cte_index += 1;
         if (cursor.matchToken(.comma) == null) break;
+    }
+    if (generated_read_ast) |read_ast| {
+        if (generated_cte_index != read_ast.cte_items.len) return error.UnsupportedSqlShape;
     }
 
     return try ctes.toOwnedSlice(alloc);
 }
 
-fn generatedReadCteForBodyRange(
-    read_ast: *const generated_parser.GeneratedSqlReadAst,
-    body_start: usize,
-    body_end: usize,
-) ?generated_parser.GeneratedSqlCteAst {
-    for (read_ast.cte_items) |cte| {
-        const body = cte.body_tokens orelse continue;
-        if (body.start == body_start and body.end == body_end) return cte;
+fn generatedReadCteNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+    pos: *usize,
+) ![]const u8 {
+    if (cte.name_tokens.start != pos.* or cte.name_tokens.end != cte.name_tokens.start + 1 or cte.name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[cte.name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    pos.* = cte.name_tokens.end;
+    return try alloc.dupe(u8, tokens[cte.name_tokens.start].text);
+}
+
+fn generatedReadCteColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+    pos: *usize,
+) ![]const []const u8 {
+    const column_tokens = cte.column_tokens orelse {
+        if (cte.column_name_tokens != null or cte.column_names.count != 0 or cte.column_names.items.len != 0) return error.UnsupportedSqlShape;
+        if (pos.* < tokens.len and tokens[pos.*].kind == .lparen) return error.UnsupportedSqlShape;
+        return &.{};
+    };
+    if (column_tokens.start != pos.* or column_tokens.end > tokens.len or column_tokens.end <= column_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (tokens[column_tokens.start].kind != .lparen or tokens[column_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    const column_name_tokens = cte.column_name_tokens orelse return error.UnsupportedSqlShape;
+    if (column_name_tokens.start != column_tokens.start + 1 or column_name_tokens.end != column_tokens.end - 1) return error.UnsupportedSqlShape;
+    if (cte.column_names.count == 0 or cte.column_names.items.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.expression_items.len != cte.column_names.count or cte.column_names.alias_items.len != cte.column_names.count or cte.column_names.alias_name_items.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.direction_items.len != cte.column_names.count or cte.column_names.directions.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.order_using_operator_items.len != cte.column_names.count or cte.column_names.nulls_order_items.len != cte.column_names.count or cte.column_names.nulls_orders.len != cte.column_names.count) return error.UnsupportedSqlShape;
+
+    var aliases = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (aliases.items) |alias| alloc.free(alias);
+        aliases.deinit(alloc);
     }
-    return null;
+    var expected_start = column_name_tokens.start;
+    for (cte.column_names.items, 0..) |item, index| {
+        if (item.start != expected_start or item.end != item.start + 1 or item.end > column_name_tokens.end) return error.UnsupportedSqlShape;
+        if (tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(cte.column_names.expression_items[index], item)) return error.UnsupportedSqlShape;
+        if (cte.column_names.alias_items[index] != null or
+            cte.column_names.alias_name_items[index] != null or
+            cte.column_names.direction_items[index] != null or
+            cte.column_names.directions[index] != null or
+            cte.column_names.order_using_operator_items[index] != null or
+            cte.column_names.nulls_order_items[index] != null or
+            cte.column_names.nulls_orders[index] != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try aliases.append(alloc, try alloc.dupe(u8, tokens[item.start].text));
+        expected_start = item.end;
+        if (index + 1 < cte.column_names.items.len) {
+            if (expected_start >= column_name_tokens.end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start += 1;
+        }
+    }
+    if (expected_start != column_name_tokens.end) return error.UnsupportedSqlShape;
+    pos.* = column_tokens.end;
+    return try aliases.toOwnedSlice(alloc);
+}
+
+fn consumeGeneratedReadCteMaterialization(
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+    pos: *usize,
+) !void {
+    const materialization_tokens = cte.materialization_tokens orelse {
+        if (cte.materialization != null) return error.UnsupportedSqlShape;
+        if (pos.* < tokens.len and (tokens[pos.*].matchesKeywordTag(.materialized) or tokens[pos.*].matchesKeywordTag(.not))) return error.UnsupportedSqlShape;
+        return;
+    };
+    if (materialization_tokens.start != pos.* or materialization_tokens.end > tokens.len or materialization_tokens.start >= materialization_tokens.end) return error.UnsupportedSqlShape;
+    switch (cte.materialization orelse return error.UnsupportedSqlShape) {
+        .materialized => {
+            if (materialization_tokens.end != materialization_tokens.start + 1 or !tokens[materialization_tokens.start].matchesKeywordTag(.materialized)) return error.UnsupportedSqlShape;
+        },
+        .not_materialized => {
+            if (materialization_tokens.end != materialization_tokens.start + 2 or
+                !tokens[materialization_tokens.start].matchesKeywordTag(.not) or
+                !tokens[materialization_tokens.start + 1].matchesKeywordTag(.materialized))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+    }
+    pos.* = materialization_tokens.end;
 }
 
 fn lowerGeneratedReadGraphTableFunctionCteAlloc(
@@ -1901,7 +2129,7 @@ fn parseSetOperationPlanWithCtesAlloc(
         if (tail.order_by.len > 0) alloc.free(tail.order_by);
     };
     if (!std.mem.eql(u8, left.table_name, right.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
-    if (!reconcileSetOperationOutputColumns(left_columns, right_columns)) return error.UnsupportedSqlShape;
+    if (!(try reconcileSetOperationOutputColumns(alloc, left_columns, right_columns))) return error.UnsupportedSqlShape;
 
     const left_table_name = left.table_name;
     left.table_name = "";
@@ -1973,17 +2201,44 @@ fn parseSetOperationSelectWithContext(
 }
 
 fn reconcileSetOperationOutputColumns(
+    alloc: std.mem.Allocator,
     lhs: []runtime_schema.RelationalColumn,
     rhs: []const runtime_schema.RelationalColumn,
-) bool {
+) !bool {
     if (lhs.len == 0 or lhs.len != rhs.len) return false;
     for (lhs, rhs) |*left, right| {
         const common = setOperationCommonColumnType(left.*, right) orelse return false;
         left.field_type = common.field_type;
         left.array_item_type = common.array_item_type;
         left.nullable = left.nullable or right.nullable;
+        try reconcileSetOperationOutputColumnCollationAlloc(alloc, left, right);
     }
     return true;
+}
+
+fn reconcileSetOperationOutputColumnCollationAlloc(
+    alloc: std.mem.Allocator,
+    left: *runtime_schema.RelationalColumn,
+    right: runtime_schema.RelationalColumn,
+) !void {
+    if (!setOperationTypeIsTextLike(left.field_type)) {
+        if (left.collation) |collation| {
+            alloc.free(collation);
+            left.collation = null;
+        }
+        return;
+    }
+
+    if (left.collation) |left_collation| {
+        if (right.collation) |right_collation| {
+            if (!std.mem.eql(u8, left_collation, right_collation)) return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+
+    if (right.collation) |right_collation| {
+        left.collation = try alloc.dupe(u8, right_collation);
+    }
 }
 
 const SetOperationCommonColumnType = struct {
@@ -2032,10 +2287,14 @@ pub fn parseRecursiveCteMemberPlanAlloc(
     try cursor.expectKeywordTag(.select);
     const projection_start = pos.*;
     const from_index = parser.findTopLevelKeywordTagFromIndex(tokens, projection_start, .from) orelse return error.UnsupportedSqlShape;
+    const generated_member = try generatedRecursiveCteMemberMetadata(tokens, hooks.generated_read_ast, projection_start, from_index);
     pos.* = from_index;
 
     try cursor.expectKeywordTag(.from);
-    const left_table = try parseTableAliasAlloc(alloc, tokens, pos);
+    const left_table = if (generated_member) |generated|
+        try generatedRecursiveCteMemberJoinSideAliasAlloc(alloc, tokens, pos, generated.join, .left)
+    else
+        try parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, left_table);
 
     const join_type: db_mod.types.RelationalRowsJoinType = if (parser.matchKeywordTag(tokens, pos, .left)) blk: {
@@ -2047,7 +2306,13 @@ pub fn parseRecursiveCteMemberPlanAlloc(
         try cursor.expectKeywordTag(.join);
         break :blk .inner;
     };
-    const right_table = try parseTableAliasAlloc(alloc, tokens, pos);
+    if (generated_member) |generated| {
+        if (join_type != .inner or generated.join.operator_tokens.end != pos.*) return error.UnsupportedSqlShape;
+    }
+    const right_table = if (generated_member) |generated|
+        try generatedRecursiveCteMemberJoinSideAliasAlloc(alloc, tokens, pos, generated.join, .right)
+    else
+        try parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, right_table);
     if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
 
@@ -2063,17 +2328,34 @@ pub fn parseRecursiveCteMemberPlanAlloc(
     const cte_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, cte_name) orelse return error.UnsupportedSqlShape;
     const target_qualifiers = [_][]const u8{ base_table.name, base_table.alias };
     const source_qualifiers = [_][]const u8{ recursive_table.name, recursive_table.alias };
-    const projections = try parseRecursiveCteMemberProjectionsAlloc(
-        alloc,
-        tokens[projection_start..from_index],
-        cte_schema,
-        target_qualifiers[0..],
-        source_qualifiers[0..],
-        hooks,
-    );
+    const projections = if (generated_member) |generated|
+        try parseGeneratedRecursiveCteMemberProjectionsAlloc(
+            alloc,
+            tokens,
+            generated.projections,
+            cte_schema,
+            target_qualifiers[0..],
+            source_qualifiers[0..],
+            hooks,
+        )
+    else
+        try parseRecursiveCteMemberProjectionsAlloc(
+            alloc,
+            tokens[projection_start..from_index],
+            cte_schema,
+            target_qualifiers[0..],
+            source_qualifiers[0..],
+            hooks,
+        );
     errdefer freeExpressionProjections(alloc, projections);
 
+    if (generated_member) |generated| {
+        if (generated.join.condition_tokens.start != pos.*) return error.UnsupportedSqlShape;
+    }
     try cursor.expectKeywordTag(.on);
+    if (generated_member) |generated| {
+        if (generated.join.condition_tokens.start + 1 != pos.*) return error.UnsupportedSqlShape;
+    }
     const on = try hooks.parse_join_on(
         hooks.ptr,
         tokens,
@@ -2140,6 +2422,52 @@ pub fn parseRecursiveCteMemberProjectionsAlloc(
     return try projections.toOwnedSlice(alloc);
 }
 
+fn parseGeneratedRecursiveCteMemberProjectionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    generated: GeneratedRecursiveCteMemberProjectionList,
+    cte_schema: runtime_schema.TableSchema,
+    target_qualifiers: []const []const u8,
+    source_qualifiers: []const []const u8,
+    hooks: RecursiveCteMemberParserHooks,
+) ![]const db_mod.types.RelationalRowsExpressionProjection {
+    var projections = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        freeExpressionProjections(alloc, projections.items);
+        projections.deinit(alloc);
+    }
+    var expected_start = generated.range.start;
+    for (generated.items.items, 0..) |item, index| {
+        if (item.start != expected_start or item.start >= item.end or item.end > generated.range.end) return error.UnsupportedSqlShape;
+        var item_pos = item.start;
+        const scoped_tokens = tokens[0..item.end];
+        const parsed = try hooks.parse_projection_expression(
+            hooks.ptr,
+            scoped_tokens,
+            &item_pos,
+            cte_schema,
+            target_qualifiers,
+            source_qualifiers,
+        );
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, parsed.expression);
+        const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, scoped_tokens, &item_pos, parsed.default_output);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        if (item_pos != item.end) return error.UnsupportedSqlShape;
+        try projections.append(alloc, .{ .output = output, .expression = parsed.expression });
+        expression_transferred = true;
+        output_transferred = true;
+        expected_start = item.end;
+        if (index + 1 < generated.items.count) {
+            if (expected_start >= generated.range.end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start += 1;
+        }
+    }
+    if (expected_start != generated.range.end) return error.UnsupportedSqlShape;
+    return try projections.toOwnedSlice(alloc);
+}
+
 pub fn parseRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2189,17 +2517,37 @@ pub fn parseRecursiveCteProducerAlloc(
     try cursor.expectKeywordTag(.with);
     try cursor.expectKeywordTag(.recursive);
 
-    const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    const generated_cte: ?generated_parser.GeneratedSqlCteAst = if (hooks.generated_read_ast) |read_ast| blk: {
+        if (!read_ast.cte_recursive or read_ast.cte_count != 1 or read_ast.cte_items.len != 1) return error.UnsupportedSqlShape;
+        if (read_ast.cte_tokens == null or read_ast.cte_list_tokens == null) return error.UnsupportedSqlShape;
+        break :blk read_ast.cte_items[0];
+    } else null;
+
+    const cte_name = if (generated_cte) |cte|
+        try generatedReadCteNameAlloc(alloc, tokens, cte, pos)
+    else
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var cte_name_transferred = false;
     errdefer if (!cte_name_transferred) alloc.free(cte_name);
 
-    const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+    const cte_column_aliases = if (generated_cte) |cte|
+        try generatedReadCteColumnAliasesAlloc(alloc, tokens, cte, pos)
+    else
+        try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
     defer strings.freeStringSlice(alloc, cte_column_aliases);
     try cursor.expectKeywordTag(.as);
-    try parser.consumeCteMaterializationHint(tokens, pos);
+    if (generated_cte) |cte| {
+        try consumeGeneratedReadCteMaterialization(tokens, cte, pos);
+    } else {
+        try parser.consumeCteMaterializationHint(tokens, pos);
+    }
     try cursor.expectToken(.lparen);
 
     const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+    if (generated_cte) |cte| {
+        const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
+        if (body.start != pos.* or body.end != close_index) return error.UnsupportedSqlShape;
+    }
     const body_tokens = tokens[pos.*..close_index];
     var body_pos: usize = 0;
     var anchor = try hooks.parse_select_with_set_boundary(hooks.ptr, body_tokens, &body_pos, &.{});
@@ -2267,10 +2615,14 @@ fn applyRecursiveCteOutputColumnAliasesAlloc(
     if (aliases.len != columns.len) return error.UnsupportedSqlShape;
     for (columns, aliases) |*column_const, alias| {
         const column: *runtime_schema.RelationalColumn = @constCast(column_const);
-        const owned_alias = try alloc.dupe(u8, alias);
-        errdefer alloc.free(owned_alias);
+        const owned_name = try alloc.dupe(u8, alias);
+        errdefer alloc.free(owned_name);
+        const owned_path = try alloc.dupe(u8, alias);
+        errdefer alloc.free(owned_path);
         alloc.free(column.name);
-        column.name = owned_alias;
+        alloc.free(column.path);
+        column.name = owned_name;
+        column.path = owned_path;
     }
 }
 
@@ -2570,14 +2922,24 @@ fn relationPopulationSourceParsedSqlAlloc(
 ) !tokenized.OwnedParsedSql {
     if (parsed.source_token_start) |start| {
         const end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
+        const generated_source_read = parent_sql.generatedRelationPopulationSourceReadAst();
+        const require_generated_source = parent_sql.generatedStatementKind() == .ddl;
         if (parsed.source_suffix_token_start) |suffix_start| {
             const suffix_end = parsed.source_suffix_token_end orelse return error.UnsupportedSqlShape;
             const ranges = [_]tokenized.TokenRange{
                 .{ .start = start, .end = end },
                 .{ .start = suffix_start, .end = suffix_end },
             };
+            if (generated_source_read) |source_read| {
+                return try tokenized.OwnedParsedSql.initChildStatementFromTokenRangesWithGeneratedReadAstAlloc(alloc, parent_sql, &ranges, source_read);
+            }
+            if (require_generated_source) return error.UnsupportedSqlShape;
             return try tokenized.OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, parent_sql, &ranges);
         }
+        if (generated_source_read) |source_read| {
+            return try tokenized.OwnedParsedSql.initChildStatementWithGeneratedReadAstAlloc(alloc, parent_sql, start, end, source_read);
+        }
+        if (require_generated_source) return error.UnsupportedSqlShape;
         return try tokenized.OwnedParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
     }
     return error.UnsupportedSqlShape;
@@ -2680,14 +3042,7 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
     parsed: tokenized.ParsedExplainStatement,
     hooks: ExplainPlanLoweringHooks,
 ) !LoweredExplainPlan {
-    const inner_start = parsed.inner_token_start orelse return error.UnsupportedSqlShape;
-    const inner_end = parsed.inner_token_end orelse return error.UnsupportedSqlShape;
-    var inner_sql = try tokenized.OwnedParsedSql.initChildStatementAlloc(
-        alloc,
-        parent_sql,
-        inner_start,
-        inner_end,
-    );
+    var inner_sql = try generatedExplainSubjectParsedSqlAlloc(alloc, parent_sql, parsed);
     defer inner_sql.deinit(alloc);
 
     const subject: LoweredExplainSubject = switch (inner_sql.parsed.statement) {
@@ -2709,6 +3064,64 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
     };
 }
 
+fn generatedExplainSubjectParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    parsed: tokenized.ParsedExplainStatement,
+) !tokenized.OwnedParsedSql {
+    const inner_start = parsed.inner_token_start orelse return error.UnsupportedSqlShape;
+    const inner_end = parsed.inner_token_end orelse return error.UnsupportedSqlShape;
+    const tokens = parsed_sql.items();
+    if (inner_start >= inner_end or inner_end > tokens.len) return error.UnsupportedSqlShape;
+
+    const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
+    const unsupported = switch (generated_ast) {
+        .unsupported => |unsupported| unsupported,
+        else => return error.UnsupportedSqlShape,
+    };
+    const subject = unsupported.subject_tokens orelse return error.UnsupportedSqlShape;
+    if (subject.start != inner_start or subject.end != inner_end) return error.UnsupportedSqlShape;
+    if (tokens[inner_start].matchesKeywordTag(.select) or tokens[inner_start].matchesKeywordTag(.with)) {
+        if (unsupported.explain_subject_read_ast) |read_ast| {
+            if (unsupported.explain_subject_dml_ast != null) return error.UnsupportedSqlShape;
+            return try tokenized.OwnedParsedSql.initChildStatementWithGeneratedReadAstAlloc(
+                alloc,
+                parsed_sql,
+                inner_start,
+                inner_end,
+                read_ast,
+            );
+        }
+        const dml_ast = unsupported.explain_subject_dml_ast orelse return error.UnsupportedSqlShape;
+        return try tokenized.OwnedParsedSql.initChildStatementWithGeneratedDmlAstAlloc(
+            alloc,
+            parsed_sql,
+            inner_start,
+            inner_end,
+            dml_ast,
+        );
+    }
+    if (tokens[inner_start].matchesKeywordTag(.insert) or
+        tokens[inner_start].matchesKeywordTag(.update) or
+        tokens[inner_start].matchesKeywordTag(.delete) or
+        tokens[inner_start].matchesKeywordTag(.truncate) or
+        tokens[inner_start].matchesKeywordTag(.merge))
+    {
+        const dml_ast = unsupported.explain_subject_dml_ast orelse return error.UnsupportedSqlShape;
+        if (unsupported.explain_subject_read_ast != null) return error.UnsupportedSqlShape;
+        return try tokenized.OwnedParsedSql.initChildStatementWithGeneratedDmlAstAlloc(
+            alloc,
+            parsed_sql,
+            inner_start,
+            inner_end,
+            dml_ast,
+        );
+    }
+    if (unsupported.explain_subject_read_ast != null or unsupported.explain_subject_dml_ast != null) return error.UnsupportedSqlShape;
+    return error.UnsupportedSqlShape;
+}
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
@@ -2726,8 +3139,13 @@ fn lowerExplainReadForTest(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedS
     } };
 }
 
-fn lowerExplainWriteForTest(_: *anyopaque, _: *const tokenized.ParsedSql) anyerror!LoweredWritePlan {
-    return error.UnsupportedSqlShape;
+fn lowerExplainWriteForTest(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedSql) anyerror!LoweredWritePlan {
+    const alloc: *std.mem.Allocator = @ptrCast(@alignCast(ptr));
+    _ = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    return .{ .insert = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .batch = .{},
+    } };
 }
 
 fn explainPlanLoweringHooksForTest(alloc: *std.mem.Allocator) ExplainPlanLoweringHooks {
@@ -2787,6 +3205,65 @@ test "sql adapter explain validates generated unsupported boundary before loweri
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerExplainPlanWithParsedSqlAlloc(alloc, &malformed_subject, explainPlanLoweringHooksForTest(&mutable_alloc)));
+
+    var malformed_subject_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN SELECT id FROM usage_records;",
+    );
+    defer malformed_subject_read.deinit(alloc);
+    if (malformed_subject_read.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    const subject_read = unsupported.explain_subject_read_ast orelse return error.TestUnexpectedResult;
+                    subject_read.kind = .cte;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerExplainPlanWithParsedSqlAlloc(alloc, &malformed_subject_read, explainPlanLoweringHooksForTest(&mutable_alloc)));
+
+    var write_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')",
+    );
+    defer write_subject.deinit(alloc);
+    switch ((write_subject.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .unsupported => |unsupported| {
+            try std.testing.expect(unsupported.explain_subject_read_ast == null);
+            try std.testing.expect(unsupported.explain_subject_dml_ast != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var lowered_write = try lowerExplainPlanWithParsedSqlAlloc(alloc, &write_subject, explainPlanLoweringHooksForTest(&mutable_alloc));
+    defer lowered_write.deinit(alloc);
+    try std.testing.expect(lowered_write.analyze);
+    switch (lowered_write.subject) {
+        .write => |write| switch (write) {
+            .insert => |insert| try std.testing.expectEqualStrings("usage_records", insert.table_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_subject_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')",
+    );
+    defer malformed_subject_dml.deinit(alloc);
+    if (malformed_subject_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    const subject_dml = unsupported.explain_subject_dml_ast orelse return error.TestUnexpectedResult;
+                    subject_dml.kind = .truncate;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerExplainPlanWithParsedSqlAlloc(alloc, &malformed_subject_dml, explainPlanLoweringHooksForTest(&mutable_alloc)));
 }
 
 pub fn cloneExpressionAlloc(
@@ -3009,6 +3486,7 @@ pub fn cloneOrderByAlloc(
         };
         if (value.field.len > 0) out[i].field = try alloc.dupe(u8, value.field);
         if (value.expression) |expression| out[i].expression = try cloneExpressionAlloc(alloc, expression);
+        if (value.collation) |collation| out[i].collation = try alloc.dupe(u8, collation);
         initialized += 1;
     }
     return out;
@@ -3236,6 +3714,7 @@ pub fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.Relati
     for (values) |value| {
         if (value.field.len > 0) alloc.free(value.field);
         if (value.expression) |expression| freeExpression(alloc, expression);
+        if (value.collation) |collation| alloc.free(collation);
     }
 }
 
@@ -3243,6 +3722,7 @@ pub fn freeRelationalCheck(alloc: std.mem.Allocator, value: runtime_schema.Relat
     std.debug.assert(value.name.len == 0);
     alloc.free(value.field);
     if (value.value_json) |json| alloc.free(json);
+    if (value.collation) |collation| alloc.free(collation);
     if (value.expression) |expression| freeExpressionCondition(alloc, expression);
 }
 
@@ -3290,6 +3770,7 @@ pub fn freeInPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.R
     for (values) |value| {
         alloc.free(value.field);
         alloc.free(value.values_json);
+        if (value.collation) |collation| alloc.free(collation);
     }
 }
 
@@ -3440,13 +3921,18 @@ pub fn cloneQueryRelationalCheckAlloc(alloc: std.mem.Allocator, value: runtime_s
     errdefer alloc.free(field);
     const value_json = if (value.value_json) |json| try alloc.dupe(u8, json) else null;
     errdefer if (value_json) |json| alloc.free(json);
+    const collation = if (value.collation) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (collation) |text| alloc.free(text);
+    const expression = if (value.expression) |source_expression| try cloneExpressionConditionAlloc(alloc, source_expression) else null;
+    errdefer if (expression) |owned_expression| freeExpressionCondition(alloc, owned_expression);
     return .{
         .name = "",
         .field = field,
         .op = value.op,
         .value_json = value_json,
+        .collation = collation,
         .validation_state = value.validation_state,
-        .expression = if (value.expression) |expression| try cloneExpressionConditionAlloc(alloc, expression) else null,
+        .expression = expression,
     };
 }
 
@@ -3500,12 +3986,17 @@ pub fn cloneInPredicateAlloc(
     const values_json = try alloc.dupe(u8, value.values_json);
     var values_transferred = false;
     errdefer if (!values_transferred) alloc.free(values_json);
+    const collation = if (value.collation) |source| try alloc.dupe(u8, source) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |owned| alloc.free(owned);
     field_transferred = true;
     values_transferred = true;
+    collation_transferred = true;
     return .{
         .field = field,
         .values_json = values_json,
         .negated = value.negated,
+        .collation = collation,
     };
 }
 
@@ -4007,6 +4498,7 @@ test "sql adapter plan clones and frees row expressions" {
         .field = try alloc.dupe(u8, "created_at"),
         .direction = .desc,
         .null_test = .is_not_null,
+        .collation = try alloc.dupe(u8, "antfly.case_insensitive"),
     };
     order_by[1] = .{
         .expression = .{
@@ -4026,8 +4518,11 @@ test "sql adapter plan clones and frees row expressions" {
 
     try std.testing.expect(cloned_order_by.ptr != order_by.ptr);
     try std.testing.expectEqualStrings("created_at", cloned_order_by[0].field);
+    try std.testing.expect(cloned_order_by[0].field.ptr != order_by[0].field.ptr);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, cloned_order_by[0].direction);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_not_null, cloned_order_by[0].null_test.?);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", cloned_order_by[0].collation.?);
+    try std.testing.expect(cloned_order_by[0].collation.?.ptr != order_by[0].collation.?.ptr);
     try std.testing.expect(cloned_order_by[1].expression != null);
     try std.testing.expect(cloned_order_by[1].expression.?.operands.ptr != order_by[1].expression.?.operands.ptr);
     try std.testing.expectEqualStrings("email", cloned_order_by[1].expression.?.operands[0].field);
@@ -4562,6 +5057,144 @@ test "sql adapter plan resolves join CTE sides to physical base table" {
     try std.testing.expectEqualStrings("usage_records", lowered.right_table_name);
     try std.testing.expectEqualStrings("", lowered.join.left.source_cte);
     try std.testing.expectEqualStrings("recent_usage", lowered.join.right.source_cte);
+}
+
+test "sql adapter plan consumes generated CTE prefix metadata before parsing body" {
+    const alloc = std.testing.allocator;
+    const FailingParser = struct {
+        fn parseSelect(ptr: *anyopaque, tokens: []const Token, ctes: []const db_mod.types.RelationalRowsCte) anyerror!LoweredSelect {
+            _ = ptr;
+            _ = tokens;
+            _ = ctes;
+            return error.TestUnexpectedResult;
+        }
+    };
+    var opaque_state: u8 = 0;
+
+    var materialized = try tokenized.ParsedSql.initAlloc(alloc, "WITH open_orders AS MATERIALIZED (SELECT id FROM orders) SELECT id FROM open_orders");
+    defer materialized.deinit(alloc);
+    var stale_materialization = switch ((materialized.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_materialization.cte_items[0].materialization = .not_materialized;
+    var materialized_pos: usize = 0;
+    var materialized_base: ?[]const u8 = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCtesForPlanAlloc(
+        alloc,
+        materialized.items(),
+        &materialized_pos,
+        &materialized_base,
+        .{
+            .ptr = &opaque_state,
+            .generated_read_ast = &stale_materialization,
+            .parse_select = FailingParser.parseSelect,
+        },
+    ));
+
+    var column_aliases = try tokenized.ParsedSql.initAlloc(alloc, "WITH open_orders(order_id) AS (SELECT id FROM orders) SELECT order_id FROM open_orders");
+    defer column_aliases.deinit(alloc);
+    var stale_column_aliases = switch ((column_aliases.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_column_aliases.cte_items[0].column_names.items[0].end += 1;
+    var column_pos: usize = 0;
+    var column_base: ?[]const u8 = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCtesForPlanAlloc(
+        alloc,
+        column_aliases.items(),
+        &column_pos,
+        &column_base,
+        .{
+            .ptr = &opaque_state,
+            .generated_read_ast = &stale_column_aliases,
+            .parse_select = FailingParser.parseSelect,
+        },
+    ));
+}
+
+test "sql adapter recursive CTE producer consumes generated prefix metadata before parsing body" {
+    const alloc = std.testing.allocator;
+    const FailingRecursiveParser = struct {
+        fn parseSelect(ptr: *anyopaque, tokens: []const Token, pos: *usize, ctes: []const db_mod.types.RelationalRowsCte) anyerror!LoweredSelect {
+            _ = ptr;
+            _ = tokens;
+            _ = pos;
+            _ = ctes;
+            return error.TestUnexpectedResult;
+        }
+
+        fn selectOutputColumns(ptr: *anyopaque, lowered: LoweredSelect) anyerror![]runtime_schema.RelationalColumn {
+            _ = ptr;
+            _ = lowered;
+            return error.TestUnexpectedResult;
+        }
+
+        fn parseRecursiveMember(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            pos: *usize,
+            ctes: []const db_mod.types.RelationalRowsCte,
+            cte_name: []const u8,
+        ) anyerror!LoweredRecursiveCteMemberPlan {
+            _ = ptr;
+            _ = tokens;
+            _ = pos;
+            _ = ctes;
+            _ = cte_name;
+            return error.TestUnexpectedResult;
+        }
+    };
+    var opaque_state: u8 = 0;
+
+    var materialized = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id) AS MATERIALIZED (SELECT id FROM nodes UNION ALL SELECT nodes.id FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer materialized.deinit(alloc);
+    var stale_materialization = switch ((materialized.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_materialization.cte_items[0].materialization = .not_materialized;
+    var materialized_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseRecursiveCteProducerAlloc(
+        alloc,
+        materialized.items(),
+        &materialized_pos,
+        .{
+            .ptr = &opaque_state,
+            .generated_read_ast = &stale_materialization,
+            .parse_select_with_set_boundary = FailingRecursiveParser.parseSelect,
+            .select_output_columns = FailingRecursiveParser.selectOutputColumns,
+            .parse_recursive_member = FailingRecursiveParser.parseRecursiveMember,
+        },
+    ));
+
+    var column_aliases = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id) AS (SELECT id FROM nodes UNION ALL SELECT nodes.id FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer column_aliases.deinit(alloc);
+    var stale_column_aliases = switch ((column_aliases.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_column_aliases.cte_items[0].column_names.items[0].end += 1;
+    var column_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseRecursiveCteProducerAlloc(
+        alloc,
+        column_aliases.items(),
+        &column_pos,
+        .{
+            .ptr = &opaque_state,
+            .generated_read_ast = &stale_column_aliases,
+            .parse_select_with_set_boundary = FailingRecursiveParser.parseSelect,
+            .select_output_columns = FailingRecursiveParser.selectOutputColumns,
+            .parse_recursive_member = FailingRecursiveParser.parseRecursiveMember,
+        },
+    ));
 }
 
 test "sql adapter lowered write containers own nested request memory" {

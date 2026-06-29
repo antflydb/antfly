@@ -243,6 +243,49 @@ pub const TableWriteSource = struct {
             doc_key: []const u8,
             artifact_name: []const u8,
         ) anyerror!?bool = null,
+        reprocess_document_artifact_range_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        update_document_artifact_child_range_placement: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
+        update_document_artifact_child_range_placement_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
+        apply_document_artifact_child_range_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
+        apply_document_artifact_child_range_batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
         graph_metric_maintenance_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1039,6 +1082,69 @@ pub const TableWriteSource = struct {
     ) !?bool {
         const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactRangeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        const fn_ptr = self.vtable.reprocess_document_artifact_range_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, artifact_name, req);
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, update);
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
     }
 
     pub fn graphMetricMaintenanceGroupLocal(

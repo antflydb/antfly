@@ -12,16 +12,16 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const http_server = @import("api/http_server.zig");
-const pgwire = @import("pgwire/mod.zig");
-const sql_adapter_integration = @import("api/sql_adapter_integration.zig");
-const relational_rows = @import("sql/relational_rows.zig");
-const table_reads = @import("api/table_reads.zig");
+pub const server = @import("server.zig");
+pub const runtime = @import("runtime.zig");
+pub const sql_backend = @import("sql_backend.zig");
+
+pub const Config = server.Config;
+pub const Server = server.Server;
+pub const start = server.start;
 
 test {
-    _ = http_server;
-    _ = pgwire;
-    _ = sql_adapter_integration;
-    _ = relational_rows;
-    _ = table_reads;
+    _ = server;
+    _ = runtime;
+    _ = sql_backend;
 }

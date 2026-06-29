@@ -27,6 +27,7 @@ const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
+const row_spill = @import("../../sql/row_spill.zig");
 const query_api = @import("../query.zig");
 const core = @import("core.zig");
 const document_sql = @import("document_sql.zig");
@@ -651,7 +652,10 @@ test "lowered sql insert source plans build batches from routed scans" {
     };
 
     const FakeRoutedSource = struct {
+        const LookupMode = enum { stable, missing, changed };
+
         scan_calls: usize = 0,
+        lookup_mode: LookupMode = .stable,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -665,14 +669,28 @@ test "lowered sql insert source plans build batches from routed scans" {
         }
 
         fn lookup(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "orders")) return error.TableNotFound;
+            if (self.lookup_mode == .missing) return null;
+            const json = if (std.mem.eql(u8, key, "o1"))
+                "{\"id\":\"o1\",\"status\":\"OPEN\",\"amount\":10}"
+            else if (std.mem.eql(u8, key, "o2"))
+                "{\"id\":\"o2\",\"status\":\"closed\",\"amount\":5}"
+            else if (std.mem.eql(u8, key, "o3"))
+                if (self.lookup_mode == .changed)
+                    "{\"id\":\"o3\",\"status\":\"OPEN\",\"amount\":8}"
+                else
+                    "{\"id\":\"o3\",\"status\":\"OPEN\",\"amount\":7}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
         }
 
         fn query(
@@ -780,6 +798,32 @@ test "lowered sql insert source plans build batches from routed scans" {
             try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"o1_copy\",\"status_key\":\"open\",\"amount\":10}", batch.returning_rows[0]);
             try std.testing.expectEqualStrings("{\"id\":\"o3_copy\",\"status_key\":\"open\",\"amount\":7}", batch.returning_rows[1]);
+
+            var missing = FakeRoutedSource{ .lookup_mode = .missing };
+            try std.testing.expectError(error.TopologyChanged, rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                missing.source(),
+                insert_source.table_name,
+                insert_source.insert_source.req.source_table,
+                target_schema,
+                source_schema,
+                plan,
+                .read_index,
+                NoConflictResolver.resolver(),
+            ));
+
+            var changed = FakeRoutedSource{ .lookup_mode = .changed };
+            try std.testing.expectError(error.TopologyChanged, rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                changed.source(),
+                insert_source.table_name,
+                insert_source.insert_source.req.source_table,
+                target_schema,
+                source_schema,
+                plan,
+                .read_index,
+                NoConflictResolver.resolver(),
+            ));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1107,7 +1151,7 @@ test "lowered sql recursive merge mutation plans build batches from routed scans
             errdefer out.deinit(scan_alloc);
             for (result.hashes, 0..) |entry, i| {
                 const json = if (opts.include_documents) result.documents[i].json else null;
-                try appendScanLine(scan_alloc, &out, entry.id, json);
+                try appendScanLine(scan_alloc, &out, entry.id, json, try self.db.getTimestamp(scan_alloc, entry.id));
             }
             return .{ .ndjson = try out.toOwnedSlice(scan_alloc) };
         }
@@ -1262,13 +1306,31 @@ test "lowered sql recursive cte plans execute bounded materialization" {
 
         fn lookup(
             _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const json = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, key, "a"))
+                    "{\"id\":\"a\",\"status\":\"open\",\"amount\":1}"
+                else if (std.mem.eql(u8, key, "b"))
+                    "{\"id\":\"b\",\"status\":\"closed\",\"amount\":9}"
+                else if (std.mem.eql(u8, key, "z"))
+                    "{\"id\":\"z\",\"status\":\"open\",\"amount\":7}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, key, "c1"))
+                    "{\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}"
+                else if (std.mem.eql(u8, key, "c2"))
+                    "{\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}"
+                else
+                    return null
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
         }
 
         fn query(
@@ -1542,7 +1604,10 @@ test "lowered relation population plans execute routed typed read sources" {
     };
 
     const FakeRoutedSource = struct {
+        const LookupMode = enum { stable, changed, version_changed };
+
         scan_calls: usize = 0,
+        lookup_mode: LookupMode = .stable,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -1556,14 +1621,35 @@ test "lowered relation population plans execute routed typed read sources" {
         }
 
         fn lookup(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const json = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, key, "o1"))
+                    "{\"id\":\"o1\",\"status\":\"open\",\"customer_id\":\"c1\"}"
+                else if (std.mem.eql(u8, key, "o2"))
+                    if (self.lookup_mode == .changed)
+                        "{\"id\":\"o2\",\"status\":\"open\",\"customer_id\":\"c2\"}"
+                    else
+                        "{\"id\":\"o2\",\"status\":\"closed\",\"customer_id\":\"c2\"}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, key, "c1"))
+                    "{\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}"
+                else if (std.mem.eql(u8, key, "c2"))
+                    "{\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}"
+                else
+                    return null
+            else
+                return null;
+            const version: u64 = if (self.lookup_mode == .version_changed and std.mem.eql(u8, table_name, "orders") and std.mem.eql(u8, key, "z")) 2 else 1;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = version };
         }
 
         fn query(
@@ -1959,9 +2045,18 @@ pub fn executeSetOperationOnQueryResultsAlloc(
     left_rows: []const []const u8,
     right_rows: []const []const u8,
 ) !db_mod.types.RelationalRowsQueryResult {
-    const combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left_rows, right_rows);
-    defer freeOwnedRows(alloc, combined);
-    try db_mod.DB.admitRelationalRowsSetOperationRowsAllowSpill(plan, combined);
+    var combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left_rows, right_rows);
+    var combined_owned = true;
+    defer if (combined_owned) freeOwnedRows(alloc, combined);
+    const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(combined) orelse return error.UnsupportedRowsQuery;
+    switch (db_mod.types.relationalRowsSetOperationMaterializationDecision(plan, combined.len, materialized_bytes)) {
+        .memory => {},
+        .reject => return error.RelationalRowsCteMaterializationRejected,
+        .spill => {
+            combined = try row_spill.spillAndReloadOwnedJsonRowsAlloc(alloc, combined, materialized_bytes, "set-operation");
+            combined_owned = true;
+        },
+    }
     return try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "set_operation", combined, .{
         .select_all = true,
         .order_by = plan.order_by,
@@ -2108,7 +2203,7 @@ pub fn rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
         return error.InvalidRowsRequest;
     }
 
-    var base_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, source_table_name, plan.ranges, consistency)) orelse return null;
+    var base_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, source_table_name, source_schema, plan.ranges, consistency)) orelse return null;
     defer base_rows.deinit(alloc);
 
     return try relational_rows_api.buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
@@ -2437,13 +2532,13 @@ fn collectMergeScanRowsFromRoutedScansAlloc(
         rows.deinit(alloc);
     }
 
-    var budget = RoutedRowsMaterializationBudget.initDefault();
+    var materialization = row_spill.JsonRowsMaterializationTracker.initDefault("routed-scan");
     var saw_source = false;
     if (ranges.len == 0) {
-        saw_source = try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &budget, consistency);
+        saw_source = try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &materialization, consistency);
     } else {
         for (ranges) |range| {
-            saw_source = (try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &budget, consistency)) or saw_source;
+            saw_source = (try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &materialization, consistency)) or saw_source;
         }
     }
     if (!saw_source) {
@@ -2455,7 +2550,12 @@ fn collectMergeScanRowsFromRoutedScansAlloc(
         return null;
     }
 
-    return .{ .rows = try rows.toOwnedSlice(alloc) };
+    var owned_rows = try rows.toOwnedSlice(alloc);
+    errdefer db_mod.types.freeRelationalRowsCollectedRows(alloc, owned_rows);
+    if (materialization.spill_required) {
+        owned_rows = try spillAndReloadCollectedRowsAlloc(alloc, owned_rows, "routed-scan");
+    }
+    return .{ .rows = owned_rows };
 }
 
 fn appendMergeScanRowsFromRoutedScanAlloc(
@@ -2465,7 +2565,7 @@ fn appendMergeScanRowsFromRoutedScanAlloc(
     from_key: []const u8,
     to_key: []const u8,
     rows: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsCollectedRow),
-    budget: *RoutedRowsMaterializationBudget,
+    materialization: *row_spill.JsonRowsMaterializationTracker,
     consistency: raft_mod.ReadConsistency,
 ) !bool {
     var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
@@ -2482,7 +2582,7 @@ fn appendMergeScanRowsFromRoutedScanAlloc(
             var owned = row;
             owned.deinit(alloc);
         }
-        try budget.account(row.json);
+        try materialization.account(row.json);
         try rows.append(alloc, row);
     }
     return true;
@@ -2497,9 +2597,15 @@ fn mergeScanRowFromScanLineAlloc(alloc: std.mem.Allocator, line: []const u8) !db
     const key = try alloc.dupe(u8, key_value.string);
     errdefer alloc.free(key);
     if (parsed.value.object.fetchOrderedRemove("key") == null) return error.InvalidRemoteResponse;
+    const version_value = parsed.value.object.get("version");
+    const version: u64 = if (version_value) |value| switch (value) {
+        .integer => |int| std.math.cast(u64, int) orelse return error.InvalidRemoteResponse,
+        else => return error.InvalidRemoteResponse,
+    } else 0;
+    _ = parsed.value.object.fetchOrderedRemove("version");
     const json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     errdefer alloc.free(json);
-    return .{ .key = key, .json = json, .version = 0 };
+    return .{ .key = key, .json = json, .version = version };
 }
 
 fn selectMergeScanRowsAlloc(
@@ -2573,13 +2679,13 @@ pub fn collectRowsFromRoutedScansAlloc(
         rows.deinit(alloc);
     }
 
-    var budget = RoutedRowsMaterializationBudget.initDefault();
+    var materialization = row_spill.JsonRowsMaterializationTracker.initDefault("routed-scan");
     var saw_source = false;
     if (ranges.len == 0) {
-        saw_source = try appendRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &budget, consistency);
+        saw_source = try appendRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &materialization, consistency);
     } else {
         for (ranges) |range| {
-            saw_source = (try appendRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &budget, consistency)) or saw_source;
+            saw_source = (try appendRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &materialization, consistency)) or saw_source;
         }
     }
     if (!saw_source) {
@@ -2588,7 +2694,50 @@ pub fn collectRowsFromRoutedScansAlloc(
         return null;
     }
 
-    return .{ .rows = try rows.toOwnedSlice(alloc) };
+    var owned_rows = try rows.toOwnedSlice(alloc);
+    errdefer freeOwnedRows(alloc, owned_rows);
+    if (materialization.spill_required) {
+        owned_rows = try row_spill.spillAndReloadOwnedJsonRowsAlloc(alloc, owned_rows, materialization.bytes, "routed-scan");
+    }
+    return .{ .rows = owned_rows };
+}
+
+fn collectStableRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?RoutedRows {
+    var scanned = (try collectMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, schema, ranges, consistency)) orelse return null;
+    defer scanned.deinit(alloc);
+
+    try verifyRoutedScanRowsStillCurrentAlloc(alloc, source, table_name, scanned.rows, consistency);
+
+    const rows = try alloc.alloc([]const u8, scanned.rows.len);
+    errdefer alloc.free(rows);
+    for (scanned.rows, 0..) |*row, i| {
+        rows[i] = row.json;
+        row.json = "";
+    }
+    return .{ .rows = rows };
+}
+
+fn verifyRoutedScanRowsStillCurrentAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    rows: []db_mod.types.RelationalRowsCollectedRow,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    for (rows) |*row| {
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != 0 and row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, lookup.json, row.json)) return error.TopologyChanged;
+        row.version = lookup.version;
+    }
 }
 
 pub fn rowsQueryPlanFromRoutedScansAlloc(
@@ -2601,7 +2750,7 @@ pub fn rowsQueryPlanFromRoutedScansAlloc(
 ) !?db_mod.types.RelationalRowsQueryResult {
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
 
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    var scanned_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
     defer scanned_rows.deinit(alloc);
 
     var local_plan = plan;
@@ -2619,7 +2768,7 @@ pub fn rowsAggregatePlanFromRoutedScansAlloc(
 ) !?db_mod.types.RelationalRowsAggregateResult {
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
 
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    var scanned_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
     defer scanned_rows.deinit(alloc);
 
     var local_plan = plan;
@@ -2653,7 +2802,7 @@ pub fn rowsWindowPlanFromRoutedScansAlloc(
 ) !?db_mod.types.RelationalRowsWindowResult {
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
 
-    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    var scanned_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
     defer scanned_rows.deinit(alloc);
 
     var local_plan = plan;
@@ -2668,7 +2817,7 @@ fn appendRowsFromRoutedScanAlloc(
     from_key: []const u8,
     to_key: []const u8,
     rows: *std.ArrayListUnmanaged([]const u8),
-    budget: *RoutedRowsMaterializationBudget,
+    materialization: *row_spill.JsonRowsMaterializationTracker,
     consistency: raft_mod.ReadConsistency,
 ) !bool {
     var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
@@ -2682,39 +2831,45 @@ fn appendRowsFromRoutedScanAlloc(
         if (line.len == 0) continue;
         const row = try rowJsonFromScanLineAlloc(alloc, line);
         errdefer alloc.free(row);
-        try budget.account(row);
+        try materialization.account(row);
         try rows.append(alloc, row);
     }
     return true;
 }
 
-const RoutedRowsMaterializationBudget = struct {
-    max_rows: u64,
-    max_bytes: u64,
-    rows: u64 = 0,
-    bytes: u64 = 2,
+fn spillAndReloadCollectedRowsAlloc(
+    alloc: std.mem.Allocator,
+    rows: []db_mod.types.RelationalRowsCollectedRow,
+    name: []const u8,
+) ![]db_mod.types.RelationalRowsCollectedRow {
+    const keyed = try alloc.alloc(row_spill.KeyedJsonRow, rows.len);
+    defer alloc.free(keyed);
+    for (rows, 0..) |row, i| keyed[i] = .{
+        .key = row.key,
+        .json = row.json,
+        .version = row.version,
+    };
 
-    fn initDefault() RoutedRowsMaterializationBudget {
-        return .init(db_mod.types.default_relational_rows_cte_max_rows, db_mod.types.default_relational_rows_cte_max_bytes);
-    }
+    var spill = try row_spill.spillKeyedJsonRowsAlloc(alloc, keyed, name);
+    defer spill.deinit(alloc);
 
-    fn init(max_rows: u64, max_bytes: u64) RoutedRowsMaterializationBudget {
-        return .{
-            .max_rows = max_rows,
-            .max_bytes = max_bytes,
+    const loaded = try row_spill.loadKeyedJsonRowsAlloc(alloc, spill);
+    errdefer row_spill.freeKeyedJsonRows(alloc, loaded);
+    const out = try alloc.alloc(db_mod.types.RelationalRowsCollectedRow, loaded.len);
+    errdefer alloc.free(out);
+    for (loaded, 0..) |*row, i| {
+        out[i] = .{
+            .key = row.key,
+            .json = row.json,
+            .version = row.version,
         };
+        row.key = "";
+        row.json = "";
     }
-
-    fn account(self: *RoutedRowsMaterializationBudget, row_json: []const u8) !void {
-        if (self.rows >= self.max_rows) return error.UnsupportedRowsQuery;
-        var next_bytes = self.bytes;
-        if (self.rows > 0) next_bytes = std.math.add(u64, next_bytes, 1) catch return error.UnsupportedRowsQuery;
-        next_bytes = std.math.add(u64, next_bytes, @intCast(row_json.len)) catch return error.UnsupportedRowsQuery;
-        if (next_bytes > self.max_bytes) return error.UnsupportedRowsQuery;
-        self.rows += 1;
-        self.bytes = next_bytes;
-    }
-};
+    alloc.free(loaded);
+    db_mod.types.freeRelationalRowsCollectedRows(alloc, rows);
+    return out;
+}
 
 pub fn routedRowsPlanRangesForJoinAlloc(
     alloc: std.mem.Allocator,
@@ -2836,6 +2991,7 @@ pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
     {
         return error.UnsupportedRowsQuery;
     }
+    try preflightRoutedRowsJoinStrategy(plan.join);
 
     const empty_rows: []const []const u8 = &.{};
     var cte_rows_storage: ?RoutedRows = null;
@@ -2852,18 +3008,24 @@ pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
             plan.right_ranges,
         );
         defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
-        cte_rows_storage = (try collectRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_ranges, consistency)) orelse return null;
+        cte_rows_storage = (try collectStableRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_base_schema, cte_ranges, consistency)) orelse return null;
         break :blk cte_rows_storage.?.rows;
     };
-    var left_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, left_table_name, plan.left_ranges, consistency)) orelse return null;
+    var left_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, left_table_name, left_schema, plan.left_ranges, consistency)) orelse return null;
     defer left_rows.deinit(alloc);
-    var right_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, right_table_name, plan.right_ranges, consistency)) orelse return null;
+    var right_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, right_table_name, right_schema, plan.right_ranges, consistency)) orelse return null;
     defer right_rows.deinit(alloc);
 
     var local_plan = plan;
     local_plan.left_ranges = &.{};
     local_plan.right_ranges = &.{};
     return try relational_rows_api.executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(alloc, cte_base_schema, left_schema, right_schema, local_plan, cte_rows, left_rows.rows, right_rows.rows);
+}
+
+fn preflightRoutedRowsJoinStrategy(join: db_mod.types.RelationalRowsJoinRequest) !void {
+    if (join.strategy == .merge and !db_mod.types.relationalRowsJoinInputsSortedOnJoinKeys(join)) {
+        return error.UnsupportedRowsQuery;
+    }
 }
 
 pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
@@ -2900,12 +3062,12 @@ pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
             plan.right_ranges,
         );
         defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
-        cte_rows_storage = (try collectRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_ranges, consistency)) orelse return null;
+        cte_rows_storage = (try collectStableRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_base_schema, cte_ranges, consistency)) orelse return null;
         break :blk cte_rows_storage.?.rows;
     };
-    var left_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, left_table_name, plan.left_ranges, consistency)) orelse return null;
+    var left_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, left_table_name, left_schema, plan.left_ranges, consistency)) orelse return null;
     defer left_rows.deinit(alloc);
-    var right_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, right_table_name, plan.right_ranges, consistency)) orelse return null;
+    var right_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, right_table_name, right_schema, plan.right_ranges, consistency)) orelse return null;
     defer right_rows.deinit(alloc);
 
     var local_plan = plan;
@@ -2961,6 +3123,19 @@ test "lowered sql set operation materialization admission distinguishes spill fr
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes - 1,
     }, &rows);
+    var spilled_execution = try executeSetOperationOnQueryResultsAlloc(std.testing.allocator, .{
+        .operation = .union_all,
+        .left = .{},
+        .right = .{},
+        .max_rows = 2,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+        .order_by = &.{.{ .field = "id", .direction = .desc }},
+    }, rows[0..1], rows[1..2]);
+    defer spilled_execution.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), spilled_execution.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", spilled_execution.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", spilled_execution.rows[1]);
     try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, db_mod.DB.admitRelationalRowsSetOperationRowsAllowSpill(.{
         .operation = .union_distinct,
         .left = .{},
@@ -3018,15 +3193,59 @@ test "lowered sql recursive cte materialization admission uses stream spill poli
     try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, admitRecursiveCteRows(too_many_rows, &rows));
 }
 
-test "routed rows materialization budget fails closed on row and byte caps" {
-    var row_budget = RoutedRowsMaterializationBudget.init(2, 128);
+test "routed rows materialization tracker uses shared spill and hard cap policy" {
+    var row_budget = row_spill.JsonRowsMaterializationTracker.init("test", 2, 128, 128);
     try row_budget.account("{\"id\":\"a\"}");
     try row_budget.account("{\"id\":\"b\"}");
+    try std.testing.expect(!row_budget.spill_required);
     try std.testing.expectError(error.UnsupportedRowsQuery, row_budget.account("{\"id\":\"c\"}"));
 
-    var byte_budget = RoutedRowsMaterializationBudget.init(8, 16);
+    var byte_budget = row_spill.JsonRowsMaterializationTracker.init("test", 8, 16, 16);
     try byte_budget.account("{\"id\":\"a\"}");
     try std.testing.expectError(error.UnsupportedRowsQuery, byte_budget.account("{\"id\":\"b\"}"));
+
+    var spill_budget = row_spill.JsonRowsMaterializationTracker.init("test", 8, 64, 16);
+    try spill_budget.account("{\"id\":\"a\"}");
+    try std.testing.expect(!spill_budget.spill_required);
+    try spill_budget.account("{\"id\":\"b\"}");
+    try std.testing.expect(spill_budget.spill_required);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"a\"}",
+        "{\"id\":\"b\"}",
+    };
+    var owned_rows = try std.testing.allocator.alloc([]const u8, rows.len);
+    var owned_rows_count: usize = 0;
+    errdefer {
+        for (owned_rows[0..owned_rows_count]) |row| std.testing.allocator.free(@constCast(row));
+        std.testing.allocator.free(owned_rows);
+    }
+    for (rows, 0..) |row, i| {
+        owned_rows[i] = try std.testing.allocator.dupe(u8, row);
+        owned_rows_count += 1;
+    }
+    const reloaded = try row_spill.spillAndReloadOwnedJsonRowsAlloc(std.testing.allocator, owned_rows, spill_budget.bytes, "routed-test");
+    owned_rows = &.{};
+    owned_rows_count = 0;
+    defer freeOwnedRows(std.testing.allocator, reloaded);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.len);
+    try std.testing.expectEqualStrings(rows[0], reloaded[0]);
+    try std.testing.expectEqualStrings(rows[1], reloaded[1]);
+
+    var collected = try std.testing.allocator.alloc(db_mod.types.RelationalRowsCollectedRow, 2);
+    collected[0] = .{ .key = try std.testing.allocator.dupe(u8, "a"), .json = try std.testing.allocator.dupe(u8, rows[0]), .version = 3 };
+    collected[1] = .{ .key = try std.testing.allocator.dupe(u8, "b"), .json = try std.testing.allocator.dupe(u8, rows[1]), .version = 4 };
+    errdefer db_mod.types.freeRelationalRowsCollectedRows(std.testing.allocator, collected);
+    const reloaded_collected = try spillAndReloadCollectedRowsAlloc(std.testing.allocator, collected, "routed-keyed-test");
+    collected = &.{};
+    defer db_mod.types.freeRelationalRowsCollectedRows(std.testing.allocator, reloaded_collected);
+    try std.testing.expectEqual(@as(usize, 2), reloaded_collected.len);
+    try std.testing.expectEqualStrings("a", reloaded_collected[0].key);
+    try std.testing.expectEqualStrings(rows[0], reloaded_collected[0].json);
+    try std.testing.expectEqual(@as(u64, 3), reloaded_collected[0].version);
+    try std.testing.expectEqualStrings("b", reloaded_collected[1].key);
+    try std.testing.expectEqualStrings(rows[1], reloaded_collected[1].json);
+    try std.testing.expectEqual(@as(u64, 4), reloaded_collected[1].version);
 }
 
 test "routed rows query plan executes over scanned owner rows with ctes" {
@@ -3043,7 +3262,10 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     };
 
     const FakeRoutedSource = struct {
+        const LookupMode = enum { stable, changed, version_changed };
+
         scan_calls: usize = 0,
+        lookup_mode: LookupMode = .stable,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -3062,14 +3284,37 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
         }
 
         fn lookup(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const json = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, key, "a"))
+                    "{\"id\":\"a\",\"status\":\"open\",\"amount\":1}"
+                else if (std.mem.eql(u8, key, "b"))
+                    "{\"id\":\"b\",\"status\":\"closed\",\"amount\":9}"
+                else if (std.mem.eql(u8, key, "z"))
+                    if (self.lookup_mode == .changed)
+                        "{\"id\":\"z\",\"status\":\"open\",\"amount\":8}"
+                    else
+                        "{\"id\":\"z\",\"status\":\"open\",\"amount\":7}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, key, "c1"))
+                    "{\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}"
+                else if (std.mem.eql(u8, key, "c2"))
+                    "{\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}"
+                else
+                    return null
+            else
+                return null;
+            const version: u64 = if (self.lookup_mode == .version_changed and std.mem.eql(u8, table_name, "orders") and std.mem.eql(u8, key, "z")) 2 else 1;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = version };
         }
 
         fn query(
@@ -3097,16 +3342,16 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
             self.scan_calls += 1;
             const ndjson = if (std.mem.eql(u8, table_name, "orders"))
                 if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, "n"))
-                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
+                    "{\"key\":\"a\",\"version\":1,\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"version\":1,\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
                 else if (std.mem.eql(u8, from_key, "n") and std.mem.eql(u8, to_key, ""))
-                    "{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                    "{\"key\":\"z\",\"version\":1,\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
                 else if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
-                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                    "{\"key\":\"a\",\"version\":1,\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"version\":1,\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n{\"key\":\"z\",\"version\":1,\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
                 else
                     return error.UnexpectedRange
             else if (std.mem.eql(u8, table_name, "customers"))
                 if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
-                    "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+                    "{\"key\":\"c1\",\"version\":1,\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"version\":1,\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
                 else
                     return error.UnexpectedRange
             else if (std.mem.eql(u8, table_name, "oversized")) {
@@ -3291,6 +3536,29 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqualStrings("{\"id\":\"z\",\"amount\":7,\"rn\":1}", window_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":1,\"rn\":2}", window_result.rows[1]);
 
+    var changed_fake = FakeRoutedSource{ .lookup_mode = .changed };
+    var changed_source = changed_fake.source();
+    try std.testing.expectError(error.TopologyChanged, changed_source.rowsAggregatePlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "open_rows" },
+            .group_by = aggregate_group_by[0..],
+            .aggregations = aggregate_specs[0..],
+        },
+    }, .read_index));
+    try std.testing.expectError(error.TopologyChanged, changed_source.rowsWindowPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "open_rows" },
+            .windows = window_specs[0..],
+            .select = window_select[0..],
+            .select_all = false,
+            .order_by = &.{.{ .field = "rn", .direction = .asc }},
+        },
+    }, .read_index));
+
     const join_on = [_]db_mod.types.RelationalRowsJoinOn{.{
         .left_field = "status",
         .right_field = "status",
@@ -3299,6 +3567,72 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
         .{ .output = "left_id", .side = .left, .field = "id" },
         .{ .output = "right_id", .side = .right, .field = "id" },
     };
+    try std.testing.expectError(error.TopologyChanged, changed_source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+
+    const lateral_correlations = [_]db_mod.types.RelationalRowsLateralCorrelation{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    try std.testing.expectError(error.TopologyChanged, changed_source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+
+    var version_changed_fake = FakeRoutedSource{ .lookup_mode = .version_changed };
+    var version_changed_source = version_changed_fake.source();
+    try std.testing.expectError(error.TopologyChanged, version_changed_source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "open_rows",
+            .select = &.{ "id", "amount" },
+            .order_by = &.{.{ .field = "amount", .direction = .desc }},
+        },
+    }, .read_index));
+
+    const scans_before_unsupported_merge = fake.scan_calls;
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{},
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(scans_before_unsupported_merge, fake.scan_calls);
+
+    var merge_join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+            .order_by = &.{ .{ .field = "left_id", .direction = .asc }, .{ .field = "right_id", .direction = .asc } },
+        },
+    }, .read_index)).?;
+    defer merge_join_result.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, merge_join_result.strategy_selection.?.requested);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, merge_join_result.strategy_selection.?.selected);
+    try std.testing.expectEqual(@as(u32, 4), merge_join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", merge_join_result.rows[0]);
+
     var join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
         .ctes = ctes[0..],
         .join = .{
@@ -3314,10 +3648,6 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(@as(u32, 4), join_result.total_rows);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", join_result.rows[0]);
 
-    const lateral_correlations = [_]db_mod.types.RelationalRowsLateralCorrelation{.{
-        .left_field = "status",
-        .right_field = "status",
-    }};
     const lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
         .{ .output = "left_id", .side = .left, .field = "id" },
         .{ .output = "latest_id", .side = .right, .field = "id" },
@@ -3471,13 +3801,29 @@ test "lowered sql cross-table read plans execute through routed scans" {
 
         fn lookup(
             _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const json = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, key, "o1"))
+                    "{\"id\":\"o1\",\"status\":\"open\",\"customer_id\":\"c1\",\"amount\":10}"
+                else if (std.mem.eql(u8, key, "o2"))
+                    "{\"id\":\"o2\",\"status\":\"closed\",\"customer_id\":\"c2\",\"amount\":5}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, key, "c1"))
+                    "{\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}"
+                else if (std.mem.eql(u8, key, "c2"))
+                    "{\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}"
+                else
+                    return null
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
         }
 
         fn query(
@@ -3633,13 +3979,22 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
 
         fn lookup(
             _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            if (!std.mem.eql(u8, table_name, "usage_records")) return error.TableNotFound;
+            const json = if (std.mem.eql(u8, key, "u1"))
+                "{\"id\":\"u1\",\"status\":\"open\",\"enabled\":true}"
+            else if (std.mem.eql(u8, key, "u2"))
+                "{\"id\":\"u2\",\"status\":\"open\",\"enabled\":false}"
+            else if (std.mem.eql(u8, key, "u3"))
+                "{\"id\":\"u3\",\"status\":\"closed\",\"enabled\":true}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
         }
 
         fn query(
@@ -3935,13 +4290,35 @@ test "lowered sql set operation plans route cross table branches through catalog
 
         fn lookup(
             _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) !?LookupResponse {
-            return null;
+            const json = if (std.mem.eql(u8, table_name, "usage_records"))
+                if (std.mem.eql(u8, key, "u1"))
+                    "{\"id\":\"u1\",\"status\":\"open\",\"enabled\":true}"
+                else if (std.mem.eql(u8, key, "u2"))
+                    "{\"id\":\"u2\",\"status\":\"open\",\"enabled\":false}"
+                else if (std.mem.eql(u8, key, "u3"))
+                    "{\"id\":\"u3\",\"status\":\"closed\",\"enabled\":true}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "archived_records"))
+                if (std.mem.eql(u8, key, "a1"))
+                    "{\"id\":\"a1\",\"status\":\"archived\",\"enabled\":true}"
+                else if (std.mem.eql(u8, key, "a2"))
+                    "{\"id\":\"a2\",\"status\":\"archived\",\"enabled\":false}"
+                else if (std.mem.eql(u8, key, "a3"))
+                    "{\"id\":\"a3\",\"status\":\"deleted\",\"enabled\":true}"
+                else if (std.mem.eql(u8, key, "u2"))
+                    "{\"id\":\"u2\",\"status\":\"deleted\",\"enabled\":false}"
+                else
+                    return null
+            else
+                return error.TableNotFound;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
         }
 
         fn query(

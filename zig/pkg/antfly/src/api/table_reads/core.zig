@@ -36,12 +36,18 @@ pub fn appendScanLine(
     out: *std.ArrayListUnmanaged(u8),
     key: []const u8,
     projected_json: ?[]const u8,
+    version: ?u64,
 ) !void {
     const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(escaped_key);
 
     try out.appendSlice(alloc, "{\"key\":");
     try out.appendSlice(alloc, escaped_key);
+    if (version) |value| {
+        const version_json = try std.fmt.allocPrint(alloc, ",\"version\":{d}", .{value});
+        defer alloc.free(version_json);
+        try out.appendSlice(alloc, version_json);
+    }
     if (projected_json) |json| {
         if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
         if (json.len > 2) {

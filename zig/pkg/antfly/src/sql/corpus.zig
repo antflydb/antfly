@@ -1628,7 +1628,10 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         const entry = try parseFixtureEntryAlloc(alloc, entry_value);
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
+            std.debug.print("source corpus parse failed: {s}: {s}: {}\n", .{ entry.name, entry.sql, err });
+            return error.TestUnexpectedResult;
+        };
         defer parsed_sql.deinit(alloc);
         try validateSourceCorpusEntryMetadataParsedSql(entry, &parsed_sql);
         try validateSourceCorpusEntryJsonPayloadsParsedSql(alloc, entry, &parsed_sql);
@@ -5974,6 +5977,44 @@ fn expectSourceCorpusResolvedRequirements(
     }
 }
 
+fn sourceEntryMayProveResolvedRequirement(entry: AppParityCorpusEntry, reason: []const u8) bool {
+    if (entry.classification_reason.len == 0) return true;
+    return std.mem.eql(u8, entry.classification_reason, reason);
+}
+
+fn expectSourceCorpusResolvedRequirementsFromEntries(
+    alloc: std.mem.Allocator,
+    entries: []const AppParityCorpusEntry,
+    resolved: []const AppParityResolvedRequirement,
+    emit_diagnostics: bool,
+) !void {
+    if (resolved.len == 0) return error.TestUnexpectedResult;
+    for (resolved) |item| {
+        if (item.coverage.len == 0) return error.TestUnexpectedResult;
+        var coverage = AppParityCorpusCoverage{};
+        var observed_entries: usize = 0;
+        for (entries) |entry| {
+            if (!sourceEntryMayProveResolvedRequirement(entry, item.reason)) continue;
+            try coverage.observe(alloc, entry);
+            observed_entries += 1;
+        }
+        if (observed_entries == 0) {
+            if (emit_diagnostics) {
+                std.debug.print("missing resolved native requirement source evidence: {s}\n", .{item.reason});
+            }
+            return error.TestUnexpectedResult;
+        }
+        for (item.coverage) |name| {
+            if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+                if (emit_diagnostics) {
+                    std.debug.print("missing reason-scoped resolved native requirement coverage: {s} -> {s}\n", .{ item.reason, name });
+                }
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
 fn resolvedRequirementContains(resolved: []const AppParityResolvedRequirement, reason: []const u8) bool {
     for (resolved) |item| {
         if (std.mem.eql(u8, item.reason, reason)) return true;
@@ -6010,11 +6051,25 @@ test "sql adapter source corpus covers resolved native requirements with positiv
     var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
     defer resolved.deinit(alloc);
 
-    var coverage = AppParityCorpusCoverage{};
-    for (source.root.entries) |entry| {
-        try coverage.observe(alloc, entry);
-    }
-    try expectSourceCorpusResolvedRequirements(coverage, resolved.root.resolved, true);
+    try expectSourceCorpusResolvedRequirementsFromEntries(alloc, source.root.entries, resolved.root.resolved, true);
+
+    const cross_reason_entries = [_]AppParityCorpusEntry{
+        .{
+            .name = "invalid duplicate conflict update target",
+            .family = .invalid_insert,
+            .classification_reason = "duplicate_conflict_update_target",
+            .plan = "invalid:insert:reason=duplicate_conflict_update_target",
+            .sql = "INSERT INTO usage_records (id, amount) VALUES ('u1', 1) ON CONFLICT (id) DO UPDATE SET amount = excluded.amount, amount = 3",
+        },
+    };
+    const borrowed_coverage = [_]AppParityResolvedRequirement{.{
+        .reason = "invalid_expression_conflict_target",
+        .coverage = &.{"invalid_duplicate_conflict_update_target"},
+    }};
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusResolvedRequirementsFromEntries(alloc, &cross_reason_entries, &borrowed_coverage, false),
+    );
 }
 
 test "sql adapter native requirement manifests classify every stable requirement" {

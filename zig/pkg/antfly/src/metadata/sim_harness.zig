@@ -439,6 +439,7 @@ test "metadata sim split runtime preserves source identity namespace" {
     _ = try split.catchUpDestination(701, 702);
 
     var dest = try db_mod.DB.open(alloc, destination_root_dir, .{
+        .open_mode = .query_readonly,
         .identity_namespace = source_namespace,
         .start_index_workers = false,
     });
@@ -494,10 +495,22 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
     defer cluster.alloc.free(path);
     const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, ctx.group_id);
 
+    var read_db = db_mod.DB.open(cluster.alloc, path, .{
+        .open_mode = .query_readonly,
+        .identity_namespace = identity_namespace,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        else => return err,
+    };
+    defer read_db.close();
+
+    if (read_db.core.index_manager.textIndex(ctx.index_name) != null) return true;
+
     var db = db_mod.DB.open(cluster.alloc, path, .{
         .identity_namespace = identity_namespace,
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
+        error.LsmRootWriterAlreadyOpen => return true,
         else => return err,
     };
     defer db.close();
@@ -2680,7 +2693,7 @@ pub const MetadataHttpNodeSimulation = struct {
         const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var db = db_mod.DB.open(alloc, db_path, .{}) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, db_path, .{ .open_mode = .status_only }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -5428,7 +5441,18 @@ const MetadataVoprCatalogJobOwner = struct {
     }
 
     pub fn promoteTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        var restart_identity = false;
+        if (request.job_ids.len > 0) {
+            const jobs = try self.manager.listTableEmptyingJobs(self.alloc);
+            defer self.manager.freeTableEmptyingJobs(self.alloc, jobs);
+            for (jobs) |job| {
+                if (job.job_id != request.job_ids[0]) continue;
+                restart_identity = job.restart_identity;
+                break;
+            }
+        }
         try self.manager.promoteTableEmptyingBarrier(request);
+        if (restart_identity) self.reset_calls += 1;
     }
 
     pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {

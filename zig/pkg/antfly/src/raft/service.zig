@@ -1469,7 +1469,7 @@ test "managed host service resumes real split transition after restart" {
         try std.testing.expectEqual(@as(usize, 0), restarted.metrics.queued_split_transitions);
         try std.testing.expectEqual(@as(usize, 1), restarted.metrics.completed_split_transitions);
 
-        var dest = try data.SplitDestination.init(std.testing.allocator, .{ .root_dir = dst_root });
+        var dest = try data.SplitDestination.initReadOnly(std.testing.allocator, dst_root);
         defer dest.deinit();
         const range = dest.getRange();
         try std.testing.expectEqualStrings("doc:m", range.start);
@@ -1620,7 +1620,7 @@ test "managed host service resumes real merge transition after restart" {
         try std.testing.expectEqual(@as(usize, 0), restarted.metrics.queued_merge_transitions);
         try std.testing.expectEqual(@as(usize, 1), restarted.metrics.completed_merge_transitions);
 
-        var receiver = try data.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+        var receiver = try data.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
         defer receiver.deinit();
         const range = receiver.getRange();
         try std.testing.expectEqualStrings("doc:a", range.start);

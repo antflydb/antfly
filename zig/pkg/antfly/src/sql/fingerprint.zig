@@ -1254,7 +1254,8 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             else
                 base;
             const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, with_generated_op, "include", plan.include_columns.len);
-            const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "where_expr", plan.where_expressions.len);
+            const with_index_keys = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "index_keys", plan.index_keys.len);
+            const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_index_keys, "where_expr", plan.where_expressions.len);
             const with_temporal = try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
             break :blk try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "nulls_not_distinct", plan.nulls_not_distinct);
         },

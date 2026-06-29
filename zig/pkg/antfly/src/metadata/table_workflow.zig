@@ -988,17 +988,12 @@ test "table workflow create preserves existing projected topology" {
 
         pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
             const records = try alloc.alloc(table_manager.TableRecord, 1);
-            records[0] = .{
+            errdefer alloc.free(records);
+            records[0] = try table_manager.cloneTable(alloc, .{
                 .table_id = 7,
-                .name = try alloc.dupe(u8, "docs"),
-                .description = try alloc.dupe(u8, ""),
-                .schema_json = try alloc.dupe(u8, ""),
-                .read_schema_json = try alloc.dupe(u8, ""),
-                .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
-                .indexes_json = try alloc.dupe(u8, ""),
-                .replication_sources_json = try alloc.dupe(u8, ""),
-                .placement_role = try alloc.dupe(u8, "data"),
-            };
+                .name = "docs",
+                .placement_role = "data",
+            });
             return records;
         }
 

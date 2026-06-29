@@ -45,6 +45,7 @@ pub const GeneratedSqlSessionKind = enum {
 
 pub const GeneratedSqlTransactionKind = enum {
     set_transaction,
+    constraint_mode,
     start_transaction,
     begin,
     commit,
@@ -196,7 +197,6 @@ pub const GeneratedSqlUnsupportedKind = enum {
     analyze,
     call,
     checkpoint,
-    close,
     cluster,
     comment,
     copy,
@@ -256,7 +256,6 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_transform,
     create_trigger,
     create_user_mapping,
-    declare,
     do_block,
     drop_foreign_table,
     drop_foreign_data_wrapper,
@@ -288,7 +287,6 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_user_mapping,
     drop_view_multi,
     explain,
-    fetch,
     graph_query,
     grant,
     import_foreign_schema,
@@ -298,10 +296,8 @@ pub const GeneratedSqlUnsupportedKind = enum {
     notify,
     reassign_owned,
     reindex,
-    release,
     revoke,
     role_session_control,
-    savepoint,
     security_label,
     drop_materialized_view,
     drop_policy,
@@ -318,7 +314,6 @@ pub const GeneratedSqlUnsupportedReason = enum {
     analyze_not_planned_by_generated_parser,
     call_not_planned_by_generated_parser,
     checkpoint_not_planned_by_generated_parser,
-    close_not_planned_by_generated_parser,
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
@@ -378,7 +373,6 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_transform_not_planned_by_generated_parser,
     create_trigger_not_planned_by_generated_parser,
     create_user_mapping_not_planned_by_generated_parser,
-    declare_not_planned_by_generated_parser,
     do_block_not_planned_by_generated_parser,
     drop_foreign_table_not_planned_by_generated_parser,
     drop_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -410,7 +404,6 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_user_mapping_not_planned_by_generated_parser,
     drop_view_multi_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
-    fetch_not_planned_by_generated_parser,
     graph_query_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
     import_foreign_schema_not_planned_by_generated_parser,
@@ -420,10 +413,8 @@ pub const GeneratedSqlUnsupportedReason = enum {
     notify_not_planned_by_generated_parser,
     reassign_owned_not_planned_by_generated_parser,
     reindex_not_planned_by_generated_parser,
-    release_not_planned_by_generated_parser,
     revoke_not_planned_by_generated_parser,
     role_session_control_not_planned_by_generated_parser,
-    savepoint_not_planned_by_generated_parser,
     security_label_not_planned_by_generated_parser,
     drop_materialized_view_not_planned_by_generated_parser,
     drop_policy_not_planned_by_generated_parser,
@@ -851,6 +842,9 @@ pub const GeneratedSqlSetOperationAst = struct {
     right_source_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     right_source_system_time_tokens: ?GeneratedSqlTokenRange = null,
     right_source_system_time_sequence_tokens: ?GeneratedSqlTokenRange = null,
+    right_join_items: []GeneratedSqlJoinAst = &.{},
+    right_join_tree_root_index: ?usize = null,
+    right_join_tree_depth: usize = 0,
     right_where_tokens: ?GeneratedSqlTokenRange = null,
     right_where_expression: GeneratedSqlExpressionAst = .{},
 
@@ -859,6 +853,8 @@ pub const GeneratedSqlSetOperationAst = struct {
         self.right_projection_items.deinit(alloc);
         self.right_projection_first_expression.deinit(alloc);
         self.right_projection_last_expression.deinit(alloc);
+        for (self.right_join_items) |*join| join.deinit(alloc);
+        if (self.right_join_items.len > 0) alloc.free(self.right_join_items);
         self.right_where_expression.deinit(alloc);
         self.* = .{};
     }
@@ -879,6 +875,10 @@ pub const GeneratedSqlJoinAst = struct {
     right_table_tokens: ?GeneratedSqlTokenRange = null,
     right_alias_tokens: ?GeneratedSqlTokenRange = null,
     right_alias_name_tokens: ?GeneratedSqlTokenRange = null,
+    right_lateral_subquery_tokens: ?GeneratedSqlTokenRange = null,
+    right_lateral_subquery_read_ast: ?*GeneratedSqlReadAst = null,
+    right_lateral_alias_tokens: ?GeneratedSqlTokenRange = null,
+    right_lateral_alias_name_tokens: ?GeneratedSqlTokenRange = null,
     condition_kind: GeneratedSqlJoinConditionKind,
     condition_tokens: GeneratedSqlTokenRange,
     predicate_tokens: ?GeneratedSqlTokenRange = null,
@@ -888,6 +888,10 @@ pub const GeneratedSqlJoinAst = struct {
     using_columns: GeneratedSqlListAst = .{},
 
     pub fn deinit(self: *GeneratedSqlJoinAst, alloc: std.mem.Allocator) void {
+        if (self.right_lateral_subquery_read_ast) |read| {
+            read.deinit(alloc);
+            alloc.destroy(read);
+        }
         self.predicate_expression.deinit(alloc);
         self.using_columns.deinit(alloc);
         self.* = undefined;
@@ -1117,12 +1121,21 @@ pub const GeneratedSqlDdlAst = struct {
     index_options_tokens: ?GeneratedSqlTokenRange = null,
     index_where_tokens: ?GeneratedSqlTokenRange = null,
     alter_table_operation_tokens: ?GeneratedSqlTokenRange = null,
+    relation_population_source_read: ?*GeneratedSqlReadAst = null,
     unique: bool = false,
     if_not_exists: bool = false,
     if_exists: bool = false,
     cascade: bool = false,
     force: bool = false,
     replace_existing: bool = false,
+
+    pub fn deinit(self: *GeneratedSqlDdlAst, alloc: std.mem.Allocator) void {
+        if (self.relation_population_source_read) |read| {
+            read.deinit(alloc);
+            alloc.destroy(read);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlReadAst = struct {
@@ -1530,6 +1543,9 @@ fn cloneRebasedGeneratedSetOperationAlloc(
     cloned.right_source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_source_alias_name_tokens, base, end);
     cloned.right_source_system_time_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_source_system_time_tokens, base, end);
     cloned.right_source_system_time_sequence_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_source_system_time_sequence_tokens, base, end);
+    cloned.right_join_items = try cloneRebasedGeneratedJoinSliceAlloc(alloc, set_operation.right_join_items, base, end);
+    cloned.right_join_tree_root_index = set_operation.right_join_tree_root_index;
+    cloned.right_join_tree_depth = set_operation.right_join_tree_depth;
     cloned.right_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_where_tokens, base, end);
     cloned.right_where_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, set_operation.right_where_expression, base, end);
     return cloned;
@@ -1540,7 +1556,7 @@ fn cloneRebasedGeneratedJoinSliceAlloc(
     joins: []const GeneratedSqlJoinAst,
     base: usize,
     end: usize,
-) ![]GeneratedSqlJoinAst {
+) anyerror![]GeneratedSqlJoinAst {
     if (joins.len == 0) return &.{};
     const cloned = try alloc.alloc(GeneratedSqlJoinAst, joins.len);
     var initialized: usize = 0;
@@ -1564,10 +1580,17 @@ fn cloneRebasedGeneratedJoinSliceAlloc(
             .right_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_table_tokens, base, end),
             .right_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_alias_tokens, base, end),
             .right_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_alias_name_tokens, base, end),
+            .right_lateral_subquery_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_lateral_subquery_tokens, base, end),
+            .right_lateral_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_lateral_alias_tokens, base, end),
+            .right_lateral_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.right_lateral_alias_name_tokens, base, end),
             .condition_kind = join.condition_kind,
             .condition_tokens = try rebaseGeneratedSqlTokenRange(join.condition_tokens, base, end),
         };
         errdefer temp.deinit(alloc);
+        if (join.right_lateral_subquery_read_ast) |read| {
+            const subquery_tokens = join.right_lateral_subquery_tokens orelse return error.UnsupportedSqlShape;
+            temp.right_lateral_subquery_read_ast = try cloneGeneratedReadAstPtrAlloc(alloc, read, subquery_tokens.end - subquery_tokens.start);
+        }
         temp.predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.predicate_tokens, base, end);
         temp.predicate_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, join.predicate_expression, base, end);
         temp.using_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.using_tokens, base, end);
@@ -1694,6 +1717,182 @@ fn cloneRebasedGeneratedWindowSliceAlloc(
     return cloned;
 }
 
+fn cloneRebasedGeneratedCteSliceAlloc(
+    alloc: std.mem.Allocator,
+    ctes: []const GeneratedSqlCteAst,
+    base: usize,
+    end: usize,
+) anyerror![]GeneratedSqlCteAst {
+    if (ctes.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlCteAst, ctes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*cte| cte.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (ctes, cloned) |cte, *out| {
+        var temp = GeneratedSqlCteAst{
+            .name_tokens = try rebaseGeneratedSqlTokenRange(cte.name_tokens, base, end),
+            .body_kind = cte.body_kind,
+            .body_join_kind = cte.body_join_kind,
+            .body_join_tree_root_index = cte.body_join_tree_root_index,
+            .body_join_tree_depth = cte.body_join_tree_depth,
+            .body_window_count = cte.body_window_count,
+            .body_limit_all = cte.body_limit_all,
+        };
+        errdefer temp.deinit(alloc);
+        temp.column_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.column_tokens, base, end);
+        temp.column_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.column_name_tokens, base, end);
+        temp.column_names = try cloneRebasedGeneratedListAlloc(alloc, cte.column_names, base, end);
+        temp.materialization_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.materialization_tokens, base, end);
+        temp.materialization = cte.materialization;
+        temp.body_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_tokens, base, end);
+        temp.body_select_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_select_tokens, base, end);
+        temp.body_distinct_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_distinct_tokens, base, end);
+        temp.body_distinct_on_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_distinct_on_items, base, end);
+        temp.body_projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_projection_tokens, base, end);
+        temp.body_source_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_tokens, base, end);
+        temp.body_source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_table_tokens, base, end);
+        temp.body_source_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_alias_tokens, base, end);
+        temp.body_source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_alias_name_tokens, base, end);
+        temp.body_source_system_time_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_system_time_tokens, base, end);
+        temp.body_source_system_time_sequence_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_system_time_sequence_tokens, base, end);
+        temp.body_source_antfly_function_items = try cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(alloc, cte.body_source_antfly_function_items, base, end);
+        temp.body_source_antfly_function_count = cte.body_source_antfly_function_count;
+        temp.body_source_graph_function_items = try cloneRebasedGeneratedGraphTableFunctionSliceAlloc(alloc, cte.body_source_graph_function_items, base, end);
+        temp.body_source_graph_function_count = cte.body_source_graph_function_count;
+        temp.body_join_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_tokens, base, end);
+        temp.body_join_operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_operator_tokens, base, end);
+        temp.body_join_left_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_left_tokens, base, end);
+        temp.body_join_right_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_right_tokens, base, end);
+        temp.body_join_predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_predicate_tokens, base, end);
+        temp.body_join_predicate_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_join_predicate_expression, base, end);
+        temp.body_join_items = try cloneRebasedGeneratedJoinSliceAlloc(alloc, cte.body_join_items, base, end);
+        temp.body_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_where_tokens, base, end);
+        temp.body_group_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_group_tokens, base, end);
+        temp.body_having_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_having_tokens, base, end);
+        temp.body_window_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_window_tokens, base, end);
+        temp.body_window_items = try cloneRebasedGeneratedWindowSliceAlloc(alloc, cte.body_window_items, base, end);
+        temp.body_order_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_order_tokens, base, end);
+        temp.body_limit_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_limit_tokens, base, end);
+        temp.body_limit_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_limit_expression, base, end);
+        temp.body_offset_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_offset_tokens, base, end);
+        temp.body_offset_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_offset_expression, base, end);
+        temp.body_fetch_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_tokens, base, end);
+        temp.body_fetch_count_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_count_tokens, base, end);
+        temp.body_fetch_count_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_fetch_count_expression, base, end);
+        temp.body_row_lock_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_row_lock_tokens, base, end);
+        temp.body_set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_set_operation_tokens, base, end);
+        temp.body_set_operation = try cloneRebasedGeneratedSetOperationAlloc(alloc, cte.body_set_operation, base, end);
+        temp.body_projection_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_projection_items, base, end);
+        temp.body_projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_first_expression, base, end);
+        temp.body_projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_last_expression, base, end);
+        temp.body_where_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_where_expression, base, end);
+        temp.body_group_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_group_items, base, end);
+        temp.body_group_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_group_first_expression, base, end);
+        temp.body_group_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_group_last_expression, base, end);
+        temp.body_having_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_having_expression, base, end);
+        temp.body_order_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_order_items, base, end);
+        temp.body_order_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_order_first_expression, base, end);
+        temp.body_order_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_order_last_expression, base, end);
+        out.* = temp;
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn cloneGeneratedReadAstPtrAlloc(
+    alloc: std.mem.Allocator,
+    read: *const GeneratedSqlReadAst,
+    token_count: usize,
+) anyerror!*GeneratedSqlReadAst {
+    const cloned = try alloc.create(GeneratedSqlReadAst);
+    errdefer alloc.destroy(cloned);
+    cloned.* = try cloneRebasedGeneratedReadAstAlloc(alloc, read.*, 0, token_count);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedReadAstAlloc(
+    alloc: std.mem.Allocator,
+    read: GeneratedSqlReadAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlReadAst {
+    var cloned = GeneratedSqlReadAst{
+        .kind = read.kind,
+        .statement_span = read.statement_span,
+        .command_span = read.command_span,
+        .cte_recursive = read.cte_recursive,
+        .cte_final_kind = read.cte_final_kind,
+        .source_graph_function_kind = read.source_graph_function_kind,
+        .join_kind = read.join_kind,
+        .join_tree_root_index = read.join_tree_root_index,
+        .join_tree_depth = read.join_tree_depth,
+        .window_count = read.window_count,
+        .limit_all = read.limit_all,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.cte_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_tokens, base, end);
+    cloned.cte_list_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_list_tokens, base, end);
+    cloned.cte_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_name_tokens, base, end);
+    cloned.cte_body_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_body_tokens, base, end);
+    cloned.cte_last_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_last_name_tokens, base, end);
+    cloned.cte_last_body_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.cte_last_body_tokens, base, end);
+    cloned.cte_items = try cloneRebasedGeneratedCteSliceAlloc(alloc, read.cte_items, base, end);
+    cloned.cte_count = read.cte_count;
+    cloned.distinct_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.distinct_tokens, base, end);
+    cloned.distinct_on_items = try cloneRebasedGeneratedListAlloc(alloc, read.distinct_on_items, base, end);
+    cloned.projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.projection_tokens, base, end);
+    cloned.projection_items = try cloneRebasedGeneratedListAlloc(alloc, read.projection_items, base, end);
+    cloned.projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.projection_first_expression, base, end);
+    cloned.projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.projection_last_expression, base, end);
+    cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_tokens, base, end);
+    cloned.source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_table_tokens, base, end);
+    cloned.source_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_alias_tokens, base, end);
+    cloned.source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_alias_name_tokens, base, end);
+    cloned.source_system_time_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_system_time_tokens, base, end);
+    cloned.source_system_time_sequence_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_system_time_sequence_tokens, base, end);
+    cloned.source_graph_function_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_graph_function_tokens, base, end);
+    cloned.source_graph_function_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_graph_function_name_tokens, base, end);
+    cloned.source_graph_function_argument_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_graph_function_argument_tokens, base, end);
+    cloned.source_antfly_function_items = try cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(alloc, read.source_antfly_function_items, base, end);
+    cloned.source_antfly_function_count = read.source_antfly_function_count;
+    cloned.source_graph_function_items = try cloneRebasedGeneratedGraphTableFunctionSliceAlloc(alloc, read.source_graph_function_items, base, end);
+    cloned.source_graph_function_count = read.source_graph_function_count;
+    cloned.join_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.join_tokens, base, end);
+    cloned.join_operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.join_operator_tokens, base, end);
+    cloned.join_left_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.join_left_tokens, base, end);
+    cloned.join_right_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.join_right_tokens, base, end);
+    cloned.join_predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.join_predicate_tokens, base, end);
+    cloned.join_predicate_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.join_predicate_expression, base, end);
+    cloned.join_items = try cloneRebasedGeneratedJoinSliceAlloc(alloc, read.join_items, base, end);
+    cloned.where_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.where_tokens, base, end);
+    cloned.where_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.where_expression, base, end);
+    cloned.group_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.group_tokens, base, end);
+    cloned.group_items = try cloneRebasedGeneratedListAlloc(alloc, read.group_items, base, end);
+    cloned.group_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.group_first_expression, base, end);
+    cloned.group_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.group_last_expression, base, end);
+    cloned.having_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.having_tokens, base, end);
+    cloned.having_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.having_expression, base, end);
+    cloned.window_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.window_tokens, base, end);
+    cloned.window_items = try cloneRebasedGeneratedWindowSliceAlloc(alloc, read.window_items, base, end);
+    cloned.order_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.order_tokens, base, end);
+    cloned.order_items = try cloneRebasedGeneratedListAlloc(alloc, read.order_items, base, end);
+    cloned.order_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.order_first_expression, base, end);
+    cloned.order_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.order_last_expression, base, end);
+    cloned.limit_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.limit_tokens, base, end);
+    cloned.limit_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.limit_expression, base, end);
+    cloned.offset_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.offset_tokens, base, end);
+    cloned.offset_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.offset_expression, base, end);
+    cloned.fetch_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.fetch_tokens, base, end);
+    cloned.fetch_count_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.fetch_count_tokens, base, end);
+    cloned.fetch_count_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, read.fetch_count_expression, base, end);
+    cloned.row_lock_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.row_lock_tokens, base, end);
+    cloned.set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.set_operation_tokens, base, end);
+    cloned.set_operation = try cloneRebasedGeneratedSetOperationAlloc(alloc, read.set_operation, base, end);
+    return cloned;
+}
+
 pub fn cloneCteBodyReadAstAlloc(
     alloc: std.mem.Allocator,
     source_statement_span: token_mod.SourceSpan,
@@ -1788,8 +1987,13 @@ pub const GeneratedSqlDmlReadBodyAst = struct {
     where_tokens: ?GeneratedSqlTokenRange = null,
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
     wrapper_projection_star: bool = false,
+    read_ast: ?*GeneratedSqlReadAst = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.read_ast) |read| {
+            read.deinit(alloc);
+            alloc.destroy(read);
+        }
         for (self.source_antfly_function_items) |*item| item.deinit(alloc);
         if (self.source_antfly_function_items.len > 0) alloc.free(self.source_antfly_function_items);
         if (self.source_graph_function_items.len > 0) alloc.free(self.source_graph_function_items);
@@ -1799,9 +2003,24 @@ pub const GeneratedSqlDmlReadBodyAst = struct {
 
 pub const GeneratedSqlDmlCteItemAst = struct {
     name_tokens: GeneratedSqlTokenRange,
+    column_tokens: ?GeneratedSqlTokenRange = null,
+    column_name_tokens: ?GeneratedSqlTokenRange = null,
+    column_names: GeneratedSqlListAst = .{},
+    materialization_tokens: ?GeneratedSqlTokenRange = null,
+    materialization: ?GeneratedSqlCteMaterialization = null,
     body_tokens: GeneratedSqlTokenRange,
     body_read: ?GeneratedSqlDmlReadBodyAst = null,
     body_dml: ?*GeneratedSqlDmlAst = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.column_names.deinit(alloc);
+        if (self.body_read) |*body_read| body_read.deinit(alloc);
+        if (self.body_dml) |body_dml| {
+            body_dml.deinit(alloc);
+            alloc.destroy(body_dml);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlDmlCteAst = struct {
@@ -1810,21 +2029,17 @@ pub const GeneratedSqlDmlCteAst = struct {
     first_name_tokens: GeneratedSqlTokenRange,
     first_body_tokens: GeneratedSqlTokenRange,
     first_body_read: ?GeneratedSqlDmlReadBodyAst = null,
+    first_body_dml: ?*GeneratedSqlDmlAst = null,
     last_name_tokens: GeneratedSqlTokenRange,
     last_body_tokens: GeneratedSqlTokenRange,
     last_body_read: ?GeneratedSqlDmlReadBodyAst = null,
+    last_body_dml: ?*GeneratedSqlDmlAst = null,
     items: []GeneratedSqlDmlCteItemAst = &.{},
     count: usize = 0,
     recursive: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.items) |*item| {
-            if (item.body_read) |*body_read| body_read.deinit(alloc);
-            if (item.body_dml) |body_dml| {
-                body_dml.deinit(alloc);
-                alloc.destroy(body_dml);
-            }
-        }
+        for (self.items) |*item| item.deinit(alloc);
         if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
     }
@@ -1900,6 +2115,8 @@ pub const GeneratedSqlDmlAst = struct {
     returning_tokens: ?GeneratedSqlTokenRange = null,
     returning_items: GeneratedSqlListAst = .{},
     additional_target_tokens: ?GeneratedSqlTokenRange = null,
+    additional_target_items: GeneratedSqlListAst = .{},
+    semijoin_source_table_tokens: ?GeneratedSqlTokenRange = null,
     cte_recursive: bool = false,
     mutation_source_tail: bool = false,
     mutation_join_source: bool = false,
@@ -1916,6 +2133,7 @@ pub const GeneratedSqlDmlAst = struct {
         self.insert_column_items.deinit(alloc);
         self.conflict_target_items.deinit(alloc);
         self.returning_items.deinit(alloc);
+        self.additional_target_items.deinit(alloc);
         self.merge_arms.deinit(alloc);
         if (self.cte_prefix) |*cte_prefix| cte_prefix.deinit(alloc);
         self.* = undefined;
@@ -1952,6 +2170,8 @@ pub const GeneratedSqlUnsupportedAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     subject_tokens: ?GeneratedSqlTokenRange = null,
+    explain_subject_read_ast: ?*GeneratedSqlReadAst = null,
+    explain_subject_dml_ast: ?*GeneratedSqlDmlAst = null,
     explain_options_tokens: ?GeneratedSqlTokenRange = null,
     explain_options_valid: bool = true,
     explain_analyze: bool = false,
@@ -1963,6 +2183,18 @@ pub const GeneratedSqlUnsupportedAst = struct {
     explain_summary: bool = true,
     explain_settings: bool = false,
     explain_wal: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.explain_subject_read_ast) |read| {
+            read.deinit(alloc);
+            alloc.destroy(read);
+        }
+        if (self.explain_subject_dml_ast) |dml| {
+            dml.deinit(alloc);
+            alloc.destroy(dml);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlExplainFormat = enum {
@@ -1985,11 +2217,14 @@ pub const GeneratedSqlAst = union(enum) {
 
     pub fn deinit(self: *GeneratedSqlAst, alloc: std.mem.Allocator) void {
         switch (self.*) {
+            .ddl => |*ddl| ddl.deinit(alloc),
             .dml => |*dml| dml.deinit(alloc),
             .read => |read| {
                 read.deinit(alloc);
                 alloc.destroy(read);
             },
+            .extension_index => |*ddl| ddl.deinit(alloc),
+            .unsupported => |*unsupported| unsupported.deinit(alloc),
             else => {},
         }
         self.* = undefined;
@@ -2094,10 +2329,13 @@ pub const GeneratedSqlCorpusCase = struct {
 
 pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SET antfly.sync_level = 'write'", .kind = .session },
+    .{ .sql = "SET default_transaction_read_only = on", .kind = .session },
+    .{ .sql = "SET default_transaction_read_only = off", .kind = .session },
     .{ .sql = "SET search_path public", .kind = .session },
     .{ .sql = "SET search_path TO public", .kind = .session },
     .{ .sql = "SET LOCAL antfly.sync_level = 'propose'", .kind = .session },
     .{ .sql = "SET LOCAL search_path TO tenant_schema, public", .kind = .session },
+    .{ .sql = "SET SESSION search_path TO tenant_schema, public", .kind = .session },
     .{ .sql = "RESET search_path", .kind = .session },
     .{ .sql = "RESET ALL", .kind = .session },
     .{ .sql = "SHOW search_path", .kind = .session },
@@ -2105,6 +2343,8 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DISCARD ALL", .kind = .session },
     .{ .sql = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", .kind = .session },
     .{ .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY", .kind = .transaction },
+    .{ .sql = "SET CONSTRAINTS ALL DEFERRED", .kind = .transaction },
+    .{ .sql = "SET CONSTRAINTS usage_fk, usage_check IMMEDIATE", .kind = .transaction },
     .{ .sql = "START TRANSACTION", .kind = .transaction },
     .{ .sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ", .kind = .transaction },
     .{ .sql = "BEGIN", .kind = .transaction },
@@ -2136,7 +2376,10 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMIT PREPARED 'usage_batch'", .kind = .prepared_transaction },
     .{ .sql = "ROLLBACK PREPARED 'usage_batch'", .kind = .prepared_transaction },
     .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records", .kind = .cursor },
+    .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id", .kind = .cursor },
+    .{ .sql = "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id", .kind = .cursor },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .cursor },
+    .{ .sql = "FETCH FIRST FROM usage_cursor", .kind = .cursor },
     .{ .sql = "MOVE FROM usage_cursor", .kind = .cursor },
     .{ .sql = "CLOSE usage_cursor", .kind = .cursor },
     .{ .sql = "CLOSE ALL", .kind = .cursor },
@@ -2492,7 +2735,6 @@ pub fn parseTokensAllocWithAstMode(
     ast_mode: GeneratedSqlAstMode,
 ) !GeneratedSqlParseResult {
     const statement = classifyStatement(tokens);
-    if (statement == .unsupported) return try buildGeneratedParseResult(alloc, tokens, statement, ast_mode);
 
     var grammar_statement_kind: GeneratedSqlStatementKind = undefined;
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
@@ -2935,11 +3177,30 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
     }
     if (generatedIndexConcurrentlyKeywordContext(tokens, index) and tok.matchesKeyword("concurrently")) return generated.tokenId(.CONCURRENTLY);
     if (generatedRoutineKeywordContext(tokens, index) and tok.matchesKeyword("routine")) return generated.tokenId(.ROUTINE);
-    if (generatedSessionKeywordContext(tokens, index) and tok.matchesKeyword("local")) return generated.tokenId(.LOCAL);
+    if (generatedSessionKeywordContext(tokens, index)) {
+        if (tok.matchesKeyword("local")) return generated.tokenId(.LOCAL);
+        if (tok.matchesKeyword("session")) return generated.tokenId(.SESSION);
+    }
+    if (generatedCursorKeywordContext(tokens, index)) {
+        if (tok.matchesKeyword("binary")) return generated.tokenId(.BINARY);
+        if (tok.matchesKeyword("cursor")) return generated.tokenId(.CURSOR);
+        if (tok.matchesKeyword("hold")) return generated.tokenId(.HOLD);
+        if (tok.matchesKeyword("scroll")) return generated.tokenId(.SCROLL);
+    }
+    if (generatedCopyDiagnosticIdentifierContext(tokens, index) and
+        (tok.matchesKeywordTag(.escape) or tok.matchesKeywordTag(.where)))
+    {
+        return generated.tokenId(.IDENT);
+    }
+    if (generatedSystemTimeForKeywordContext(tokens, index) and tok.matchesKeywordTag(.@"for")) return generated.tokenId(.SYSTEM_TIME_FOR);
+    if (generatedAnalyzeKeywordContext(tokens, index) and tok.matchesKeyword("verbose")) return generated.tokenId(.ANALYZE_VERBOSE);
     if (!generatedTransactionControlContext(tokens, index)) return null;
     if (tok.matchesKeyword("characteristics")) return generated.tokenId(.CHARACTERISTICS);
     if (tok.matchesKeyword("committed")) return generated.tokenId(.COMMITTED);
+    if (tok.matchesKeyword("constraints")) return generated.tokenId(.CONSTRAINTS);
     if (tok.matchesKeyword("deferrable")) return generated.tokenId(.DEFERRABLE);
+    if (tok.matchesKeyword("deferred")) return generated.tokenId(.DEFERRED);
+    if (tok.matchesKeyword("immediate")) return generated.tokenId(.IMMEDIATE);
     if (tok.matchesKeyword("isolation")) return generated.tokenId(.ISOLATION);
     if (tok.matchesKeyword("level")) return generated.tokenId(.LEVEL);
     if (tok.matchesKeyword("read")) return generated.tokenId(.READ);
@@ -2961,6 +3222,27 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
 fn generatedSessionKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
     if (index >= tokens.len or index != 1 or tokens.len == 0) return false;
     return tokens[0].matchesKeywordTag(.set);
+}
+
+fn generatedCursorKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or index < 2 or tokens.len == 0) return false;
+    return tokens[0].matchesKeywordTag(.declare);
+}
+
+fn generatedSystemTimeForKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index + 3 >= tokens.len) return false;
+    return tokens[index].matchesKeywordTag(.@"for") and
+        std.ascii.eqlIgnoreCase(tokens[index + 1].text, "system_time") and
+        tokens[index + 2].matchesKeywordTag(.as) and
+        tokens[index + 3].matchesKeywordTag(.of);
+}
+
+fn generatedAnalyzeKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
+    return index == 1 and tokens.len > 0 and tokens[0].matchesKeywordTag(.analyze);
+}
+
+fn generatedCopyDiagnosticIdentifierContext(tokens: []const token_mod.Token, index: usize) bool {
+    return index > 0 and tokens.len > 0 and tokens[0].matchesKeywordTag(.copy);
 }
 
 fn generatedSessionAuthorizationKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -2995,6 +3277,7 @@ fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: us
     if (first.matchesKeywordTag(.end)) return index <= 1;
     if (first.matchesKeywordTag(.rollback)) return index <= 3;
     if (!first.matchesKeywordTag(.set)) return false;
+    if (tokens.len > 1 and tokens[1].matchesKeyword("constraints")) return true;
     if (tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return true;
     return tokens.len > 4 and
         tokens[1].matchesKeyword("session") and
@@ -3010,8 +3293,17 @@ fn generatedRoutineKeywordContext(tokens: []const token_mod.Token, index: usize)
 }
 
 fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
+    if (tok.matchesKeywordTag(.conflict)) {
+        return prev != null and prev.?.matchesKeywordTag(.as);
+    }
     if (tok.matchesKeywordTag(.offset)) return next != null and next.?.matchesKeywordTag(.limit);
     if (tok.matchesKeywordTag(.fetch)) return prev != null and prev.?.matchesKeywordTag(.as);
+    if (tok.matchesKeywordTag(.rows)) {
+        return prev != null and prev.?.kind == .identifier and next != null and next.?.kind == .number;
+    }
+    if (tok.matchesKeywordTag(.window)) {
+        return prev != null and prev.?.kind == .identifier and (next == null or next.?.kind == .semicolon);
+    }
     return false;
 }
 
@@ -3072,6 +3364,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.commit) and tokens.len > 1 and tokens[1].matchesKeyword("prepared")) return .{ .prepared_transaction = .commit };
     if (first.matchesKeywordTag(.rollback) and tokens.len > 1 and tokens[1].matchesKeyword("prepared")) return .{ .prepared_transaction = .rollback };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .transaction = .set_transaction };
+    if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("constraints")) return .{ .transaction = .constraint_mode };
     if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeywordTag(.role)) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.set) and tokens.len > 2 and tokens[1].matchesKeyword("session") and tokens[2].matchesKeyword("authorization")) return .{ .unsupported = .role_session_control };
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
@@ -3537,19 +3830,19 @@ fn generatedInsertHasOverridingValue(tokens: []const token_mod.Token) bool {
 }
 
 fn buildUnsupportedAst(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlUnsupportedKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
-) GeneratedSqlUnsupportedAst {
+) !GeneratedSqlUnsupportedAst {
     var ast = GeneratedSqlUnsupportedAst{
         .kind = kind,
         .reason = switch (kind) {
             .analyze => .analyze_not_planned_by_generated_parser,
             .call => .call_not_planned_by_generated_parser,
             .checkpoint => .checkpoint_not_planned_by_generated_parser,
-            .close => .close_not_planned_by_generated_parser,
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
@@ -3609,7 +3902,6 @@ fn buildUnsupportedAst(
             .create_transform => .create_transform_not_planned_by_generated_parser,
             .create_trigger => .create_trigger_not_planned_by_generated_parser,
             .create_user_mapping => .create_user_mapping_not_planned_by_generated_parser,
-            .declare => .declare_not_planned_by_generated_parser,
             .do_block => .do_block_not_planned_by_generated_parser,
             .drop_foreign_table => .drop_foreign_table_not_planned_by_generated_parser,
             .drop_foreign_data_wrapper => .drop_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -3641,7 +3933,6 @@ fn buildUnsupportedAst(
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .drop_view_multi => .drop_view_multi_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
-            .fetch => .fetch_not_planned_by_generated_parser,
             .graph_query => .graph_query_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
             .import_foreign_schema => .import_foreign_schema_not_planned_by_generated_parser,
@@ -3651,10 +3942,8 @@ fn buildUnsupportedAst(
             .notify => .notify_not_planned_by_generated_parser,
             .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
             .reindex => .reindex_not_planned_by_generated_parser,
-            .release => .release_not_planned_by_generated_parser,
             .revoke => .revoke_not_planned_by_generated_parser,
             .role_session_control => .role_session_control_not_planned_by_generated_parser,
-            .savepoint => .savepoint_not_planned_by_generated_parser,
             .security_label => .security_label_not_planned_by_generated_parser,
             .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,
             .drop_policy => .drop_policy_not_planned_by_generated_parser,
@@ -3669,8 +3958,9 @@ fn buildUnsupportedAst(
         .statement_span = statement_span,
         .command_span = command_span,
     };
+    errdefer ast.deinit(alloc);
     if (kind == .explain) {
-        populateGeneratedExplainUnsupportedAst(tokens, end, &ast);
+        try populateGeneratedExplainUnsupportedAst(alloc, tokens, end, &ast);
     } else if (generatedUnsupportedSubjectStart(tokens, kind, end)) |subject_start| {
         ast.subject_tokens = .{ .start = subject_start, .end = end };
     }
@@ -3693,10 +3983,11 @@ fn generatedUnsupportedSubjectStart(tokens: []const token_mod.Token, kind: Gener
 }
 
 fn populateGeneratedExplainUnsupportedAst(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     end: usize,
     ast: *GeneratedSqlUnsupportedAst,
-) void {
+) !void {
     if (end <= 1 or end > tokens.len) return;
     var index: usize = 1;
     if (tokens[index].matchesKeywordTag(.analyze)) {
@@ -3713,7 +4004,19 @@ fn populateGeneratedExplainUnsupportedAst(
         };
         index = close + 1;
     }
-    if (index < end) ast.subject_tokens = .{ .start = index, .end = end };
+    if (index < end) {
+        const subject = GeneratedSqlTokenRange{ .start = index, .end = end };
+        ast.subject_tokens = subject;
+        if (tokens[index].matchesKeywordTag(.select) or tokens[index].matchesKeywordTag(.with)) {
+            if (try buildGeneratedDmlAstForRangeAlloc(alloc, tokens, subject)) |dml| {
+                ast.explain_subject_dml_ast = dml;
+            } else {
+                ast.explain_subject_read_ast = try buildGeneratedReadAstForRangeAlloc(alloc, tokens, subject);
+            }
+        } else if (try buildGeneratedDmlAstForRangeAlloc(alloc, tokens, subject)) |dml| {
+            ast.explain_subject_dml_ast = dml;
+        }
+    }
 }
 
 fn parseGeneratedExplainOptionList(
@@ -3815,7 +4118,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         .transaction => |kind| .{ .transaction = buildTransactionAst(tokens, end, kind, statement_span, command_span) },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .prepared_transaction => |kind| .{ .prepared_transaction = buildPreparedTransactionAst(end, kind, statement_span, command_span) },
-        .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
+        .ddl => |kind| .{ .ddl = try buildDdlAst(alloc, tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
         .read => |kind| {
             const read_ast = try alloc.create(GeneratedSqlReadAst);
@@ -3823,10 +4126,10 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
             try buildReadAstInPlace(alloc, tokens, end, kind, statement_span, command_span, read_ast);
             return .{ .read = read_ast };
         },
-        .extension_index => |kind| .{ .extension_index = buildDdlAst(tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
+        .extension_index => |kind| .{ .extension_index = try buildDdlAst(alloc, tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
         .graph => |kind| .{ .graph = buildGraphAst(tokens, end, kind, statement_span, command_span) },
         .cursor => |kind| .{ .cursor = buildCursorAst(end, kind, statement_span, command_span) },
-        .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
+        .unsupported => |kind| .{ .unsupported = try buildUnsupportedAst(alloc, tokens, end, kind, statement_span, command_span) },
         else => null,
     };
 }
@@ -3844,7 +4147,7 @@ fn buildTransactionAst(
         .command_span = command_span,
     };
     switch (kind) {
-        .set_transaction => ast.mode_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
+        .set_transaction, .constraint_mode => ast.mode_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
         .start_transaction => {
             if (end == 2) {
                 ast.boundary_tail_tokens = .{ .start = 1, .end = 2 };
@@ -4198,6 +4501,10 @@ fn buildSessionAst(
 
 fn findSetNameStart(tokens: []const token_mod.Token, end: usize) usize {
     if (end > 2 and tokens[1].matchesKeyword("local")) return 2;
+    if (end > 2 and tokens[1].matchesKeyword("session")) {
+        if (end > 3 and tokens[2].matchesKeyword("characteristics")) return 1;
+        return 2;
+    }
     return 1;
 }
 
@@ -4263,17 +4570,19 @@ fn buildPreparedTransactionAst(
 }
 
 fn buildDdlAst(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlDdlKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
-) GeneratedSqlDdlAst {
+) !GeneratedSqlDdlAst {
     var ast = GeneratedSqlDdlAst{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
     };
+    errdefer ast.deinit(alloc);
     var index: usize = 2;
     switch (kind) {
         .create_database => {
@@ -4736,10 +5045,111 @@ fn buildDdlAst(
                 if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
                 ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             }
+            ast.relation_population_source_read = try buildGeneratedRelationPopulationSourceReadAstAlloc(alloc, tokens, end);
         },
         else => {},
     }
     return ast;
+}
+
+fn buildGeneratedRelationPopulationSourceReadAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    end: usize,
+) !?*GeneratedSqlReadAst {
+    if (end == 0 or end > tokens.len) return null;
+    if (tokens[0].matchesKeywordTag(.select)) {
+        const ranges = generatedSelectIntoSourceRanges(tokens, 0, end) orelse return null;
+        return try buildGeneratedReadAstForFlattenedRangesAlloc(alloc, tokens, &.{
+            ranges.prefix,
+            ranges.suffix,
+        });
+    }
+    const range = generatedCreateTableAsSourceRange(tokens, 0, end) orelse return null;
+    return try buildGeneratedReadAstForRangeAlloc(alloc, tokens, range);
+}
+
+const GeneratedSelectIntoSourceRanges = struct {
+    prefix: GeneratedSqlTokenRange,
+    suffix: GeneratedSqlTokenRange,
+};
+
+fn generatedSelectIntoSourceRanges(
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+) ?GeneratedSelectIntoSourceRanges {
+    if (start >= end or end > tokens.len) return null;
+    if (!tokens[start].matchesKeywordTag(.select)) return null;
+    const into_index = findTopLevelKeyword(tokens, start + 1, end, .into) orelse return null;
+    if (into_index <= start + 1) return null;
+    const target = generatedSelectIntoTargetRange(tokens, start, end) orelse return null;
+    if (target.end >= end or !tokens[target.end].matchesKeywordTag(.from)) return null;
+    return .{
+        .prefix = .{ .start = start, .end = into_index },
+        .suffix = .{ .start = target.end, .end = end },
+    };
+}
+
+fn generatedCreateTableAsSourceRange(
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+) ?GeneratedSqlTokenRange {
+    if (start >= end or end > tokens.len) return null;
+    const target = generatedCreateTableAsTargetRange(tokens, start, end) orelse return null;
+    if (target.end >= end or !tokens[target.end].matchesKeywordTag(.as)) return null;
+    const source_start = target.end + 1;
+    var source_end = generatedRelationPopulationDataClauseStart(tokens, source_start, end) orelse end;
+    while (source_end > source_start and tokens[source_end - 1].kind == .semicolon) source_end -= 1;
+    if (source_start >= source_end or !tokens[source_start].matchesKeywordTag(.select)) return null;
+    return .{ .start = source_start, .end = source_end };
+}
+
+fn generatedRelationPopulationDataClauseStart(
+    tokens: []const token_mod.Token,
+    source_start: usize,
+    end: usize,
+) ?usize {
+    if (end < source_start + 2 or end > tokens.len) return null;
+    const with_data_index = end - 2;
+    if (tokens[with_data_index].matchesKeywordTag(.with) and
+        tokens[with_data_index + 1].matchesKeywordTag(.data) and
+        topLevelTokenAt(tokens, source_start, with_data_index))
+    {
+        return with_data_index;
+    }
+    if (end < source_start + 3) return null;
+    const with_no_data_index = end - 3;
+    if (tokens[with_no_data_index].matchesKeywordTag(.with) and
+        tokens[with_no_data_index + 1].matchesKeywordTag(.no) and
+        tokens[with_no_data_index + 2].matchesKeywordTag(.data) and
+        topLevelTokenAt(tokens, source_start, with_no_data_index))
+    {
+        return with_no_data_index;
+    }
+    return null;
+}
+
+fn topLevelTokenAt(
+    tokens: []const token_mod.Token,
+    start: usize,
+    index: usize,
+) bool {
+    if (start > index or index > tokens.len) return false;
+    var depth: usize = 0;
+    var cursor = start;
+    while (cursor < index) : (cursor += 1) {
+        switch (tokens[cursor].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return depth == 0;
 }
 
 fn buildDmlAst(
@@ -4766,7 +5176,7 @@ fn buildDmlAst(
         .insert_values, .insert_select => try buildInsertDmlAst(alloc, tokens, start, end, &ast),
         .update => try buildUpdateDmlAst(alloc, tokens, start, end, &ast),
         .delete => try buildDeleteDmlAst(alloc, tokens, start, end, &ast),
-        .truncate => buildTruncateDmlAst(tokens, start, end, &ast),
+        .truncate => try buildTruncateDmlAst(alloc, tokens, start, end, &ast),
         .merge => try buildMergeDmlAst(alloc, tokens, start, end, &ast),
     }
     try buildDmlChildReadAst(alloc, tokens, &ast);
@@ -4790,21 +5200,41 @@ fn buildDmlCteAstAlloc(
     var first_name: ?GeneratedSqlTokenRange = null;
     var first_body: ?GeneratedSqlTokenRange = null;
     var first_read: ?GeneratedSqlDmlReadBodyAst = null;
+    var first_dml: ?*GeneratedSqlDmlAst = null;
     var last_name: ?GeneratedSqlTokenRange = null;
     var last_body: ?GeneratedSqlTokenRange = null;
     var last_read: ?GeneratedSqlDmlReadBodyAst = null;
+    var last_dml: ?*GeneratedSqlDmlAst = null;
     while (index < final_statement_index) {
         if (tokens[index].kind != .identifier) return;
         const name_tokens = GeneratedSqlTokenRange{ .start = index, .end = index + 1 };
         index += 1;
+        var column_tokens: ?GeneratedSqlTokenRange = null;
+        var column_name_tokens: ?GeneratedSqlTokenRange = null;
+        var column_names: GeneratedSqlListAst = .{};
+        var column_names_transferred = false;
+        errdefer if (!column_names_transferred) column_names.deinit(alloc);
         if (index < final_statement_index and tokens[index].kind == .lparen) {
-            index = (findMatchingParen(tokens, index, final_statement_index) orelse return) + 1;
+            const column_close = findMatchingParen(tokens, index, final_statement_index) orelse return;
+            if (column_close >= final_statement_index) return;
+            column_tokens = .{ .start = index, .end = column_close + 1 };
+            if (index + 1 < column_close) {
+                column_name_tokens = .{ .start = index + 1, .end = column_close };
+                column_names = try buildTopLevelListAst(alloc, tokens, column_name_tokens.?, .{});
+            }
+            index = column_close + 1;
         }
         if (index >= final_statement_index or !tokens[index].matchesKeywordTag(.as)) return;
         index += 1;
+        var materialization_tokens: ?GeneratedSqlTokenRange = null;
+        var materialization: ?GeneratedSqlCteMaterialization = null;
         if (index < final_statement_index and tokens[index].matchesKeywordTag(.materialized)) {
+            materialization_tokens = .{ .start = index, .end = index + 1 };
+            materialization = .materialized;
             index += 1;
         } else if (index + 1 < final_statement_index and tokens[index].matchesKeywordTag(.not) and tokens[index + 1].matchesKeywordTag(.materialized)) {
+            materialization_tokens = .{ .start = index, .end = index + 2 };
+            materialization = .not_materialized;
             index += 2;
         }
         if (index >= final_statement_index or tokens[index].kind != .lparen) return;
@@ -4830,20 +5260,28 @@ fn buildDmlCteAstAlloc(
         if (body_read == null and body_dml == null) return;
         try items.append(alloc, .{
             .name_tokens = name_tokens,
+            .column_tokens = column_tokens,
+            .column_name_tokens = column_name_tokens,
+            .column_names = column_names,
+            .materialization_tokens = materialization_tokens,
+            .materialization = materialization,
             .body_tokens = body_tokens,
             .body_read = body_read,
             .body_dml = body_dml,
         });
+        column_names_transferred = true;
         body_read_transferred = true;
         body_dml_transferred = true;
         if (count == 0) {
             first_name = name_tokens;
             first_body = body_tokens;
             first_read = body_read;
+            first_dml = body_dml;
         }
         last_name = name_tokens;
         last_body = body_tokens;
         last_read = body_read;
+        last_dml = body_dml;
         count += 1;
         index = close + 1;
         if (index < final_statement_index and tokens[index].kind == .comma) {
@@ -4861,9 +5299,11 @@ fn buildDmlCteAstAlloc(
         .first_name_tokens = first_name.?,
         .first_body_tokens = first_body.?,
         .first_body_read = first_read,
+        .first_body_dml = first_dml,
         .last_name_tokens = last_name.?,
         .last_body_tokens = last_body.?,
         .last_body_read = last_read,
+        .last_body_dml = last_dml,
         .items = owned_items,
         .count = count,
         .recursive = ast.cte_recursive,
@@ -4871,17 +5311,7 @@ fn buildDmlCteAstAlloc(
 }
 
 fn deinitGeneratedDmlCteItems(alloc: std.mem.Allocator, items: []GeneratedSqlDmlCteItemAst) void {
-    for (items) |*item| {
-        if (item.body_read) |*body_read| {
-            body_read.deinit(alloc);
-            item.body_read = null;
-        }
-        if (item.body_dml) |body_dml| {
-            body_dml.deinit(alloc);
-            alloc.destroy(body_dml);
-            item.body_dml = null;
-        }
-    }
+    for (items) |*item| item.deinit(alloc);
 }
 
 fn buildDataModifyingCteBodyDmlAstAlloc(
@@ -4947,6 +5377,7 @@ fn buildDmlReadBodyMetadata(
         .command_span = tokens[source_tokens.start].sourceSpan(),
     };
     errdefer read_body.deinit(alloc);
+    read_body.read_ast = try buildGeneratedReadAstForRangeAlloc(alloc, tokens, source_tokens);
     const body_end = firstTopLevelSetOperation(tokens, source_tokens.start + 1, source_tokens.end) orelse source_tokens.end;
     if (body_end < source_tokens.end) {
         const set_operation_tail_start = generatedSetOperationResultTailStart(tokens, .{ .start = body_end, .end = source_tokens.end }) orelse source_tokens.end;
@@ -4981,6 +5412,287 @@ fn buildDmlReadBodyMetadata(
     }
     buildDmlReadBodySingleSourceAst(tokens, &read_body);
     return read_body;
+}
+
+fn buildGeneratedReadAstForRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) anyerror!*GeneratedSqlReadAst {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const child_tokens = tokens[range.start..range.end];
+    const child_end = child_tokens.len;
+    const select_index = findTopLevelKeyword(child_tokens, 0, child_end, .select) orelse return error.UnsupportedSqlShape;
+    if (select_index != 0 and !child_tokens[0].matchesKeywordTag(.with)) return error.UnsupportedSqlShape;
+    const statement_span = sourceSpanForTokenRange(tokens, range) orelse return error.UnsupportedSqlShape;
+    const read = try alloc.create(GeneratedSqlReadAst);
+    errdefer alloc.destroy(read);
+    try buildReadAstInPlace(
+        alloc,
+        child_tokens,
+        child_end,
+        classifyReadKindInRange(child_tokens, .{ .start = 0, .end = child_end }),
+        statement_span,
+        child_tokens[select_index].sourceSpan(),
+        read,
+    );
+    return read;
+}
+
+fn buildGeneratedReadAstForFlattenedRangesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    ranges: []const GeneratedSqlTokenRange,
+) anyerror!*GeneratedSqlReadAst {
+    var total: usize = 0;
+    for (ranges) |range| {
+        if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+        total += range.end - range.start;
+    }
+    if (total == 0) return error.UnsupportedSqlShape;
+    const flattened = try alloc.alloc(token_mod.Token, total);
+    defer alloc.free(flattened);
+    var index: usize = 0;
+    for (ranges) |range| {
+        for (tokens[range.start..range.end]) |token| {
+            flattened[index] = token;
+            index += 1;
+        }
+    }
+    return try buildGeneratedReadAstForRangeAlloc(alloc, flattened, .{ .start = 0, .end = flattened.len });
+}
+
+fn buildGeneratedDmlAstForRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) !?*GeneratedSqlDmlAst {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const child_tokens = tokens[range.start..range.end];
+    const child_end = child_tokens.len;
+    const kind: GeneratedSqlDmlKind = if (child_tokens[0].matchesKeywordTag(.with))
+        generatedWriteKindForWithStatement(child_tokens) orelse return null
+    else if (child_tokens[0].matchesKeywordTag(.insert))
+        if (findTopLevelKeyword(child_tokens, 1, child_end, .select) != null)
+            .insert_select
+        else
+            .insert_values
+    else if (child_tokens[0].matchesKeywordTag(.update))
+        .update
+    else if (child_tokens[0].matchesKeywordTag(.delete))
+        .delete
+    else if (child_tokens[0].matchesKeywordTag(.truncate))
+        .truncate
+    else if (child_tokens[0].matchesKeywordTag(.merge))
+        .merge
+    else
+        return null;
+
+    const command_start = if (child_tokens[0].matchesKeywordTag(.with))
+        generatedWithFinalStatementIndex(child_tokens, .{ .allow_recursive = true }) orelse return error.UnsupportedSqlShape
+    else
+        0;
+    const statement_span = sourceSpanForTokenRange(tokens, range) orelse return error.UnsupportedSqlShape;
+    const dml = try alloc.create(GeneratedSqlDmlAst);
+    errdefer alloc.destroy(dml);
+    dml.* = try buildDmlAst(
+        alloc,
+        child_tokens,
+        command_start,
+        child_end,
+        kind,
+        statement_span,
+        child_tokens[command_start].sourceSpan(),
+    );
+    return dml;
+}
+
+pub fn cloneGeneratedDmlAstPtrAlloc(
+    alloc: std.mem.Allocator,
+    dml: *const GeneratedSqlDmlAst,
+    token_count: usize,
+) anyerror!*GeneratedSqlDmlAst {
+    const cloned = try alloc.create(GeneratedSqlDmlAst);
+    errdefer alloc.destroy(cloned);
+    cloned.* = try cloneRebasedGeneratedDmlAstAlloc(alloc, dml.*, 0, token_count);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    dml: GeneratedSqlDmlAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlDmlAst {
+    var cloned = GeneratedSqlDmlAst{
+        .kind = dml.kind,
+        .statement_span = dml.statement_span,
+        .command_span = dml.command_span,
+        .cte_recursive = dml.cte_recursive,
+        .mutation_source_tail = dml.mutation_source_tail,
+        .mutation_join_source = dml.mutation_join_source,
+        .default_values = dml.default_values,
+        .restart_identity = dml.restart_identity,
+        .cascade = dml.cascade,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.cte_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.cte_tokens, base, end);
+    if (dml.cte_prefix) |cte_prefix| cloned.cte_prefix = try cloneRebasedGeneratedDmlCteAstAlloc(alloc, cte_prefix, base, end);
+    cloned.target_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.target_table_tokens, base, end);
+    cloned.target_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.target_alias_tokens, base, end);
+    cloned.target_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.target_alias_name_tokens, base, end);
+    cloned.insert_columns_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.insert_columns_tokens, base, end);
+    cloned.insert_column_items = try cloneRebasedGeneratedListAlloc(alloc, dml.insert_column_items, base, end);
+    cloned.values_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.values_tokens, base, end);
+    cloned.insert_value_rows = try cloneRebasedGeneratedListAlloc(alloc, dml.insert_value_rows, base, end);
+    cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.source_tokens, base, end);
+    if (dml.source_read) |source_read| cloned.source_read = try cloneRebasedGeneratedDmlReadBodyAstAlloc(alloc, source_read, base, end);
+    cloned.assignments_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.assignments_tokens, base, end);
+    cloned.assignment_items = try cloneRebasedGeneratedListAlloc(alloc, dml.assignment_items, base, end);
+    cloned.where_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.where_tokens, base, end);
+    cloned.conflict_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_tokens, base, end);
+    cloned.conflict_target_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_target_tokens, base, end);
+    cloned.conflict_target_items = try cloneRebasedGeneratedListAlloc(alloc, dml.conflict_target_items, base, end);
+    cloned.conflict_action_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_action_tokens, base, end);
+    cloned.conflict_assignments_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_assignments_tokens, base, end);
+    cloned.conflict_assignment_items = try cloneRebasedGeneratedListAlloc(alloc, dml.conflict_assignment_items, base, end);
+    cloned.conflict_target_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_target_where_tokens, base, end);
+    cloned.conflict_action_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.conflict_action_where_tokens, base, end);
+    cloned.returning_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.returning_tokens, base, end);
+    cloned.returning_items = try cloneRebasedGeneratedListAlloc(alloc, dml.returning_items, base, end);
+    cloned.additional_target_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.additional_target_tokens, base, end);
+    cloned.additional_target_items = try cloneRebasedGeneratedListAlloc(alloc, dml.additional_target_items, base, end);
+    cloned.semijoin_source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(dml.semijoin_source_table_tokens, base, end);
+    cloned.merge_arms = try cloneRebasedGeneratedMergeArmListAstAlloc(alloc, dml.merge_arms, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedDmlReadBodyAstAlloc(
+    alloc: std.mem.Allocator,
+    read: GeneratedSqlDmlReadBodyAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlDmlReadBodyAst {
+    var cloned = GeneratedSqlDmlReadBodyAst{
+        .tokens = try rebaseGeneratedSqlTokenRange(read.tokens, base, end),
+        .kind = read.kind,
+        .statement_span = read.statement_span,
+        .command_span = read.command_span,
+        .source_antfly_function_count = read.source_antfly_function_count,
+        .source_graph_function_count = read.source_graph_function_count,
+        .wrapper_projection_star = read.wrapper_projection_star,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.projection_tokens, base, end);
+    cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_tokens, base, end);
+    cloned.source_table_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_table_tokens, base, end);
+    cloned.source_alias_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_alias_tokens, base, end);
+    cloned.source_alias_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_alias_name_tokens, base, end);
+    cloned.source_system_time_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_system_time_tokens, base, end);
+    cloned.source_system_time_sequence_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.source_system_time_sequence_tokens, base, end);
+    cloned.source_antfly_function_items = try cloneRebasedGeneratedAntflyTableFunctionSliceAlloc(alloc, read.source_antfly_function_items, base, end);
+    cloned.source_graph_function_items = try cloneRebasedGeneratedGraphTableFunctionSliceAlloc(alloc, read.source_graph_function_items, base, end);
+    cloned.where_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.where_tokens, base, end);
+    cloned.set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(read.set_operation_tokens, base, end);
+    if (read.read_ast) |read_ast| cloned.read_ast = try cloneGeneratedReadAstPtrAlloc(alloc, read_ast, end - base);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedDmlCteAstAlloc(
+    alloc: std.mem.Allocator,
+    cte: GeneratedSqlDmlCteAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlDmlCteAst {
+    var cloned = GeneratedSqlDmlCteAst{
+        .tokens = try rebaseGeneratedSqlTokenRange(cte.tokens, base, end),
+        .list_tokens = try rebaseGeneratedSqlTokenRange(cte.list_tokens, base, end),
+        .first_name_tokens = try rebaseGeneratedSqlTokenRange(cte.first_name_tokens, base, end),
+        .first_body_tokens = try rebaseGeneratedSqlTokenRange(cte.first_body_tokens, base, end),
+        .last_name_tokens = try rebaseGeneratedSqlTokenRange(cte.last_name_tokens, base, end),
+        .last_body_tokens = try rebaseGeneratedSqlTokenRange(cte.last_body_tokens, base, end),
+        .count = cte.count,
+        .recursive = cte.recursive,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.items = try cloneRebasedGeneratedDmlCteItemSliceAlloc(alloc, cte.items, base, end);
+    if (cloned.items.len == 0 or cloned.items.len != cloned.count) return error.UnsupportedSqlShape;
+    cloned.first_body_read = cloned.items[0].body_read;
+    cloned.first_body_dml = cloned.items[0].body_dml;
+    cloned.last_body_read = cloned.items[cloned.items.len - 1].body_read;
+    cloned.last_body_dml = cloned.items[cloned.items.len - 1].body_dml;
+    return cloned;
+}
+
+fn cloneRebasedGeneratedDmlCteItemSliceAlloc(
+    alloc: std.mem.Allocator,
+    items: []const GeneratedSqlDmlCteItemAst,
+    base: usize,
+    end: usize,
+) anyerror![]GeneratedSqlDmlCteItemAst {
+    if (items.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlDmlCteItemAst, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*item| item.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (items, cloned) |item, *out| {
+        var temp = GeneratedSqlDmlCteItemAst{
+            .name_tokens = try rebaseGeneratedSqlTokenRange(item.name_tokens, base, end),
+            .body_tokens = try rebaseGeneratedSqlTokenRange(item.body_tokens, base, end),
+            .materialization = item.materialization,
+        };
+        errdefer temp.deinit(alloc);
+        temp.column_tokens = try rebaseGeneratedSqlTokenRangeOptional(item.column_tokens, base, end);
+        temp.column_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(item.column_name_tokens, base, end);
+        temp.column_names = try cloneRebasedGeneratedListAlloc(alloc, item.column_names, base, end);
+        temp.materialization_tokens = try rebaseGeneratedSqlTokenRangeOptional(item.materialization_tokens, base, end);
+        if (item.body_read) |body_read| temp.body_read = try cloneRebasedGeneratedDmlReadBodyAstAlloc(alloc, body_read, base, end);
+        if (item.body_dml) |body_dml| temp.body_dml = try cloneGeneratedDmlAstPtrAlloc(alloc, body_dml, end - base);
+        out.* = temp;
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneRebasedGeneratedMergeArmListAstAlloc(
+    alloc: std.mem.Allocator,
+    arms: GeneratedSqlMergeArmListAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlMergeArmListAst {
+    if (arms.items.len == 0) return .{ .count = arms.count, .matched_count = arms.matched_count, .not_matched_count = arms.not_matched_count };
+    const cloned_items = try alloc.alloc(GeneratedSqlMergeArmAst, arms.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned_items[0..initialized]) |*item| item.deinit(alloc);
+        alloc.free(cloned_items);
+    }
+    for (arms.items, cloned_items) |arm, *out| {
+        var temp = GeneratedSqlMergeArmAst{
+            .tokens = try rebaseGeneratedSqlTokenRange(arm.tokens, base, end),
+            .action_tokens = try rebaseGeneratedSqlTokenRange(arm.action_tokens, base, end),
+            .action_kind = arm.action_kind,
+            .matched = arm.matched,
+        };
+        errdefer temp.deinit(alloc);
+        temp.predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(arm.predicate_tokens, base, end);
+        temp.assignments_tokens = try rebaseGeneratedSqlTokenRangeOptional(arm.assignments_tokens, base, end);
+        temp.assignment_items = try cloneRebasedGeneratedListAlloc(alloc, arm.assignment_items, base, end);
+        temp.insert_columns_tokens = try rebaseGeneratedSqlTokenRangeOptional(arm.insert_columns_tokens, base, end);
+        temp.insert_column_items = try cloneRebasedGeneratedListAlloc(alloc, arm.insert_column_items, base, end);
+        temp.insert_values_tokens = try rebaseGeneratedSqlTokenRangeOptional(arm.insert_values_tokens, base, end);
+        temp.insert_value_items = try cloneRebasedGeneratedListAlloc(alloc, arm.insert_value_items, base, end);
+        out.* = temp;
+        initialized += 1;
+    }
+    return .{
+        .items = cloned_items,
+        .count = arms.count,
+        .matched_count = arms.matched_count,
+        .not_matched_count = arms.not_matched_count,
+    };
 }
 
 fn buildDmlRelationSourceReadAst(
@@ -6059,6 +6771,11 @@ fn buildGeneratedSetOperationAstInPlace(
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             out_ast.right_source_tokens = source_tokens;
             buildGeneratedSetOperationRightSingleSourceAst(tokens, source_tokens, out_ast);
+            out_ast.right_join_items = try buildGeneratedJoinItemsAst(alloc, tokens, source_tokens);
+            if (out_ast.right_join_items.len > 0) {
+                out_ast.right_join_tree_root_index = out_ast.right_join_items.len - 1;
+                out_ast.right_join_tree_depth = out_ast.right_join_items.len;
+            }
         }
     }
     if (where_index) |idx| {
@@ -6582,6 +7299,7 @@ fn buildGeneratedJoinItemsAst(
         };
         buildGeneratedJoinSideSourceAst(tokens, item.left_tokens, .left, &item);
         buildGeneratedJoinSideSourceAst(tokens, item.right_tokens, .right, &item);
+        try buildGeneratedJoinRightLateralSubqueryAst(alloc, tokens, &item);
         switch (item.condition_kind) {
             .none => {},
             .on => {
@@ -6641,6 +7359,41 @@ fn buildGeneratedJoinSideSourceAst(
             item.right_alias_name_tokens = alias_name_tokens;
         },
     }
+}
+
+fn buildGeneratedJoinRightLateralSubqueryAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    item: *GeneratedSqlJoinAst,
+) anyerror!void {
+    const right = item.right_tokens;
+    if (right.start + 4 > right.end or right.end > tokens.len) return;
+    if (!tokens[right.start].matchesKeywordTag(.lateral) or tokens[right.start + 1].kind != .lparen) return;
+    const close_index = findMatchingParen(tokens, right.start + 1, right.end) orelse return;
+    if (close_index + 1 >= right.end) return;
+    const alias = generatedReadSourceAlias(tokens, close_index + 1, right.end) orelse return;
+    if (alias.end != right.end) return;
+    const body = GeneratedSqlTokenRange{ .start = right.start + 2, .end = close_index };
+    if (body.start >= body.end) return;
+    const child_tokens = tokens[body.start..body.end];
+    const child_end = child_tokens.len;
+    const child_select_index = findTopLevelKeyword(child_tokens, 0, child_end, .select) orelse return;
+    const statement_span = sourceSpanForTokenRange(tokens, body) orelse return;
+    const child = try alloc.create(GeneratedSqlReadAst);
+    errdefer alloc.destroy(child);
+    try buildReadAstInPlace(
+        alloc,
+        child_tokens,
+        child_end,
+        classifyReadKindInRange(child_tokens, .{ .start = 0, .end = child_end }),
+        statement_span,
+        child_tokens[child_select_index].sourceSpan(),
+        child,
+    );
+    item.right_lateral_subquery_tokens = body;
+    item.right_lateral_subquery_read_ast = child;
+    item.right_lateral_alias_tokens = alias.alias_tokens;
+    item.right_lateral_alias_name_tokens = alias.alias_name_tokens;
 }
 
 const GeneratedJoinCondition = struct {
@@ -6888,7 +7641,10 @@ fn buildUpdateDmlAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         const where_end = returning_index orelse end;
         if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
-    if (statementHasWhereSemijoinSubquery(tokens, set_index + 1, end)) ast.mutation_join_source = true;
+    if (statementWhereSemijoinSourceTableTokens(tokens, set_index + 1, end)) |source_table| {
+        ast.semijoin_source_table_tokens = source_table;
+        ast.mutation_join_source = true;
+    }
     if (returning_index) |idx| {
         try setGeneratedDmlReturningAst(alloc, tokens, idx, end, ast);
     }
@@ -6922,13 +7678,16 @@ fn buildDeleteDmlAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         const where_end = returning_index orelse end;
         if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
-    if (statementHasWhereSemijoinSubquery(tokens, scan_start, end)) ast.mutation_join_source = true;
+    if (statementWhereSemijoinSourceTableTokens(tokens, scan_start, end)) |source_table| {
+        ast.semijoin_source_table_tokens = source_table;
+        ast.mutation_join_source = true;
+    }
     if (returning_index) |idx| {
         try setGeneratedDmlReturningAst(alloc, tokens, idx, end, ast);
     }
 }
 
-fn buildTruncateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
+fn buildTruncateDmlAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) !void {
     var index: usize = start + 1;
     if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
     if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
@@ -6938,6 +7697,7 @@ fn buildTruncateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize
     const option_index = firstTopLevelTruncateOption(tokens, index, end) orelse end;
     if (index < option_index and tokens[index].kind == .comma) {
         ast.additional_target_tokens = .{ .start = index, .end = option_index };
+        ast.additional_target_items = try buildTopLevelListAst(alloc, tokens, ast.additional_target_tokens.?, .{});
     }
     ast.restart_identity = generatedTruncateHasRestartIdentity(tokens, option_index, end);
     ast.cascade = findTopLevelKeyword(tokens, option_index, end, .cascade) != null;
@@ -7184,13 +7944,13 @@ fn statementHasMutationSourceTail(tokens: []const token_mod.Token, start: usize,
     return false;
 }
 
-fn statementHasWhereSemijoinSubquery(tokens: []const token_mod.Token, start: usize, end: usize) bool {
-    const where_index = findTopLevelKeyword(tokens, start, end, .where) orelse return false;
+fn statementWhereSemijoinSourceTableTokens(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedSqlTokenRange {
+    const where_index = findTopLevelKeyword(tokens, start, end, .where) orelse return null;
     const stop = firstTopLevelKeywordIndex(tokens, where_index + 1, end, &.{ .order, .limit, .offset, .fetch, .@"for", .returning }) orelse end;
-    return tokenRangeHasTopLevelSemijoinSubquery(tokens, where_index + 1, stop);
+    return tokenRangeSemijoinSourceTableTokens(tokens, where_index + 1, stop);
 }
 
-fn tokenRangeHasTopLevelSemijoinSubquery(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+fn tokenRangeSemijoinSourceTableTokens(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedSqlTokenRange {
     var depth: usize = 0;
     var index = start;
     while (index < end) : (index += 1) {
@@ -7200,24 +7960,26 @@ fn tokenRangeHasTopLevelSemijoinSubquery(tokens: []const token_mod.Token, start:
                 if (depth > 0) depth -= 1;
             },
             .identifier => if (depth == 0) {
-                if ((tokens[index].matchesKeywordTag(.in) or tokens[index].matchesKeywordTag(.exists)) and
-                    nextParenContainsSelect(tokens, index + 1, end))
-                {
-                    return true;
+                if (tokens[index].matchesKeywordTag(.in) or tokens[index].matchesKeywordTag(.exists)) {
+                    if (nextParenSelectSourceTableTokens(tokens, index + 1, end)) |source_table| return source_table;
                 }
             },
             else => {},
         }
     }
-    return false;
+    return null;
 }
 
-fn nextParenContainsSelect(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+fn nextParenSelectSourceTableTokens(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedSqlTokenRange {
     var index = start;
     while (index < end and tokens[index].kind == .comma) : (index += 1) {}
-    if (index >= end or tokens[index].kind != .lparen) return false;
-    if (index + 1 >= end or !tokens[index + 1].matchesKeywordTag(.select)) return false;
-    return findMatchingParen(tokens, index, end) != null;
+    if (index >= end or tokens[index].kind != .lparen) return null;
+    if (index + 1 >= end or !tokens[index + 1].matchesKeywordTag(.select)) return null;
+    const close_index = findMatchingParen(tokens, index, end) orelse return null;
+    const from_index = findTopLevelKeyword(tokens, index + 2, close_index, .from) orelse return null;
+    var source_index = from_index + 1;
+    if (source_index < close_index and tokens[source_index].matchesKeywordTag(.only)) source_index += 1;
+    return generatedSingleTokenRangeIfIdentifier(tokens, source_index, close_index);
 }
 
 fn consumeGeneratedIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
@@ -8850,9 +9612,13 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_subscription }, (try parseSqlAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_subscription }, (try parseSqlAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_policy }, (try parseSqlAlloc(alloc, "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_policy }, (try parseSqlAlloc(alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_policy }, (try parseSqlAlloc(alloc, "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_policy }, (try parseSqlAlloc(alloc, "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_policy }, (try parseSqlAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE FUNCTION rows_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE FUNCTION window_audit() RETURNS trigger LANGUAGE plpgsql WINDOW")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_procedure }, (try parseSqlAlloc(alloc, "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_function }, (try parseSqlAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE")).statement);
@@ -8871,6 +9637,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_collation }, (try parseSqlAlloc(alloc, "DROP COLLATION IF EXISTS ci_text")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_operator }, (try parseSqlAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_operator }, (try parseSqlAlloc(alloc, "DROP OPERATOR === (text, text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_operator }, (try parseSqlAlloc(alloc, "DROP OPERATOR IF EXISTS === (text, text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_aggregate }, (try parseSqlAlloc(alloc, "ALTER AGGREGATE first_value_text(text) OWNER TO app_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator }, (try parseSqlAlloc(alloc, "ALTER OPERATOR === (text, text) OWNER TO app_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator_class }, (try parseSqlAlloc(alloc, "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2")).statement);
@@ -8881,15 +9648,26 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_operator_family }, (try parseSqlAlloc(alloc, "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_aggregate }, (try parseSqlAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_aggregate }, (try parseSqlAlloc(alloc, "DROP AGGREGATE first_value_text(text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_aggregate }, (try parseSqlAlloc(alloc, "DROP AGGREGATE IF EXISTS first_value_text(text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_cast }, (try parseSqlAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_cast }, (try parseSqlAlloc(alloc, "DROP CAST (jsonb AS text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_cast }, (try parseSqlAlloc(alloc, "DROP CAST IF EXISTS (jsonb AS text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_table }, (try parseSqlAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX CONCURRENTLY usage_status_idx ON usage_records (status)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_status_idx ON usage_records (lower(status))")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status) WHERE status = 'pending'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX public.usage_records_status_idx ON ONLY public.usage_records (status) WHERE status = 'pending'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX CONCURRENTLY IF EXISTS usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_extension }, (try parseSqlAlloc(alloc, "CREATE EXTENSION vector")).statement);
@@ -8974,6 +9752,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_schema_options }, (try parseSqlAlloc(alloc, "CREATE SCHEMA analytics AUTHORIZATION app_user")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_event_trigger }, (try parseSqlAlloc(alloc, "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_conversion }, (try parseSqlAlloc(alloc, "DROP CONVERSION IF EXISTS usage_conv")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_event_trigger }, (try parseSqlAlloc(alloc, "DROP EVENT TRIGGER IF EXISTS usage_ddl_start")).statement);
@@ -9064,6 +9843,19 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const set_default_readonly_sql = "SET default_transaction_read_only = on;";
+    const set_default_readonly_result = try parseSqlAlloc(alloc, set_default_readonly_sql);
+    switch (set_default_readonly_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.set, session.kind);
+            try std.testing.expectEqualStrings("SET default_transaction_read_only = on", spanText(set_default_readonly_sql, session.statement_span));
+            try std.testing.expectEqualStrings("SET", spanText(set_default_readonly_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, session.name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const set_local_sql = "SET LOCAL antfly.sync_level = 'propose';";
     const set_local_result = try parseSqlAlloc(alloc, set_local_sql);
     switch (set_local_result.ast.?) {
@@ -9073,6 +9865,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("SET", spanText(set_local_sql, session.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, session.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const set_session_sql = "SET SESSION search_path TO tenant_schema, public;";
+    const set_session_result = try parseSqlAlloc(alloc, set_session_sql);
+    switch (set_session_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.set, session.kind);
+            try std.testing.expectEqualStrings("SET SESSION search_path TO tenant_schema, public", spanText(set_session_sql, session.statement_span));
+            try std.testing.expectEqualStrings("SET", spanText(set_session_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, session.name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, session.value_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9426,6 +10231,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings(select_into_sql, spanText(select_into_sql, ddl.statement_span));
             try std.testing.expectEqualStrings("SELECT", spanText(select_into_sql, ddl.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+            const source_read = ddl.relation_population_source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
+            try std.testing.expect(source_read.projection_tokens != null);
+            try std.testing.expect(source_read.source_tokens != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9439,6 +10248,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("CREATE", spanText(create_table_as_sql, ddl.command_span));
             try std.testing.expect(ddl.if_not_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.object_name_tokens.?);
+            const source_read = ddl.relation_population_source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
+            try std.testing.expect(source_read.projection_tokens != null);
+            try std.testing.expect(source_read.source_tokens != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9777,6 +10590,42 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, dml.assignments_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 24 }, dml.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 25, .end = 26 }, dml.returning_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aliased_cte_update_sql = "WITH source_rows(source_id) AS NOT MATERIALIZED (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT source_id FROM source_rows)";
+    const aliased_cte_update_result = try parseSqlAlloc(alloc, aliased_cte_update_sql);
+    switch (aliased_cte_update_result.ast.?) {
+        .dml => |dml| {
+            const cte_prefix = dml.cte_prefix orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), cte_prefix.items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, cte_prefix.items[0].column_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, cte_prefix.items[0].column_name_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), cte_prefix.items[0].column_names.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, cte_prefix.items[0].column_names.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, cte_prefix.items[0].materialization_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlCteMaterialization.not_materialized, cte_prefix.items[0].materialization.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 13 }, cte_prefix.items[0].body_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const data_cte_merge_sql = "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status";
+    const data_cte_merge_result = try parseSqlAlloc(alloc, data_cte_merge_sql);
+    switch (data_cte_merge_result.ast.?) {
+        .dml => |dml| {
+            const cte_prefix = dml.cte_prefix orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), cte_prefix.items.len);
+            try std.testing.expect(cte_prefix.first_body_read == null);
+            try std.testing.expect(cte_prefix.last_body_read == null);
+            const first_body_dml = cte_prefix.first_body_dml orelse return error.TestUnexpectedResult;
+            const last_body_dml = cte_prefix.last_body_dml orelse return error.TestUnexpectedResult;
+            const item_body_dml = cte_prefix.items[0].body_dml orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlDmlKind.update, first_body_dml.kind);
+            try std.testing.expectEqual(GeneratedSqlDmlKind.update, last_body_dml.kind);
+            try std.testing.expectEqual(item_body_dml.statement_span, first_body_dml.statement_span);
+            try std.testing.expectEqual(item_body_dml.command_span, last_body_dml.command_span);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -10177,6 +11026,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDmlKind.truncate, dml.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, dml.additional_target_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), dml.additional_target_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, dml.additional_target_items.items[0]);
             try std.testing.expect(dml.restart_identity);
             try std.testing.expect(dml.cascade);
         },
@@ -12391,6 +13242,32 @@ test "generated SQL parser facade builds null logical and join AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const lateral_joined_read_sql = "SELECT org.id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true";
+    const lateral_joined_read_result = try parseSqlAlloc(alloc, lateral_joined_read_sql);
+    switch (lateral_joined_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.lateral, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 27 }, read.source_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+            const join = read.join_items[0];
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 27 }, join.tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, join.operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.left, join.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, join.left_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 25 }, join.right_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 22 }, join.right_lateral_subquery_tokens.?);
+            const child = join.right_lateral_subquery_read_ast orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, child.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, child.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, child.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, child.source_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 6 }, child.source_alias_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, child.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, child.limit_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const conditionless_join_cases = [_]struct {
         sql: []const u8,
         kind: GeneratedSqlJoinKind,
@@ -12956,6 +13833,24 @@ test "generated SQL parser facade builds extended read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const cte_set_operation_right_join_read_sql = "WITH source_rows AS (SELECT usage_records.id FROM usage_records UNION SELECT accounts.id FROM accounts JOIN tenants ON accounts.tenant_id = tenants.id) SELECT id FROM source_rows";
+    const cte_set_operation_right_join_read_result = try parseSqlAlloc(alloc, cte_set_operation_right_join_read_sql);
+    switch (cte_set_operation_right_join_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlReadKind.set_operation, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 19 }, read.cte_items[0].body_set_operation.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 19 }, read.cte_items[0].body_set_operation.right_source_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_set_operation.right_join_items.len);
+            try std.testing.expectEqual(@as(?usize, 0), read.cte_items[0].body_set_operation.right_join_tree_root_index);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_set_operation.right_join_tree_depth);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 19 }, read.cte_items[0].body_set_operation.right_join_items[0].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.cte_items[0].body_set_operation.right_join_items[0].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 19 }, read.cte_items[0].body_set_operation.right_join_items[0].predicate_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const cte_set_operation_tail_read_sql = "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive ORDER BY id LIMIT 5) SELECT id FROM source_rows";
     const cte_set_operation_tail_read_result = try parseSqlAlloc(alloc, cte_set_operation_tail_read_sql);
     switch (cte_set_operation_tail_read_result.ast.?) {
@@ -13224,6 +14119,21 @@ test "generated SQL parser facade builds extended read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const analyze_table_sql = "ANALYZE usage_records";
+    var analyze_table_tokens = try lexer.tokenizeAlloc(alloc, analyze_table_sql);
+    defer lexer.freeTokens(alloc, &analyze_table_tokens);
+    const analyze_table_result = try parseSqlAlloc(alloc, analyze_table_sql);
+    switch (analyze_table_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.analyze, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.analyze_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("ANALYZE usage_records", spanText(analyze_table_sql, unsupported.statement_span));
+            try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_table_sql, unsupported.command_span));
+            try std.testing.expectEqualStrings("usage_records", tokenRangeText(analyze_table_sql, analyze_table_tokens.items, unsupported.subject_tokens.?));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const row_lock_sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED";
     const row_lock_result = try parseSqlAlloc(alloc, row_lock_sql);
     switch (row_lock_result.ast.?) {
@@ -13281,6 +14191,19 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlUnsupportedReason.copy_not_planned_by_generated_parser, unsupported.reason);
             try std.testing.expectEqualStrings("COPY", spanText(copy_sql, unsupported.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, unsupported.subject_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const copy_where_sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active'";
+    const copy_where_result = try parseSqlAlloc(alloc, copy_where_sql);
+    switch (copy_where_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.copy, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.copy_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings(copy_where_sql, spanText(copy_where_sql, unsupported.statement_span));
+            try std.testing.expectEqualStrings("COPY", spanText(copy_where_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 18 }, unsupported.subject_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

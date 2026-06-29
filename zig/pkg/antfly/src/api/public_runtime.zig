@@ -16,8 +16,8 @@ const std = @import("std");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_server = @import("http_server.zig");
 const metadata_service = @import("../metadata/service.zig");
-const pgwire = @import("pgwire.zig");
-const pgwire_runtime = @import("pgwire_runtime.zig");
+const pgwire = @import("../pgwire/mod.zig");
+const pgwire_backend = @import("pgwire_backend.zig");
 const raft = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
@@ -144,13 +144,22 @@ pub const PublicApiSurface = struct {
     }
 
     pub fn startPgwireOptional(self: *PublicApiSurface, cfg: PgwireListenerConfig) !void {
-        self.pgwire_server = try pgwire_runtime.startOptional(self.alloc, .{
+        const backend = if (cfg.bind_port) |_| blk: {
+            const api_server = self.api_server orelse {
+                std.log.err("pgwire listener requires a public API server; omit --pgwire-port", .{});
+                return error.InvalidArguments;
+            };
+            if ((cfg.auth_enabled or api_server.cfg.trusted_principal_secret != null) and api_server.cfg.user_manager == null) {
+                std.log.err("{s}", .{cfg.auth_error_message});
+                return error.InvalidArguments;
+            }
+            break :blk pgwire_backend.backendFromApiServer(api_server);
+        } else null;
+        self.pgwire_server = try pgwire.runtime.startOptional(self.alloc, .{
             .bind_host = cfg.bind_host,
             .default_bind_host = cfg.default_bind_host,
             .bind_port = cfg.bind_port,
-            .auth_enabled = cfg.auth_enabled,
-            .auth_error_message = cfg.auth_error_message,
-            .api_server = self.api_server,
+            .backend = backend,
         });
     }
 };

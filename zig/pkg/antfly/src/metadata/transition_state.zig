@@ -411,7 +411,8 @@ test "transition state prefers observed local split readiness over metadata phas
     defer std.testing.allocator.free(dest_root_dir);
 
     var source = try data.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root_dir });
-    defer source.deinit();
+    var source_open = true;
+    defer if (source_open) source.deinit();
 
     const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
@@ -425,6 +426,8 @@ test "transition state prefers observed local split readiness over metadata phas
         .commit_index = 4,
         .entries_bytes = prepare,
     });
+    source.deinit();
+    source_open = false;
 
     var coord = try data.SplitSyncCoordinator.init(std.testing.allocator, .{
         .source_root_dir = source_root_dir,
@@ -432,7 +435,8 @@ test "transition state prefers observed local split readiness over metadata phas
         .source_group_id = 131,
         .dest_group_id = 132,
     });
-    defer coord.deinit();
+    var coord_open = true;
+    defer if (coord_open) coord.deinit();
 
     const start = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:doc:m") },
@@ -444,6 +448,8 @@ test "transition state prefers observed local split readiness over metadata phas
         .entries_bytes = start,
     });
     _ = try coord.syncOnce();
+    coord.deinit();
+    coord_open = false;
 
     const readiness = try readinessForLocalGroup(
         std.testing.allocator,

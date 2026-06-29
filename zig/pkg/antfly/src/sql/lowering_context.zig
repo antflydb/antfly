@@ -185,7 +185,10 @@ fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |read| read,
+                .read => |read| blk: {
+                    try validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
                 else => error.UnsupportedSqlShape,
             };
         }
@@ -204,6 +207,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !plan.LoweredReadPlan {
+    try validateGeneratedReadPublishedKind(parsed_sql);
     const read_kind = try generatedReadStatementKind(parsed_sql.items(), read_ast);
     const published_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (read_kind != published_kind) return error.UnsupportedSqlShape;
@@ -4629,6 +4633,41 @@ test "sql adapter lowering context requires generated read publication before ge
         error.UnsupportedSqlShape,
         lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &missing_ast_sql, schema, &.{}, .{}),
     );
+
+    var stale_published_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'order'",
+    );
+    defer stale_published_read.deinit(alloc);
+    const stale_read_ast = blk: {
+        if (stale_published_read.generated_statement) |*generated_statement| {
+            switch (generated_statement.ast.?) {
+                .read => |*read| break :blk read,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    };
+    var stale_context = ReadPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .source_schema = null,
+        .params = &.{},
+        .function_bindings = .{},
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+    stale_published_read.statement = .{ .unknown = stale_published_read.raw_statement };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&stale_context, &stale_published_read, stale_read_ast),
+    );
 }
 
 test "sql adapter lowering context rejects malformed generated read AST ranges" {
@@ -7842,7 +7881,13 @@ pub const WritePlanLoweringContext = struct {
 
 fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlDmlAst {
     if (parsed_sql.generatedStatementKind() != .dml) return null;
-    _ = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    const published = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != published.kind or statement.recursive != published.recursive) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -7852,6 +7897,18 @@ fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const 
         }
     }
     return error.UnsupportedSqlShape;
+}
+
+test "write lowering generated dml accessor validates published statement family" {
+    const alloc = std.testing.allocator;
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer parsed_sql.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed_sql.generatedStatementKind().?);
+    try std.testing.expect((try generatedDmlAstForParsedSql(&parsed_sql)) != null);
+
+    parsed_sql.statement = .{ .unknown = parsed_sql.raw_statement };
+    try std.testing.expectError(error.UnsupportedSqlShape, generatedDmlAstForParsedSql(&parsed_sql));
 }
 
 pub const ExplainPlanLoweringCallbacks = struct {

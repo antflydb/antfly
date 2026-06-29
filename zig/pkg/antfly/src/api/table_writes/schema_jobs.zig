@@ -731,6 +731,15 @@ pub fn runTableEmptyingJobGroupLocal(
         result.invalidated = true;
         return error.InvalidTableEmptyingJob;
     }
+    if (!metadata_table_manager.tableEmptyingAffectedTableIdsCanonicalValid(table.table_id, record.affected_table_ids)) {
+        catalog.invalidateTableEmptyingJob(.{
+            .job_id = record.job_id,
+            .lease_owner = worker_id,
+            .last_error = @errorName(error.InvalidTableEmptyingJob),
+        }) catch {};
+        result.invalidated = true;
+        return error.InvalidTableEmptyingJob;
+    }
     if (!(try tableEmptyingJobMatchesCurrentCatalogRange(catalog, table, record))) {
         catalog.invalidateTableEmptyingJob(.{
             .job_id = record.job_id,
@@ -1331,6 +1340,99 @@ test "table emptying worker invalidates stale range job before deleting rows" {
     try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
     try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, final_jobs[0].state);
     try std.testing.expectEqualStrings(@errorName(error.TopologyChanged), final_jobs[0].last_error);
+}
+
+test "table emptying worker invalidates malformed affected table metadata before deleting rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-invalid-affected-tables", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    const job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 7001,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .data_generation = table.data_generation,
+        .affected_table_ids = &.{ 88, 77 },
+    };
+
+    const Catalog = struct {
+        invalidated: bool = false,
+        last_error: []const u8 = "",
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(_: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            if (request.job_id != 7001 or request.lease_owner.len == 0) return error.TestUnexpectedResult;
+        }
+
+        fn finishTableEmptyingJob(_: *anyopaque, _: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != 7001 or request.lease_owner.len == 0) return error.TestUnexpectedResult;
+            self.invalidated = true;
+            self.last_error = request.last_error;
+        }
+    };
+
+    var catalog = Catalog{};
+    try std.testing.expectError(
+        error.InvalidTableEmptyingJob,
+        runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, job, "worker-a", 1000, 500),
+    );
+    try std.testing.expect(catalog.invalidated);
+    try std.testing.expectEqualStrings(@errorName(error.InvalidTableEmptyingJob), catalog.last_error);
+
+    const row = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
 }
 
 test "table emptying worker completes restart identity range delete before catalog reset" {

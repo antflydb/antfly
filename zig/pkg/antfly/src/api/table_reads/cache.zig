@@ -636,28 +636,6 @@ pub fn openProvisionedQueryDbForTableWithCache(
     var enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
     errdefer enrichments.deinit(alloc);
 
-    {
-        var reconcile_db = try db_mod.DB.open(alloc, path, .{
-            .open_mode = .writer_no_replay,
-            .lsm_cache = lsm_cache,
-            .hbc_cache = hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = resource_manager,
-            .backend_runtime = backend_runtime,
-            .secret_store = secret_store,
-            .remote_content = remote_content,
-            .identity_namespace = identity_namespace,
-            .prefer_existing_identity_namespace = identity_namespace != null,
-            .start_index_workers = false,
-            .start_optional_runtimes = false,
-        });
-        defer reconcile_db.close();
-        try validateOpenedProvisionedDbIdentityNamespace(&reconcile_db, identity_namespace);
-        _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &reconcile_db, indexes_json, .{
-            .drain_resolver_backfill = false,
-        });
-    }
-
     var db = if (enrichments.enabled()) blk: {
         const enrichment_cfg = enrichments.config();
         const opened = try db_mod.DB.open(alloc, path, .{
@@ -689,6 +667,10 @@ pub fn openProvisionedQueryDbForTableWithCache(
     });
     errdefer db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+        .drain_resolver_backfill = false,
+    });
+    if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
     return db;
 }
 

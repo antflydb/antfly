@@ -225,6 +225,7 @@ pub const MatchQuery = struct {
 pub const TermQuery = struct {
     field: []const u8,
     term: []const u8,
+    collation: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 
@@ -319,6 +320,7 @@ pub const TermRangeQuery = struct {
     max: ?[]const u8 = null,
     inclusive_min: bool = true,
     inclusive_max: bool = false,
+    collation: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 

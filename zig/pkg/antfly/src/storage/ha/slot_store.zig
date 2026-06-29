@@ -42,8 +42,6 @@ const flags_offset: usize = 48;
 const body_crc_offset: usize = 52;
 const header_crc_offset: usize = 56;
 
-var test_path_counter: u64 = 0;
-
 comptime {
     std.debug.assert(header_crc_offset + 4 == header_len);
 }
@@ -607,11 +605,10 @@ fn encodeV2TestEvent(alloc: Allocator, event: EventView) ![]u8 {
 }
 
 fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
-    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
     const raw = try std.fmt.allocPrint(
         alloc,
         ".zig-cache/tmp/ha-slot-store-" ++ name ++ "-{d}-{d}",
-        .{ std.testing.random_seed, nonce },
+        .{ std.posix.system.getpid(), std.testing.random_seed },
     );
     defer alloc.free(raw);
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -836,7 +833,8 @@ test "storage.ha slot store marks active slots at restart lsn for timeline" {
     defer alloc.free(path);
 
     var store = try SlotStore.open(alloc, path.ptr, .{});
-    defer store.close();
+    var store_open = true;
+    defer if (store_open) store.close();
     try store.createOrUpdate(.{ .name = "old-a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
     try store.createOrUpdate(.{ .name = "old-b", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
     try store.createOrUpdate(.{ .name = "new", .timeline_id = 1, .restart_lsn = 7, .received_lsn = 9, .applied_lsn = 7, .safe_read_lsn = 7 });
@@ -851,6 +849,9 @@ test "storage.ha slot store marks active slots at restart lsn for timeline" {
     try std.testing.expect(!(store.get("new") orelse return error.TestExpectedEqual).reseed_required);
     try std.testing.expect(!(store.get("old-timeline") orelse return error.TestExpectedEqual).reseed_required);
     try std.testing.expect(!(store.get("paused") orelse return error.TestExpectedEqual).reseed_required);
+
+    store.close();
+    store_open = false;
 
     {
         var reopened = try SlotStore.open(alloc, path.ptr, .{});

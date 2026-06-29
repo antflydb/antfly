@@ -2145,8 +2145,8 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(handle.alloc);
-    portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
-    portable_backup.validatePortable(handle.alloc, out.items) catch |err| return capi.mapError(err);
+    portable_backup.exportPortableDb(handle.alloc, &handle.db, &out) catch |err| return capi.mapError(err);
+    portable_backup.validatePortableDb(handle.alloc, out.items) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
     out = .empty;
     out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
@@ -2340,7 +2340,7 @@ fn restorePortableBackupToLiteFile(
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
-    try portable_backup.validatePortable(alloc, backup);
+    try portable_backup.validatePortableDb(alloc, backup);
 
     const dest_exists = liteCapiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
@@ -7078,7 +7078,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"relational\":{\"tables\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sql\":{\"adapter\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"embedded_exec\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);

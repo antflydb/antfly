@@ -1581,7 +1581,7 @@ const SchemaRewriteWakeJob = struct {
     runtime: *db_mod.background_runtime.BackendRuntime,
     owner_id: u64,
     source: table_writes.TableWriteSource,
-    catalog: ?StatusSource = null,
+    catalog: ?table_catalog.CatalogSource = null,
     registry: ?*SchemaRewriteWakeRegistry = null,
     table_name: []u8,
     table_id: u64 = 0,
@@ -1605,7 +1605,7 @@ const SchemaRewriteWakeJob = struct {
         owner_id: u64,
         source: table_writes.TableWriteSource,
         table_name: []const u8,
-        catalog: ?StatusSource,
+        catalog: ?table_catalog.CatalogSource,
         promoted_table: ?metadata_table_manager.TableRecord,
     ) !void {
         return try SchemaRewriteWakeJob.submitWithPromotionAndRegistry(runtime, owner_id, source, table_name, catalog, promoted_table, null, 0);
@@ -1616,7 +1616,7 @@ const SchemaRewriteWakeJob = struct {
         owner_id: u64,
         source: table_writes.TableWriteSource,
         table_name: []const u8,
-        catalog: ?StatusSource,
+        catalog: ?table_catalog.CatalogSource,
         promoted_table: ?metadata_table_manager.TableRecord,
         registry: ?*SchemaRewriteWakeRegistry,
         table_id: u64,
@@ -1704,11 +1704,7 @@ const SchemaRewriteWakeJob = struct {
     fn promoteCompletedSchemaRewrite(self: *SchemaRewriteWakeJob) !void {
         const catalog = self.catalog orelse return;
         const promoted_table = self.promoted_table orelse return;
-        catalog.compareAndSwapTableSchema(.{
-            .table_id = promoted_table.table_id,
-            .expected_schema_json = promoted_table.schema_json,
-            .promoted_table = promoted_table,
-        }) catch |err| switch (err) {
+        _ = catalog_jobs.promoteCompletedSchemaRewriteForTableIdAlloc(std.heap.page_allocator, catalog, promoted_table.table_id) catch |err| switch (err) {
             error.UnsupportedOperation => return,
             else => return err,
         };
@@ -2255,12 +2251,25 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
     const FakeSource = struct {
         apply_count: usize = 0,
         compare_count: usize = 0,
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 88,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
 
         fn iface(self: *@This()) StatusSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                     .compare_and_swap_table_schema = compareAndSwapTableSchema,
                 },
@@ -2270,6 +2279,22 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
@@ -2288,6 +2313,7 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
                 .database_name = catalog_resources.default_database_name,
                 .namespace_name = catalog_resources.default_namespace_name,
                 .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
                 .indexes_json = "{}",
                 .replication_sources_json = "[]",
                 .placement_role = "data",
@@ -2328,6 +2354,7 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
             try std.testing.expectEqual(@as(u64, 88), request.promoted_table.table_id);
             try std.testing.expectEqualStrings("audit_log", request.promoted_table.name);
             try std.testing.expectEqualStrings(request.promoted_table.schema_json, request.expected_schema_json);
+            try std.testing.expectEqualStrings("", request.promoted_table.read_schema_json);
             try std.testing.expect(std.mem.indexOf(u8, request.promoted_table.schema_json, "\"storage_mode\":\"relational\"") != null);
         }
     };
@@ -2414,12 +2441,25 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
     const FakeSource = struct {
         apply_count: usize = 0,
         compare_count: usize = 0,
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 89,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]},\"unique_constraints\":[{\"name\":\"audit_log_email_key\",\"columns\":[\"email\"],\"validation_state\":\"enforced\"}]}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]},\"unique_constraints\":[{\"name\":\"audit_log_email_key\",\"columns\":[\"email\"],\"validation_state\":\"unvalidated\"}]}",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
 
         fn iface(self: *@This()) StatusSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                     .compare_and_swap_table_schema = compareAndSwapTableSchema,
                 },
@@ -2429,6 +2469,22 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn applyRelationalSqlDdlPlanWithSession(
             ptr: *anyopaque,
@@ -2447,6 +2503,7 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
                 .database_name = catalog_resources.default_database_name,
                 .namespace_name = catalog_resources.default_namespace_name,
                 .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
                 .indexes_json = "{}",
                 .replication_sources_json = "[]",
                 .placement_role = "data",
@@ -2476,6 +2533,7 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
             try std.testing.expectEqual(@as(u64, 89), request.promoted_table.table_id);
             try std.testing.expectEqualStrings("audit_log", request.promoted_table.name);
             try std.testing.expectEqualStrings(request.promoted_table.schema_json, request.expected_schema_json);
+            try std.testing.expectEqualStrings("", request.promoted_table.read_schema_json);
             try std.testing.expect(std.mem.indexOf(u8, request.promoted_table.schema_json, "\"storage_mode\":\"relational\"") != null);
         }
     };
@@ -2817,6 +2875,7 @@ test "api session maintenance runs schema rewrite catalog catch-up" {
                 .database_name = catalog_resources.default_database_name,
                 .namespace_name = catalog_resources.default_namespace_name,
                 .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
                 .indexes_json = "{}",
                 .replication_sources_json = "[]",
                 .placement_role = "data",
@@ -2851,7 +2910,7 @@ test "api session maintenance runs schema rewrite catalog catch-up" {
                 .action = "rewrite",
                 .reason = "row_images",
                 .start_row_key = "m",
-                .state = metadata_table_manager.schema_rewrite_declared,
+                .state = metadata_table_manager.schema_rewrite_ready,
             },
             .{
                 .job_id = 3,
@@ -2977,7 +3036,7 @@ test "api session maintenance runs schema rewrite catalog catch-up" {
 
     try server.runSessionMaintenanceOnce();
 
-    try std.testing.expectEqual(@as(usize, 2), source.snapshot_count);
+    try std.testing.expectEqual(@as(usize, 3), source.snapshot_count);
     try std.testing.expectEqual(@as(usize, 1), source.compare_count);
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
@@ -3157,6 +3216,7 @@ test "api schema rewrite catalog catch-up dedupes in-flight table wakes" {
             .database_name = catalog_resources.default_database_name,
             .namespace_name = catalog_resources.default_namespace_name,
             .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+            .read_schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
             .indexes_json = "{}",
             .replication_sources_json = "[]",
             .placement_role = "data",
@@ -3280,7 +3340,7 @@ test "api schema rewrite catalog catch-up dedupes in-flight table wakes" {
     writes.allow_finish.store(true, .release);
     runtime.ptr().durable_jobs.drainOwner(server.schema_rewrite_wake_owner_id);
 
-    try std.testing.expectEqual(@as(u32, 2), source.snapshot_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), source.snapshot_count.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.pass_count.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), source.compare_count.load(.monotonic));
 }
@@ -4687,6 +4747,7 @@ pub const ApiHttpServer = struct {
                 .promote_table_emptying_barrier = apiHttpServerCatalogPromoteTableEmptyingBarrier,
                 .reset_identity_allocators_for_table_emptying_barrier = apiHttpServerCatalogResetIdentityAllocatorsForTableEmptyingBarrier,
                 .supports_identity_allocator_reset_for_table_emptying_barrier = apiHttpServerCatalogSupportsIdentityAllocatorResetForTableEmptyingBarrier,
+                .compare_and_swap_table_schema = apiHttpServerCatalogCompareAndSwapTableSchema,
             },
         };
     }
@@ -5730,7 +5791,7 @@ pub const ApiHttpServer = struct {
         );
         if (result.row_count) |row_count| try writer.print(",\"row_count\":{d}", .{row_count});
         if (result.payload) |payload| try writer.print(",\"payload\":{f}", .{std.json.fmt(payload, .{})});
-        try writer.writeAll("}}}");
+        try writer.writeAll("}}");
         return try out.toOwnedSlice();
     }
 
@@ -10514,7 +10575,7 @@ pub const ApiHttpServer = struct {
             self.schemaRewriteWakeOwnerId(runtime),
             write_source,
             table.name,
-            self.source,
+            self.catalogSource(),
             table,
             &self.schema_rewrite_wake_registry,
             table.table_id,
@@ -15938,6 +15999,14 @@ pub const ApiHttpServer = struct {
         return try self.source.applyTableCatalogDropWithSchemaRewriteJobs(request);
     }
 
+    fn apiHttpServerCatalogCompareAndSwapTableSchema(
+        ptr: *anyopaque,
+        request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+    ) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.compareAndSwapTableSchema(request);
+    }
+
     fn apiHttpServerCatalogPromoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.source.promoteTableEmptyingBarrier(request);
@@ -16606,6 +16675,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
+            error.LeaderUnavailable => return error.WriteUnavailable,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,
@@ -20241,6 +20311,7 @@ pub const ApiHttpServer = struct {
             for (self.in_predicates) |predicate| {
                 alloc.free(predicate.field);
                 alloc.free(predicate.values_json);
+                if (predicate.collation) |collation| alloc.free(collation);
             }
             if (self.in_predicates.len > 0) alloc.free(self.in_predicates);
             for (self.json_contains) |predicate| {
@@ -20467,6 +20538,7 @@ pub const ApiHttpServer = struct {
             for (self.in_predicates.items) |predicate| {
                 alloc.free(predicate.field);
                 alloc.free(predicate.values_json);
+                if (predicate.collation) |collation| alloc.free(collation);
             }
             self.in_predicates.deinit(alloc);
             for (self.json_contains.items) |predicate| {
@@ -20749,12 +20821,19 @@ pub const ApiHttpServer = struct {
         var values_transferred = false;
         errdefer if (!values_transferred) self.alloc.free(values_json);
         const field = try self.alloc.dupe(u8, entry.key_ptr.*);
-        errdefer self.alloc.free(field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(field);
+        const collation = if (column.collation) |value| try self.alloc.dupe(u8, value) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
         try filter.in_predicates.append(self.alloc, .{
             .field = field,
             .values_json = values_json,
+            .collation = collation,
         });
+        field_transferred = true;
         values_transferred = true;
+        collation_transferred = true;
     }
 
     fn appendRowsAuthArrayAnyFilter(
@@ -21086,6 +21165,7 @@ pub const ApiHttpServer = struct {
             for (combined[query.in_predicates.len..initialized]) |predicate| {
                 self.alloc.free(predicate.field);
                 self.alloc.free(predicate.values_json);
+                if (predicate.collation) |collation| self.alloc.free(collation);
             }
             self.alloc.free(combined);
         }
@@ -21094,11 +21174,7 @@ pub const ApiHttpServer = struct {
             initialized += 1;
         }
         for (predicates) |predicate| {
-            combined[initialized] = .{
-                .field = try self.alloc.dupe(u8, predicate.field),
-                .values_json = try self.alloc.dupe(u8, predicate.values_json),
-                .negated = predicate.negated,
-            };
+            combined[initialized] = try cloneRowsAuthInPredicate(self.alloc, predicate);
             initialized += 1;
         }
         if (query.in_predicates.len > 0) self.alloc.free(@constCast(query.in_predicates));
@@ -21213,11 +21289,15 @@ pub const ApiHttpServer = struct {
         const field = try alloc.dupe(u8, predicate.field);
         errdefer alloc.free(field);
         const value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (value_json) |value| alloc.free(value);
+        const collation = if (predicate.collation) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (collation) |value| alloc.free(value);
         return .{
             .name = "",
             .field = field,
             .op = predicate.op,
             .value_json = value_json,
+            .collation = collation,
             .validation_state = predicate.validation_state,
         };
     }
@@ -21257,10 +21337,15 @@ pub const ApiHttpServer = struct {
     ) !db_mod.types.RelationalRowsInPredicate {
         const field = try alloc.dupe(u8, predicate.field);
         errdefer alloc.free(field);
+        const values_json = try alloc.dupe(u8, predicate.values_json);
+        errdefer alloc.free(values_json);
+        const collation = if (predicate.collation) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (collation) |value| alloc.free(value);
         return .{
             .field = field,
-            .values_json = try alloc.dupe(u8, predicate.values_json),
+            .values_json = values_json,
             .negated = predicate.negated,
+            .collation = collation,
         };
     }
 
@@ -21336,6 +21421,7 @@ pub const ApiHttpServer = struct {
         for (predicates) |predicate| {
             alloc.free(predicate.field);
             if (predicate.value_json) |value_json| alloc.free(value_json);
+            if (predicate.collation) |collation| alloc.free(collation);
         }
     }
 
@@ -21350,6 +21436,7 @@ pub const ApiHttpServer = struct {
         for (predicates) |predicate| {
             alloc.free(predicate.field);
             alloc.free(predicate.values_json);
+            if (predicate.collation) |collation| alloc.free(collation);
         }
     }
 
@@ -35169,9 +35256,14 @@ test "api http server executes public SQL COPY FROM STDIN payload" {
             return .{
                 .ptr = self,
                 .vtable = &.{
+                    .batch = batch,
                     .batch_catalog = batchCatalog,
                 },
             };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
         }
 
         fn batchCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.BatchRequest) anyerror!?void {
@@ -35186,11 +35278,65 @@ test "api http server executes public SQL COPY FROM STDIN payload" {
             return {};
         }
     };
+    const FakeReads = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan_catalog = rowsQueryPlanCatalog,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn rowsQueryPlanCatalog(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: runtime_schema_mod.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("events", target.table_name);
+            try std.testing.expectEqual(@as(usize, 3), runtime_schema.relational_columns.len);
+            try std.testing.expect(!plan.query.select_all);
+            try std.testing.expectEqual(@as(usize, 2), plan.query.select.len);
+            try std.testing.expectEqualStrings("id", plan.query.select[0]);
+            try std.testing.expectEqualStrings("status", plan.query.select[1]);
+            self.calls += 1;
+
+            const rows = try allocator.alloc([]const u8, 1);
+            errdefer allocator.free(rows);
+            rows[0] = try allocator.dupe(u8, "{\"id\":\"u_export\",\"status\":\"Ready\"}");
+            return .{ .rows = rows, .total = 1 };
+        }
+    };
 
     var source = FakeSource{};
+    var reads = FakeReads{};
     var writes = FakeWrites{};
     defer writes.deinit(alloc);
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
     defer server.deinit();
 
     var resp = try server.handle(.{
@@ -35216,6 +35362,27 @@ test "api http server executes public SQL COPY FROM STDIN payload" {
     try std.testing.expectEqualStrings("Ready", first_row.value.object.get("status").?.string);
     try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
 
+    var copy_to_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body =
+        \\{"database":"tenant_ops","namespace":"analytics","read_only":true,"sql":"COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true);"}
+        ,
+    });
+    defer copy_to_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), copy_to_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), reads.calls);
+    var parsed_copy_to = try std.json.parseFromSlice(std.json.Value, alloc, copy_to_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_copy_to.deinit();
+    try std.testing.expectEqualStrings("bulk_io", parsed_copy_to.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("bulk_io", parsed_copy_to.value.object.get("statement_kind").?.string);
+    const copy_to_result = parsed_copy_to.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("export_rows", copy_to_result.get("operation").?.string);
+    try std.testing.expectEqualStrings("stdout", copy_to_result.get("stream").?.string);
+    try std.testing.expectEqual(@as(i64, 1), copy_to_result.get("row_count").?.integer);
+    try std.testing.expectEqualStrings("id,status\nu_export,Ready\n", copy_to_result.get("payload").?.string);
+
     var missing_payload_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -35237,26 +35404,8 @@ test "api http server executes public SQL COPY FROM STDIN payload" {
         ,
     });
     defer prepare_copy_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), prepare_copy_resp.status);
-    var parsed_prepare_copy = try std.json.parseFromSlice(std.json.Value, alloc, prepare_copy_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_prepare_copy.deinit();
-    const copy_session_id = parsed_prepare_copy.value.object.get("session_id").?.integer;
-
-    const execute_copy_body = try std.fmt.allocPrint(
-        alloc,
-        "{{\"database\":\"tenant_ops\",\"namespace\":\"analytics\",\"session_id\":{d},\"sql\":\"EXECUTE copy_plan;\"}}",
-        .{copy_session_id},
-    );
-    defer alloc.free(execute_copy_body);
-    var execute_copy_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = execute_copy_body,
-    });
-    defer execute_copy_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), execute_copy_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, execute_copy_resp.body, "bind", "invalid_sql_request", "invalid sql request", null, null);
+    try std.testing.expectEqual(@as(u16, 501), prepare_copy_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, prepare_copy_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
 }
 
 test "api http server serves api key and row filter routes" {

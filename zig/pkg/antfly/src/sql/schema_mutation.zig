@@ -29,8 +29,9 @@ pub fn alterRelationalColumnTypeAlloc(
     const index = binder.relationalColumnIndex(schema.relational_columns, operation.column_name) orelse return error.InvalidSqlCatalog;
     const columns = @constCast(schema.relational_columns);
     if (columns[index].generated != null) return error.UnsupportedSqlShape;
-    if (operation.collation != null and !binder.relationalFieldTypeSupportsCollation(operation.field_type)) return error.UnsupportedSqlShape;
-    if (!binder.relationalFieldTypeSupportsCollation(operation.field_type) and columns[index].collation != null) return error.UnsupportedSqlShape;
+    const supports_collation = binder.relationalColumnTypeSupportsCollation(operation.field_type, operation.array_item_type);
+    if (operation.collation != null and !supports_collation) return error.UnsupportedSqlShape;
+    if (!supports_collation and columns[index].collation != null) return error.UnsupportedSqlShape;
     const new_array_item_type = if (operation.field_type == .array) operation.array_item_type orelse return error.InvalidSqlCatalog else null;
     const new_collation = if (operation.collation) |collation| try alloc.dupe(u8, collation) else null;
     columns[index].field_type = operation.field_type;

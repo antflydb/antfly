@@ -123,6 +123,7 @@ pub fn schemaJsonPropertyFromColumnAlloc(alloc: std.mem.Allocator, column: runti
     if (column.index_generation != 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(column.index_generation) });
     if (column.index_name) |index_name| try putJsonString(alloc, &object, "x-antfly-index-name", index_name);
     if (column.index_include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, column.index_include_columns));
+    if (column.index_keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, column.index_keys));
     if (column.collation) |collation| try putJsonString(alloc, &object, "collation", collation);
     if (column.index_where.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, column.index_where));
     if (column.index_where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where-expressions"), try schemaJsonExpressionConditionsAlloc(alloc, column.index_where_expressions));
@@ -229,6 +230,7 @@ pub fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: run
     if (constraint.columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, constraint.columns));
     if (constraint.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, constraint.expressions));
     if (constraint.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, constraint.include_columns));
+    if (constraint.index_keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "index_keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, constraint.index_keys));
     if (constraint.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
     if (constraint.nulls_not_distinct) try object.put(alloc, try alloc.dupe(u8, "nulls_not_distinct"), .{ .bool = true });
     if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
@@ -362,6 +364,7 @@ pub fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_s
     }
     try putJsonString(alloc, &object, "field", check.field);
     try putJsonString(alloc, &object, "op", ddl_plan.relationalCheckOpToken(check.op));
+    if (check.collation) |collation| try putJsonString(alloc, &object, "collation", collation);
     if (check.value_json) |value_json| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
@@ -373,6 +376,25 @@ pub fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_s
 pub fn schemaJsonStringArrayAlloc(alloc: std.mem.Allocator, values: []const []const u8) !std.json.Value {
     var array = std.json.Array.init(alloc);
     for (values) |value| try array.append(.{ .string = try alloc.dupe(u8, value) });
+    return .{ .array = array };
+}
+
+pub fn schemaJsonRelationalIndexKeysAlloc(alloc: std.mem.Allocator, keys: []const runtime_schema.RelationalIndexKey) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (keys) |key| {
+        var object = std.json.ObjectMap.empty;
+        try putJsonString(alloc, &object, "column", key.column);
+        try putJsonString(alloc, &object, "direction", switch (key.direction) {
+            .asc => "asc",
+            .desc => "desc",
+        });
+        try putJsonString(alloc, &object, "nulls", switch (key.nulls) {
+            .default => "default",
+            .first => "first",
+            .last => "last",
+        });
+        try array.append(.{ .object = object });
+    }
     return .{ .array = array };
 }
 
@@ -407,7 +429,9 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
             .columns = plan.columns,
             .expressions = plan.expressions,
             .include_columns = plan.include_columns,
+            .index_keys = plan.index_keys,
             .without_overlaps_period = plan.without_overlaps_period,
+            .nulls_not_distinct = plan.nulls_not_distinct,
             .where = plan.where,
             .where_expressions = plan.where_expressions,
             .validation_state = .unvalidated,
@@ -432,6 +456,7 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
             .index_generation = index_generation,
             .index_name = plan.index_name,
             .index_include_columns = plan.include_columns,
+            .index_keys = plan.index_keys,
             .generated = generated_expression,
             .index_where = plan.where,
             .index_where_expressions = plan.where_expressions,
@@ -457,6 +482,7 @@ pub fn applyCreateIndexPlanToSchemaJsonValue(
         try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(index_generation) });
         try putJsonString(alloc, &property.object, "x-antfly-index-name", plan.index_name);
         if (plan.include_columns.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, plan.include_columns));
+        if (plan.index_keys.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, plan.index_keys));
         if (plan.where.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, plan.where));
         if (plan.where_expressions.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where-expressions"), try schemaJsonExpressionConditionsAlloc(alloc, plan.where_expressions));
     }
@@ -493,6 +519,7 @@ pub fn applyDropIndexPlanToSchemaJsonValue(
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-generation");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-name");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-include");
+        _ = entry.value_ptr.object.orderedRemove("x-antfly-index-keys");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-where");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-where-expressions");
         removed = true;
@@ -912,8 +939,9 @@ fn alterColumnTypeInSchemaJsonValue(
     const property = schema_parts.properties.getPtr(operation.column_name) orelse return error.InvalidSqlCatalog;
     if (property.* != .object) return error.InvalidSqlCatalog;
     if (property.object.get("generated") != null) return error.UnsupportedSqlShape;
-    if (operation.collation != null and !binder.relationalFieldTypeSupportsCollation(operation.field_type)) return error.UnsupportedSqlShape;
-    if (!binder.relationalFieldTypeSupportsCollation(operation.field_type) and property.object.get("collation") != null) return error.UnsupportedSqlShape;
+    const supports_collation = binder.relationalColumnTypeSupportsCollation(operation.field_type, operation.array_item_type);
+    if (operation.collation != null and !supports_collation) return error.UnsupportedSqlShape;
+    if (!supports_collation and property.object.get("collation") != null) return error.UnsupportedSqlShape;
     try putJsonString(alloc, &property.object, "type", ddl_plan.antflyTypeSchemaName(operation.field_type));
     _ = property.object.orderedRemove("items");
     if (operation.field_type == .array) {
@@ -957,6 +985,7 @@ fn renameSchemaPropertyReferences(
     if (property.* != .object) return;
     if (property.object.getPtr("generated")) |generated| try renameGeneratedJsonFields(alloc, generated, old_name, new_name);
     try renameStringInJsonArray(alloc, property.object.getPtr("x-antfly-index-include"), old_name, new_name);
+    if (property.object.getPtr("x-antfly-index-keys")) |index_keys| try renameRelationalIndexKeyJsonFields(alloc, index_keys, old_name, new_name);
     if (property.object.getPtr("x-antfly-index-where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
     if (property.object.getPtr("x-antfly-index-where-expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
 }
@@ -989,6 +1018,7 @@ fn renameConstraintArrayFields(
                 try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name);
                 if (item.object.getPtr("expressions")) |expressions| try renameUniqueExpressionJsonFields(alloc, expressions, old_name, new_name);
                 try renameStringInJsonArray(alloc, item.object.getPtr("include_columns"), old_name, new_name);
+                if (item.object.getPtr("index_keys")) |index_keys| try renameRelationalIndexKeyJsonFields(alloc, index_keys, old_name, new_name);
                 if (item.object.getPtr("where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
                 if (item.object.getPtr("where_expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
             },
@@ -1050,6 +1080,19 @@ fn renameExpressionJsonFields(
             }
         },
         else => {},
+    }
+}
+
+fn renameRelationalIndexKeyJsonFields(
+    alloc: std.mem.Allocator,
+    keys: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (keys.* != .array) return error.InvalidSqlCatalog;
+    for (keys.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        try renameStringFieldInJsonObject(alloc, &item.object, "column", old_name, new_name);
     }
 }
 
@@ -1199,6 +1242,9 @@ fn jsonUniqueConstraintReferencesAny(value: std.json.Value, fields: []const []co
     }
     if (value.object.get("include_columns")) |include_columns| {
         if (jsonStringArrayReferencesAny(include_columns, fields)) return true;
+    }
+    if (value.object.get("index_keys")) |index_keys| {
+        if (jsonRelationalIndexKeysReferenceAny(index_keys, fields)) return true;
     }
     if (value.object.get("where")) |where| {
         if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
@@ -1380,6 +1426,9 @@ pub fn schemaJsonSecondaryIndexReferencesAny(property: std.json.Value, fields: [
     if (property.object.get("x-antfly-index-name") == null) return false;
     if (property.object.get("x-antfly-index-include")) |include| {
         if (jsonStringArrayReferencesAny(include, fields)) return true;
+    }
+    if (property.object.get("x-antfly-index-keys")) |index_keys| {
+        if (jsonRelationalIndexKeysReferenceAny(index_keys, fields)) return true;
     }
     if (property.object.get("x-antfly-index-where")) |where| {
         if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
@@ -1588,6 +1637,16 @@ fn jsonStringArrayReferencesAny(value: std.json.Value, fields: []const []const u
     return false;
 }
 
+fn jsonRelationalIndexKeysReferenceAny(value: std.json.Value, fields: []const []const u8) bool {
+    if (value != .array) return false;
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const column = item.object.get("column") orelse continue;
+        if (column == .string and stringSlicesContains(fields, column.string)) return true;
+    }
+    return false;
+}
+
 fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
     for (values) |candidate| {
         if (std.mem.eql(u8, candidate, value)) return true;
@@ -1606,4 +1665,20 @@ test "schema json emits sequence-backed relational defaults" {
     const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings("{\"op\":\"sequence_next\",\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", encoded);
+}
+
+test "schema json emits relational check collation" {
+    const alloc = std.testing.allocator;
+    var value = try schemaJsonRelationalCheckAlloc(alloc, .{
+        .name = "status_case_match",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"OPEN\"",
+        .collation = "antfly.case_insensitive",
+    });
+    defer json_helpers.deinitJsonValue(alloc, &value);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"collation\":\"antfly.case_insensitive\"") != null);
 }

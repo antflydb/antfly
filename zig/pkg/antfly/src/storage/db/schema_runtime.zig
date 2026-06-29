@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const algebraic_ir = @import("algebraic/ir.zig");
+const db_config = @import("config.zig");
 const db_internal = @import("internal.zig");
 const derived_types = @import("derived/derived_types.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -547,6 +548,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             var apply_locked = true;
             errdefer if (apply_locked) self.core.unlockApply();
@@ -570,12 +572,14 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.addEnrichment(cfg);
         }
 
         pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.core.upsertEnrichment(cfg);
@@ -600,6 +604,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.executor.removeWorker(name);
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -607,6 +612,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.core.deleteEnrichment(kind, name);

@@ -52,7 +52,7 @@ func (d SourceDocument) ToDocument() map[string]any {
 		"sha256":      d.SHA256,
 		"source_path": d.SourcePath,
 		"source_kind": d.SourceKind,
-		"_type":       "source_document",
+		"doc_type":    "source_document",
 	}
 	if d.ETag != "" {
 		doc["etag"] = d.ETag

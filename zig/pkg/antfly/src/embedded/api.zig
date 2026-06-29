@@ -538,7 +538,7 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hybrid_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"graph_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"relational\":{\"tables\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sql\":{\"adapter\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"embedded_exec\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
@@ -607,7 +607,7 @@ test "embedded api hosted profile drains derived indexing without native runtime
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hybrid_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"graph_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"relational\":{\"tables\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sql\":{\"adapter\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"embedded_exec\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);

@@ -1122,22 +1122,48 @@ fn parseMergeCtesForPlanAlloc(
         data_ctes.deinit(alloc);
     }
 
+    const generated_prefix = generated_cte_prefix;
+    var generated_cte_index: usize = 0;
+    if (generated_prefix) |cte_prefix| {
+        if (cte_prefix.recursive) return error.UnsupportedSqlShape;
+        if (cte_prefix.count == 0 or cte_prefix.count != cte_prefix.items.len) return error.UnsupportedSqlShape;
+        try validateGeneratedDmlCtePrefixBoundaryMirrors(cte_prefix);
+    }
+
     while (true) {
-        const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        const generated_cte: ?*const generated_parser.GeneratedSqlDmlCteItemAst = if (generated_prefix) |cte_prefix| blk: {
+            if (generated_cte_index >= cte_prefix.items.len) return error.UnsupportedSqlShape;
+            break :blk &cte_prefix.items[generated_cte_index];
+        } else null;
+
+        const cte_name = if (generated_cte) |cte|
+            try generatedDmlCteNameAlloc(alloc, tokens, cte, pos)
+        else
+            try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
         var cte_name_transferred = false;
         errdefer if (!cte_name_transferred) alloc.free(cte_name);
         if (plan_mod.findCteByName(read_ctes.items, cte_name) != null or findDataModifyingCteByName(data_ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
-        const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+        const cte_column_aliases = if (generated_cte) |cte|
+            try generatedDmlCteColumnAliasesAlloc(alloc, tokens, cte, pos)
+        else
+            try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
         defer strings.freeStringSlice(alloc, cte_column_aliases);
         try cursor.expectKeywordTag(.as);
-        try parser.consumeCteMaterializationHint(tokens, pos);
+        if (generated_cte) |cte| {
+            try consumeGeneratedDmlCteMaterialization(tokens, cte, pos);
+        } else {
+            try parser.consumeCteMaterializationHint(tokens, pos);
+        }
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+        if (generated_cte) |cte| {
+            if (cte.body_tokens.start != pos.* or cte.body_tokens.end != close_index) return error.UnsupportedSqlShape;
+        }
         if (parser.peekKeywordTag(tokens, pos.*, .update) or parser.peekKeywordTag(tokens, pos.*, .delete)) {
             if (cte_column_aliases.len != 0) return error.UnsupportedSqlShape;
             var inner_pos: usize = 0;
-            var lowered = if (generated_cte_prefix != null) blk: {
-                const generated_body_dml = generatedDmlCteBodyDmlForRange(generated_cte_prefix, pos.*, close_index) orelse return error.UnsupportedSqlShape;
+            var lowered = if (generated_cte) |cte| blk: {
+                const generated_body_dml = cte.body_dml orelse return error.UnsupportedSqlShape;
                 break :blk try parseDataModifyingCteMutationSourceWithGeneratedDmlAstAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options, generated_body_dml);
             } else try parseDataModifyingCteMutationSourceAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options);
             var lowered_transferred = false;
@@ -1153,12 +1179,13 @@ fn parseMergeCtesForPlanAlloc(
             lowered_transferred = true;
             cte_name_transferred = true;
             pos.* = close_index + 1;
+            if (generated_cte != null) generated_cte_index += 1;
             if (cursor.matchToken(.comma) == null) break;
             continue;
         }
-        if (generated_cte_prefix) |cte_prefix| {
-            const generated_body_read = generatedDmlCteBodyReadForRange(cte_prefix, pos.*, close_index) orelse return error.UnsupportedSqlShape;
-            if (try lowerGeneratedDmlGraphTableFunctionCteAlloc(alloc, tokens, generated_body_read)) |table_function| {
+        if (generated_cte) |cte| {
+            const generated_body_read = cte.body_read orelse return error.UnsupportedSqlShape;
+            if (try lowerGeneratedDmlGraphTableFunctionCteAlloc(alloc, tokens, &generated_body_read)) |table_function| {
                 pos.* = close_index + 1;
                 try plan_mod.resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
                 try read_ctes.append(alloc, .{
@@ -1166,6 +1193,7 @@ fn parseMergeCtesForPlanAlloc(
                     .table_function = table_function,
                 });
                 cte_name_transferred = true;
+                generated_cte_index += 1;
                 if (cursor.matchToken(.comma) == null) break;
                 continue;
             }
@@ -1199,7 +1227,11 @@ fn parseMergeCtesForPlanAlloc(
         alloc.free(lowered.table_name);
         lowered.table_name = "";
         cte_name_transferred = true;
+        if (generated_cte != null) generated_cte_index += 1;
         if (cursor.matchToken(.comma) == null) break;
+    }
+    if (generated_prefix) |cte_prefix| {
+        if (generated_cte_index != cte_prefix.items.len) return error.UnsupportedSqlShape;
     }
 
     return .{
@@ -1208,31 +1240,147 @@ fn parseMergeCtesForPlanAlloc(
     };
 }
 
-fn generatedDmlCteBodyReadForRange(
-    generated_cte_prefix: generated_parser.GeneratedSqlDmlCteAst,
-    body_start: usize,
-    body_end: usize,
-) ?*const generated_parser.GeneratedSqlDmlReadBodyAst {
-    for (generated_cte_prefix.items) |*item| {
-        if (item.body_tokens.start == body_start and item.body_tokens.end == body_end) {
-            return if (item.body_read) |*body_read| body_read else null;
-        }
-    }
-    return null;
+fn generatedDmlTokenRangeEqual(
+    a: generated_parser.GeneratedSqlTokenRange,
+    b: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return a.start == b.start and a.end == b.end;
 }
 
-fn generatedDmlCteBodyDmlForRange(
-    generated_cte_prefix: ?generated_parser.GeneratedSqlDmlCteAst,
-    body_start: usize,
-    body_end: usize,
-) ?*const generated_parser.GeneratedSqlDmlAst {
-    const cte_prefix = generated_cte_prefix orelse return null;
-    for (cte_prefix.items) |item| {
-        if (item.body_tokens.start == body_start and item.body_tokens.end == body_end) {
-            return item.body_dml;
+fn validateGeneratedDmlCtePrefixBoundaryMirrors(cte_prefix: generated_parser.GeneratedSqlDmlCteAst) !void {
+    if (cte_prefix.count == 0 or cte_prefix.items.len == 0 or cte_prefix.count != cte_prefix.items.len) return error.UnsupportedSqlShape;
+    const first = cte_prefix.items[0];
+    if (!generatedDmlTokenRangeEqual(cte_prefix.first_name_tokens, first.name_tokens) or
+        !generatedDmlTokenRangeEqual(cte_prefix.first_body_tokens, first.body_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedDmlCteBodyBoundaryMirror(first, cte_prefix.first_body_read, cte_prefix.first_body_dml);
+
+    const last = cte_prefix.items[cte_prefix.items.len - 1];
+    if (!generatedDmlTokenRangeEqual(cte_prefix.last_name_tokens, last.name_tokens) or
+        !generatedDmlTokenRangeEqual(cte_prefix.last_body_tokens, last.body_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedDmlCteBodyBoundaryMirror(last, cte_prefix.last_body_read, cte_prefix.last_body_dml);
+}
+
+fn validateGeneratedDmlCteBodyBoundaryMirror(
+    item: generated_parser.GeneratedSqlDmlCteItemAst,
+    mirror_read: ?generated_parser.GeneratedSqlDmlReadBodyAst,
+    mirror_dml: ?*const generated_parser.GeneratedSqlDmlAst,
+) !void {
+    if (item.body_read) |body_read| {
+        if (mirror_dml != null) return error.UnsupportedSqlShape;
+        const prefix_read = mirror_read orelse return error.UnsupportedSqlShape;
+        if (!generatedDmlTokenRangeEqual(body_read.tokens, prefix_read.tokens)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (item.body_dml) |body_dml| {
+        if (mirror_read != null) return error.UnsupportedSqlShape;
+        const prefix_dml = mirror_dml orelse return error.UnsupportedSqlShape;
+        if (body_dml.kind != prefix_dml.kind or
+            !std.meta.eql(body_dml.statement_span, prefix_dml.statement_span) or
+            !std.meta.eql(body_dml.command_span, prefix_dml.command_span))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (mirror_read != null or mirror_dml != null) return error.UnsupportedSqlShape;
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedDmlCteNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: *const generated_parser.GeneratedSqlDmlCteItemAst,
+    pos: *usize,
+) ![]const u8 {
+    if (cte.name_tokens.start != pos.* or cte.name_tokens.end != cte.name_tokens.start + 1 or cte.name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[cte.name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    pos.* = cte.name_tokens.end;
+    return try alloc.dupe(u8, tokens[cte.name_tokens.start].text);
+}
+
+fn generatedDmlCteColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: *const generated_parser.GeneratedSqlDmlCteItemAst,
+    pos: *usize,
+) ![]const []const u8 {
+    const column_tokens = cte.column_tokens orelse {
+        if (cte.column_name_tokens != null or cte.column_names.count != 0 or cte.column_names.items.len != 0) return error.UnsupportedSqlShape;
+        if (pos.* < tokens.len and tokens[pos.*].kind == .lparen) return error.UnsupportedSqlShape;
+        return &.{};
+    };
+    if (column_tokens.start != pos.* or column_tokens.end > tokens.len or column_tokens.end <= column_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (tokens[column_tokens.start].kind != .lparen or tokens[column_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    const column_name_tokens = cte.column_name_tokens orelse return error.UnsupportedSqlShape;
+    if (column_name_tokens.start != column_tokens.start + 1 or column_name_tokens.end != column_tokens.end - 1) return error.UnsupportedSqlShape;
+    if (cte.column_names.count == 0 or cte.column_names.items.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.expression_items.len != cte.column_names.count or cte.column_names.alias_items.len != cte.column_names.count or cte.column_names.alias_name_items.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.direction_items.len != cte.column_names.count or cte.column_names.directions.len != cte.column_names.count) return error.UnsupportedSqlShape;
+    if (cte.column_names.order_using_operator_items.len != cte.column_names.count or cte.column_names.nulls_order_items.len != cte.column_names.count or cte.column_names.nulls_orders.len != cte.column_names.count) return error.UnsupportedSqlShape;
+
+    var aliases = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (aliases.items) |alias| alloc.free(alias);
+        aliases.deinit(alloc);
+    }
+    var expected_start = column_name_tokens.start;
+    for (cte.column_names.items, 0..) |item, index| {
+        if (item.start != expected_start or item.end != item.start + 1 or item.end > column_name_tokens.end) return error.UnsupportedSqlShape;
+        if (tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+        if (!generatedDmlTokenRangeEqual(cte.column_names.expression_items[index], item)) return error.UnsupportedSqlShape;
+        if (cte.column_names.alias_items[index] != null or
+            cte.column_names.alias_name_items[index] != null or
+            cte.column_names.direction_items[index] != null or
+            cte.column_names.directions[index] != null or
+            cte.column_names.order_using_operator_items[index] != null or
+            cte.column_names.nulls_order_items[index] != null or
+            cte.column_names.nulls_orders[index] != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try aliases.append(alloc, try alloc.dupe(u8, tokens[item.start].text));
+        expected_start = item.end;
+        if (index + 1 < cte.column_names.items.len) {
+            if (expected_start >= column_name_tokens.end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start += 1;
         }
     }
-    return null;
+    if (expected_start != column_name_tokens.end) return error.UnsupportedSqlShape;
+    pos.* = column_tokens.end;
+    return try aliases.toOwnedSlice(alloc);
+}
+
+fn consumeGeneratedDmlCteMaterialization(
+    tokens: []const Token,
+    cte: *const generated_parser.GeneratedSqlDmlCteItemAst,
+    pos: *usize,
+) !void {
+    const materialization_tokens = cte.materialization_tokens orelse {
+        if (cte.materialization != null) return error.UnsupportedSqlShape;
+        if (pos.* < tokens.len and (tokens[pos.*].matchesKeywordTag(.materialized) or tokens[pos.*].matchesKeywordTag(.not))) return error.UnsupportedSqlShape;
+        return;
+    };
+    if (materialization_tokens.start != pos.* or materialization_tokens.end > tokens.len or materialization_tokens.start >= materialization_tokens.end) return error.UnsupportedSqlShape;
+    switch (cte.materialization orelse return error.UnsupportedSqlShape) {
+        .materialized => {
+            if (materialization_tokens.end != materialization_tokens.start + 1 or !tokens[materialization_tokens.start].matchesKeywordTag(.materialized)) return error.UnsupportedSqlShape;
+        },
+        .not_materialized => {
+            if (materialization_tokens.end != materialization_tokens.start + 2 or
+                !tokens[materialization_tokens.start].matchesKeywordTag(.not) or
+                !tokens[materialization_tokens.start + 1].matchesKeywordTag(.materialized))
+            {
+                return error.UnsupportedSqlShape;
+            }
+        },
+    }
+    pos.* = materialization_tokens.end;
 }
 
 fn lowerGeneratedDmlGraphTableFunctionCteAlloc(
@@ -1240,6 +1388,14 @@ fn lowerGeneratedDmlGraphTableFunctionCteAlloc(
     tokens: []const Token,
     body_read: *const generated_parser.GeneratedSqlDmlReadBodyAst,
 ) !?db_mod.types.RelationalRowsTableFunction {
+    try validateGeneratedDmlReadBodyTableFunctionPayloads(
+        tokens,
+        body_read.source_tokens,
+        body_read.source_antfly_function_items,
+        body_read.source_antfly_function_count,
+        body_read.source_graph_function_items,
+        body_read.source_graph_function_count,
+    );
     if (body_read.source_graph_function_items.len == 0) return null;
     if (body_read.source_graph_function_items.len != 1) return error.UnsupportedSqlShape;
     const graph_item = body_read.source_graph_function_items[0];
@@ -7611,9 +7767,13 @@ pub fn parseJoinedMutationWhereAlloc(
                 if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                 continue;
             }
-            try lhs_predicates.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json });
+            const collation = if (lhs_column.collation) |value| try alloc.dupe(u8, value) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+            try lhs_predicates.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json, .collation = collation });
             field_transferred = true;
             value_transferred = true;
+            collation_transferred = true;
         }
         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
@@ -13751,6 +13911,12 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     const published_write = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != published_write.kind or statement.recursive != published_write.recursive) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     const write_kind = published_write.kind;
     if (dml_ast.cte_recursive != published_write.recursive) return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
@@ -14218,37 +14384,28 @@ fn generatedDmlReadBodySourceLooksLikeSingleTableSource(
     return false;
 }
 
-fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !void {
-    const generated = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
-    if (generated.kind() != .read) return error.UnsupportedSqlShape;
-    const read_ast = switch (generated.ast orelse return error.UnsupportedSqlShape) {
-        .read => |read| read,
-        else => return error.UnsupportedSqlShape,
-    };
-    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read_ast);
-}
-
-fn validateGeneratedChildReadRangeAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    range: generated_parser.GeneratedSqlTokenRange,
-) !void {
-    var child = tokenized.OwnedParsedSql.initChildStatementAlloc(alloc, parsed_sql, range.start, range.end) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
-        else => return err,
-    };
-    defer child.deinit(alloc);
-    try validateGeneratedChildReadParsedSql(&child.parsed);
-}
-
 fn validateGeneratedDmlReadSourceBodyAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
 ) !void {
+    _ = alloc;
     try validateGeneratedDmlReadSourceBodyAst(parsed_sql.items(), ast);
     const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, source_range);
+    const source_read = ast.source_read orelse return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReadBodyReadAst(parsed_sql.items(), source_range, source_read);
+}
+
+fn validateGeneratedDmlReadBodyReadAst(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    read_body: generated_parser.GeneratedSqlDmlReadBodyAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (read_body.tokens.start != range.start or read_body.tokens.end != range.end) return error.UnsupportedSqlShape;
+    if (read_body.wrapper_projection_star) return error.UnsupportedSqlShape;
+    const read_ast = read_body.read_ast orelse return error.UnsupportedSqlShape;
+    try lowering_context.validateGeneratedReadAstForStatement(tokens[range.start..range.end], read_ast);
 }
 
 fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
@@ -14264,7 +14421,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     _ = try generatedDmlCommandStart(tokens, ast, end);
-    try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, parsed_sql, ast, end);
+    try validateGeneratedRecursiveDmlCtePayloadAlloc(parsed_sql, ast, end);
     switch (ast.kind) {
         .insert_select => {
             if (write_kind != .insert_source) return error.UnsupportedSqlShape;
@@ -14350,6 +14507,13 @@ fn recursiveInsertSourceFromGeneratedDmlAstAlloc(
         .insert_source_allows_different_table = true,
         .params = params,
         .unique_resolver = unique_resolver,
+        .generated_dml_ast = &ast,
+        .generated_returning_items = generatedDmlFinalStatementReturningItems(&ast),
+        .generated_assignment_items = &ast.conflict_assignment_items,
+        .generated_insert_column_items = &ast.insert_column_items,
+        .generated_conflict_target_items = &ast.conflict_target_items,
+        .generated_conflict_target_where_tokens = ast.conflict_target_where_tokens,
+        .generated_conflict_action_where_tokens = ast.conflict_action_where_tokens,
     };
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
         alloc,
@@ -14415,6 +14579,9 @@ fn recursiveJoinedMutationSourceFromGeneratedDmlAstAlloc(
         .joined_source_schema = source_schema,
         .params = params,
         .mutation_claim = row_claim,
+        .generated_dml_ast = &ast,
+        .generated_returning_items = generatedDmlFinalStatementReturningItems(&ast),
+        .generated_assignment_items = if (kind == .update) &ast.assignment_items else null,
     };
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
         alloc,
@@ -14481,6 +14648,9 @@ fn recursiveMergeMutationFromGeneratedDmlAstAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_dml_ast = &ast,
+        .generated_returning_items = generatedDmlFinalStatementReturningItems(&ast),
+        .generated_merge_arms = &ast.merge_arms,
     };
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(
         alloc,
@@ -14523,7 +14693,6 @@ fn recursiveMergeMutationFromGeneratedDmlAstAlloc(
 }
 
 fn validateGeneratedRecursiveDmlCtePayloadAlloc(
-    alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
     end: usize,
@@ -14544,12 +14713,14 @@ fn validateGeneratedRecursiveDmlCtePayloadAlloc(
     {
         return error.UnsupportedSqlShape;
     }
+    try validateGeneratedDmlCteBodyBoundaryMirror(cte_prefix.items[0], cte_prefix.first_body_read, cte_prefix.first_body_dml);
     const last = cte_prefix.items[cte_prefix.items.len - 1];
     if (!generatedDmlTokenRangeEql(cte_prefix.last_name_tokens, last.name_tokens) or
         !generatedDmlTokenRangeEql(cte_prefix.last_body_tokens, last.body_tokens))
     {
         return error.UnsupportedSqlShape;
     }
+    try validateGeneratedDmlCteBodyBoundaryMirror(last, cte_prefix.last_body_read, cte_prefix.last_body_dml);
     var previous_end = cte_list_tokens.start;
     for (cte_prefix.items, 0..) |item, item_index| {
         if (item.name_tokens.start != previous_end or
@@ -14574,7 +14745,7 @@ fn validateGeneratedRecursiveDmlCtePayloadAlloc(
         const body_read = item.body_read orelse return error.UnsupportedSqlShape;
         if (item.body_dml != null) return error.UnsupportedSqlShape;
         try validateGeneratedDmlReadBodyLayout(tokens, item.body_tokens, body_read);
-        try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, item.body_tokens);
+        try validateGeneratedDmlReadBodyReadAst(tokens, item.body_tokens, body_read);
     }
 }
 
@@ -16162,13 +16333,18 @@ fn truncateSyntaxFromGeneratedDmlAstAlloc(
     }
     if (ast.additional_target_tokens) |additional_range| {
         if (additional_range.start != index or additional_range.end > end) return error.UnsupportedSqlShape;
-        while (index < additional_range.end) {
-            if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
-            index += 1;
-            const additional_name_range = try requireGeneratedDmlTokenRangeAt(.{ .start = index, .end = index + 1 }, index, additional_range.end);
-            try additional_table_names.append(alloc, try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, additional_name_range));
-            index = additional_name_range.end;
+        if (ast.additional_target_items.count == 0 or ast.additional_target_items.items.len != ast.additional_target_items.count) return error.UnsupportedSqlShape;
+        var expected_comma = additional_range.start;
+        for (ast.additional_target_items.items) |item| {
+            if (expected_comma >= additional_range.end or tokens[expected_comma].kind != .comma) return error.UnsupportedSqlShape;
+            if (item.start != expected_comma + 1 or item.end != item.start + 1 or item.end > additional_range.end) return error.UnsupportedSqlShape;
+            try additional_table_names.append(alloc, try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, item));
+            expected_comma = item.end;
         }
+        if (expected_comma != additional_range.end) return error.UnsupportedSqlShape;
+        index = additional_range.end;
+    } else if (ast.additional_target_items.count != 0 or ast.additional_target_items.items.len != 0) {
+        return error.UnsupportedSqlShape;
     }
 
     var restart_identity = false;
@@ -16590,22 +16766,6 @@ const TestPrimaryResolver = test_support.TestPrimaryResolver;
 
 test "sql adapter lower dml validates generated child read payloads" {
     const alloc = std.testing.allocator;
-    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
-    defer parsed.deinit(alloc);
-
-    try validateGeneratedChildReadParsedSql(&parsed);
-
-    if (parsed.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .read => |read| read.projection_tokens = read.source_tokens,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-
-    try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedChildReadParsedSql(&parsed));
-
     var insert_source = try tokenized.ParsedSql.initAlloc(
         alloc,
         "INSERT INTO usage_records (id) SELECT id FROM usage_records WHERE status = 'ready'",
@@ -16613,6 +16773,27 @@ test "sql adapter lower dml validates generated child read payloads" {
     defer insert_source.deinit(alloc);
     switch (insert_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try validateGeneratedDmlReadSourceBodyAlloc(alloc, &insert_source, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    var insert_source_stale_read_ast = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id) SELECT id FROM usage_records WHERE status = 'ready'",
+    );
+    defer insert_source_stale_read_ast.deinit(alloc);
+    if (insert_source_stale_read_ast.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    const source_read = if (dml.source_read) |*source_read| source_read else return error.TestUnexpectedResult;
+                    const read_ast = source_read.read_ast orelse return error.TestUnexpectedResult;
+                    read_ast.projection_tokens = read_ast.source_tokens;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (insert_source_stale_read_ast.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAlloc(alloc, &insert_source_stale_read_ast, dml)),
         else => return error.TestUnexpectedResult,
     }
     var insert_source_alias = try tokenized.ParsedSql.initAlloc(
@@ -16849,7 +17030,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         else => return error.TestUnexpectedResult,
     };
     switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end),
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed, dml, end),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16863,9 +17044,66 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         else => return error.TestUnexpectedResult,
     };
     switch (parsed_multi.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_multi, dml, multi_end),
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_multi, dml, multi_end),
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_missing_first_mirror = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+    );
+    defer parsed_missing_first_mirror.deinit(alloc);
+    const missing_first_mirror_end = switch (parsed_missing_first_mirror.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(parsed_missing_first_mirror.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (parsed_missing_first_mirror.generated_statement) |*mutable_statement| {
+        if (mutable_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.cte_prefix) |*cte_prefix| {
+                        cte_prefix.first_body_read = null;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (parsed_missing_first_mirror.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_missing_first_mirror, dml, missing_first_mirror_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var parsed_mismatched_last_mirror = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE seed_rows AS (SELECT id FROM usage_records), source_rows AS (SELECT id FROM seed_rows), final_rows AS (SELECT id FROM source_rows) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM final_rows)",
+    );
+    defer parsed_mismatched_last_mirror.deinit(alloc);
+    const mismatched_last_mirror_end = switch (parsed_mismatched_last_mirror.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(parsed_mismatched_last_mirror.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (parsed_mismatched_last_mirror.generated_statement) |*mutable_statement| {
+        if (mutable_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.cte_prefix) |*cte_prefix| {
+                        try std.testing.expectEqual(@as(usize, 3), cte_prefix.items.len);
+                        const first_body_read = cte_prefix.items[0].body_read orelse return error.TestUnexpectedResult;
+                        if (cte_prefix.last_body_read) |*last_body_read| {
+                            last_body_read.tokens = first_body_read.tokens;
+                        } else return error.TestUnexpectedResult;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (parsed_mismatched_last_mirror.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_mismatched_last_mirror, dml, mismatched_last_mirror_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
     var parsed_multi_gap = try tokenized.ParsedSql.initAlloc(
         alloc,
         "WITH RECURSIVE seed_rows AS (SELECT id FROM usage_records), source_rows AS (SELECT id FROM seed_rows), final_rows AS (SELECT id FROM source_rows) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM final_rows)",
@@ -16889,7 +17127,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     switch (parsed_multi_gap.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_multi_gap, dml, multi_gap_end)),
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_multi_gap, dml, multi_gap_end)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16911,7 +17149,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     switch (parsed_multi.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_multi, dml, multi_end)),
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_multi, dml, multi_end)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16933,7 +17171,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
     } else return error.TestUnexpectedResult;
 
     switch (parsed.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end)),
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed, dml, end)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16947,7 +17185,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         else => return error.TestUnexpectedResult,
     };
     switch (parsed_where_body.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_where_body, dml, where_body_end),
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_where_body, dml, where_body_end),
         else => return error.TestUnexpectedResult,
     }
     if (parsed_where_body.generated_statement) |*mutable_statement| {
@@ -16965,7 +17203,7 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     switch (parsed_where_body.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_where_body, dml, where_body_end)),
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(&parsed_where_body, dml, where_body_end)),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -17125,6 +17363,21 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &recursive_with_nonrecursive_ast, mutated_nonrecursive_ast, schema, &.{}, options),
+    );
+
+    var stale_published_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u2', 'active', 'o1', 7) RETURNING id",
+    );
+    defer stale_published_dml.deinit(alloc);
+    const stale_published_dml_ast = switch ((stale_published_dml.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_published_dml.statement = .{ .unknown = stale_published_dml.raw_statement };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &stale_published_dml, stale_published_dml_ast, schema, &.{}, options),
     );
 
     const resolver_free_options = plan_mod.LowerWritePlanOptions{
@@ -18847,6 +19100,28 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+    var parsed_stale_recursive_update_assignment = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done', quantity = quantity + 1 WHERE id IN (SELECT id FROM source_rows)",
+    );
+    defer parsed_stale_recursive_update_assignment.deinit(alloc);
+    var stale_recursive_update_assignment_ast = switch ((parsed_stale_recursive_update_assignment.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), stale_recursive_update_assignment_ast.assignment_items.count);
+    stale_recursive_update_assignment_ast.assignment_items.items[0].end = (stale_recursive_update_assignment_ast.assignments_tokens orelse return error.TestUnexpectedResult).end;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &parsed_stale_recursive_update_assignment,
+            stale_recursive_update_assignment_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 
     var parsed_recursive_update_returning = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -18874,6 +19149,19 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+    var missing_recursive_update_returning_items_ast = recursive_update_returning_ast;
+    missing_recursive_update_returning_items_ast.returning_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &parsed_recursive_update_returning,
+            missing_recursive_update_returning_items_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
     const recursive_update_returning_range = recursive_update_returning_ast.returning_tokens orelse return error.TestUnexpectedResult;
     if (recursive_update_returning_range.start == 0) return error.TestUnexpectedResult;
     recursive_update_returning_ast.statement_span.end = parsed_recursive_update_returning.items()[recursive_update_returning_range.start - 2].source_end;
@@ -19201,6 +19489,25 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_generated_truncate = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE TABLE public.usage_records, usage_archive RESTART IDENTITY CASCADE");
+    defer parsed_generated_truncate.deinit(alloc);
+    var stale_generated_truncate_ast = switch ((parsed_generated_truncate.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_generated_truncate_ast.additional_target_items.items[0].end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &parsed_generated_truncate,
+            stale_generated_truncate_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 }
 
 test "sql adapter lower dml routes write sql through typed plan families" {
@@ -22513,6 +22820,8 @@ test "sql adapter lower dml lowers insert source write plans" {
     try std.testing.expectEqual(@as(usize, 1), generated_data_cte_prefix.items.len);
     try std.testing.expect(generated_data_cte_prefix.items[0].body_read == null);
     try std.testing.expectEqual(generated_parser.GeneratedSqlDmlKind.update, (generated_data_cte_prefix.items[0].body_dml orelse return error.TestUnexpectedResult).kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlDmlKind.update, (generated_data_cte_prefix.first_body_dml orelse return error.TestUnexpectedResult).kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlDmlKind.update, (generated_data_cte_prefix.last_body_dml orelse return error.TestUnexpectedResult).kind);
     var generated_data_cte_merge = try mergeMutationFromGeneratedDmlAstAlloc(
         alloc,
         &parsed_generated_data_cte_merge,
@@ -22523,6 +22832,56 @@ test "sql adapter lower dml lowers insert source write plans" {
     );
     defer generated_data_cte_merge.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), generated_data_cte_merge.data_modifying_ctes.len);
+
+    var missing_data_cte_prefix_mirror_ast = generated_data_cte_merge_ast;
+    if (missing_data_cte_prefix_mirror_ast.cte_prefix) |*cte_prefix| {
+        cte_prefix.first_body_dml = null;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_data_cte_merge,
+            missing_data_cte_prefix_mirror_ast,
+            schema,
+            &.{},
+            .{},
+        ),
+    );
+
+    var stale_data_cte_name_merge_ast = generated_data_cte_merge_ast;
+    var stale_data_cte_name_items = try alloc.dupe(generated_parser.GeneratedSqlDmlCteItemAst, generated_data_cte_prefix.items);
+    defer alloc.free(stale_data_cte_name_items);
+    stale_data_cte_name_items[0].name_tokens.start += 1;
+    stale_data_cte_name_merge_ast.cte_prefix.?.items = stale_data_cte_name_items;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_data_cte_merge,
+            stale_data_cte_name_merge_ast,
+            schema,
+            &.{},
+            .{},
+        ),
+    );
+
+    var stale_data_cte_materialization_merge_ast = generated_data_cte_merge_ast;
+    var stale_data_cte_materialization_items = try alloc.dupe(generated_parser.GeneratedSqlDmlCteItemAst, generated_data_cte_prefix.items);
+    defer alloc.free(stale_data_cte_materialization_items);
+    stale_data_cte_materialization_items[0].materialization = .materialized;
+    stale_data_cte_materialization_merge_ast.cte_prefix.?.items = stale_data_cte_materialization_items;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_data_cte_merge,
+            stale_data_cte_materialization_merge_ast,
+            schema,
+            &.{},
+            .{},
+        ),
+    );
 
     var parsed_generated_graph_cte_merge = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -22558,17 +22917,17 @@ test "sql adapter lower dml lowers insert source write plans" {
             body_read.source_antfly_function_count += 1;
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    var stale_graph_cte_count_merge = try mergeMutationFromGeneratedDmlAstAlloc(
-        alloc,
-        &parsed_generated_graph_cte_merge,
-        stale_graph_cte_count_merge_ast,
-        schema,
-        &.{},
-        .{},
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_graph_cte_merge,
+            stale_graph_cte_count_merge_ast,
+            schema,
+            &.{},
+            .{},
+        ),
     );
-    defer stale_graph_cte_count_merge.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), stale_graph_cte_count_merge.ctes.len);
-    try std.testing.expect(stale_graph_cte_count_merge.ctes[0].table_function != null);
 
     var stale_graph_cte_merge_ast = generated_graph_cte_merge_ast;
     if (stale_graph_cte_merge_ast.cte_prefix) |*cte_prefix| {
@@ -22576,17 +22935,17 @@ test "sql adapter lower dml lowers insert source write plans" {
             body_read.source_graph_function_items[0].metric_value_tokens = null;
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    var stale_graph_cte_merge = try mergeMutationFromGeneratedDmlAstAlloc(
-        alloc,
-        &parsed_generated_graph_cte_merge,
-        stale_graph_cte_merge_ast,
-        schema,
-        &.{},
-        .{},
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_graph_cte_merge,
+            stale_graph_cte_merge_ast,
+            schema,
+            &.{},
+            .{},
+        ),
     );
-    defer stale_graph_cte_merge.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), stale_graph_cte_merge.ctes.len);
-    try std.testing.expect(stale_graph_cte_merge.ctes[0].table_function != null);
 
     var parsed_missing_data_cte_body = try tokenized.ParsedSql.initAlloc(
         alloc,

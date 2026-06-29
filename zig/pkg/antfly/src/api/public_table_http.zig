@@ -58,6 +58,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         Backpressured,
         Unavailable,
+        WriteUnavailable,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
@@ -516,6 +517,7 @@ pub fn handleTableBatch(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
+        error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
@@ -1445,6 +1447,44 @@ test "public table batch handler maps unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("maintenance routes unavailable on query-only runtime", resp.body);
+}
+
+test "public table batch handler maps write unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.WriteUnavailable;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("write unavailable", resp.body);
 }
 
 test "public table batch handler maps doc identity unavailable errors" {
