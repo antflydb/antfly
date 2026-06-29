@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const core = @import("../core/mod.zig");
+const clock = @import("clock.zig");
 const group_mod = @import("group.zig");
 const scheduler_mod = @import("scheduler.zig");
 const transport_iface = @import("transport_iface.zig");
@@ -53,11 +54,68 @@ pub const RuntimeHooks = struct {
     replica_factory: ?replica_catalog_iface.ReplicaFactory = null,
 };
 
+pub const ReadyGroupDiagnostics = struct {
+    group_id: core.types.GroupId = 0,
+    elapsed_ns: u64 = 0,
+    ready_build_elapsed_ns: u64 = 0,
+    backpressure_elapsed_ns: u64 = 0,
+    capacity_check_elapsed_ns: u64 = 0,
+    snapshot_throttle_elapsed_ns: u64 = 0,
+    persist_ready_elapsed_ns: u64 = 0,
+    async_ready_elapsed_ns: u64 = 0,
+    clone_messages_elapsed_ns: u64 = 0,
+    enqueue_apply_elapsed_ns: u64 = 0,
+    async_message_loop_elapsed_ns: u64 = 0,
+    outbox_append_elapsed_ns: u64 = 0,
+    raft_advance_elapsed_ns: u64 = 0,
+    inline_apply_flush_elapsed_ns: u64 = 0,
+    inline_outbox_drain_elapsed_ns: u64 = 0,
+    inline_transport_flush_elapsed_ns: u64 = 0,
+    message_count: usize = 0,
+    message_bytes: usize = 0,
+    committed_entries: usize = 0,
+    committed_entry_bytes: usize = 0,
+    unstable_entries: usize = 0,
+    unstable_entry_bytes: usize = 0,
+    read_states: usize = 0,
+    has_snapshot: bool = false,
+    snapshot_bytes: usize = 0,
+    async_storage_writes: bool = false,
+    processed: bool = false,
+    denied_by_backpressure: bool = false,
+    denied_by_transport_capacity: bool = false,
+    denied_by_apply_capacity: bool = false,
+    denied_by_snapshot_throttle: bool = false,
+    has_more_ready: bool = false,
+};
+
 pub const HostRound = struct {
     ticked_groups: usize = 0,
     processed_groups: usize = 0,
     virtual_round: u64 = 0,
     virtual_time_ms: u64 = 0,
+    elapsed_ns: u64 = 0,
+    inbound_drain_elapsed_ns: u64 = 0,
+    tick_elapsed_ns: u64 = 0,
+    drain_ready_elapsed_ns: u64 = 0,
+    drain_ready_scan_elapsed_ns: u64 = 0,
+    persist_batch_begin_elapsed_ns: u64 = 0,
+    persist_batch_finish_elapsed_ns: u64 = 0,
+    outbox_drain_elapsed_ns: u64 = 0,
+    apply_flush_elapsed_ns: u64 = 0,
+    transport_flush_elapsed_ns: u64 = 0,
+    transport_advance_elapsed_ns: u64 = 0,
+    slowest_ready_group: ReadyGroupDiagnostics = .{},
+};
+
+pub const DrainReadyDiagnostics = struct {
+    scan_elapsed_ns: u64 = 0,
+    persist_batch_begin_elapsed_ns: u64 = 0,
+    persist_batch_finish_elapsed_ns: u64 = 0,
+    outbox_drain_elapsed_ns: u64 = 0,
+    apply_flush_elapsed_ns: u64 = 0,
+    transport_flush_elapsed_ns: u64 = 0,
+    slowest_ready_group: ReadyGroupDiagnostics = .{},
 };
 
 pub const HostMetrics = struct {
@@ -304,27 +362,47 @@ pub const MultiRaft = struct {
     }
 
     pub fn runRound(self: *MultiRaft, max_tick_groups: usize, max_ready_groups: usize) !HostRound {
+        const round_start_ns = clock.monotonicNs();
         const virtual_time = self.scheduler.advanceVirtualTime();
         var ticked_groups: usize = 0;
         const tick_limit = @min(max_tick_groups, self.scheduler.activeGroupCount());
 
+        const tick_start_ns = clock.monotonicNs();
         while (ticked_groups < tick_limit) : (ticked_groups += 1) {
             const group_id = self.scheduler.nextTickGroup() orelse break;
             try self.tickGroup(group_id);
         }
+        const tick_elapsed_ns = clock.elapsedSinceNs(tick_start_ns);
 
-        const round: HostRound = .{
+        var drain_diag = DrainReadyDiagnostics{};
+        const drain_ready_start_ns = clock.monotonicNs();
+        const processed_groups = try self.drainReadyWithDiagnostics(max_ready_groups, &drain_diag);
+        const drain_ready_elapsed_ns = clock.elapsedSinceNs(drain_ready_start_ns);
+
+        var round: HostRound = .{
             .ticked_groups = ticked_groups,
-            .processed_groups = try self.drainReady(max_ready_groups),
+            .processed_groups = processed_groups,
             .virtual_round = virtual_time.round,
             .virtual_time_ms = virtual_time.now_ms,
+            .tick_elapsed_ns = tick_elapsed_ns,
+            .drain_ready_elapsed_ns = drain_ready_elapsed_ns,
+            .drain_ready_scan_elapsed_ns = drain_diag.scan_elapsed_ns,
+            .persist_batch_begin_elapsed_ns = drain_diag.persist_batch_begin_elapsed_ns,
+            .persist_batch_finish_elapsed_ns = drain_diag.persist_batch_finish_elapsed_ns,
+            .outbox_drain_elapsed_ns = drain_diag.outbox_drain_elapsed_ns,
+            .apply_flush_elapsed_ns = drain_diag.apply_flush_elapsed_ns,
+            .transport_flush_elapsed_ns = drain_diag.transport_flush_elapsed_ns,
+            .slowest_ready_group = drain_diag.slowest_ready_group,
         };
         self.metrics.rounds += 1;
         self.metrics.virtual_round = virtual_time.round;
         self.metrics.virtual_time_ms = virtual_time.now_ms;
         self.metrics.ticked_groups += round.ticked_groups;
         self.metrics.processed_groups += round.processed_groups;
+        const transport_advance_start_ns = clock.monotonicNs();
         if (self.hooks.transport) |transport| try transport.advanceTimeMs(virtual_time.now_ms);
+        round.transport_advance_elapsed_ns = clock.elapsedSinceNs(transport_advance_start_ns);
+        round.elapsed_ns = clock.elapsedSinceNs(round_start_ns);
         return round;
     }
 
@@ -407,7 +485,7 @@ pub const MultiRaft = struct {
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (batch != null) self.metrics.persist_batches += 1;
         defer if (batch) |persist_batch| persist_batch.finish() catch unreachable;
-        const processed = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false);
+        const processed = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
         try outbox.drainInto(self.alloc, &self.pending_outbox);
         try self.flushPendingApply();
         try self.flushPendingTransport();
@@ -416,24 +494,59 @@ pub const MultiRaft = struct {
     }
 
     pub fn drainReady(self: *MultiRaft, max_groups: usize) !usize {
+        return try self.drainReadyWithDiagnostics(max_groups, null);
+    }
+
+    fn drainReadyWithDiagnostics(self: *MultiRaft, max_groups: usize, diagnostics: ?*DrainReadyDiagnostics) !usize {
         var processed: usize = 0;
         var outbox = TransportOutbox{};
         defer outbox.deinit(self.alloc);
+        const persist_batch_begin_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
+        if (diagnostics) |diag| diag.persist_batch_begin_elapsed_ns = clock.elapsedSinceNs(persist_batch_begin_start_ns);
         if (batch != null) self.metrics.persist_batches += 1;
-        defer if (batch) |persist_batch| persist_batch.finish() catch unreachable;
+        var batch_finish_attempted = false;
+        errdefer if (!batch_finish_attempted) {
+            if (batch) |persist_batch| persist_batch.finish() catch unreachable;
+        };
 
         var scanned: usize = 0;
         const scan_limit = self.groups.count();
+        const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         while (scanned < scan_limit) : (scanned += 1) {
             if (processed >= max_groups) break;
             const group_id = self.scheduler.nextReadyGroup() orelse break;
-            if (try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false)) processed += 1;
+            const ready_processed = if (diagnostics) |diag| blk: {
+                var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
+                const ready_start_ns = clock.monotonicNs();
+                const processed_ready = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, &ready_diag);
+                ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
+                ready_diag.processed = processed_ready;
+                if (ready_diag.elapsed_ns > diag.slowest_ready_group.elapsed_ns) diag.slowest_ready_group = ready_diag;
+                break :blk processed_ready;
+            } else try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
+            if (ready_processed) processed += 1;
         }
+        if (diagnostics) |diag| diag.scan_elapsed_ns = clock.elapsedSinceNs(scan_start_ns);
 
+        const outbox_drain_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try outbox.drainInto(self.alloc, &self.pending_outbox);
+        if (diagnostics) |diag| diag.outbox_drain_elapsed_ns = clock.elapsedSinceNs(outbox_drain_start_ns);
+        const apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.flushPendingApply();
+        if (diagnostics) |diag| diag.apply_flush_elapsed_ns = clock.elapsedSinceNs(apply_flush_start_ns);
+        const transport_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.flushPendingTransport();
+        if (diagnostics) |diag| diag.transport_flush_elapsed_ns = clock.elapsedSinceNs(transport_flush_start_ns);
+        if (batch) |persist_batch| {
+            const persist_batch_finish_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            batch_finish_attempted = true;
+            persist_batch.finish() catch |err| {
+                if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
+                return err;
+            };
+            if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
+        }
         self.refreshQueueMetrics();
         return processed;
     }
@@ -445,27 +558,52 @@ pub const MultiRaft = struct {
         persist_batch: ?storage_iface.PersistBatch,
         flush_transport: bool,
         flush_apply_queue: bool,
+        diagnostics: ?*ReadyGroupDiagnostics,
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (!grp.hasReady()) return false;
 
+        const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const ready = grp.ready();
+        if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
         if (ready.isEmpty()) return false;
 
+        const ready_pressure = summarizeReady(group_id, ready);
+        const async_storage_writes = grp.asyncStorageWrites();
+        if (diagnostics) |diag| {
+            diag.message_count = ready_pressure.message_count;
+            diag.message_bytes = ready_pressure.message_bytes;
+            diag.committed_entries = ready_pressure.committed_entries;
+            diag.committed_entry_bytes = ready_pressure.committed_entry_bytes;
+            diag.unstable_entries = ready_pressure.unstable_entries;
+            diag.unstable_entry_bytes = ready_pressure.unstable_entry_bytes;
+            diag.read_states = ready.read_states.len;
+            diag.has_snapshot = ready_pressure.has_snapshot;
+            diag.snapshot_bytes = ready_pressure.snapshot_bytes;
+            diag.async_storage_writes = async_storage_writes;
+        }
+
         if (self.hooks.backpressure) |backpressure| {
-            const pressure = summarizeReady(group_id, ready);
-            if (!backpressure.allowReady(pressure)) {
+            const backpressure_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            const allowed = backpressure.allowReady(ready_pressure);
+            if (diagnostics) |diag| diag.backpressure_elapsed_ns = clock.elapsedSinceNs(backpressure_start_ns);
+            if (!allowed) {
+                if (diagnostics) |diag| diag.denied_by_backpressure = true;
                 self.metrics.backpressure_denials += 1;
                 self.scheduler.noteReady(group_id);
                 return false;
             }
         }
 
-        const ready_pressure = summarizeReady(group_id, ready);
+        const capacity_check_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (!self.hasOutboundCapacity(
             outbox.items.items.len + ready_pressure.message_count,
             outbox.approxBytes() + ready_pressure.message_bytes,
         )) {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.denied_by_transport_capacity = true;
+            }
             self.metrics.transport_queue_denials += 1;
             self.scheduler.noteReady(group_id);
             return false;
@@ -474,15 +612,25 @@ pub const MultiRaft = struct {
             if (ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
             ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
         )) {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.denied_by_apply_capacity = true;
+            }
             self.metrics.apply_queue_denials += 1;
             self.scheduler.noteReady(group_id);
             return false;
         }
+        if (diagnostics) |diag| diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
 
+        const snapshot_throttle_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const snapshot_started = blk: {
             if (ready.snapshot == null) break :blk false;
             if (self.hooks.snapshot_throttle) |throttle| {
                 if (!throttle.beginSnapshot(group_id)) {
+                    if (diagnostics) |diag| {
+                        diag.snapshot_throttle_elapsed_ns = clock.elapsedSinceNs(snapshot_throttle_start_ns);
+                        diag.denied_by_snapshot_throttle = true;
+                    }
                     self.metrics.snapshot_throttle_denials += 1;
                     self.scheduler.noteReady(group_id);
                     return false;
@@ -491,30 +639,51 @@ pub const MultiRaft = struct {
             }
             break :blk false;
         };
+        if (diagnostics) |diag| diag.snapshot_throttle_elapsed_ns = clock.elapsedSinceNs(snapshot_throttle_start_ns);
         defer if (snapshot_started) {
             self.hooks.snapshot_throttle.?.endSnapshot(group_id);
         };
 
+        const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (persist_batch) |batch| {
             try batch.persistReady(group_id, ready);
         } else if (self.hooks.group_storage) |storage| {
             try storage.persistReady(group_id, ready);
         }
+        if (diagnostics) |diag| diag.persist_ready_elapsed_ns = clock.elapsedSinceNs(persist_ready_start_ns);
 
-        if (grp.asyncStorageWrites()) {
-            try self.handleAsyncReady(group_id, grp, ready, outbox, flush_apply_queue);
+        if (async_storage_writes) {
+            const async_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            try self.handleAsyncReady(group_id, grp, ready, outbox, flush_apply_queue, diagnostics);
+            if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
+            const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
+            if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
+            const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try outbox.appendMessages(self.alloc, group_id, ready.messages);
+            if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
+            const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
+            if (diagnostics) |diag| diag.raft_advance_elapsed_ns = clock.elapsedSinceNs(advance_start_ns);
         }
 
-        if (flush_apply_queue) try self.flushPendingApply();
-        if (flush_transport) {
-            try outbox.drainInto(self.alloc, &self.pending_outbox);
-            try self.flushPendingTransport();
+        if (flush_apply_queue) {
+            const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            try self.flushPendingApply();
+            if (diagnostics) |diag| diag.inline_apply_flush_elapsed_ns = clock.elapsedSinceNs(inline_apply_flush_start_ns);
         }
-        if (grp.hasReady()) self.scheduler.noteReady(group_id);
+        if (flush_transport) {
+            const inline_outbox_drain_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            try outbox.drainInto(self.alloc, &self.pending_outbox);
+            if (diagnostics) |diag| diag.inline_outbox_drain_elapsed_ns = clock.elapsedSinceNs(inline_outbox_drain_start_ns);
+            const inline_transport_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            try self.flushPendingTransport();
+            if (diagnostics) |diag| diag.inline_transport_flush_elapsed_ns = clock.elapsedSinceNs(inline_transport_flush_start_ns);
+        }
+        const has_more_ready = grp.hasReady();
+        if (diagnostics) |diag| diag.has_more_ready = has_more_ready;
+        if (has_more_ready) self.scheduler.noteReady(group_id);
         return true;
     }
 
@@ -525,13 +694,23 @@ pub const MultiRaft = struct {
         ready: core.Ready,
         outbox: *TransportOutbox,
         flush_apply_queue: bool,
+        diagnostics: ?*ReadyGroupDiagnostics,
     ) !void {
+        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const messages = try core.message.cloneMessages(self.alloc, ready.messages);
         defer core.message.freeMessages(self.alloc, messages);
+        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
+        const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
-        if (flush_apply_queue) try self.flushPendingApply();
+        if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
+        if (flush_apply_queue) {
+            const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+            try self.flushPendingApply();
+            if (diagnostics) |diag| diag.inline_apply_flush_elapsed_ns = clock.elapsedSinceNs(inline_apply_flush_start_ns);
+        }
 
+        const async_message_loop_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         for (messages) |msg| {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
@@ -539,6 +718,7 @@ pub const MultiRaft = struct {
                 else => try outbox.appendMessage(self.alloc, group_id, msg),
             }
         }
+        if (diagnostics) |diag| diag.async_message_loop_elapsed_ns = clock.elapsedSinceNs(async_message_loop_start_ns);
     }
 
     fn enqueueApply(

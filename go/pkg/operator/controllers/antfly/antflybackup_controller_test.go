@@ -1,12 +1,16 @@
 package controllers
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func TestShellQuote(t *testing.T) {
@@ -254,6 +258,108 @@ func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
 	}
 	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
 		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %q", got)
+	}
+}
+
+func TestRequestsForClusterEnqueuesReferencingBackups(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "cluster-ns"},
+	}
+	sameNamespaceBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "same-ns", Namespace: "cluster-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "cluster"},
+		},
+	}
+	crossNamespaceBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-ns", Namespace: "backup-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "cluster", Namespace: "cluster-ns"},
+		},
+	}
+	otherBackup := &antflyv1.AntflyBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "cluster-ns"},
+		Spec: antflyv1.AntflyBackupSpec{
+			ClusterRef: antflyv1.ClusterReference{Name: "other-cluster"},
+		},
+	}
+
+	r := &AntflyBackupReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(sameNamespaceBackup, crossNamespaceBackup, otherBackup).
+			Build(),
+	}
+
+	requests := r.requestsForCluster(context.Background(), cluster)
+	got := make(map[string]bool, len(requests))
+	for _, req := range requests {
+		got[req.NamespacedName.String()] = true
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 requests, got %d: %#v", len(got), got)
+	}
+	if !got["cluster-ns/same-ns"] {
+		t.Fatalf("expected same-namespace backup request, got %#v", got)
+	}
+	if !got["backup-ns/cross-ns"] {
+		t.Fatalf("expected cross-namespace backup request, got %#v", got)
+	}
+	if got["cluster-ns/other"] {
+		t.Fatalf("did not expect unrelated backup request, got %#v", got)
+	}
+}
+
+func TestBackupClusterDependencyChangedPredicate(t *testing.T) {
+	pred := backupClusterDependencyChangedPredicate()
+
+	base := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "cluster",
+			Namespace:  "default",
+			Generation: 10,
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:v1",
+			Mode:  antflyv1.ClusterModeClustered,
+		},
+	}
+
+	if !pred.Create(event.CreateEvent{Object: base}) {
+		t.Fatalf("expected create event to enqueue backups")
+	}
+	if !pred.Delete(event.DeleteEvent{Object: base}) {
+		t.Fatalf("expected delete event to enqueue backups")
+	}
+	if !pred.Generic(event.GenericEvent{Object: base}) {
+		t.Fatalf("expected generic event to enqueue backups")
+	}
+
+	statusOnly := base.DeepCopy()
+	statusOnly.Status.Phase = "Running"
+	statusOnly.Generation = base.Generation
+	if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: statusOnly}) {
+		t.Fatalf("expected status-only cluster update to be filtered")
+	}
+
+	unrelatedSpec := base.DeepCopy()
+	unrelatedSpec.Generation = base.Generation + 1
+	unrelatedSpec.Spec.Mode = antflyv1.ClusterModeSwarm
+	if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: unrelatedSpec}) {
+		t.Fatalf("expected non-image spec update to be filtered")
+	}
+
+	imageChanged := base.DeepCopy()
+	imageChanged.Generation = base.Generation + 1
+	imageChanged.Spec.Image = "antfly:v2"
+	if !pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: imageChanged}) {
+		t.Fatalf("expected image update to enqueue backups")
 	}
 }
 
