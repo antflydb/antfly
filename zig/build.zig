@@ -3027,6 +3027,7 @@ pub fn build(b: *std.Build) void {
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
+        "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears no-debt busy writer groups",

@@ -42,6 +42,9 @@ from conftest import (
 from helpers import wait_until
 
 
+MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
+
+
 class _ClusterStartupDeadline:
     def __init__(self, expires_at: float):
         self.expires_at = expires_at
@@ -925,6 +928,77 @@ def _all_metadata_snapshots(cluster: MultiNodeScalingCluster) -> list[dict[str, 
         return None
 
 
+def _table_write_route_diagnostic(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    *,
+    min_group_count: int,
+) -> dict[str, Any]:
+    snapshot = cluster.metadata_snapshot()
+    table_id: int | None = None
+    for table in snapshot.get("tables", []):
+        if isinstance(table, dict) and table.get("name") == table_name:
+            table_id = int(table.get("table_id", 0))
+            break
+    if table_id is None:
+        return {
+            "table_name": table_name,
+            "table_found": False,
+            "min_group_count": min_group_count,
+            "projected_tables": [table.get("name") for table in snapshot.get("tables", []) if isinstance(table, dict)],
+        }
+
+    group_ids = sorted(
+        int(record.get("group_id", 0))
+        for record in snapshot.get("ranges", [])
+        if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
+    )
+    leader_store_by_group: dict[int, int] = {}
+    group_statuses: dict[int, dict[str, Any]] = {}
+    for status in snapshot.get("merged_group_statuses", []):
+        if not isinstance(status, dict):
+            continue
+        group_id = int(status.get("group_id", 0))
+        if group_id not in group_ids:
+            continue
+        group_statuses[group_id] = {
+            "leader_known": bool(status.get("leader_known", False)),
+            "leader_store_id": int(status.get("leader_store_id", 0)),
+            "voter_count_known": bool(status.get("voter_count_known", False)),
+            "voter_count": int(status.get("voter_count", 0)),
+            "healthy_voter_reports": int(status.get("healthy_voter_reports", 0)),
+            "updated_at_millis": int(status.get("updated_at_millis", 0)),
+        }
+        leader_store_id = int(status.get("leader_store_id", 0))
+        if leader_store_id != 0:
+            leader_store_by_group[group_id] = leader_store_id
+
+    placed_nodes_by_group: dict[int, list[int]] = {group_id: [] for group_id in group_ids}
+    for intent in snapshot.get("placement_intents", []):
+        if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
+            continue
+        group_id = int(intent["record"].get("group_id", 0))
+        if group_id not in placed_nodes_by_group:
+            continue
+        placed_nodes_by_group[group_id].append(int(intent["record"].get("local_node_id", 0)))
+    for nodes in placed_nodes_by_group.values():
+        nodes.sort()
+
+    return {
+        "table_name": table_name,
+        "table_found": True,
+        "table_id": table_id,
+        "min_group_count": min_group_count,
+        "group_count": len(group_ids),
+        "group_ids": group_ids,
+        "missing_group_count": max(0, min_group_count - len(group_ids)),
+        "missing_leader_group_ids": [group_id for group_id in group_ids if group_id not in leader_store_by_group],
+        "leader_store_by_group": leader_store_by_group,
+        "group_statuses": group_statuses,
+        "placed_nodes_by_group": placed_nodes_by_group,
+    }
+
+
 def _lookup_from_any_data_node(
     cluster: MultiNodeScalingCluster,
     table_name: str,
@@ -971,11 +1045,12 @@ def _insert_docs(
                 return api_url
         return None
 
-    api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
+    api_url = wait_until(route_ready, timeout_s=MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S, interval_s=0.5)
     assert api_url is not None, (
         f"table {table_name} never became write-routable before seed batch\n"
+        f"route readiness: {json.dumps(_table_write_route_diagnostic(cluster, table_name, min_group_count=min_group_count), indent=2, sort_keys=True)}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
-        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
 
