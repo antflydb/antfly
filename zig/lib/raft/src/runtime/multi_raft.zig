@@ -501,7 +501,7 @@ pub const MultiRaft = struct {
         var processed: usize = 0;
         var outbox = TransportOutbox{};
         defer outbox.deinit(self.alloc);
-        const persist_batch_begin_start_ns = clock.monotonicNs();
+        const persist_batch_begin_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (diagnostics) |diag| diag.persist_batch_begin_elapsed_ns = clock.elapsedSinceNs(persist_batch_begin_start_ns);
         if (batch != null) self.metrics.persist_batches += 1;
@@ -512,33 +512,34 @@ pub const MultiRaft = struct {
 
         var scanned: usize = 0;
         const scan_limit = self.groups.count();
-        const scan_start_ns = clock.monotonicNs();
+        const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         while (scanned < scan_limit) : (scanned += 1) {
             if (processed >= max_groups) break;
             const group_id = self.scheduler.nextReadyGroup() orelse break;
-            var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
-            const ready_start_ns = clock.monotonicNs();
-            const ready_processed = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, &ready_diag);
-            ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
-            ready_diag.processed = ready_processed;
-            if (diagnostics) |diag| {
+            const ready_processed = if (diagnostics) |diag| blk: {
+                var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
+                const ready_start_ns = clock.monotonicNs();
+                const processed_ready = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, &ready_diag);
+                ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
+                ready_diag.processed = processed_ready;
                 if (ready_diag.elapsed_ns > diag.slowest_ready_group.elapsed_ns) diag.slowest_ready_group = ready_diag;
-            }
+                break :blk processed_ready;
+            } else try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
             if (ready_processed) processed += 1;
         }
         if (diagnostics) |diag| diag.scan_elapsed_ns = clock.elapsedSinceNs(scan_start_ns);
 
-        const outbox_drain_start_ns = clock.monotonicNs();
+        const outbox_drain_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try outbox.drainInto(self.alloc, &self.pending_outbox);
         if (diagnostics) |diag| diag.outbox_drain_elapsed_ns = clock.elapsedSinceNs(outbox_drain_start_ns);
-        const apply_flush_start_ns = clock.monotonicNs();
+        const apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.flushPendingApply();
         if (diagnostics) |diag| diag.apply_flush_elapsed_ns = clock.elapsedSinceNs(apply_flush_start_ns);
-        const transport_flush_start_ns = clock.monotonicNs();
+        const transport_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.flushPendingTransport();
         if (diagnostics) |diag| diag.transport_flush_elapsed_ns = clock.elapsedSinceNs(transport_flush_start_ns);
         if (batch) |persist_batch| {
-            const persist_batch_finish_start_ns = clock.monotonicNs();
+            const persist_batch_finish_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             batch_finish_attempted = true;
             persist_batch.finish() catch |err| {
                 if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
@@ -562,7 +563,7 @@ pub const MultiRaft = struct {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (!grp.hasReady()) return false;
 
-        const ready_build_start_ns = clock.monotonicNs();
+        const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const ready = grp.ready();
         if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
         if (ready.isEmpty()) return false;
@@ -583,7 +584,7 @@ pub const MultiRaft = struct {
         }
 
         if (self.hooks.backpressure) |backpressure| {
-            const backpressure_start_ns = clock.monotonicNs();
+            const backpressure_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             const allowed = backpressure.allowReady(ready_pressure);
             if (diagnostics) |diag| diag.backpressure_elapsed_ns = clock.elapsedSinceNs(backpressure_start_ns);
             if (!allowed) {
@@ -594,7 +595,7 @@ pub const MultiRaft = struct {
             }
         }
 
-        const capacity_check_start_ns = clock.monotonicNs();
+        const capacity_check_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (!self.hasOutboundCapacity(
             outbox.items.items.len + ready_pressure.message_count,
             outbox.approxBytes() + ready_pressure.message_bytes,
@@ -621,7 +622,7 @@ pub const MultiRaft = struct {
         }
         if (diagnostics) |diag| diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
 
-        const snapshot_throttle_start_ns = clock.monotonicNs();
+        const snapshot_throttle_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const snapshot_started = blk: {
             if (ready.snapshot == null) break :blk false;
             if (self.hooks.snapshot_throttle) |throttle| {
@@ -643,7 +644,7 @@ pub const MultiRaft = struct {
             self.hooks.snapshot_throttle.?.endSnapshot(group_id);
         };
 
-        const persist_ready_start_ns = clock.monotonicNs();
+        const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (persist_batch) |batch| {
             try batch.persistReady(group_id, ready);
         } else if (self.hooks.group_storage) |storage| {
@@ -652,31 +653,31 @@ pub const MultiRaft = struct {
         if (diagnostics) |diag| diag.persist_ready_elapsed_ns = clock.elapsedSinceNs(persist_ready_start_ns);
 
         if (async_storage_writes) {
-            const async_ready_start_ns = clock.monotonicNs();
+            const async_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.handleAsyncReady(group_id, grp, ready, outbox, flush_apply_queue, diagnostics);
             if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
-            const enqueue_apply_start_ns = clock.monotonicNs();
+            const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
-            const outbox_append_start_ns = clock.monotonicNs();
+            const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try outbox.appendMessages(self.alloc, group_id, ready.messages);
             if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
-            const advance_start_ns = clock.monotonicNs();
+            const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
             if (diagnostics) |diag| diag.raft_advance_elapsed_ns = clock.elapsedSinceNs(advance_start_ns);
         }
 
         if (flush_apply_queue) {
-            const inline_apply_flush_start_ns = clock.monotonicNs();
+            const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.flushPendingApply();
             if (diagnostics) |diag| diag.inline_apply_flush_elapsed_ns = clock.elapsedSinceNs(inline_apply_flush_start_ns);
         }
         if (flush_transport) {
-            const inline_outbox_drain_start_ns = clock.monotonicNs();
+            const inline_outbox_drain_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try outbox.drainInto(self.alloc, &self.pending_outbox);
             if (diagnostics) |diag| diag.inline_outbox_drain_elapsed_ns = clock.elapsedSinceNs(inline_outbox_drain_start_ns);
-            const inline_transport_flush_start_ns = clock.monotonicNs();
+            const inline_transport_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.flushPendingTransport();
             if (diagnostics) |diag| diag.inline_transport_flush_elapsed_ns = clock.elapsedSinceNs(inline_transport_flush_start_ns);
         }
@@ -695,21 +696,21 @@ pub const MultiRaft = struct {
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
     ) !void {
-        const clone_messages_start_ns = clock.monotonicNs();
+        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const messages = try core.message.cloneMessages(self.alloc, ready.messages);
         defer core.message.freeMessages(self.alloc, messages);
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
-        const enqueue_apply_start_ns = clock.monotonicNs();
+        const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
         if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
         if (flush_apply_queue) {
-            const inline_apply_flush_start_ns = clock.monotonicNs();
+            const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.flushPendingApply();
             if (diagnostics) |diag| diag.inline_apply_flush_elapsed_ns = clock.elapsedSinceNs(inline_apply_flush_start_ns);
         }
 
-        const async_message_loop_start_ns = clock.monotonicNs();
+        const async_message_loop_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         for (messages) |msg| {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),

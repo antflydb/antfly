@@ -71,7 +71,7 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     if (round.elapsed_ns <= metadata_run_round_slow_phase_threshold_ns) return;
     const ready = round.slowest_ready_group;
     std.log.warn(
-        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d} ready_messages={d} ready_message_bytes={d} ready_committed_entries={d} ready_committed_bytes={d} ready_unstable_entries={d} ready_unstable_bytes={d} ready_read_states={d} ready_has_snapshot={} ready_snapshot_bytes={d} ready_async_storage={} ready_processed={} ready_denied_backpressure={} ready_denied_transport_capacity={} ready_denied_apply_capacity={} ready_denied_snapshot_throttle={} ready_has_more={}",
+        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d}",
         .{
             @divTrunc(round.elapsed_ns, std.time.ns_per_ms),
             @divTrunc(round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
@@ -90,6 +90,12 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             round.virtual_time_ms,
             ready.group_id,
             @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+    std.log.warn(
+        "metadata raft ready slow group_id={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d}",
+        .{
+            ready.group_id,
             @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
@@ -104,6 +110,12 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+    std.log.warn(
+        "metadata raft ready pressure group_id={d} ready_messages={d} ready_message_bytes={d} ready_committed_entries={d} ready_committed_bytes={d} ready_unstable_entries={d} ready_unstable_bytes={d} ready_read_states={d} ready_has_snapshot={} ready_snapshot_bytes={d} ready_async_storage={} ready_processed={} ready_denied_backpressure={} ready_denied_transport_capacity={} ready_denied_apply_capacity={} ready_denied_snapshot_throttle={} ready_has_more={}",
+        .{
+            ready.group_id,
             ready.message_count,
             ready.message_bytes,
             ready.committed_entries,
@@ -3123,6 +3135,7 @@ pub const MetadataHttpService = struct {
         var not_leader_count: usize = 0;
         var raft_rounds: usize = 0;
         var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
+        var latest_raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
@@ -3154,6 +3167,7 @@ pub const MetadataHttpService = struct {
                     try self.raft.runRaftRoundOnly();
                 }
                 raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
+                latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
             }
             raft_rounds += 1;
             if (raft_diagnostics_snapshot.last_runtime_round) |round| {
@@ -3164,12 +3178,7 @@ pub const MetadataHttpService = struct {
             platform_clock.Clock.real().sleepMs(1);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
-        const timeout_snapshot = blk: {
-            self.lockRuntime();
-            defer self.unlockRuntime();
-            break :blk self.raftDiagnosticsSnapshotLocked();
-        };
-        self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, timeout_snapshot);
+        self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, latest_raft_diagnostics_snapshot);
         return error.MetadataLinearizableReadTimeout;
     }
 
@@ -3184,7 +3193,7 @@ pub const MetadataHttpService = struct {
     ) void {
         const ready = slowest_round.slowest_ready_group;
         std.log.warn(
-            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_ready_group_id={d} slowest_ready_group_ms={d} slowest_ready_build_ms={d} slowest_ready_backpressure_ms={d} slowest_ready_capacity_ms={d} slowest_ready_snapshot_throttle_ms={d} slowest_ready_persist_ms={d} slowest_ready_async_ms={d} slowest_ready_clone_messages_ms={d} slowest_ready_enqueue_apply_ms={d} slowest_ready_async_loop_ms={d} slowest_ready_outbox_append_ms={d} slowest_ready_advance_ms={d} slowest_ready_inline_apply_flush_ms={d} slowest_ready_inline_outbox_drain_ms={d} slowest_ready_inline_transport_flush_ms={d} slowest_ready_messages={d} slowest_ready_committed_entries={d} slowest_ready_unstable_entries={d} slowest_ready_read_states={d} slowest_ready_has_snapshot={} slowest_ready_async_storage={} slowest_ready_processed={} slowest_ready_denied_backpressure={} slowest_ready_denied_transport_capacity={} slowest_ready_denied_apply_capacity={} slowest_ready_denied_snapshot_throttle={} slowest_ready_has_more={}",
+            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_ready_group_id={d} slowest_ready_group_ms={d}",
             .{
                 request_id,
                 self.metadata_group_id,
@@ -3213,6 +3222,13 @@ pub const MetadataHttpService = struct {
                 slowest_round.processed_groups,
                 ready.group_id,
                 @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+        std.log.warn(
+            "metadata linearizable read timeout ready timings request_id={d} group_id={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d}",
+            .{
+                request_id,
+                ready.group_id,
                 @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
@@ -3227,6 +3243,13 @@ pub const MetadataHttpService = struct {
                 @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+        std.log.warn(
+            "metadata linearizable read timeout ready pressure request_id={d} group_id={d} slowest_ready_messages={d} slowest_ready_committed_entries={d} slowest_ready_unstable_entries={d} slowest_ready_read_states={d} slowest_ready_has_snapshot={} slowest_ready_async_storage={} slowest_ready_processed={} slowest_ready_denied_backpressure={} slowest_ready_denied_transport_capacity={} slowest_ready_denied_apply_capacity={} slowest_ready_denied_snapshot_throttle={} slowest_ready_has_more={}",
+            .{
+                request_id,
+                ready.group_id,
                 ready.message_count,
                 ready.committed_entries,
                 ready.unstable_entries,
