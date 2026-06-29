@@ -549,6 +549,10 @@ pub const Server = struct {
 
         try self.server.svc.raft.submitBatch(updates.items);
         _ = try self.server.svc.syncPending();
+        if (metadataClusterPreferredCampaigner(cluster_peers, local_node_id)) {
+            try self.server.campaignMetadataGroup();
+            try self.server.runRound();
+        }
     }
 
     pub fn bootstrapLocal(self: *Server, metadata_group_id: u64, local_node_id: u64) !void {
@@ -655,6 +659,15 @@ fn indexOfClusterPeer(cluster_peers: []const MetadataClusterPeer, node_id: u64) 
         if (peer.node_id == node_id) return index;
     }
     return null;
+}
+
+fn metadataClusterPreferredCampaigner(cluster_peers: []const MetadataClusterPeer, local_node_id: u64) bool {
+    if (cluster_peers.len == 0) return true;
+    var min_node_id = cluster_peers[0].node_id;
+    for (cluster_peers[1..]) |peer| {
+        if (peer.node_id < min_node_id) min_node_id = peer.node_id;
+    }
+    return local_node_id == min_node_id;
 }
 
 fn allocMetadataPeerNodeIds(
@@ -1486,6 +1499,19 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
     try std.testing.expect(!wal_cfg.compaction_single_node_only);
+}
+
+test "metadata runtime chooses one preferred bootstrap campaigner" {
+    const peers = [_]MetadataClusterPeer{
+        .{ .node_id = 3, .raft_url = "http://127.0.0.1:3003" },
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:3001" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:3002" },
+    };
+
+    try std.testing.expect(metadataClusterPreferredCampaigner(&.{}, 7));
+    try std.testing.expect(metadataClusterPreferredCampaigner(&peers, 1));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 2));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 3));
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
