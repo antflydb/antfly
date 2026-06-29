@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
+const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 
 const Allocator = std.mem.Allocator;
@@ -535,13 +536,13 @@ const BufferedAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
@@ -1980,13 +1981,13 @@ const NativeBufferedAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
@@ -2507,6 +2508,30 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "buffered atomic write sink supports overlapping writes and appends" {
+    var backing = MemoryStorage.init(std.testing.allocator);
+    defer backing.deinit();
+
+    var writer = try backing.storage().beginAtomicWrite(std.testing.allocator, "/alias-safe.bin");
+    var active = true;
+    defer if (active) writer.abort();
+
+    try writer.appendSlice("abcdef");
+    const impl: *BufferedAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+    try writer.writeAt(2, impl.out.items[0..4]);
+    try std.testing.expectEqualStrings("ababcd", impl.out.items);
+
+    try writer.appendSlice(impl.out.items[1..5]);
+    try std.testing.expectEqualStrings("ababcdbabc", impl.out.items);
+
+    active = false;
+    try writer.finish();
+
+    const written = try backing.storage().readFileAlloc(std.testing.allocator, "/alias-safe.bin", 64);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("ababcdbabc", written);
 }
 
 test "native fd cache evicts to per-store budget" {
