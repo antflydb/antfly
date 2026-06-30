@@ -79,6 +79,9 @@ pub fn restoreSnapshotMatchesPath(
 
     var db = db_mod.DB.open(alloc, path, .{
         .identity_namespace = options.expected_identity_namespace,
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
     }) catch |err| switch (err) {
         error.FileNotFound, error.IdentityNamespaceMismatch => return false,
         else => return err,
@@ -193,10 +196,6 @@ fn applyRestoreSnapshot(
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
-
-    var restored_db = try db_mod.DB.open(alloc, path, .{});
-    defer restored_db.close();
-    if (manifest.indexes_json.len > 0) _ = try reconcileDbIndexes(alloc, &restored_db, manifest.indexes_json);
 }
 
 fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u64 {
