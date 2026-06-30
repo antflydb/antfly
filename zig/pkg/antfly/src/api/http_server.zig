@@ -155,6 +155,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             .source = self.server.source,
             .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
+            .inference_api_url = self.server.configuredInferenceAPIURL(),
             .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
@@ -190,6 +191,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             .source = self.server.source,
             .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
+            .inference_api_url = self.server.configuredInferenceAPIURL(),
             .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
@@ -311,6 +313,7 @@ pub const SemanticStatusResolver = struct {
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
@@ -338,6 +341,7 @@ pub const SemanticStatusResolver = struct {
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.remote_content,
+            .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
@@ -1121,6 +1125,11 @@ pub const ApiHttpServer = struct {
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
         };
+    }
+
+    pub fn configuredInferenceAPIURL(self: *const ApiHttpServer) ?[]const u8 {
+        const node_config = self.cfg.node_config orelse return null;
+        return node_config.inference.api_url;
     }
 
     pub fn initWithConfig(
@@ -3554,6 +3563,7 @@ pub const ApiHttpServer = struct {
                     .source = runner.server.source,
                     .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
+                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
                     .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
@@ -3736,6 +3746,7 @@ pub const ApiHttpServer = struct {
                     .source = runner.server.source,
                     .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
+                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
                     .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
@@ -3974,9 +3985,12 @@ pub const ApiHttpServer = struct {
                         .antfly_provider = self.antfly_provider,
                         .secret_store = self.cfg.secret_store,
                         .remote_content = self.cfg.remote_content,
+                        .inference_api_url = self.configuredInferenceAPIURL(),
+                        .inference_api_key = self.cfg.inference_api_key,
                     },
                 ) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                     error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
                     else => return err,
                 };
@@ -6105,6 +6119,7 @@ pub const ApiHttpServer = struct {
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
+            .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
         };
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
@@ -6183,6 +6198,7 @@ pub const ApiHttpServer = struct {
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
+            .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
         };
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
@@ -6349,6 +6365,7 @@ pub const ApiHttpServer = struct {
                 .antfly_provider = self.antfly_provider,
                 .secret_store = self.cfg.secret_store,
                 .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
@@ -6362,6 +6379,7 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .remote_content = self.cfg.remote_content,
+            .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,

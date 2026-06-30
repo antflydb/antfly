@@ -424,6 +424,7 @@ pub const ProvisionedTableWriteCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     /// Cross-shard entity-resolution candidate source applied to every managed
@@ -1018,6 +1019,7 @@ pub const ProvisionedTableWriteCache = struct {
                 identity_namespace: ?doc_identity.Namespace,
                 ha_write_gate: ?db_mod.HAWriteGate,
                 ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+                inference_api_url: ?[]const u8,
             ) !OpenedDb {
                 const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, ha_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
@@ -1037,6 +1039,7 @@ pub const ProvisionedTableWriteCache = struct {
                         identity_namespace,
                         .{
                             .drain_resolver_backfill = false,
+                            .inference_api_url = inference_api_url,
                             .ha_write_gate = ha_write_gate,
                             .ha_async_effect_mirror = effective_ha_mirror,
                             .ha_async_batch_mirror = effective_ha_mirror,
@@ -1100,6 +1103,7 @@ pub const ProvisionedTableWriteCache = struct {
                 identity_namespace,
                 self.ha_write_gate,
                 self.ha_async_mirror,
+                self.inference_api_url,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -1151,6 +1155,7 @@ pub const ProvisionedTableWriteCache = struct {
             identity_namespace,
             self.ha_write_gate,
             self.ha_async_mirror,
+            self.inference_api_url,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionActiveForTable(table_name);
@@ -3405,6 +3410,7 @@ pub const ProvisionedTableWriteSource = struct {
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
@@ -3458,6 +3464,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.antfly_provider = provider;
         if (self.write_cache) |cache| cache.antfly_provider = provider;
         if (self.startup_write_cache) |cache| cache.antfly_provider = provider;
+        return self;
+    }
+
+    pub fn withInferenceAPIURL(
+        self: *ProvisionedTableWriteSource,
+        inference_api_url: ?[]const u8,
+    ) *ProvisionedTableWriteSource {
+        self.inference_api_url = inference_api_url;
+        if (self.write_cache) |cache| cache.inference_api_url = inference_api_url;
+        if (self.startup_write_cache) |cache| cache.inference_api_url = inference_api_url;
         return self;
     }
 
@@ -4143,6 +4159,7 @@ pub const ProvisionedTableWriteSource = struct {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
+        cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
         const identity_namespace = if (preloaded_metadata) |metadata|
@@ -4244,6 +4261,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .inference_api_url = self.inference_api_url,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -4656,6 +4674,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
+        cache.inference_api_url = self.inference_api_url;
         cache.secret_store = self.secret_store;
         cache.remote_content = self.remote_content;
 
@@ -4973,6 +4992,7 @@ pub const ProvisionedTableWriteSource = struct {
                     identity_namespace,
                     .{
                         .drain_resolver_backfill = false,
+                        .inference_api_url = self.inference_api_url,
                         .ha_write_gate = self.ha_write_gate,
                         .ha_async_effect_mirror = effective_ha_mirror,
                         .ha_async_batch_mirror = effective_ha_mirror,
@@ -6492,6 +6512,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.write_cache) |cache| {
                 if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
                 cache.antfly_provider = self.antfly_provider;
+                cache.inference_api_url = self.inference_api_url;
                 cache.secret_store = self.secret_store;
                 cache.remote_content = self.remote_content;
             }
@@ -8354,6 +8375,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -9714,6 +9736,7 @@ fn applyIndexCreateToCachedDb(
     index_name: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
@@ -9726,7 +9749,7 @@ fn applyIndexCreateToCachedDb(
 
     const owned_name = try alloc.dupe(u8, index_name);
     defer alloc.free(owned_name);
-    var enrichments = try createManagedDbEnrichments(db.runtime_alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(db.runtime_alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(db.runtime_alloc);
     if (enrichments.enabled()) {
         try db.reconfigureEnrichmentRuntime(enrichments.config());
@@ -9776,7 +9799,7 @@ fn reconcileCachedLocalTableIndexCreate(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
-        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content) catch |err| {
+        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.inference_api_url, self.secret_store, self.remote_content) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
             return err;
@@ -10420,6 +10443,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 
 const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    inference_api_url: ?[]const u8 = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
@@ -10467,6 +10491,7 @@ fn createManagedDbEnrichments(
     raw_indexes_json: []const u8,
     runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
 ) !ManagedDbEnrichmentSet {
@@ -10482,8 +10507,8 @@ fn createManagedDbEnrichments(
         allocator.destroy(owned);
     };
     return .{
-        .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
-        .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
+        .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
+        .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
         .asset_runtime = asset_runtime,
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };
@@ -10514,7 +10539,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     var enrichments = if (mode == .startup_catch_up)
         ManagedDbEnrichmentSet{}
     else
-        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -10765,7 +10790,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         enrichments = if (mode == .startup_catch_up)
             ManagedDbEnrichmentSet{}
         else
-            try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+            try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);

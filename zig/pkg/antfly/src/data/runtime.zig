@@ -2480,11 +2480,16 @@ pub const DataServer = struct {
         self: *DataServer,
         provider: ?antfly.inference.managed_embedder.AntflyProvider,
     ) void {
+        const inference_api_url = if (self.api_server_cfg.node_config) |cfg| cfg.inference.api_url else null;
         _ = self.read_source.withAntflyProvider(provider);
+        _ = self.read_source.withInferenceAPIURL(inference_api_url);
         _ = self.write_source.withAntflyProvider(provider);
+        _ = self.write_source.withInferenceAPIURL(inference_api_url);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withAntflyProvider(provider);
+            _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
             apply_sm.write_cache.antfly_provider = provider;
+            apply_sm.write_cache.inference_api_url = inference_api_url;
         }
         if (self.http_server) |*server| server.antfly_provider = provider;
     }
