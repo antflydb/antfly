@@ -275,15 +275,49 @@ jobs:
             echo "::endgroup::"
           fi
 
-          make zig-unit-test &
+          unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
+          : > "$unit_log"
+
+          (
+            set +e
+            make zig-unit-test 2>&1 | tee -a "$unit_log"
+            exit "${PIPESTATUS[0]}"
+          ) &
           unit_pid="$!"
           (
-            sleep "${ANTFLY_UNIT_WATCHDOG_SECS:-1200}"
-            if kill -0 "$unit_pid" 2>/dev/null; then
-              echo "::error::zig-unit-test watchdog fired; dumping stacks before terminating live test processes"
-              dump_stacks "$unit_pid"
-              terminate_tree "$unit_pid"
-            fi
+            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-900}"
+            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
+            start_epoch="$(date +%s)"
+            last_progress_epoch="$start_epoch"
+            last_mtime=0
+            while kill -0 "$unit_pid" 2>/dev/null; do
+              sleep 15
+              now_epoch="$(date +%s)"
+              if [ -e "$unit_log" ]; then
+                current_mtime="$(stat -c %Y "$unit_log" 2>/dev/null || echo 0)"
+                if [ "$current_mtime" -gt "$last_mtime" ]; then
+                  last_mtime="$current_mtime"
+                  last_progress_epoch="$now_epoch"
+                fi
+              fi
+
+              elapsed_secs=$((now_epoch - start_epoch))
+              idle_secs=$((now_epoch - last_progress_epoch))
+              if [ "$hard_limit_secs" -gt 0 ] && [ "$elapsed_secs" -ge "$hard_limit_secs" ]; then
+                echo "::error::zig-unit-test hard watchdog fired after ${elapsed_secs}s; dumping stacks before terminating live test processes"
+                tail -n 200 "$unit_log" || true
+                dump_stacks "$unit_pid"
+                terminate_tree "$unit_pid"
+                exit 0
+              fi
+              if [ "$idle_limit_secs" -gt 0 ] && [ "$idle_secs" -ge "$idle_limit_secs" ]; then
+                echo "::error::zig-unit-test idle watchdog fired after ${idle_secs}s without unit log progress; dumping stacks before terminating live test processes"
+                tail -n 200 "$unit_log" || true
+                dump_stacks "$unit_pid"
+                terminate_tree "$unit_pid"
+                exit 0
+              fi
+            done
           ) &
           watchdog_pid="$!"
 

@@ -3804,6 +3804,7 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
+            "provisioned table restore retry skips exact incomplete restore state with active writer",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned create index updates cached writer in place",

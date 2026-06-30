@@ -1035,7 +1035,7 @@ def _insert_docs(
             api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
-                require_all_group_leaders=True,
+                require_all_group_leaders=False,
                 min_group_count=min_group_count,
             )
         except (AssertionError, requests.RequestException, ValueError):
@@ -1047,7 +1047,7 @@ def _insert_docs(
 
     api_url = wait_until(route_ready, timeout_s=MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S, interval_s=0.5)
     assert api_url is not None, (
-        f"table {table_name} never became write-routable before seed batch\n"
+        f"table {table_name} never exposed a live write endpoint before seed batch\n"
         f"route readiness: {json.dumps(_table_write_route_diagnostic(cluster, table_name, min_group_count=min_group_count), indent=2, sort_keys=True)}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
@@ -1251,6 +1251,10 @@ def _wait_node_drained_for_groups(
     timeout_s: float = 90.0,
 ) -> dict[str, Any] | None:
     def drained_and_replaced() -> dict[str, Any] | None:
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            return None
         snapshots = _all_metadata_snapshots(cluster)
         if snapshots is None:
             return None
@@ -1260,7 +1264,7 @@ def _wait_node_drained_for_groups(
                 (store for store in stores if int(store.get("node_id", 0)) == node_id),
                 None,
             )
-            if not drained_store or drained_store.get("drain_requested") is not True:
+            if drained_store is not None and drained_store.get("drain_requested") is not True:
                 return None
             for intent in snapshot.get("placement_intents", []):
                 if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):

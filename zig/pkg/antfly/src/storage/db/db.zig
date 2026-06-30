@@ -867,6 +867,7 @@ const StartupOpenStats = struct {
     lsm_open_failed: AtomicU64 = .init(0),
     lsm_open_total_ns: AtomicU64 = .init(0),
     lsm_open_initializing_storage_ns: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_cleanup_ns: AtomicU64 = .init(0),
     lsm_open_manifest_ns: AtomicU64 = .init(0),
     lsm_open_ensuring_dirs_ns: AtomicU64 = .init(0),
     lsm_open_wal_replay_ns: AtomicU64 = .init(0),
@@ -875,6 +876,8 @@ const StartupOpenStats = struct {
     lsm_open_obsolete_paths: AtomicU64 = .init(0),
     lsm_open_mutable_entries_after_replay: AtomicU64 = .init(0),
     lsm_open_immutable_memtables_after_replay: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_files_deleted: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_bytes_deleted: AtomicU64 = .init(0),
     wal_replay_records: AtomicU64 = .init(0),
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
@@ -906,6 +909,7 @@ const StartupOpenStats = struct {
             .lsm_open_failed = self.lsm_open_failed.load(.monotonic),
             .lsm_open_total_ns = self.lsm_open_total_ns.load(.monotonic),
             .lsm_open_initializing_storage_ns = self.lsm_open_initializing_storage_ns.load(.monotonic),
+            .lsm_open_recovered_temp_cleanup_ns = self.lsm_open_recovered_temp_cleanup_ns.load(.monotonic),
             .lsm_open_manifest_ns = self.lsm_open_manifest_ns.load(.monotonic),
             .lsm_open_ensuring_dirs_ns = self.lsm_open_ensuring_dirs_ns.load(.monotonic),
             .lsm_open_wal_replay_ns = self.lsm_open_wal_replay_ns.load(.monotonic),
@@ -914,6 +918,8 @@ const StartupOpenStats = struct {
             .lsm_open_obsolete_paths = self.lsm_open_obsolete_paths.load(.monotonic),
             .lsm_open_mutable_entries_after_replay = self.lsm_open_mutable_entries_after_replay.load(.monotonic),
             .lsm_open_immutable_memtables_after_replay = self.lsm_open_immutable_memtables_after_replay.load(.monotonic),
+            .lsm_open_recovered_temp_files_deleted = self.lsm_open_recovered_temp_files_deleted.load(.monotonic),
+            .lsm_open_recovered_temp_bytes_deleted = self.lsm_open_recovered_temp_bytes_deleted.load(.monotonic),
             .wal_replay_records = self.wal_replay_records.load(.monotonic),
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
@@ -3873,6 +3879,7 @@ pub const DB = struct {
         self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
         self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_cleanup_ns.store(lsm_open_stats.cleaning_recovered_run_temps_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
@@ -3881,6 +3888,8 @@ pub const DB = struct {
         self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
         self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
         self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_files_deleted.store(lsm_open_stats.recovered_table_temp_files_deleted, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_bytes_deleted.store(lsm_open_stats.recovered_table_temp_bytes_deleted, .monotonic);
         self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
         self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
         self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
@@ -4184,6 +4193,10 @@ pub const DB = struct {
 
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
+            // This test verifies the explicit primary-only maintenance entry
+            // point; keep detached LSM maintenance from consuming the queued
+            // primary obsolete path before the assertion.
+            .executor = .{ .backend = .manual },
             .primary_backend = .{ .lsm = .{
                 .flush_threshold = 1,
                 .defer_flush_on_commit = true,

@@ -141,10 +141,13 @@ fn applyRestoreSnapshotIfNeeded(
             std.mem.eql(u8, state.backup_id, restore.backup_id) and
             std.mem.eql(u8, state.location, restore.location) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
-            state.group_id == group_id and
-            try restoreSnapshotMatchesPath(alloc, path, restore, options))
+            state.group_id == group_id)
         {
-            return;
+            if (!state.runtime_repair_complete or
+                try restoreSnapshotMatchesPath(alloc, path, restore, options))
+            {
+                return;
+            }
         }
     }
 
