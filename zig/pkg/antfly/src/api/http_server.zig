@@ -6371,6 +6371,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
         defer alloc.free(normalized_index_json);
@@ -6384,6 +6385,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
 
