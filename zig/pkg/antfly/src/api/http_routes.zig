@@ -102,6 +102,11 @@ pub const Routes = struct {
     pub const rows_join_suffix = "/rows/join";
     pub const rows_lateral_suffix = "/rows/lateral";
     pub const rows_mutation_source_suffix = "/rows/mutation-source";
+    pub const rows_mutation_source_collect_suffix = "/rows/mutation-source/collect";
+    pub const rows_mutation_source_stage_suffix = "/rows/mutation-source/stage";
+    pub const rows_joined_mutation_source_collect_suffix = "/rows/joined-mutation-source/collect";
+    pub const rows_joined_mutation_source_inputs_suffix = "/rows/joined-mutation-source/inputs";
+    pub const rows_joined_mutation_source_stage_suffix = "/rows/joined-mutation-source/stage";
     pub const rows_source_suffix = "/rows/source";
     pub const rows_explain_suffix = "/rows/explain";
     pub const merge_suffix = "/merge";
@@ -427,6 +432,16 @@ pub const Routes = struct {
     };
 
     pub const GroupRowsSource = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupRowsMutationSource = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupRowsJoinedMutationSource = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -1316,6 +1331,46 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupRowsMutationSourceStage(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_stage_suffix);
+    }
+
+    pub fn matchGroupRowsMutationSourceCollect(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_collect_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceStage(path: []const u8) ?GroupRowsJoinedMutationSource {
+        return matchGroupRowsJoinedMutationSourceAction(path, rows_joined_mutation_source_stage_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceCollect(path: []const u8) ?GroupRowsJoinedMutationSource {
+        return matchGroupRowsJoinedMutationSourceAction(path, rows_joined_mutation_source_collect_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceInputs(path: []const u8) ?GroupRowsJoinedMutationSource {
+        return matchGroupRowsJoinedMutationSourceAction(path, rows_joined_mutation_source_inputs_suffix);
+    }
+
+    fn matchGroupRowsMutationSourceAction(path: []const u8, suffix: []const u8) ?GroupRowsMutationSource {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    fn matchGroupRowsJoinedMutationSourceAction(path: []const u8, suffix: []const u8) ?GroupRowsJoinedMutationSource {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupBatch(path: []const u8) ?GroupBatch {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1843,6 +1898,23 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("group:eng", subject_row_filter.subject);
     try std.testing.expectEqualStrings("docs", subject_row_filter.table);
     const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a").?;
+    const group_rows_mutation_source_collect = Routes.matchGroupRowsMutationSourceCollect("/internal/v1/groups/7/tables/docs/rows/mutation-source/collect").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_mutation_source_collect.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_mutation_source_collect.table_name);
+    const group_rows_mutation_source_stage = Routes.matchGroupRowsMutationSourceStage("/internal/v1/groups/7/tables/docs/rows/mutation-source/stage").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_mutation_source_stage.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_mutation_source_stage.table_name);
+    const group_rows_joined_mutation_source_stage = Routes.matchGroupRowsJoinedMutationSourceStage("/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_joined_mutation_source_stage.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_joined_mutation_source_stage.table_name);
+    const group_rows_joined_mutation_source_collect = Routes.matchGroupRowsJoinedMutationSourceCollect("/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/collect").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_joined_mutation_source_collect.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_joined_mutation_source_collect.table_name);
+    const group_rows_joined_mutation_source_inputs = Routes.matchGroupRowsJoinedMutationSourceInputs("/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/inputs").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_joined_mutation_source_inputs.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_joined_mutation_source_inputs.table_name);
+    try std.testing.expect(Routes.matchGroupRowsMutationSourceStage("/internal/v1/groups/7/tables/docs/rows/mutation-source/stage/extra") == null);
+    try std.testing.expect(Routes.matchGroupRowsJoinedMutationSourceStage("/internal/v1/groups/7/tables/docs/child/rows/joined-mutation-source/stage") == null);
     try std.testing.expectEqualStrings("/extensions/v1/packages", Routes.extensions_v1_packages);
     const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package.name);

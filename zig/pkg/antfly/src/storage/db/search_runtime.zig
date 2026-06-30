@@ -2932,8 +2932,18 @@ pub fn Impl(comptime DB: type) type {
         ) !bool {
             if (!column.indexed) return false;
             if (column.index_lifecycle != .ready) return false;
+            if (!relationalColumnIndexKeysUsableForQuery(column)) return false;
             if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, column.index_where, columns))) return false;
             return try self.relationalRowsExpressionPredicatesImply(alloc, implications, column.index_where_expressions);
+        }
+
+        fn relationalColumnIndexKeysUsableForQuery(column: schema_mod.RelationalColumn) bool {
+            if (column.index_keys.len == 0) return true;
+            if (column.index_keys.len != 1) return false;
+            const key = column.index_keys[0];
+            return std.mem.eql(u8, key.column, column.name) and
+                key.direction == .asc and
+                key.nulls == .default;
         }
 
         pub fn resolveRelationalFilterQueryDocSetAlloc(

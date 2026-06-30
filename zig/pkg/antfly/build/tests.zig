@@ -801,6 +801,7 @@ pub const APITestFilters = struct {
         "internal group write routes expose unique integrity",
         "internal group write routes expose foreign key action job requeue",
         "batch parser accepts Go transform op spelling",
+        "batch parser and encoder preserve relational identity rewrites",
         "public table contract exposes migration metadata",
         "table contract accepts public field scoped full text create index",
         "api http client round-trips public table management routes",
@@ -983,6 +984,7 @@ pub const APITestFilters = struct {
         "sql adapter binder validates relational catalog lookups",
         "sql adapter binder resolves join projection bindings",
         "sql adapter lowering context classifies read sql into typed plan families",
+        "sql adapter lowering context rejects stale generated read clause order metadata",
         "sql adapter lowering context lowers catalog-backed equality join read plans",
         "sql adapter lowering context lowers catalog-backed bounded left join lateral read plans",
         "sql adapter diagnostics accept only stable known classification reasons",
@@ -1001,6 +1003,54 @@ pub const APITestFilters = struct {
         "catalog apply applies additive alter table ddl plan to runtime schema",
         "catalog apply applies create index ddl plan to runtime schema",
         "catalog apply applies updated-at trigger ddl plan to runtime schema",
+        "sql adapter lower dml validates generated child read payloads",
+        "sql adapter lower dml validates generated mutation tail metadata",
+        "sql adapter lower dml validates recursive generated CTE child reads",
+        "sql adapter lower dml rejects stale generated absent CTE column alias payload metadata",
+        "sql adapter lower dml rejects stale generated CTE column alias expression metadata",
+        "sql adapter lower dml lowers generated DML AST through typed write plans",
+        "sql adapter lower dml rejects stale generated DML typed write-plan metadata",
+        "sql adapter lower dml rejects stale generated DML insert-source write-plan metadata",
+        "sql adapter lower dml rejects stale generated conflict assignment ranges",
+        "sql adapter lower dml rejects stale generated absent conflict payload metadata",
+        "sql adapter lower dml rejects stale generated DML list adornment metadata",
+        "sql adapter lower dml rejects stale generated insert value row list adornment metadata",
+        "sql adapter lower dml rejects stale generated truncate target list adornment metadata",
+        "sql adapter lower dml rejects stale generated conflict update assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated conflict literal assignment rhs expression kind metadata",
+        "sql adapter lower dml rejects stale generated conflict default assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated conflict boolean assignment operator metadata",
+        "sql adapter lower dml rejects stale generated conflict boolean assignment rhs child metadata",
+        "sql adapter lower dml rejects stale generated conflict expression assignment rhs child metadata",
+        "sql adapter lower dml rejects stale generated conflict action where predicate child metadata",
+        "sql adapter lower dml rejects stale generated joined update assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated joined source assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated point update assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated merge update assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated merge update assignment function argument metadata",
+        "sql adapter lower dml rejects stale generated merge default assignment rhs metadata",
+        "sql adapter lower dml rejects stale generated merge unused action payload metadata",
+        "sql adapter lower dml rejects stale generated merge arm list boundary metadata",
+        "sql adapter lower dml rejects stale generated merge arm hook metadata",
+        "sql adapter lower dml rejects stale generated merge bodyless action hook payload metadata",
+        "sql adapter lower dml rejects stale generated merge insert value expression metadata",
+        "sql adapter lower dml rejects stale generated merge arm predicate expression metadata",
+        "sql adapter lower dml rejects stale generated merge arm expression predicate child metadata",
+        "sql adapter lower dml rejects stale generated returning alias metadata",
+        "sql adapter lower dml rejects stale generated returning parenthesized null-test expression metadata",
+        "sql adapter lower dml rejects stale generated returning boolean field expression metadata",
+        "sql adapter lower dml rejects stale generated returning boolean field expression child metadata",
+        "sql adapter lower dml rejects stale generated returning function argument metadata",
+        "sql adapter lower dml rejects stale generated returning extract field metadata",
+        "sql adapter lower dml lowers generated targetless conflict do nothing",
+        "sql adapter lower dml rejects stale generated conflict target helper payload metadata",
+        "sql adapter lower dml rejects stale generated conflict target expression argument metadata",
+        "sql adapter lower dml rejects stale generated conflict target where json predicate child metadata",
+        "sql adapter lower dml rejects stale generated targetless conflict do nothing hook payload metadata",
+        "sql adapter lower dml rejects stale generated merge CTE prefix hook range metadata",
+        "sql adapter lower dml rejects stale generated merge arm boolean is-tail predicate identity metadata",
+        "sql adapter lower dml rejects stale generated conflict case boolean is-tail predicate identity metadata",
+        "sql adapter lower dml keeps generated insert AST deinit isolated before insert-source parse",
         "sql adapter lower dml detects dotted path conflicts",
         "sql adapter lower dml detects json set path conflicts",
         "sql adapter lower dml routes write sql through typed plan families",
@@ -1066,6 +1116,7 @@ pub const APITestFilters = struct {
         "sql adapter lower expr lowers pipe concat operator expressions",
         "sql adapter lower expr lowers concat projections",
         "sql adapter lower expr lowers boolean projection operators",
+        "sql adapter lower expr peeks simple returning fields",
         "sql adapter lower expr lowers nullif projections",
         "sql adapter lower expr lowers numeric function projections",
         "sql adapter lower expr lowers unary minus projections",
@@ -1087,6 +1138,8 @@ pub const APITestFilters = struct {
         "sql adapter lower expr lowers exact percentile continuous aggregates",
         "sql adapter lower expr lowers global aggregate queries",
         "sql adapter lower expr lowers pagination limit all and fetch forms",
+        "sql adapter lower expr validates retained generated read body payloads",
+        "sql adapter lower expr rejects unsupported generated subquery predicates",
         "sql adapter lower expr lowers row claim query plans",
         "sql adapter lower expr treats direct graph table functions as relation sources",
         "sql adapter lower expr lowers select all with named extra projections",
@@ -1426,6 +1479,7 @@ pub const APITestFilters = struct {
         "internal group join routes map doc identity mismatch to conflict",
         "internal group read routes map doc identity mismatch to conflict",
         "api http client preserves group doc identity conflicts",
+        "api http client preserves public service unavailable response classes",
         "aggregation context rejects non-current identity generation",
         "aggregation full-result rerun can reuse snapped result identity generation",
         "provisioned distributed aggregations collect path terms nested cardinality",
@@ -1583,6 +1637,10 @@ pub const APITestFilters = struct {
         table_reads_docid_prefix,
     };
 
+    pub const internal_group_read_routes = [_][]const u8{
+        "internal group read routes",
+    };
+
     pub const table_reads_graph_metric = [_][]const u8{
         "hosted cross-range graph metric fan-in merges compatible hits pair",
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
@@ -1598,7 +1656,10 @@ pub const APITestFilters = struct {
     pub const public_table_http_docid = [_][]const u8{
         "public table batch handler maps doc identity unavailable errors",
         "public table query handler maps doc identity unavailable errors",
+        "public table query handler maps HA read gate errors",
         "public table query view handler maps doc identity unavailable errors",
+        "public table query view handler maps HA read gate errors",
+        "public document artifact manifest handlers map HA read gate errors",
     };
 
     pub const rows = [_][]const u8{
@@ -3432,6 +3493,7 @@ pub fn addAPITableTestSteps(
     const table_writes = addSimpleAPITestRun(b, modules.table_writes, &APITestFilters.table_writes, true);
     const provisioned_query_visibility = addSimpleAPITestRun(b, modules.table_writes, &APITestFilters.provisioned_query_visibility, true);
     const table_reads = addSimpleAPITestRun(b, modules.table_reads, &APITestFilters.table_reads, false);
+    const internal_group_read_routes = addSimpleAPITestRun(b, modules.table_reads, &APITestFilters.internal_group_read_routes, false);
     const table_reads_graph_metric = addSimpleAPITestRun(b, modules.table_reads, &APITestFilters.table_reads_graph_metric, false);
     const public_table_http_docid = addSimpleAPITestRun(b, modules.public_table_http_docid, &APITestFilters.public_table_http_docid, false);
     const rows = addSimpleAPITestRun(b, modules.rows, &APITestFilters.rows, true);
@@ -3447,6 +3509,8 @@ pub fn addAPITableTestSteps(
     addFocusedAPITestStep(b, "api-table-writes-test", "Run focused API table write tests", table_writes);
     addFocusedAPITestStep(b, "provisioned-query-visibility-test", "Run focused provisioned query visibility tests", provisioned_query_visibility);
     addFocusedAPITestStep(b, "api-table-reads-test", "Run focused API table read tests", table_reads);
+    addFocusedAPITestStep(b, "api-internal-group-read-routes-test", "Run focused internal group read route tests", internal_group_read_routes);
+    addFocusedAPITestStep(b, "api-public-table-http-test", "Run focused public table HTTP adapter tests", public_table_http_docid);
     addFocusedAPITestStep(b, "api-internal-group-write-routes-test", "Run focused internal group write route tests", internal_group_write_routes);
     addFocusedAPITestStep(b, "api-rows-test", "Run focused relational row API tests", rows);
     addFocusedAPITestStep(b, "sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests", sql_api_parity);

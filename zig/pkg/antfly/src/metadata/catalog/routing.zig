@@ -269,7 +269,7 @@ pub fn topologyEpoch(
     return tableTopologyEpochFromRanges(table.*, ranges);
 }
 
-fn tableTopologyEpochFromRanges(
+pub fn tableTopologyEpochFromRanges(
     table: metadata_table_manager.TableRecord,
     ranges: []const *const metadata_table_manager.RangeRecord,
 ) u64 {

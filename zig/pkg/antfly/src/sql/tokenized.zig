@@ -3609,14 +3609,36 @@ fn generatedReadSystemTimePayloadIsValid(
     const sequence = maybe_sequence orelse return false;
     if (source.start >= source.end or source.end > end or end > tokens.len) return false;
     if (system_time.start < source.start or system_time.end != source.end or system_time.end > end) return false;
-    if (system_time.end != system_time.start + 5) return false;
+    if (system_time.end != system_time.start + 5 and system_time.end != system_time.start + 6) return false;
     if (!tokens[system_time.start].matchesKeywordTag(.@"for")) return false;
     if (!std.ascii.eqlIgnoreCase(tokens[system_time.start + 1].text, "system_time")) return false;
     if (!tokens[system_time.start + 2].matchesKeywordTag(.as)) return false;
     if (!tokens[system_time.start + 3].matchesKeywordTag(.of)) return false;
     if (sequence.start != system_time.start + 4 or sequence.end != system_time.end) return false;
-    if (tokens[sequence.start].kind != .number) return false;
-    return std.mem.indexOfAny(u8, tokens[sequence.start].text, ".eE+-") == null;
+    return generatedReadSystemTimePayloadValueIsValid(tokens, sequence);
+}
+
+fn generatedReadSystemTimePayloadValueIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.start >= range.end or range.end > tokens.len) return false;
+    if (range.end == range.start + 1) {
+        return switch (tokens[range.start].kind) {
+            .number => std.mem.indexOfAny(u8, tokens[range.start].text, ".eE+-") == null,
+            .string => true,
+            else => false,
+        };
+    }
+    if (range.end == range.start + 2 and tokens[range.start + 1].kind == .string) {
+        return tokenMatchesSystemTimePayloadType(tokens[range.start]);
+    }
+    return false;
+}
+
+fn tokenMatchesSystemTimePayloadType(token: Token) bool {
+    const keyword = token.keyword orelse return false;
+    return keyword == .date or keyword == .timestamp or std.ascii.eqlIgnoreCase(token.text, "timestamptz");
 }
 
 fn generatedDmlReadBodyIsValid(
@@ -4511,15 +4533,29 @@ fn generatedReadJoinLateralSubqueryPayloadIsValid(
 ) bool {
     if (item.right_tokens.start >= item.right_tokens.end or item.right_tokens.end > tokens.len) return false;
     if (!tokens[item.right_tokens.start].matchesKeywordTag(.lateral)) {
-        return item.right_lateral_subquery_tokens == null and item.right_lateral_subquery_read_ast == null;
+        return item.right_lateral_subquery_tokens == null and
+            item.right_lateral_subquery_read_ast == null and
+            item.right_lateral_alias_tokens == null and
+            item.right_lateral_alias_name_tokens == null;
     }
     const subquery_tokens = item.right_lateral_subquery_tokens orelse return false;
     const subquery_read = item.right_lateral_subquery_read_ast orelse return false;
+    const alias_tokens = item.right_lateral_alias_tokens orelse return false;
+    const alias_name_tokens = item.right_lateral_alias_name_tokens orelse return false;
     if (item.right_tokens.start + 2 != subquery_tokens.start) return false;
     if (subquery_tokens.start >= subquery_tokens.end or subquery_tokens.end >= item.right_tokens.end) return false;
     if (item.right_tokens.start + 1 >= tokens.len or tokens[item.right_tokens.start + 1].kind != .lparen) return false;
     if (subquery_tokens.end >= tokens.len or tokens[subquery_tokens.end].kind != .rparen) return false;
-    if (!generatedReadJoinRelationGapIsOptionalAlias(tokens, subquery_tokens.end + 1, item.right_tokens.end)) return false;
+    if (alias_tokens.start != subquery_tokens.end + 1 or alias_tokens.end != item.right_tokens.end) return false;
+    if (alias_name_tokens.end != alias_name_tokens.start + 1 or alias_name_tokens.end > alias_tokens.end) return false;
+    if (tokens[alias_name_tokens.start].kind != .identifier) return false;
+    if (alias_tokens.end == alias_tokens.start + 2) {
+        if (!tokens[alias_tokens.start].matchesKeywordTag(.as) or alias_name_tokens.start != alias_tokens.start + 1) return false;
+    } else if (alias_tokens.end == alias_tokens.start + 1) {
+        if (alias_name_tokens.start != alias_tokens.start) return false;
+    } else {
+        return false;
+    }
     return generatedReadAstHasValidClassificationPayload(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read);
 }
 
@@ -5592,9 +5628,9 @@ fn generatedReadStatementKindFromStructuredClauses(
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) sql_statement_kind.SqlReadStatementKind {
     if (read_ast.set_operation_tokens != null) return .set_operation;
-    if (read_ast.kind == .lateral) return .lateral;
+    if (read_ast.kind == .lateral and read_ast.join_items.len != 0) return .lateral;
     if (read_ast.source_tokens) |source| {
-        if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
+        if (generatedReadRangeContainsKeyword(tokens, source, .lateral) and read_ast.join_items.len != 0) return .lateral;
     }
     if (read_ast.kind == .window or read_ast.window_tokens != null) return .window;
     if (read_ast.projection_tokens) |projection| {
@@ -5737,6 +5773,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_schema_options,
         .create_server,
         .create_statistics,
+        .create_table_missing_as,
         .create_text_search_configuration,
         .create_text_search_dictionary,
         .create_text_search_parser,
@@ -9620,7 +9657,6 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id", .generated = .join, .read = .join },
         .{ .sql = "SELECT usage_records.id FROM usage_records LEFT OUTER JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
-        .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .generated = .lateral, .read = .lateral },
         .{ .sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records", .generated = .window, .read = .window },
         .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY id) AS rn FROM usage_records", .generated = .window, .read = .window },
         .{ .sql = "SELECT id, row_number() OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM usage_records", .generated = .window, .read = .window },
@@ -10463,6 +10499,16 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         }
     }
 
+    var standalone_lateral_source = try ParsedSql.initAlloc(alloc, "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows");
+    defer standalone_lateral_source.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, standalone_lateral_source.generatedStatementKind().?);
+    switch (standalone_lateral_source.generated_statement.?.ast.?) {
+        .read => |read_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.lateral, read_ast.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(standalone_lateral_source.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(standalone_lateral_source.statement));
+
     var generated_distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
     defer generated_distinct_on.deinit(alloc);
     try std.testing.expect(generated_distinct_on.generated_statement != null);
@@ -11056,6 +11102,22 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     try std.testing.expect(generated_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
 
+    var stale_non_lateral_join_payload_generated = generated_join_query.generated_statement.?;
+    if (stale_non_lateral_join_payload_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                read_ast.join_items[0].right_lateral_alias_tokens = read_ast.join_items[0].right_tokens;
+                read_ast.join_items[0].right_lateral_alias_name_tokens = read_ast.join_items[0].right_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_join_query.statement = parseStatement(generated_join_query.raw_statement, stale_non_lateral_join_payload_generated, &generated_join_query.tokenized_sql);
+    try std.testing.expect(generated_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_join_query.statement));
+
     var generated_lateral_query = try ParsedSql.initAlloc(alloc, "SELECT org.id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true");
     defer generated_lateral_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_lateral_query.generatedStatementKind().?);
@@ -11074,6 +11136,22 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
         return error.TestUnexpectedResult;
     }
     generated_lateral_query.statement = parseStatement(generated_lateral_query.raw_statement, malformed_lateral_child_generated, &generated_lateral_query.tokenized_sql);
+    try std.testing.expect(generated_lateral_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_lateral_query.statement));
+
+    var malformed_lateral_alias_generated = generated_lateral_query.generated_statement.?;
+    if (malformed_lateral_alias_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                const alias_tokens = read_ast.join_items[0].right_lateral_alias_tokens orelse return error.TestUnexpectedResult;
+                read_ast.join_items[0].right_lateral_alias_name_tokens = alias_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_lateral_query.statement = parseStatement(generated_lateral_query.raw_statement, malformed_lateral_alias_generated, &generated_lateral_query.tokenized_sql);
     try std.testing.expect(generated_lateral_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_lateral_query.statement));
 

@@ -646,6 +646,60 @@ test "hosted remote temporal unique owner lookup resolves point interval" {
     try std.testing.expectEqual(@as(usize, 1), executor.overlap_calls);
 }
 
+test "hosted remote temporal unique owner lookup preserves unavailable owner" {
+    const alloc = std.testing.allocator;
+
+    const ExecutorState = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if ((std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-owner") or
+                std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-overlap-owner")) and
+                req.method == .POST)
+            {
+                self.calls += 1;
+                return .{
+                    .status = 503,
+                    .body = try alloc_inner.dupe(u8, "unique owner unavailable"),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor = ExecutorState{};
+
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, lookupRelationalTemporalUniqueOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        "15",
+    ));
+
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, lookupRelationalTemporalUniqueOverlapOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        "12",
+        "18",
+    ));
+
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
 pub fn scanRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -1781,6 +1835,25 @@ pub fn documentAlgebraicAggregateRemote(
     var result = try client.fetchGroupDocumentAlgebraicAggregate(base_uri, group_id, table_name, body);
     defer result.deinit(alloc);
     return try parseDocumentAlgebraicAggregateResponseAlloc(alloc, result.body);
+}
+
+pub fn rowsSourceGroupRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: table_read_core.RelationalRowsSourceGroupRequest,
+) !db_mod.types.RelationalRowsQueryResult {
+    const body = try std.json.Stringify.valueAlloc(alloc, req, .{});
+    defer alloc.free(body);
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupRowsSource(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try std.json.parseFromSliceLeaky(db_mod.types.RelationalRowsQueryResult, alloc, result.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
 }
 
 test "remote document algebraic aggregate preserves typed unavailable and not found errors" {

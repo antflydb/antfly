@@ -451,7 +451,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        try mapStatus(resp.status, null, null, null);
         return try parseJson(T, self.alloc, resp.body);
     }
 
@@ -464,7 +464,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        try mapStatus(resp.status, null, null, null);
         return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
     }
 
@@ -564,6 +564,7 @@ pub const MetadataHttpClient = struct {
         if (status == 404) return not_found_err orelse error.UnexpectedHttpStatus;
         if (status == 409) return conflict_err orelse error.UnexpectedHttpStatus;
         if (status == 405) return error.UnsupportedOperation;
+        if (status == 503) return error.LeaderUnavailable;
         return error.UnexpectedHttpStatus;
     }
 };
@@ -622,6 +623,35 @@ test "metadata http client retries transient connection close on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
+}
+
+test "metadata http client preserves service unavailable as leader unavailable" {
+    const UnavailableExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "leader unavailable"),
+            };
+        }
+    };
+
+    var executor = UnavailableExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchStatus("http://127.0.0.1:9000"));
+    try std.testing.expectError(error.LeaderUnavailable, client.triggerReallocate("http://127.0.0.1:9000"));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }
 
 test "metadata http client preserves split merge doc identity conflicts" {

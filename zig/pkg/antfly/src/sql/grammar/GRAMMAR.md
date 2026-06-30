@@ -520,13 +520,23 @@ also retains Antfly and graph table-function source payloads for non-recursive
 write CTEs and relation-source wrappers; generated `WITH ... MERGE` graph
 table-function CTEs are selected from retained metadata, and corrupt graph
 argument ranges fail closed instead of being rediscovered by a generic graph
-CTE token probe. Generated DML now also retains top-level assignment item
+CTE token probe. Generated DML read-body table-function arguments now also
+require the retained function kind to match the `antfly.*` source token, exact
+named-argument token layout, `=`/`=>` operator metadata, and duplicate-name
+rejection, and require retained argument items to cover the whole argument span
+with comma-adjacent boundaries; graph semantic argument aliases such as
+`table_name`/`table` and `index`/`graph_index` must also resolve to at most one
+retained value before source-body lowering. Generated DML now also retains top-level assignment item
 lists for `UPDATE ... SET`, `INSERT ... ON CONFLICT DO UPDATE SET`, and
 `MERGE ... WHEN MATCHED THEN UPDATE SET`; parsed-statement publication and
 generated validation require those lists to cover the retained assignment body
 exactly, and point-update lowering plus source-update and joined-update
 mutation-source lowering consume each retained assignment item instead of
 scanning the whole assignment tail and rediscovering comma boundaries.
+Generated merge-arm hook metadata also now rejects action-child payloads that do
+not belong to the retained action kind before the arm parser consumes the hook,
+so stale update assignment ranges cannot ride along on retained insert arms and
+bodyless actions must carry empty child lists.
 Generated insert-values and insert-source conflict-action lowering use the
 retained `ON CONFLICT DO UPDATE SET` assignment item list the same way, so
 stale generated conflict assignment boundaries fail closed before the conflict
@@ -564,6 +574,13 @@ from the surrounding conflict clause. Generated insert-values and insert-source
 lowering now also share one generated-aware conflict-keyword locator, so a
 top-level `ON CONFLICT` clause must agree with retained generated conflict
 metadata before either lowerer computes body boundaries. Generated
+`ON CONFLICT ON CONSTRAINT ...` target lowering also requires the retained
+target-item list to be fully empty, not just zero-count, so stale list boundary
+metadata or target-`WHERE` payloads cannot survive the named-constraint helper
+path. Generated `ON CONFLICT DO UPDATE SET` hook lowering now also requires
+the retained assignment item list and assignment range to be supplied together,
+so the update-action parser cannot consume generated item boundaries without
+the generated `SET` body range that anchors them to the conflict action.
 `INSERT ... SELECT` target
 table/alias binding now consumes the retained DML target spans and fails closed
 on stale target alias metadata before the typed insert-source lowerer can
@@ -662,7 +679,8 @@ generated clause ranges before calling their typed read-plan lowerers directly;
 single binary join reads also validate generated join-tree metadata against the
 typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
-compatibility metadata, and `ON`/`USING` condition payloads. The executable
+compatibility metadata, and `ON`/`USING` condition payloads, including
+comma-adjacent retained `USING (...)` column-list coverage. The executable
 join contract is intentionally limited to one generated binary inner/left/cross
 or natural join until the row-plan API grows N-way and right/full outer-join
 semantics;
@@ -1891,9 +1909,16 @@ body-local read AST plus alias/name spans for `LATERAL (SELECT ...)` right
 sides, and lateral subquery lowering consumes that retained child AST and alias
 metadata for early right-side qualifier inference, alias binding, and
 `FROM`-clause consumption instead of reparsing the parenthesized token slice or
-alias tail. Catalog prebinding uses the same retained lateral child read AST
-and alias metadata before resolving right-side source tables, leaving raw token
-source inference as the non-generated fallback path only.
+alias tail. Generated read-family classification, publication, and executable
+lowering now also reject stale lateral-only alias payloads on non-lateral join
+sides and require lateral alias/name spans to match the retained alias tail, so
+ordinary table joins cannot carry impossible lateral subquery metadata into
+typed lowering; standalone `FROM LATERAL (SELECT ...) AS alias` source forms
+remain generated-parseable but fail closed at read-family classification and
+retained-AST validation until a non-join lateral-source planner exists. Catalog
+prebinding uses the same retained lateral child read AST and alias metadata
+before resolving right-side source tables, leaving raw token source inference
+as the non-generated fallback path only.
 Public SQL special-case read dispatch for Antfly query functions also uses the
 shared generated-aware read classifier and retained read-AST validator, so
 generated-covered reads with stale or inconsistent retained table-function,
@@ -2334,7 +2359,9 @@ Generated grammar work needs evidence at multiple levels:
   simple-query lowering first; CTE-prefixed set-operation plans now own the
   parsed CTE list at the set-operation plan level and route both arms through
   the resolved physical base table while preserving each arm's `source_cte`
-  reference for storage materialization,
+  reference for storage materialization, and generated set-operation right-side
+  `WHERE` predicates now validate recursive expression child payloads before
+  publication,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
   prefixes, binary `JOIN ... USING (...)` and `NATURAL JOIN` lowering through
@@ -2344,13 +2371,19 @@ Generated grammar work needs evidence at multiple levels:
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata and fail-closed
   expression-owned token range containment plus operator/kind token
-  consistency validation, including `IS NULL`/boolean-test predicate keyword
-  consistency and postfix `ISNULL`/`NOTNULL` shape checks, generated function
+  consistency validation, including exact generated `ESCAPE` child payloads,
+  boolean-chain item/operator layout, `IS NULL`/boolean-test predicate keyword
+  consistency, and postfix `ISNULL`/`NOTNULL` shape checks, generated function
   call metadata now fails closed when argument `DISTINCT`/`ORDER BY`, `WITHIN
   GROUP`, or `FILTER (WHERE ...)` clause ranges disagree with their keywords
-  and parentheses, generated grouped, `CAST(... AS ...)`, and `CASE
+  and parentheses, and generated expression-owned comma lists now fail closed
+  when function argument, aggregate-order, inline window partition/order, or
+  array-constructor child payloads drift from their retained item ranges or
+  leave gaps inside their retained ranges.
+  Generated grouped, `CAST(... AS ...)`, and `CASE
   WHEN ... THEN ... ELSE ... END` expression metadata now fails closed when
-  child ranges disagree with clause keywords and enclosure tokens, generated
+  child ranges or branch child payloads disagree with clause keywords,
+  list-item ranges, and enclosure tokens, generated
   projection/group/order alias metadata now fails closed when `AS name` or
   bare alias ranges disagree with the underlying list-item tokens, and
   generated ordering lists now fail closed when typed `ASC`/`DESC`, `USING`
@@ -2361,8 +2394,9 @@ Generated grammar work needs evidence at multiple levels:
   retained `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`,
   `OFFSET`, or `FETCH` payload ranges are not preceded by their matching
   clause keywords.
-  Subquery expression tests cover generated
-  `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
+  Subquery expression tests cover exact generated projection-list and
+  tail `ORDER BY` list payloads, tail clause-order/end-of-query validation,
+  `LIMIT`, `OFFSET`, and `FETCH` payloads plus fail-closed
   malformed subquery tail validation, including recursive checks for retained
   subquery result-tail expression payloads.
   Graph DDL has generated AST-to-plan parity for executable graph index and

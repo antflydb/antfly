@@ -1245,29 +1245,17 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn rowsSetOperationPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlan(alloc, table_name, runtime_schema, plan, consistency);
-        if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
-
-        var left = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.left, consistency)) orelse return null;
-        defer left.deinit(alloc);
-        var right = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.right, consistency)) orelse return null;
-        defer right.deinit(alloc);
-        return try table_read_relational_rows.executeSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+        return try lake_source.source().rowsSetOperationPlan(alloc, table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsSetOperationPlanCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlanCatalog(alloc, target, runtime_schema, plan, consistency);
-        if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
-
-        var left = (try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan.left, consistency)) orelse return null;
-        defer left.deinit(alloc);
-        var right = (try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan.right, consistency)) orelse return null;
-        defer right.deinit(alloc);
-        return try table_read_relational_rows.executeSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+        return try lake_source.source().rowsSetOperationPlan(alloc, target.table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsAggregatePlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsAggregatePlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsAggregateResult {
@@ -1318,9 +1306,9 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         return try lake_source.source().rowsLateralPlan(alloc, table_name, runtime_schema, plan, consistency);
     }
 
-    fn relationalRowsSourceGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, schema_json: []const u8, topology_epoch: u64, req: db_mod.types.RelationalRowsQueryRequest, doc_key_range: db_mod.types.RelationalRowsDocKeyRange, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+    fn relationalRowsSourceGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, schema_json: []const u8, topology_epoch: u64, req: db_mod.types.RelationalRowsQueryRequest, doc_key_range: db_mod.types.RelationalRowsDocKeyRange, system_time: ?table_read_core.RelationalRowsSourceGroupSystemTime, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.base.relationalRowsSourceGroupLocal(alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, consistency);
+        return try self.base.relationalRowsSourceGroupLocal(alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, system_time, consistency);
     }
 
     fn scanGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
@@ -1519,7 +1507,11 @@ pub fn rowsSetOperationPlanFromLakeScanAlloc(
     plan: db_mod.types.RelationalRowsSetOperationPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
-    if (plan.ctes.len != 0) return error.UnsupportedRowsQuery;
+    if (plan.ctes.len != 0) {
+        var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+        defer base_rows.deinit(alloc);
+        return try relational_rows_api.executeRowsSetOperationPlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+    }
     var left = (try rowsQueryPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
     defer left.deinit(alloc);
     var right = (try rowsQueryPlanFromLakeScanAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;
@@ -1535,7 +1527,6 @@ pub fn rowsWindowPlanFromLakeScanAlloc(
     plan: db_mod.types.RelationalRowsWindowPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsWindowResult {
-    if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
     var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
     defer base_rows.deinit(alloc);
     return try relational_rows_api.executeRowsWindowPlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
@@ -2639,6 +2630,28 @@ test "external lake row plans route broad relational operators through lake scan
     try std.testing.expectEqual(@as(usize, 1), cte_query_result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":30}", cte_query_result.rows[0]);
 
+    const cte_set_side = db_mod.types.RelationalRowsQueryPlan{ .query = .{
+        .source_cte = "high_amounts",
+        .select = select[0..],
+        .select_all = false,
+    } };
+    var cte_set_result = (try source.rowsSetOperationPlan(alloc, "events", schema, .{
+        .operation = .union_all,
+        .ctes = lake_ctes[0..],
+        .left = cte_set_side,
+        .right = cte_set_side,
+        .order_by = set_order[0..],
+        .limit = 2,
+    }, .read_index)).?;
+    defer cte_set_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 29), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), cte_set_result.total);
+    try std.testing.expectEqual(@as(usize, 2), cte_set_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", cte_set_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"amount\":30}", cte_set_result.rows[1]);
+
     var cte_aggregate_result = (try source.rowsAggregatePlan(alloc, "events", schema, .{
         .ctes = lake_ctes[0..],
         .aggregate = .{
@@ -2647,11 +2660,45 @@ test "external lake row plans route broad relational operators through lake scan
         },
     }, .read_index)).?;
     defer cte_aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 29), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 30), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), cte_aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":1,\"sum_amount\":30}", cte_aggregate_result.rows[0]);
+
+    var ranged_window_result = (try source.rowsWindowPlan(alloc, "events", schema, .{
+        .ranges = lake_range[0..],
+        .window = .{
+            .source = .{ .select_all = true },
+            .windows = windows[0..],
+            .select = select[0..],
+            .order_by = window_order[0..],
+        },
+    }, .read_index)).?;
+    defer ranged_window_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 31), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), ranged_window_result.total_rows);
+    try std.testing.expectEqual(@as(usize, 1), ranged_window_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30,\"rn\":1}", ranged_window_result.rows[0]);
+
+    var cte_window_result = (try source.rowsWindowPlan(alloc, "events", schema, .{
+        .ctes = lake_ctes[0..],
+        .window = .{
+            .source = .{ .source_cte = "high_amounts" },
+            .windows = windows[0..],
+            .select = select[0..],
+            .order_by = window_order[0..],
+        },
+    }, .read_index)).?;
+    defer cte_window_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 32), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), cte_window_result.total_rows);
+    try std.testing.expectEqual(@as(usize, 1), cte_window_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30,\"rn\":1}", cte_window_result.rows[0]);
 }
 
 test "pinned external lake rows scanner validates schema binding against inventory" {
@@ -3326,6 +3373,106 @@ test "opened object storage iceberg source applies position delete files" {
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
 }
 
+test "opened object storage iceberg source applies equality delete files" {
+    const alloc = std.testing.allocator;
+    const metadata_json = icebergRoutingMetadataJsonWithSchema();
+    var metadata_plan = try external_source_api.parseIcebergMetadataPlanAlloc(
+        alloc,
+        "s3://bucket/events/metadata/v1.metadata.json",
+        metadata_json,
+        null,
+    );
+    defer metadata_plan.deinit(alloc);
+
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = metadata_plan.schema_fingerprint,
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var version_hint = try client.putObject("bucket", "events/metadata/version-hint.text", "1\n", .{});
+    defer version_hint.deinit(alloc);
+    var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", metadata_json, .{});
+    defer metadata_file.deinit(alloc);
+
+    const data_file_path = "s3://bucket/events/data/a.parquet";
+    const data_columns = [_]serverless_query.LakeParquetTestPlainI64Column{.{
+        .column_id = "amount",
+        .values = &[_]i64{ 10, 20, 30 },
+        .field_id = 1,
+    }};
+    const data_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &data_columns, &.{});
+    defer alloc.free(data_object);
+    var data_put = try client.putObject("bucket", "events/data/a.parquet", data_object, .{});
+    defer data_put.deinit(alloc);
+
+    const delete_file_path = "s3://bucket/events/deletes/eq-a.parquet";
+    const delete_columns = [_]serverless_query.LakeParquetTestPlainI64Column{.{
+        .column_id = "amount",
+        .values = &[_]i64{20},
+        .field_id = 1,
+    }};
+    const delete_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &delete_columns, &.{});
+    defer alloc.free(delete_object);
+    var delete_put = try client.putObject("bucket", "events/deletes/eq-a.parquet", delete_object, .{});
+    defer delete_put.deinit(alloc);
+
+    var data_manifest = try buildIcebergRoutingOneDataManifestFixture(alloc, data_file_path, 3, data_object.len);
+    defer data_manifest.deinit(alloc);
+    var delete_manifest = try buildIcebergRoutingEqualityDeleteManifestFixture(alloc, delete_file_path, 1, delete_object.len, &.{1});
+    defer delete_manifest.deinit(alloc);
+    var manifest_list = try buildIcebergRoutingDataAndDeleteManifestListFixture(
+        alloc,
+        data_manifest.items.len,
+        delete_manifest.items.len,
+    );
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+    var delete_manifest_put = try client.putObject("bucket", "events/metadata/d-a.avro", delete_manifest.items, .{});
+    defer delete_manifest_put.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    const projection = [_][]const u8{"amount"};
+    var result = try opened_source.owned_source.pinned_source.scanner.scanAlloc(alloc, schema, .{
+        .projected_columns = &projection,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 10), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
 test "external lake routing source resolves object store for external row plans" {
     const alloc = std.testing.allocator;
     var columns = [_]storage_schema.RelationalColumn{
@@ -3499,6 +3646,34 @@ fn icebergRoutingMetadataJson() []const u8 {
     ;
 }
 
+fn icebergRoutingMetadataJsonWithSchema() []const u8 {
+    return
+    \\{
+    \\  "format-version": 2,
+    \\  "table-uuid": "uuid-events",
+    \\  "location": "s3://bucket/events",
+    \\  "current-schema-id": 7,
+    \\  "schemas": [
+    \\    {
+    \\      "schema-id": 7,
+    \\      "fields": [
+    \\        {"id": 1, "name": "amount", "required": true, "type": "long"}
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "current-snapshot-id": 12,
+    \\  "snapshots": [
+    \\    {
+    \\      "snapshot-id": 12,
+    \\      "sequence-number": 42,
+    \\      "timestamp-ms": 1700000000000,
+    \\      "manifest-list": "s3://bucket/events/metadata/snap-12.avro"
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
 fn buildIcebergRoutingManifestListFixture(alloc: std.mem.Allocator, data_manifest_len: usize) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -3616,6 +3791,36 @@ fn buildIcebergRoutingDeleteManifestFixture(
     return out;
 }
 
+fn buildIcebergRoutingEqualityDeleteManifestFixture(
+    alloc: std.mem.Allocator,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: usize,
+    equality_ids: []const i32,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingEqualityDeleteManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingDataManifestRecordWithContentAndSequences(
+        alloc,
+        &block,
+        1,
+        2,
+        file_path,
+        record_count,
+        @intCast(file_size_in_bytes),
+        44,
+        45,
+    );
+    try appendIcebergRoutingIntArray(alloc, &block, equality_ids);
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
 fn icebergRoutingManifestListSchema() []const u8 {
     return
     \\{"type":"record","name":"manifest_file","fields":[
@@ -3649,6 +3854,23 @@ fn icebergRoutingDataManifestSchema() []const u8 {
     ;
 }
 
+fn icebergRoutingEqualityDeleteManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"},
+    \\{"name":"equality_ids","type":{"type":"array","items":"int"}}]}}]}
+    ;
+}
+
 fn appendIcebergRoutingDataManifestRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -3677,13 +3899,37 @@ fn appendIcebergRoutingDataManifestRecordWithContent(
     record_count: i64,
     file_size_in_bytes: i64,
 ) !void {
+    return try appendIcebergRoutingDataManifestRecordWithContentAndSequences(
+        alloc,
+        out,
+        status,
+        content,
+        file_path,
+        record_count,
+        file_size_in_bytes,
+        42,
+        43,
+    );
+}
+
+fn appendIcebergRoutingDataManifestRecordWithContentAndSequences(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: i64,
+    content: i64,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+    data_sequence_number: i64,
+    file_sequence_number: i64,
+) !void {
     try appendIcebergRoutingLong(alloc, out, status);
     try appendIcebergRoutingLong(alloc, out, 1);
     try appendIcebergRoutingLong(alloc, out, 12);
     try appendIcebergRoutingLong(alloc, out, 1);
-    try appendIcebergRoutingLong(alloc, out, 42);
+    try appendIcebergRoutingLong(alloc, out, data_sequence_number);
     try appendIcebergRoutingLong(alloc, out, 1);
-    try appendIcebergRoutingLong(alloc, out, 43);
+    try appendIcebergRoutingLong(alloc, out, file_sequence_number);
     try appendIcebergRoutingLong(alloc, out, content);
     try appendIcebergRoutingString(alloc, out, file_path);
     try appendIcebergRoutingString(alloc, out, "PARQUET");
@@ -3736,6 +3982,20 @@ fn appendIcebergRoutingLong(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
         remaining >>= 7;
     }
     try out.append(alloc, @intCast(remaining));
+}
+
+fn appendIcebergRoutingIntArray(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    values: []const i32,
+) !void {
+    if (values.len == 0) {
+        try appendIcebergRoutingLong(alloc, out, 0);
+        return;
+    }
+    try appendIcebergRoutingLong(alloc, out, @intCast(values.len));
+    for (values) |value| try appendIcebergRoutingLong(alloc, out, value);
+    try appendIcebergRoutingLong(alloc, out, 0);
 }
 
 fn encodeIcebergRoutingZigzag(value: i64) u64 {

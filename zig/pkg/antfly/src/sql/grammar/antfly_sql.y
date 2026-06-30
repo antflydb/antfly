@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10406
+%expect 10424
 
 %start statement
 
@@ -225,7 +225,7 @@ create_schema_statement:
   ;
 
 create_table_statement:
-    CREATE relation_lifetime_opt TABLE if_not_exists_opt qualified_name create_table_body create_table_partition_opt create_table_option_list_opt
+    CREATE relation_lifetime_opt TABLE index_target_relation_prefix_opt if_not_exists_opt qualified_name create_table_body create_table_partition_opt create_table_option_list_opt
   ;
 
 create_table_body:
@@ -744,10 +744,15 @@ graph_statement:
 
 cursor_statement:
     CLOSE diagnostic_tail
-  | DECLARE identifier_name declare_cursor_options_opt CURSOR declare_cursor_hold_opt FOR read_statement
+  | DECLARE identifier_name declare_cursor_options_opt CURSOR declare_cursor_hold_opt FOR cursor_subject_statement
   | DECLARE diagnostic_tail
   | FETCH diagnostic_tail
   | MOVE diagnostic_tail
+  ;
+
+cursor_subject_statement:
+    read_statement
+  | dml_statement
   ;
 
 declare_cursor_options_opt:
@@ -779,8 +784,8 @@ unsupported_statement:
   | ANALYZE ANALYZE_VERBOSE qualified_name analyze_column_list_opt
   | EXPLAIN explain_options_opt explain_subject_opt
   | DO diagnostic_tail_opt
-  | INSERT INTO insert_target OVERRIDING SYSTEM VALUE diagnostic_tail
-  | INSERT INTO insert_target OVERRIDING USER VALUE diagnostic_tail
+  | INSERT INTO insert_target insert_columns_opt OVERRIDING SYSTEM VALUE insert_overriding_body
+  | INSERT INTO insert_target insert_columns_opt OVERRIDING USER VALUE insert_overriding_body
   | CREATE DATABASE if_not_exists_opt qualified_name diagnostic_tail
   | CREATE SCHEMA if_not_exists_opt qualified_name diagnostic_tail
   | CREATE ACCESS METHOD diagnostic_tail_opt
@@ -860,6 +865,12 @@ unsupported_statement:
   | UNLISTEN diagnostic_tail_opt
   ;
 
+insert_overriding_body:
+    VALUES value_tuple_list conflict_clause_opt returning_clause_opt
+  | DEFAULT VALUES conflict_clause_opt returning_clause_opt
+  | read_statement conflict_clause_opt returning_clause_opt
+  ;
+
 explain_options_opt:
     /* empty */
   | ANALYZE
@@ -913,6 +924,7 @@ column_definition_list:
 table_definition:
     column_definition
   | table_constraint
+  | table_constraint table_constraint_attribute_list
   | period_table_constraint
   | LIKE qualified_name table_like_options_opt
   ;
@@ -1031,10 +1043,14 @@ column_constraint_list:
 column_constraint:
     PRIMARY KEY
   | UNIQUE
+  | NULLS DISTINCT
+  | NULLS NOT DISTINCT
+  | INCLUDE LPAREN identifier_list RPAREN
+  | table_constraint_attribute
   | NOT NULL
   | DEFAULT expression
   | CHECK LPAREN expression RPAREN
-  | IDENT qualified_name LPAREN identifier_list RPAREN foreign_key_action_list_opt
+  | IDENT qualified_name LPAREN identifier_list RPAREN foreign_key_match_opt foreign_key_action_list_opt
   | CONSTRAINT identifier_name column_constraint
   | IDENT identifier_name
   | generated_column_constraint
@@ -1179,7 +1195,15 @@ table_relation_source:
 
 system_time_as_of_opt:
     /* empty */
-  | SYSTEM_TIME_FOR IDENT AS OF NUMBER
+  | SYSTEM_TIME_FOR IDENT AS OF system_time_as_of_value
+  ;
+
+system_time_as_of_value:
+    NUMBER
+  | STRING
+  | DATE STRING
+  | TIMESTAMP STRING
+  | TIMESTAMPTZ STRING
   ;
 
 table_function_alias_opt:
@@ -1814,8 +1838,14 @@ type_modifier_opt:
 
 type_keyword_name:
     DATE
-  | TIMESTAMP
+  | TIMESTAMP timestamp_time_zone_opt
   | TIMESTAMPTZ
+  ;
+
+timestamp_time_zone_opt:
+    /* empty */
+  | WITH identifier_name identifier_name
+  | WITHOUT identifier_name identifier_name
   ;
 
 array_type_suffix_opt:

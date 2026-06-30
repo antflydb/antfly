@@ -720,6 +720,7 @@ pub fn matchStandaloneSqlBooleanLiteral(tokens: []const Token, pos: *usize) ?boo
 pub fn parseNullableSqlU32Value(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeywordTag(.null)) return null;
+    _ = cursor.matchToken(.plus);
     if (cursor.matchToken(.number)) |token| {
         return try std.fmt.parseInt(u32, token.text, 10);
     }
@@ -1557,6 +1558,10 @@ test "sql adapter value parses limit offset and fetch values" {
         .{ .kind = .number, .text = "5" },
         .{ .kind = .identifier, .text = "rows" },
         .{ .kind = .identifier, .text = "only" },
+        .{ .kind = .plus, .text = "+" },
+        .{ .kind = .number, .text = "9" },
+        .{ .kind = .plus, .text = "+" },
+        .{ .kind = .placeholder, .text = "$1" },
     };
 
     var all_pos: usize = 0;
@@ -1582,6 +1587,14 @@ test "sql adapter value parses limit offset and fetch values" {
     var fetch_number_pos: usize = 8;
     try std.testing.expectEqual(@as(?u32, 5), try parseFetchLimitValue(tokens[0..], &fetch_number_pos, params[0..]));
     try std.testing.expectEqual(@as(usize, 12), fetch_number_pos);
+
+    var plus_limit_pos: usize = 12;
+    try std.testing.expectEqual(@as(?u32, 9), try parseLimitValue(tokens[0..], &plus_limit_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 14), plus_limit_pos);
+
+    var plus_param_pos: usize = 14;
+    try std.testing.expectEqual(@as(u32, 7), try parseOffsetValue(tokens[0..], &plus_param_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 16), plus_param_pos);
 }
 
 test "sql adapter value coerces text placeholders through column type" {

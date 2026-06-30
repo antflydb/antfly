@@ -302,6 +302,49 @@ pub fn buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
     conflict_resolver: ?UniqueSelectorResolver,
     default_context: DefaultValueContext,
 ) !OwnedRowsBatchRequest {
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidRowsRequest;
+    db_mod.DB.validateRelationalRowsInsertSourceRequestWithSchemas(target_schema, source_schema, req) catch return error.InvalidRowsRequest;
+    if (req.on_conflict != null) _ = conflict_resolver orelse return error.UnsupportedRowsSelector;
+
+    const selected_source_query = rowsInsertSourceFullRowQuery(req.source);
+    var selected_source_rows = try executeRowsQueryOnJsonRowsAlloc(alloc, source_schema, selected_source_query, source_rows);
+    defer selected_source_rows.deinit(alloc);
+
+    return try buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
+        alloc,
+        table_name,
+        target_schema,
+        source_schema,
+        req,
+        selected_source_rows.rows,
+        conflict_resolver,
+        default_context,
+    );
+}
+
+fn rowsInsertSourceFullRowQuery(req: db_mod.types.RelationalRowsQueryRequest) db_mod.types.RelationalRowsQueryRequest {
+    var query = req;
+    query.source_cte = "";
+    query.select = &.{};
+    query.json_extract = &.{};
+    query.array_length = &.{};
+    query.coalesce = &.{};
+    query.field_aliases = &.{};
+    query.expressions = &.{};
+    query.select_all = true;
+    return query;
+}
+
+fn buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    source_rows: []const []const u8,
+    conflict_resolver: ?UniqueSelectorResolver,
+    default_context: DefaultValueContext,
+) !OwnedRowsBatchRequest {
     const schema = target_schema;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
     db_mod.DB.validateRelationalRowsInsertSourceRequestWithSchemas(target_schema, source_schema, req) catch return error.InvalidRowsRequest;
@@ -335,7 +378,6 @@ pub fn buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
     }
 
     for (source_rows) |source_row_json| {
-        if (!try rowJsonInDocKeyRangeAlloc(alloc, source_schema, source_row_json, req.source.doc_key_range)) continue;
         const row_json = try insertSourceAssignedRowJsonAlloc(alloc, req, source_row_json);
         defer alloc.free(row_json);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
@@ -345,18 +387,10 @@ pub fn buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
         if (req.on_conflict) |conflict| {
             const planned = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, parsed.value, default_context);
             defer alloc.free(planned);
-            const duplicate_key = try typedConflictTargetDuplicateKeyAlloc(alloc, schema, planned, conflict.target);
-            var duplicate_key_transferred = false;
-            errdefer if (!duplicate_key_transferred) if (duplicate_key) |key| alloc.free(key);
-            if (duplicate_key) |key| {
-                const gop = try proposed_conflict_targets.getOrPut(alloc, key);
-                if (gop.found_existing) {
-                    duplicate_key_transferred = true;
-                    alloc.free(key);
-                    if (conflict.action == .update) return error.InvalidRowsRequest;
-                    continue;
-                }
-                duplicate_key_transferred = true;
+            const duplicate_keys = try typedConflictTargetDuplicateKeysAlloc(alloc, schema, planned, conflict.target);
+            if (try proposedConflictTargetsContainOrPutAllAlloc(alloc, &proposed_conflict_targets, duplicate_keys)) {
+                if (conflict.action == .update) return error.InvalidRowsRequest;
+                continue;
             }
             const conflict_key = try typedConflictTargetPrimaryKeyAlloc(alloc, table_name, schema, planned, conflict.target, conflict_resolver.?);
             defer if (conflict_key) |key| alloc.free(key);
@@ -467,7 +501,7 @@ pub fn buildRowsInsertSourceBatchFromDbAcrossRangesAlloc(
     defer alloc.free(source_rows);
     for (source_preimages, 0..) |row, i| source_rows[i] = row.json;
 
-    return try buildRowsInsertSourceBatchWithSchemasAlloc(
+    return try buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
         alloc,
         table_name,
         target_schema,
@@ -475,6 +509,7 @@ pub fn buildRowsInsertSourceBatchFromDbAcrossRangesAlloc(
         req,
         source_rows,
         conflict_resolver,
+        .{},
     );
 }
 
@@ -525,7 +560,7 @@ pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
     var final_source_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, final_source_schema, final_source_query, final_source_rows, final_source_ranges);
     defer final_source_result.deinit(alloc);
 
-    var batch = try buildRowsInsertSourceBatchWithSchemasAlloc(
+    var batch = try buildRowsInsertSourceBatchFromSelectedRowsWithSchemasAndDefaultContextAlloc(
         alloc,
         table_name,
         target_schema,
@@ -533,6 +568,7 @@ pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
         plan.insert_source,
         final_source_result.rows,
         conflict_resolver,
+        .{},
     );
     batch.req.sync_level = plan.sync_level;
     return batch;
@@ -620,6 +656,78 @@ pub fn executeRowsQueryPlanFromDbAlloc(
     defer base_rows.deinit(alloc);
 
     return try executeRowsQueryPlanOnJsonRowsAlloc(alloc, base_schema, plan, base_rows.rows);
+}
+
+pub fn executeRowsSetOperationPlanOnJsonRowsAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    base_rows: []const []const u8,
+) !OwnedRowsQueryResult {
+    if (base_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+    if (plan.left.ctes.len != 0 or plan.right.ctes.len != 0) return error.InvalidRowsRequest;
+    try validateRowsPlanRanges(plan.left.ranges);
+    try validateRowsPlanRanges(plan.right.ranges);
+
+    var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, base_schema, base_rows, &.{}, plan.ctes);
+    defer materialized_ctes.deinit(alloc);
+    try validateRowsQueryAgainstPlannedCteOutput(materialized_ctes.planned, plan.left.query);
+    try validateRowsQueryAgainstPlannedCteOutput(materialized_ctes.planned, plan.right.query);
+
+    var left = try executeRowsSetOperationSideOnJsonRowsAlloc(
+        alloc,
+        base_schema,
+        base_rows,
+        materialized_ctes.ctes.items,
+        "set_operation_left",
+        plan.left,
+    );
+    defer left.deinit(alloc);
+    var right = try executeRowsSetOperationSideOnJsonRowsAlloc(
+        alloc,
+        base_schema,
+        base_rows,
+        materialized_ctes.ctes.items,
+        "set_operation_right",
+        plan.right,
+    );
+    defer right.deinit(alloc);
+
+    var combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left.rows, right.rows);
+    var combined_owned = true;
+    defer if (combined_owned) row_spill.freeJsonRows(alloc, combined);
+
+    const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(combined) orelse return error.UnsupportedRowsQuery;
+    switch (db_mod.types.relationalRowsSetOperationMaterializationDecision(plan, combined.len, materialized_bytes)) {
+        .memory => {},
+        .reject => return error.RelationalRowsCteMaterializationRejected,
+        .spill => {
+            combined = try row_spill.spillAndReloadOwnedJsonRowsAlloc(alloc, combined, materialized_bytes, "set-operation");
+            combined_owned = true;
+        },
+    }
+    return try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "set_operation", combined, .{
+        .select_all = true,
+        .order_by = plan.order_by,
+        .limit = plan.limit,
+        .offset = plan.offset,
+    });
+}
+
+fn executeRowsSetOperationSideOnJsonRowsAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    base_rows: []const []const u8,
+    materialized_ctes: []RowsJsonMaterializedCte,
+    base_name: []const u8,
+    plan: OwnedRowsQueryPlan,
+) !OwnedRowsQueryResult {
+    var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes, base_name, base_schema, base_rows, plan.query.source_cte)) orelse return error.InvalidRowsRequest;
+    defer source.deinit(alloc);
+    var query = plan.query;
+    query.source_cte = "";
+    const ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (plan.query.source_cte.len == 0) plan.ranges else &.{};
+    return try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source.schema, query, source.rows, ranges);
 }
 
 pub fn executeRowsAggregatePlanOnJsonRowsAlloc(
@@ -1028,10 +1136,20 @@ fn loadRowsJsonSpilledCteAlloc(alloc: std.mem.Allocator, spill: row_spill.Spille
     return .{ .rows = rows, .total = total };
 }
 
-fn rowsAggregateSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
+fn rowsFullSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
     var source = source_req;
     source.select = &.{};
+    source.json_extract = &.{};
+    source.array_length = &.{};
+    source.coalesce = &.{};
+    source.field_aliases = &.{};
+    source.expressions = &.{};
     source.select_all = true;
+    return source;
+}
+
+fn rowsAggregateSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
+    var source = rowsFullSourceQuery(source_req);
     source.order_by = &.{};
     source.limit = null;
     source.offset = 0;
@@ -1039,17 +1157,11 @@ fn rowsAggregateSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryReq
 }
 
 fn rowsJoinSideSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
-    var source = source_req;
-    source.select = &.{};
-    source.select_all = true;
-    return source;
+    return rowsFullSourceQuery(source_req);
 }
 
 fn rowsLateralLeftSourceQuery(source_req: OwnedRowsQueryRequest) OwnedRowsQueryRequest {
-    var source = source_req;
-    source.select = &.{};
-    source.select_all = true;
-    return source;
+    return rowsFullSourceQuery(source_req);
 }
 
 fn rowsPlanRangesForJoinAlloc(
@@ -2137,6 +2249,414 @@ pub fn parseRowsMutationSourceRequest(
     } };
 }
 
+pub fn encodeRowsMutationSourceRequestAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.RelationalRowsMutationSourceRequest,
+) ![]u8 {
+    if (req.patch_expressions.len != 0 or
+        req.increment_expressions.len != 0 or
+        req.json_set_expressions.len != 0 or
+        req.returning_expressions.len != 0 or
+        req.temporal_portion != null)
+    {
+        return error.UnsupportedOperation;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"op\":");
+    try writer.print("{f}", .{std.json.fmt(rowsMutationKindText(req.kind), .{})});
+    try writer.writeAll(",\"source\":");
+    try encodeRowsMutationSourceQueryRequest(writer, req.source);
+
+    if (req.rewrite_identity) try writer.writeAll(",\"rewrite_identity\":true");
+    if (req.restart_identity) try writer.writeAll(",\"restart_identity\":true");
+    if (req.operations.len != 0) {
+        if (req.kind != .update) return error.UnsupportedOperation;
+        try writer.writeAll(",\"patch\":{");
+        for (req.operations, 0..) |op, i| {
+            if (op.op != .set or op.path.len == 0) return error.UnsupportedOperation;
+            const value_json = op.value_json orelse return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(op.path, .{})});
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte('}');
+    }
+    if (req.returning_all or req.returning.len != 0) {
+        try writer.writeAll(",\"returning\":[");
+        if (req.returning_all) {
+            try writer.print("{f}", .{std.json.fmt("*", .{})});
+        } else {
+            for (req.returning, 0..) |field, i| {
+                if (field.len == 0) return error.UnsupportedOperation;
+                if (i > 0) try writer.writeByte(',');
+                try writer.print("{f}", .{std.json.fmt(field, .{})});
+            }
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+pub fn encodeRowsJoinedMutationSourceRequestAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+) ![]u8 {
+    if (req.ctes.len != 0 or
+        req.match_expression_predicates.len != 0 or
+        req.match_expression_or_predicates.len != 0 or
+        req.match_expression_not_predicates.len != 0 or
+        req.match_expression_array_contains.len != 0 or
+        req.rewrite_identity or
+        req.patch_expressions.len != 0 or
+        req.increment_expressions.len != 0 or
+        req.json_set_expressions.len != 0 or
+        req.returning_expressions.len != 0)
+    {
+        return error.UnsupportedOperation;
+    }
+    if (req.join.join_type != .inner or
+        req.join.strategy != .auto or
+        req.join.select.len != 0 or
+        req.join.on_expression_predicates.len != 0 or
+        req.join.on_expression_or_predicates.len != 0 or
+        req.join.on_expression_not_predicates.len != 0 or
+        req.join.on_expression_array_contains.len != 0 or
+        req.join.match_expression_predicates.len != 0 or
+        req.join.match_expression_or_predicates.len != 0 or
+        req.join.match_expression_not_predicates.len != 0 or
+        req.join.match_expression_array_contains.len != 0)
+    {
+        return error.UnsupportedOperation;
+    }
+
+    const target_query = if (req.target_side == .left) req.join.left else req.join.right;
+    const source_query = if (req.target_side == .left) req.join.right else req.join.left;
+    if (target_query.row_claim == null or source_query.row_claim != null) return error.UnsupportedOperation;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"op\":");
+    try writer.print("{f}", .{std.json.fmt(rowsMutationKindText(req.kind), .{})});
+    if (req.source_table.len != 0) {
+        try writer.print(",\"source_table\":{f}", .{std.json.fmt(req.source_table, .{})});
+    }
+    try writer.print(",\"target_side\":{f}", .{std.json.fmt(rowsJoinProjectionSideText(req.target_side), .{})});
+    try writer.writeAll(",\"join\":");
+    try encodeRowsJoinedMutationSourceJoin(writer, req.join);
+
+    if (req.source_assignments.len != 0) {
+        if (req.kind != .update) return error.UnsupportedOperation;
+        try writer.writeAll(",\"source_assignments\":[");
+        for (req.source_assignments, 0..) |assignment, i| {
+            if (assignment.field.len == 0 or assignment.source_field.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print(
+                "{{\"target_field\":{f},\"side\":{f},\"field\":{f}}}",
+                .{
+                    std.json.fmt(assignment.field, .{}),
+                    std.json.fmt(rowsJoinProjectionSideText(assignment.source_side), .{}),
+                    std.json.fmt(assignment.source_field, .{}),
+                },
+            );
+        }
+        try writer.writeByte(']');
+    }
+    if (req.operations.len != 0) {
+        if (req.kind != .update) return error.UnsupportedOperation;
+        try writer.writeAll(",\"patch\":{");
+        for (req.operations, 0..) |op, i| {
+            if (op.op != .set or op.path.len == 0) return error.UnsupportedOperation;
+            const value_json = op.value_json orelse return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(op.path, .{})});
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte('}');
+    }
+    if (req.returning_all or req.returning.len != 0) {
+        try writer.writeAll(",\"returning\":[");
+        if (req.returning_all) {
+            try writer.print("{f}", .{std.json.fmt("*", .{})});
+        } else {
+            for (req.returning, 0..) |field, i| {
+                if (field.len == 0) return error.UnsupportedOperation;
+                if (i > 0) try writer.writeByte(',');
+                try writer.print("{f}", .{std.json.fmt(field, .{})});
+            }
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn encodeRowsJoinedMutationSourceJoin(writer: *std.Io.Writer, req: db_mod.types.RelationalRowsJoinRequest) !void {
+    try writer.writeAll("{\"left\":");
+    try encodeRowsMutationSourceQueryRequest(writer, req.left);
+    try writer.writeAll(",\"right\":");
+    try encodeRowsMutationSourceQueryRequest(writer, req.right);
+    if (req.on.len != 0) {
+        try writer.writeAll(",\"on\":[");
+        for (req.on, 0..) |join_on, i| {
+            if (join_on.left_field.len == 0 or join_on.right_field.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.print(
+                "{{\"left_field\":{f},\"right_field\":{f}}}",
+                .{ std.json.fmt(join_on.left_field, .{}), std.json.fmt(join_on.right_field, .{}) },
+            );
+        }
+        try writer.writeByte(']');
+    }
+    if (req.order_by.len != 0) {
+        try writer.writeAll(",\"order_by\":[");
+        for (req.order_by, 0..) |order, i| {
+            if (order.expression != null or order.field.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            try writer.print("\"field\":{f}", .{std.json.fmt(order.field, .{})});
+            if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
+            if (order.null_test) |null_test| {
+                try writer.writeAll(",\"null_test\":");
+                try writer.print("{f}", .{std.json.fmt(rowsQueryOrderNullTestText(null_test), .{})});
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (req.limit) |limit| try writer.print(",\"limit\":{d}", .{limit});
+    if (req.offset != 0) try writer.print(",\"offset\":{d}", .{req.offset});
+    try writer.writeByte('}');
+}
+
+fn rowsMutationKindText(kind: db_mod.types.RelationalRowsMutationKind) []const u8 {
+    return switch (kind) {
+        .update => "update",
+        .delete => "delete",
+    };
+}
+
+fn rowsJoinProjectionSideText(side: db_mod.types.RelationalRowsJoinProjectionSide) []const u8 {
+    return switch (side) {
+        .left => "left",
+        .right => "right",
+    };
+}
+
+fn encodeRowsMutationSourceQueryRequest(writer: *std.Io.Writer, req: db_mod.types.RelationalRowsQueryRequest) !void {
+    if (req.source_cte.len != 0 or
+        req.array_any.len != 0 or
+        req.array_contains.len != 0 or
+        req.array_eq.len != 0 or
+        req.in_predicates.len != 0 or
+        req.json_contains.len != 0 or
+        req.json_path_eq.len != 0 or
+        req.json_path_exists.len != 0 or
+        req.text_patterns.len != 0 or
+        req.access_or_predicates.len != 0 or
+        req.access_not_predicates.len != 0 or
+        req.expression_predicates.len != 0 or
+        req.expression_or_predicates.len != 0 or
+        req.expression_not_predicates.len != 0 or
+        req.expression_array_contains.len != 0 or
+        req.select.len != 0 or
+        req.json_extract.len != 0 or
+        req.array_length.len != 0 or
+        req.coalesce.len != 0 or
+        req.field_aliases.len != 0 or
+        req.expressions.len != 0 or
+        !req.select_all or
+        req.distinct_on.len != 0 or
+        req.distinct_on_expressions.len != 0)
+    {
+        return error.UnsupportedOperation;
+    }
+
+    try writer.writeByte('{');
+    var wrote = false;
+    if (req.predicates.len != 0 or req.or_predicates.len != 0 or req.not_predicates.len != 0) {
+        try writer.writeAll("\"where\":");
+        try encodeRowsMutationSourceWhere(writer, req);
+        wrote = true;
+    }
+    if (req.order_by.len != 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"order_by\":[");
+        for (req.order_by, 0..) |order, i| {
+            if (order.expression != null or order.field.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            try writer.print("\"field\":{f}", .{std.json.fmt(order.field, .{})});
+            if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
+            if (order.null_test) |null_test| {
+                try writer.writeAll(",\"null_test\":");
+                try writer.print("{f}", .{std.json.fmt(rowsQueryOrderNullTestText(null_test), .{})});
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (req.limit) |limit| {
+        if (wrote) try writer.writeByte(',');
+        try writer.print("\"limit\":{d}", .{limit});
+        wrote = true;
+    }
+    if (req.offset != 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.print("\"offset\":{d}", .{req.offset});
+        wrote = true;
+    }
+    if (req.row_claim) |claim| {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"row_claim\":");
+        try encodeRowsMutationSourceRowClaim(writer, claim);
+        wrote = true;
+    }
+    if (req.doc_key_range) |range| {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"doc_key_range\":{");
+        try writer.print("\"start\":{f},\"end\":{f}", .{ std.json.fmt(range.start, .{}), std.json.fmt(range.end, .{}) });
+        try writer.writeByte('}');
+    }
+    try writer.writeByte('}');
+}
+
+fn encodeRowsMutationSourceWhere(writer: *std.Io.Writer, req: db_mod.types.RelationalRowsQueryRequest) !void {
+    const grouped = req.predicates.len != 1 or req.or_predicates.len != 0 or req.not_predicates.len != 0;
+    if (!grouped) return try encodeRowsMutationSourcePredicate(writer, req.predicates[0]);
+
+    try writer.writeByte('{');
+    var wrote = false;
+    if (req.predicates.len != 0) {
+        try writer.writeAll("\"all\":[");
+        for (req.predicates, 0..) |predicate, i| {
+            if (i > 0) try writer.writeByte(',');
+            try encodeRowsMutationSourcePredicate(writer, predicate);
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (req.or_predicates.len != 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"any\":[");
+        for (req.or_predicates, 0..) |group, i| {
+            if (group.predicates.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try encodeRowsMutationSourcePredicateGroup(writer, group);
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (req.not_predicates.len != 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"not\":[");
+        for (req.not_predicates, 0..) |group, i| {
+            if (group.predicates.len == 0) return error.UnsupportedOperation;
+            if (i > 0) try writer.writeByte(',');
+            try encodeRowsMutationSourcePredicateGroup(writer, group);
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte('}');
+}
+
+fn encodeRowsMutationSourcePredicateGroup(writer: *std.Io.Writer, group: db_mod.types.RelationalRowsPredicateGroup) !void {
+    if (group.predicates.len == 1) return try encodeRowsMutationSourcePredicate(writer, group.predicates[0]);
+    try writer.writeAll("{\"all\":[");
+    for (group.predicates, 0..) |predicate, i| {
+        if (i > 0) try writer.writeByte(',');
+        try encodeRowsMutationSourcePredicate(writer, predicate);
+    }
+    try writer.writeAll("]}");
+}
+
+fn encodeRowsMutationSourcePredicate(writer: *std.Io.Writer, predicate: runtime_schema.RelationalCheck) !void {
+    if (predicate.expression != null or predicate.field.len == 0) return error.UnsupportedOperation;
+    try writer.writeByte('{');
+    try writer.print("\"field\":{f},\"op\":{f}", .{
+        std.json.fmt(predicate.field, .{}),
+        std.json.fmt(rowsPredicateOpText(predicate.op), .{}),
+    });
+    if (rowsQueryPredicateNeedsValue(predicate.op)) {
+        const value_json = predicate.value_json orelse return error.UnsupportedOperation;
+        try writer.writeAll(",\"value\":");
+        try writer.writeAll(value_json);
+    } else if (predicate.value_json != null) {
+        return error.UnsupportedOperation;
+    }
+    try writer.writeByte('}');
+}
+
+fn rowsPredicateOpText(op: runtime_schema.RelationalCheckOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .eq => "eq",
+        .ne => "ne",
+        .gt => "gt",
+        .gte => "gte",
+        .lt => "lt",
+        .lte => "lte",
+        .is_distinct => "is_distinct",
+        .is_not_distinct => "is_not_distinct",
+    };
+}
+
+fn rowsQueryOrderNullTestText(null_test: RowsQueryOrderNullTest) []const u8 {
+    return switch (null_test) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+    };
+}
+
+fn encodeRowsMutationSourceRowClaim(writer: *std.Io.Writer, claim: db_mod.types.RowClaimRequest) !void {
+    const txn_id = claim.txn_id orelse return error.UnsupportedOperation;
+    var txn_hex: [32]u8 = undefined;
+    encodeRowsMutationSourceTxnIdHex(txn_id, &txn_hex);
+    try writer.writeByte('{');
+    try writer.print("\"mode\":{f},\"wait_policy\":{f},\"lease_ms\":{d},\"owner_id\":{f},\"transaction_id\":{f}", .{
+        std.json.fmt(rowsClaimModeText(claim.mode), .{}),
+        std.json.fmt(rowsClaimWaitPolicyText(claim.effectiveWaitPolicy()), .{}),
+        claim.lease_ms,
+        std.json.fmt(claim.owner_id, .{}),
+        std.json.fmt(txn_hex[0..], .{}),
+    });
+    if (claim.skip_locked) try writer.writeAll(",\"skip_locked\":true");
+    try writer.writeByte('}');
+}
+
+fn rowsClaimModeText(mode: db_mod.types.RowClaimMode) []const u8 {
+    return switch (mode) {
+        .for_update => "for_update",
+        .for_no_key_update => "for_no_key_update",
+        .for_share => "for_share",
+        .for_key_share => "for_key_share",
+    };
+}
+
+fn rowsClaimWaitPolicyText(policy: db_mod.types.RowClaimWaitPolicy) []const u8 {
+    return switch (policy) {
+        .wait => "wait",
+        .nowait => "nowait",
+        .skip_locked => "skip_locked",
+    };
+}
+
+fn encodeRowsMutationSourceTxnIdHex(txn_id: db_mod.types.TxnId, out: *[32]u8) void {
+    const alphabet = "0123456789abcdef";
+    for (txn_id, 0..) |byte, i| {
+        out[i * 2] = alphabet[byte >> 4];
+        out[i * 2 + 1] = alphabet[byte & 0x0f];
+    }
+}
+
 fn rowsQueryIsClaimedWholeTableMutationSource(source: db_mod.types.RelationalRowsQueryRequest) bool {
     return source.row_claim != null and
         source.source_cte.len == 0 and
@@ -3067,8 +3587,569 @@ pub fn encodeRowsMutationSourceResponseAlloc(
         }
         try writer.writeByte(']');
     }
+    if (result.participant_predicates.len > 0) {
+        try writer.writeAll(",\"participant_predicates\":[");
+        for (result.participant_predicates, 0..) |predicate, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"key\":");
+            try writeJsonString(writer, predicate.key);
+            try writer.print(",\"expected_version\":{d}}}", .{predicate.expected_version});
+        }
+        try writer.writeByte(']');
+    }
+    if (result.participant_preimages.len > 0) {
+        try writeRowsMutationSourceResponseWrites(writer, "participant_preimages", result.participant_preimages);
+    }
+    if (result.participant_writes.len > 0) {
+        try writeRowsMutationSourceResponseWrites(writer, "participant_writes", result.participant_writes);
+    }
+    if (result.participant_deletes.len > 0) {
+        try writer.writeAll(",\"participant_deletes\":[");
+        for (result.participant_deletes, 0..) |key, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeJsonString(writer, key);
+        }
+        try writer.writeByte(']');
+    }
+    if (result.participant_transforms.len > 0) {
+        try writer.writeAll(",\"participant_transforms\":[");
+        for (result.participant_transforms, 0..) |transform, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"key\":");
+            try writeJsonString(writer, transform.key);
+            try writer.writeAll(",\"operations\":[");
+            for (transform.operations, 0..) |op, op_index| {
+                if (op_index > 0) try writer.writeByte(',');
+                try writer.writeAll("{\"op\":");
+                try writeJsonString(writer, db_mod.transform.transformOpText(op.op));
+                try writer.writeAll(",\"path\":");
+                try writeJsonString(writer, op.path);
+                if (op.value_json) |value_json| {
+                    try writer.writeAll(",\"value\":");
+                    try writer.writeAll(value_json);
+                }
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+            if (transform.upsert) try writer.writeAll(",\"upsert\":true");
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+pub fn parseRowsMutationSourceResponseAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !OwnedRowsMutationSourceResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidRowsMutationSourceResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+
+    var result: OwnedRowsMutationSourceResult = .{
+        .matched = @intCast(try rowsMutationSourceResponseInteger(root, "matched")),
+        .staged = @intCast(try rowsMutationSourceResponseInteger(root, "staged")),
+    };
+    errdefer result.deinit(alloc);
+
+    result.returning_rows = try parseRowsMutationSourceResponseJsonArray(alloc, root.get("returning"));
+    result.participant_predicates = try parseRowsMutationSourceResponsePredicates(alloc, root.get("participant_predicates"));
+    result.participant_preimages = try parseRowsMutationSourceResponseWrites(alloc, root.get("participant_preimages"));
+    result.participant_writes = try parseRowsMutationSourceResponseWrites(alloc, root.get("participant_writes"));
+    result.participant_deletes = try parseRowsMutationSourceResponseStringArray(alloc, root.get("participant_deletes"));
+    result.participant_transforms = try parseRowsMutationSourceResponseTransforms(alloc, root.get("participant_transforms"));
+    return result;
+}
+
+pub fn encodeRowsJoinedMutationSourcePlannedStageAlloc(
+    alloc: std.mem.Allocator,
+    matched: u32,
+    candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"matched\":{d},\"candidates\":[", .{matched});
+    for (candidates, 0..) |candidate, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"target\":");
+        try writeRowsJoinedMutationSourceCollectCandidate(writer, candidate.target);
+        try writer.writeAll(",\"source_json\":");
+        try writer.writeAll(candidate.source_json);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub const ParsedRowsJoinedMutationSourcePlannedStage = struct {
+    matched: u32,
+    candidates: []db_mod.DB.RelationalRowsJoinedMutationSourceCandidate = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.candidates) |*candidate| candidate.deinit(alloc);
+        if (self.candidates.len > 0) alloc.free(self.candidates);
+        self.* = undefined;
+    }
+};
+
+pub fn encodeRowsMutationSourcePlannedStageAlloc(
+    alloc: std.mem.Allocator,
+    matched: u32,
+    candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"matched\":{d},\"candidates\":[", .{matched});
+    for (candidates, 0..) |candidate, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeRowsJoinedMutationSourceCollectCandidate(writer, candidate);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub const ParsedRowsMutationSourcePlannedStage = struct {
+    matched: u32,
+    candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.candidates) |*candidate| candidate.deinit(alloc);
+        if (self.candidates.len > 0) alloc.free(self.candidates);
+        self.* = undefined;
+    }
+};
+
+pub fn parseRowsMutationSourcePlannedStageAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !ParsedRowsMutationSourcePlannedStage {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidRowsMutationSourceResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    const candidates_value = root.get("candidates") orelse return error.InvalidRowsMutationSourceResponse;
+    const candidates_arr = switch (candidates_value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+
+    var result = ParsedRowsMutationSourcePlannedStage{
+        .matched = @intCast(try rowsMutationSourceResponseInteger(root, "matched")),
+        .candidates = try alloc.alloc(db_mod.DB.RelationalRowsMutationSourceCandidate, candidates_arr.len),
+    };
+    var initialized: usize = 0;
+    errdefer {
+        for (result.candidates[0..initialized]) |*candidate| candidate.deinit(alloc);
+        if (result.candidates.len > 0) alloc.free(result.candidates);
+    }
+
+    for (candidates_arr, 0..) |item, i| {
+        result.candidates[i] = try parseRowsJoinedMutationSourceCollectCandidate(alloc, item);
+        initialized += 1;
+    }
+    return result;
+}
+
+pub fn parseRowsJoinedMutationSourcePlannedStageAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !ParsedRowsJoinedMutationSourcePlannedStage {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidRowsMutationSourceResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    const candidates_value = root.get("candidates") orelse return error.InvalidRowsMutationSourceResponse;
+    const candidates_arr = switch (candidates_value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+
+    var result = ParsedRowsJoinedMutationSourcePlannedStage{
+        .matched = @intCast(try rowsMutationSourceResponseInteger(root, "matched")),
+        .candidates = try alloc.alloc(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate, candidates_arr.len),
+    };
+    var initialized: usize = 0;
+    errdefer {
+        for (result.candidates[0..initialized]) |*candidate| candidate.deinit(alloc);
+        if (result.candidates.len > 0) alloc.free(result.candidates);
+    }
+
+    for (candidates_arr, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |inner| inner,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        const target_value = obj.get("target") orelse return error.InvalidRowsMutationSourceResponse;
+        const source_value = obj.get("source_json") orelse return error.InvalidRowsMutationSourceResponse;
+        const target = try parseRowsJoinedMutationSourceCollectCandidate(alloc, target_value);
+        var target_transferred = false;
+        errdefer if (!target_transferred) {
+            var owned_target = target;
+            owned_target.deinit(alloc);
+        };
+        result.candidates[i] = .{
+            .target = target,
+            .source_json = try std.json.Stringify.valueAlloc(alloc, source_value, .{}),
+        };
+        target_transferred = true;
+        initialized += 1;
+    }
+    return result;
+}
+
+pub fn parseRowsJoinedMutationSourceCollectResponseAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) ![]db_mod.DB.RelationalRowsMutationSourceCandidate {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidRowsMutationSourceResponse;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    const candidates_value = root.get("candidates") orelse return error.InvalidRowsMutationSourceResponse;
+    const candidates_arr = switch (candidates_value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+
+    var out = try alloc.alloc(db_mod.DB.RelationalRowsMutationSourceCandidate, candidates_arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*candidate| candidate.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (candidates_arr, 0..) |item, i| {
+        out[i] = try parseRowsJoinedMutationSourceCollectCandidate(alloc, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub const encodeRowsMutationSourceCollectResponseAlloc = encodeRowsJoinedMutationSourceCollectResponseAlloc;
+pub const parseRowsMutationSourceCollectResponseAlloc = parseRowsJoinedMutationSourceCollectResponseAlloc;
+
+fn parseRowsJoinedMutationSourceCollectCandidate(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !db_mod.DB.RelationalRowsMutationSourceCandidate {
+    const obj = switch (value) {
+        .object => |inner| inner,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    const doc_key = rowsMutationSourceResponseString(obj, "doc_key") orelse return error.InvalidRowsMutationSourceResponse;
+    const json_value = obj.get("json") orelse return error.InvalidRowsMutationSourceResponse;
+    const order_keys = try parseRowsJoinedMutationSourceCollectOrderKeys(alloc, obj.get("order_keys") orelse return error.InvalidRowsMutationSourceResponse);
+    var order_keys_transferred = false;
+    errdefer if (!order_keys_transferred) db_mod.DB.freeRelationalRowsQueryOrderKeySlice(alloc, order_keys);
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_json = try std.json.Stringify.valueAlloc(alloc, json_value, .{});
+    errdefer alloc.free(owned_json);
+    order_keys_transferred = true;
+    return .{
+        .doc_key = owned_doc_key,
+        .json = owned_json,
+        .version = try rowsMutationSourceResponseInteger(obj, "version"),
+        .order_keys = order_keys,
+        .ordinal = @intCast(try rowsMutationSourceResponseInteger(obj, "ordinal")),
+        .group_id = try rowsMutationSourceResponseInteger(obj, "group_id"),
+    };
+}
+
+fn parseRowsJoinedMutationSourceCollectOrderKeys(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]db_mod.DB.RelationalRowsQueryOrderKey {
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc(db_mod.DB.RelationalRowsQueryOrderKey, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        db_mod.DB.freeRelationalRowsQueryOrderKeys(alloc, out[0..initialized]);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        out[i] = try parseRowsJoinedMutationSourceCollectOrderKey(alloc, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRowsJoinedMutationSourceCollectOrderKey(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !db_mod.DB.RelationalRowsQueryOrderKey {
+    const obj = switch (value) {
+        .object => |inner| inner,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    const type_text = rowsMutationSourceResponseString(obj, "type") orelse return error.InvalidRowsMutationSourceResponse;
+    if (std.mem.eql(u8, type_text, "missing")) return .missing;
+    if (std.mem.eql(u8, type_text, "null")) return .null;
+    const raw_value = obj.get("value") orelse return error.InvalidRowsMutationSourceResponse;
+    if (std.mem.eql(u8, type_text, "bool")) return switch (raw_value) {
+        .bool => |flag| .{ .bool = flag },
+        else => error.InvalidRowsMutationSourceResponse,
+    };
+    if (std.mem.eql(u8, type_text, "number")) return switch (raw_value) {
+        .float => |number| .{ .number = number },
+        .integer => |number| .{ .number = @floatFromInt(number) },
+        else => error.InvalidRowsMutationSourceResponse,
+    };
+    if (std.mem.eql(u8, type_text, "string")) return switch (raw_value) {
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        else => error.InvalidRowsMutationSourceResponse,
+    };
+    if (std.mem.eql(u8, type_text, "json")) {
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, raw_value, .{}) };
+    }
+    return error.InvalidRowsMutationSourceResponse;
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn writeRowsMutationSourceResponseWrites(
+    writer: *std.Io.Writer,
+    field: []const u8,
+    writes: []const db_mod.types.TransactionWrite,
+) !void {
+    try writer.writeAll(",\"");
+    try writer.writeAll(field);
+    try writer.writeAll("\":[");
+    for (writes, 0..) |write, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"key\":");
+        try writeJsonString(writer, write.key);
+        try writer.writeAll(",\"value\":");
+        try writer.writeAll(write.value);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn rowsMutationSourceResponseInteger(root: std.json.ObjectMap, field: []const u8) !u64 {
+    const value = root.get(field) orelse return error.InvalidRowsMutationSourceResponse;
+    return switch (value) {
+        .integer => |int| if (int >= 0) @intCast(int) else error.InvalidRowsMutationSourceResponse,
+        else => error.InvalidRowsMutationSourceResponse,
+    };
+}
+
+fn parseRowsMutationSourceResponseJsonArray(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![][]const u8 {
+    const value = maybe_value orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc([]const u8, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(@constCast(item));
+        alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        out[i] = try std.json.Stringify.valueAlloc(alloc, item, .{});
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRowsMutationSourceResponseStringArray(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![][]const u8 {
+    const value = maybe_value orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc([]const u8, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(@constCast(item));
+        alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        const text = switch (item) {
+            .string => |s| s,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        out[i] = try alloc.dupe(u8, text);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRowsMutationSourceResponseWrites(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![]db_mod.types.TransactionWrite {
+    const value = maybe_value orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc(db_mod.types.TransactionWrite, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |inner| inner,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        const key = rowsMutationSourceResponseString(obj, "key") orelse return error.InvalidRowsMutationSourceResponse;
+        const value_json = obj.get("value") orelse return error.InvalidRowsMutationSourceResponse;
+        out[i] = .{
+            .key = try alloc.dupe(u8, key),
+            .value = try std.json.Stringify.valueAlloc(alloc, value_json, .{}),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRowsMutationSourceResponsePredicates(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![]db_mod.types.TransactionVersionPredicate {
+    const value = maybe_value orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc(db_mod.types.TransactionVersionPredicate, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |inner| inner,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        const key = rowsMutationSourceResponseString(obj, "key") orelse return error.InvalidRowsMutationSourceResponse;
+        out[i] = .{
+            .key = try alloc.dupe(u8, key),
+            .expected_version = try rowsMutationSourceResponseInteger(obj, "expected_version"),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRowsMutationSourceResponseTransforms(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![]db_mod.types.DocumentTransform {
+    const value = maybe_value orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items.items,
+        else => return error.InvalidRowsMutationSourceResponse,
+    };
+    var out = try alloc.alloc(db_mod.types.DocumentTransform, arr.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |transform| freeRowsMutationSourceResponseTransform(alloc, transform);
+        alloc.free(out);
+    }
+    for (arr, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |inner| inner,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        const key = rowsMutationSourceResponseString(obj, "key") orelse return error.InvalidRowsMutationSourceResponse;
+        const operations_value = obj.get("operations") orelse return error.InvalidRowsMutationSourceResponse;
+        const operations_arr = switch (operations_value) {
+            .array => |items| items.items,
+            else => return error.InvalidRowsMutationSourceResponse,
+        };
+        var operations = try alloc.alloc(db_mod.types.TransformOp, operations_arr.len);
+        var operations_initialized: usize = 0;
+        errdefer {
+            for (operations[0..operations_initialized]) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (operations.len > 0) alloc.free(operations);
+        }
+        for (operations_arr, 0..) |op_item, op_index| {
+            const op_obj = switch (op_item) {
+                .object => |inner| inner,
+                else => return error.InvalidRowsMutationSourceResponse,
+            };
+            const op_text = rowsMutationSourceResponseString(op_obj, "op") orelse return error.InvalidRowsMutationSourceResponse;
+            const path = rowsMutationSourceResponseString(op_obj, "path") orelse return error.InvalidRowsMutationSourceResponse;
+            operations[op_index] = .{
+                .op = rowsMutationSourceResponseTransformOp(op_text) orelse return error.InvalidRowsMutationSourceResponse,
+                .path = try alloc.dupe(u8, path),
+                .value_json = if (op_obj.get("value")) |raw_value| try std.json.Stringify.valueAlloc(alloc, raw_value, .{}) else null,
+            };
+            operations_initialized += 1;
+        }
+        out[i] = .{
+            .key = try alloc.dupe(u8, key),
+            .operations = operations,
+            .upsert = if (obj.get("upsert")) |upsert_value| switch (upsert_value) {
+                .bool => |flag| flag,
+                .null => false,
+                else => return error.InvalidRowsMutationSourceResponse,
+            } else false,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeRowsMutationSourceResponseTransform(alloc: std.mem.Allocator, transform: db_mod.types.DocumentTransform) void {
+    alloc.free(@constCast(transform.key));
+    for (transform.operations) |op| {
+        alloc.free(@constCast(op.path));
+        if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+    }
+    if (transform.operations.len > 0) alloc.free(@constCast(transform.operations));
+}
+
+fn rowsMutationSourceResponseString(obj: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    return switch (obj.get(field) orelse return null) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn rowsMutationSourceResponseTransformOp(text: []const u8) ?db_mod.types.TransformOpType {
+    inline for (std.meta.fields(db_mod.types.TransformOpType)) |field| {
+        const op: db_mod.types.TransformOpType = @enumFromInt(field.value);
+        if (std.mem.eql(u8, text, db_mod.transform.transformOpText(op))) return op;
+    }
+    if (std.mem.eql(u8, text, "$set_on_insert")) return .set_on_insert;
+    return null;
 }
 
 pub fn executeRowsQueryOnJsonRowsAlloc(
@@ -3699,7 +4780,7 @@ fn lakeRowsAggregateOutputOrderCandidateLessThan(
     rhs: LakeAggregateOutputOrderCandidate,
 ) bool {
     for (ctx.order_by, 0..) |order, i| {
-        const comparison = compareQueryOrderKeys(lhs.order_keys[i], rhs.order_keys[i]);
+        const comparison = compareQueryOrderKeysWithCollation(lhs.order_keys[i], rhs.order_keys[i], order.collation);
         if (comparison == .eq) continue;
         return switch (order.direction) {
             .asc => comparison == .lt,
@@ -4649,7 +5730,7 @@ fn lakeRowsQueryOrderKeyFromCellAlloc(
 
 fn lakeRowsQueryOrderCandidateLessThan(ctx: QuerySortContext, lhs: LakeRowsQueryOrderCandidate, rhs: LakeRowsQueryOrderCandidate) bool {
     for (ctx.order_by, 0..) |order, i| {
-        const comparison = compareQueryOrderKeys(lhs.order_keys[i], rhs.order_keys[i]);
+        const comparison = compareQueryOrderKeysWithCollation(lhs.order_keys[i], rhs.order_keys[i], order.collation);
         if (comparison == .eq) continue;
         return switch (order.direction) {
             .asc => comparison == .lt,
@@ -5974,7 +7055,13 @@ fn rowsQueryDistinctOnKeyJsonAlloc(
         if (wrote_key) try writer.writeByte(',');
         const value_json = try expressionValueJsonAlloc(alloc, parsed.value, expression);
         defer alloc.free(value_json);
-        try writer.writeAll(value_json);
+        if (expressionDirectRowFieldCollation(distinct_columns, expression)) |collation| {
+            var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed_value.deinit();
+            try writeDistinctOnJsonValueWithCollation(alloc, writer, parsed_value.value, collation);
+        } else {
+            try writer.writeAll(value_json);
+        }
         wrote_key = true;
     }
     try writer.writeByte(']');
@@ -6038,9 +7125,18 @@ fn lakeRowsQueryDistinctOnKeyJsonAlloc(
     }
     for (distinct_on_expressions) |expression| {
         if (wrote_key) try writer.writeByte(',');
-        const value_json = try lakeRowsExpressionValueJsonAlloc(alloc, row, expression);
-        defer alloc.free(value_json);
-        try writer.writeAll(value_json);
+        if (expressionDirectRowFieldCollation(distinct_columns, expression)) |collation| {
+            const maybe_cell = row.find(expression.field);
+            if (maybe_cell) |cell| {
+                try writeLakeRowsCellJsonWithCollation(alloc, writer, cell.value, collation);
+            } else {
+                try writer.writeAll("null");
+            }
+        } else {
+            const value_json = try lakeRowsExpressionValueJsonAlloc(alloc, row, expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
         wrote_key = true;
     }
     try writer.writeByte(']');
@@ -6052,6 +7148,14 @@ fn distinctFieldCollation(columns: []const runtime_schema.RelationalColumn, fiel
         if (std.mem.eql(u8, column.path, field) or std.mem.eql(u8, column.name, field)) return column.collation;
     }
     return null;
+}
+
+fn expressionDirectRowFieldCollation(
+    columns: []const runtime_schema.RelationalColumn,
+    expression: db_mod.types.RelationalRowsExpression,
+) ?[]const u8 {
+    if (expression.kind != .field or expression.field_source != .row) return null;
+    return distinctFieldCollation(columns, expression.field);
 }
 
 fn writeDistinctOnJsonValueWithCollation(
@@ -6157,6 +7261,54 @@ pub fn encodeRowsQueryResponseWithResultSchemaAlloc(
     }
     try writer.writeAll("]}");
     return try out.toOwnedSlice();
+}
+
+pub fn encodeRowsJoinedMutationSourceCollectResponseAlloc(
+    alloc: std.mem.Allocator,
+    candidates: anytype,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"candidates\":[");
+    for (candidates, 0..) |candidate, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writeRowsJoinedMutationSourceCollectCandidate(writer, candidate);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+fn writeRowsJoinedMutationSourceCollectCandidate(writer: *std.Io.Writer, candidate: anytype) !void {
+    try writer.print(
+        "{{\"doc_key\":{f},\"json\":",
+        .{std.json.fmt(candidate.doc_key, .{})},
+    );
+    try writer.writeAll(candidate.json);
+    try writer.print(
+        ",\"version\":{d},\"ordinal\":{d},\"group_id\":{d},\"order_keys\":[",
+        .{ candidate.version, candidate.ordinal, candidate.group_id },
+    );
+    for (candidate.order_keys, 0..) |key, key_i| {
+        if (key_i != 0) try writer.writeByte(',');
+        try encodeRowsJoinedMutationSourceOrderKey(writer, key);
+    }
+    try writer.writeAll("]}");
+}
+
+fn encodeRowsJoinedMutationSourceOrderKey(writer: *std.Io.Writer, key: anytype) !void {
+    switch (key) {
+        .missing => try writer.writeAll("{\"type\":\"missing\"}"),
+        .null => try writer.writeAll("{\"type\":\"null\"}"),
+        .bool => |value| try writer.print("{{\"type\":\"bool\",\"value\":{}}}", .{value}),
+        .number => |value| try writer.print("{{\"type\":\"number\",\"value\":{d}}}", .{value}),
+        .string => |value| try writer.print("{{\"type\":\"string\",\"value\":{f}}}", .{std.json.fmt(value, .{})}),
+        .json => |value| {
+            try writer.writeAll("{\"type\":\"json\",\"value\":");
+            try writer.writeAll(value);
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn encodeRowsResultWithTotalFieldAlloc(
@@ -12606,6 +13758,11 @@ fn parseRowsQueryOrderAlloc(
         const expression = if (expression_value) |value| try parseRowsQueryExpressionAlloc(alloc, schema, value) else null;
         var expression_transferred = false;
         errdefer if (!expression_transferred) if (expression) |owned| freeRowsQueryExpression(alloc, owned);
+        if (expression) |owned| {
+            if (expressionDirectRowFieldCollation(schema.relational_columns, owned)) |collation| {
+                field_collation = try alloc.dupe(u8, collation);
+            }
+        }
         const null_test = if (item.object.get("null_test")) |null_test_value| blk: {
             if (null_test_value != .string) return error.InvalidRowsRequest;
             if (std.mem.eql(u8, null_test_value.string, "is_null")) break :blk RowsQueryOrderNullTest.is_null;
@@ -12776,10 +13933,9 @@ fn parseRowsQueryRowClaimAlloc(
         break :blk @as(u64, @intCast(lease_value.integer));
     } else @as(u64, 30_000);
 
-    const owner_id = if (claim.object.get("owner_id")) |owner_value| blk: {
-        if (owner_value != .string) return error.InvalidRowsRequest;
-        break :blk try alloc.dupe(u8, owner_value.string);
-    } else try alloc.dupe(u8, "");
+    const owner_value = claim.object.get("owner_id") orelse return error.InvalidRowsRequest;
+    if (owner_value != .string or owner_value.string.len == 0) return error.InvalidRowsRequest;
+    const owner_id = try alloc.dupe(u8, owner_value.string);
     errdefer alloc.free(owner_id);
 
     const txn_value = claim.object.get("transaction_id") orelse return error.InvalidRowsRequest;
@@ -16677,19 +17833,11 @@ fn appendInsertWithConflictAlloc(
     const row_json = try plannedRelationalRowJsonWithDefaultContextAlloc(alloc, schema, row_value, default_context);
     defer alloc.free(row_json);
 
-    const duplicate_key = try conflictTargetDuplicateKeyAlloc(alloc, schema, row_json, target_value);
-    var duplicate_key_transferred = false;
-    errdefer if (!duplicate_key_transferred) if (duplicate_key) |key| alloc.free(key);
-    if (duplicate_key) |key| {
-        const gop = try proposed_conflict_targets.getOrPut(alloc, key);
-        if (gop.found_existing) {
-            duplicate_key_transferred = true;
-            alloc.free(key);
-            if (action == .update) return error.InvalidRowsRequest;
-            if (hasConflictActionCondition(conflict_value)) return error.InvalidRowsRequest;
-            return;
-        }
-        duplicate_key_transferred = true;
+    const duplicate_keys = try conflictTargetDuplicateKeysAlloc(alloc, schema, row_json, target_value);
+    if (try proposedConflictTargetsContainOrPutAllAlloc(alloc, proposed_conflict_targets, duplicate_keys)) {
+        if (action == .update) return error.InvalidRowsRequest;
+        if (hasConflictActionCondition(conflict_value)) return error.InvalidRowsRequest;
+        return;
     }
 
     const conflict_key = try conflictTargetPrimaryKeyAlloc(alloc, table_name, schema, row_json, target_value, resolver);
@@ -16787,8 +17935,12 @@ fn conflictTargetPrimaryKeyAlloc(
     resolver: UniqueSelectorResolver,
 ) !?[]u8 {
     if (target_value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(target_value.object, &.{ "primary", "unique" });
-    if (target_value.object.get("primary") != null and target_value.object.get("unique") != null) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(target_value.object, &.{ "any", "primary", "unique" });
+    try validateConflictTargetObjectShape(target_value);
+    if (target_value.object.get("any")) |any_value| {
+        if (any_value != .bool or !any_value.bool) return error.InvalidRowsRequest;
+        return try anyConflictTargetPrimaryKeyAlloc(alloc, table_name, schema, row_json, resolver);
+    }
     if (target_value.object.get("primary")) |primary_value| {
         if (primary_value != .bool or !primary_value.bool) return error.InvalidRowsRequest;
         const primary_key = schema.primary_key orelse return error.InvalidRowsRequest;
@@ -16826,18 +17978,38 @@ fn conflictTargetPrimaryKeyAlloc(
     return error.InvalidRowsRequest;
 }
 
-fn conflictTargetDuplicateKeyAlloc(
+fn validateConflictTargetObjectShape(target_value: std.json.Value) !void {
+    if (target_value != .object) return error.InvalidRowsRequest;
+    var count: usize = 0;
+    if (target_value.object.get("any") != null) count += 1;
+    if (target_value.object.get("primary") != null) count += 1;
+    if (target_value.object.get("unique") != null) count += 1;
+    if (count != 1) return error.InvalidRowsRequest;
+}
+
+fn conflictTargetDuplicateKeysAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     row_json: []const u8,
     target_value: std.json.Value,
-) !?[]const u8 {
+) ![]const []const u8 {
     if (target_value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(target_value.object, &.{ "primary", "unique" });
-    if (target_value.object.get("primary") != null and target_value.object.get("unique") != null) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(target_value.object, &.{ "any", "primary", "unique" });
+    try validateConflictTargetObjectShape(target_value);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+    if (target_value.object.get("any")) |any_value| {
+        if (any_value != .bool or !any_value.bool) return error.InvalidRowsRequest;
+        try appendAnyConflictTargetDuplicateKeysAlloc(alloc, schema, row_json, &keys);
+        return try keys.toOwnedSlice(alloc);
+    }
     if (target_value.object.get("primary")) |primary_value| {
         if (primary_value != .bool or !primary_value.bool) return error.InvalidRowsRequest;
-        return try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+        try appendPrimaryConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, &keys);
+        return try keys.toOwnedSlice(alloc);
     }
     if (target_value.object.get("unique")) |unique_value| {
         if (unique_value != .object) return error.InvalidRowsRequest;
@@ -16846,16 +18018,133 @@ fn conflictTargetDuplicateKeyAlloc(
         if (name_value != .string) return error.InvalidRowsRequest;
         const constraint = findUniqueConstraint(schema.unique_constraints, name_value.string) orelse return error.InvalidRowsRequest;
         try validateConflictTargetPredicateMatchesConstraint(alloc, schema, unique_value, constraint);
-        const encoded_value = (try uniqueConstraintValueFromRowAlloc(alloc, schema, constraint, row_json)) orelse return null;
+        try appendUniqueConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, constraint, &keys);
+        return try keys.toOwnedSlice(alloc);
+    }
+    return error.InvalidRowsRequest;
+}
+
+fn typedConflictTargetDuplicateKeysAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    target: db_mod.types.RelationalRowsConflictTarget,
+) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+    switch (target.kind) {
+        .any => try appendAnyConflictTargetDuplicateKeysAlloc(alloc, schema, row_json, &keys),
+        .primary => try appendPrimaryConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, &keys),
+        .unique => {
+            if (target.unique_name.len == 0) return error.InvalidRowsRequest;
+            const constraint = findUniqueConstraint(schema.unique_constraints, target.unique_name) orelse return error.InvalidRowsRequest;
+            try validateTypedConflictTargetMatchesConstraint(target, constraint);
+            try appendUniqueConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, constraint, &keys);
+        },
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn appendPrimaryConflictTargetDuplicateKeyAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const key = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+    errdefer alloc.free(key);
+    try keys.append(alloc, key);
+}
+
+fn appendUniqueConflictTargetDuplicateKeyAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    constraint: runtime_schema.UniqueConstraint,
+    keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const encoded_value = (try uniqueConstraintValueFromRowAlloc(alloc, schema, constraint, row_json)) orelse return;
+    defer alloc.free(encoded_value);
+    const key = if (constraint.without_overlaps_period) |period_name| blk: {
+        var span = try temporalPeriodSpanBytesFromRowAlloc(alloc, schema, row_json, period_name);
+        defer span.deinit(alloc);
+        break :blk try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value, "\x00period\x00", span.start, "\x00", span.end });
+    } else try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value });
+    errdefer alloc.free(key);
+    try keys.append(alloc, key);
+}
+
+fn appendAnyConflictTargetDuplicateKeysAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try appendPrimaryConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, keys);
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        try appendUniqueConflictTargetDuplicateKeyAlloc(alloc, schema, row_json, constraint, keys);
+    }
+}
+
+fn proposedConflictTargetsContainOrPutAllAlloc(
+    alloc: std.mem.Allocator,
+    proposed_conflict_targets: *std.StringHashMapUnmanaged(void),
+    keys: []const []const u8,
+) !bool {
+    for (keys) |key| {
+        if (proposed_conflict_targets.contains(key)) {
+            for (keys) |owned| alloc.free(@constCast(owned));
+            if (keys.len > 0) alloc.free(keys);
+            return true;
+        }
+    }
+    for (keys) |key| {
+        const gop = try proposed_conflict_targets.getOrPut(alloc, key);
+        if (gop.found_existing) unreachable;
+        gop.value_ptr.* = {};
+    }
+    if (keys.len > 0) alloc.free(keys);
+    return false;
+}
+
+fn anyConflictTargetPrimaryKeyAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+    resolver: UniqueSelectorResolver,
+) !?[]u8 {
+    const primary_key = schema.primary_key orelse return error.InvalidRowsRequest;
+    if (primary_key.without_overlaps_period) |period_name| {
+        const encoded_value = try primaryKeyValueFromRowJsonAlloc(alloc, schema, primary_key, row_json);
+        defer alloc.free(encoded_value);
+        var span = try temporalPeriodSpanBytesFromRowAlloc(alloc, schema, row_json, period_name);
+        defer span.deinit(alloc);
+        if (try resolver.resolveTemporalUniqueOverlap(alloc, table_name, db_mod.relational_store.primary_key_constraint_name, encoded_value, span.start, span.end)) |key| return key;
+    } else {
+        const key = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+        errdefer alloc.free(key);
+        if (try resolver.primaryExists(alloc, table_name, key)) return key;
+        alloc.free(key);
+    }
+
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        const encoded_value = (try uniqueConstraintValueFromRowAlloc(alloc, schema, constraint, row_json)) orelse continue;
         defer alloc.free(encoded_value);
         if (constraint.without_overlaps_period) |period_name| {
             var span = try temporalPeriodSpanBytesFromRowAlloc(alloc, schema, row_json, period_name);
             defer span.deinit(alloc);
-            return try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value, "\x00period\x00", span.start, "\x00", span.end });
+            if (try resolver.resolveTemporalUniqueOverlap(alloc, table_name, constraint.name, encoded_value, span.start, span.end)) |key| return key;
+        } else {
+            if (try resolver.resolveUnique(alloc, table_name, constraint.name, encoded_value)) |key| return key;
         }
-        return try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value });
     }
-    return error.InvalidRowsRequest;
+    return null;
 }
 
 fn typedConflictTargetPrimaryKeyAlloc(
@@ -16867,6 +18156,7 @@ fn typedConflictTargetPrimaryKeyAlloc(
     resolver: UniqueSelectorResolver,
 ) !?[]u8 {
     switch (target.kind) {
+        .any => return try anyConflictTargetPrimaryKeyAlloc(alloc, table_name, schema, row_json, resolver),
         .primary => {
             const primary_key = schema.primary_key orelse return error.InvalidRowsRequest;
             if (primary_key.without_overlaps_period) |period_name| {
@@ -16894,30 +18184,6 @@ fn typedConflictTargetPrimaryKeyAlloc(
                 return try resolver.resolveTemporalUniqueOverlap(alloc, table_name, constraint.name, encoded_value, span.start, span.end);
             }
             return try resolver.resolveUnique(alloc, table_name, constraint.name, encoded_value);
-        },
-    }
-}
-
-fn typedConflictTargetDuplicateKeyAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    row_json: []const u8,
-    target: db_mod.types.RelationalRowsConflictTarget,
-) !?[]const u8 {
-    switch (target.kind) {
-        .primary => return try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json),
-        .unique => {
-            if (target.unique_name.len == 0) return error.InvalidRowsRequest;
-            const constraint = findUniqueConstraint(schema.unique_constraints, target.unique_name) orelse return error.InvalidRowsRequest;
-            try validateTypedConflictTargetMatchesConstraint(target, constraint);
-            const encoded_value = (try uniqueConstraintValueFromRowAlloc(alloc, schema, constraint, row_json)) orelse return null;
-            defer alloc.free(encoded_value);
-            if (constraint.without_overlaps_period) |period_name| {
-                var span = try temporalPeriodSpanBytesFromRowAlloc(alloc, schema, row_json, period_name);
-                defer span.deinit(alloc);
-                return try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value, "\x00period\x00", span.start, "\x00", span.end });
-            }
-            return try std.mem.concat(alloc, u8, &.{ "unique\x00", constraint.name, "\x00", encoded_value });
         },
     }
 }
@@ -17482,11 +18748,13 @@ fn uniqueConstraintColumnsAlloc(
     schema: runtime_schema.TableSchema,
     constraint: runtime_schema.UniqueConstraint,
 ) ![]runtime_schema.RelationalColumn {
-    if (constraint.expressions.len != 0) return error.InvalidRowsRequest;
     var selected = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
     errdefer selected.deinit(alloc);
     for (constraint.columns) |column_name| {
         try appendUniqueConstraintSelectedColumn(alloc, &selected, schema, column_name);
+    }
+    for (constraint.expressions) |expression| {
+        try appendUniqueConstraintUniqueExpressionColumns(alloc, &selected, schema, expression);
     }
     for (constraint.where) |predicate| {
         try appendUniqueConstraintSelectedColumn(alloc, &selected, schema, predicate.field);
@@ -17495,6 +18763,21 @@ fn uniqueConstraintColumnsAlloc(
         try appendUniqueConstraintExpressionConditionColumns(alloc, &selected, schema, condition);
     }
     return try selected.toOwnedSlice(alloc);
+}
+
+fn appendUniqueConstraintUniqueExpressionColumns(
+    alloc: std.mem.Allocator,
+    selected: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+    schema: runtime_schema.TableSchema,
+    expression: runtime_schema.UniqueExpression,
+) anyerror!void {
+    switch (expression.op) {
+        .lower, .upper, .md5 => try appendUniqueConstraintSelectedColumn(alloc, selected, schema, expression.field),
+        .expression => {
+            const row_expression = expression.expression orelse return error.InvalidRowsRequest;
+            try appendUniqueConstraintExpressionColumns(alloc, selected, schema, row_expression);
+        },
+    }
 }
 
 fn appendUniqueConstraintSelectedColumn(
@@ -18081,8 +19364,12 @@ fn parseRowsConflictTargetAlloc(
     target_value: std.json.Value,
 ) !db_mod.types.RelationalRowsConflictTarget {
     if (target_value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(target_value.object, &.{ "primary", "unique" });
-    if (target_value.object.get("primary") != null and target_value.object.get("unique") != null) return error.InvalidRowsRequest;
+    try requireJsonObjectOnlyKeys(target_value.object, &.{ "any", "primary", "unique" });
+    try validateConflictTargetObjectShape(target_value);
+    if (target_value.object.get("any")) |any_value| {
+        if (any_value != .bool or !any_value.bool) return error.InvalidRowsRequest;
+        return .{ .kind = .any };
+    }
     if (target_value.object.get("primary")) |primary_value| {
         if (primary_value != .bool or !primary_value.bool) return error.InvalidRowsRequest;
         return .{ .kind = .primary };
@@ -19177,6 +20464,71 @@ test "relational rows lake bridge supports field ordering before query limit" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":20}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"amount\":30}", result.rows[1]);
+}
+
+test "relational rows lake bridge distinct on direct field expression inherits collation" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsQueryRequest(
+        alloc,
+        "{\"select\":[\"id\",\"name\"],\"distinct_on_expressions\":[{\"field\":\"name\"}],\"order_by\":[{\"expr\":{\"field\":\"name\"}},{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer request.deinit(alloc);
+
+    const id_b = @constCast("id"[0..]);
+    const name_b = @constCast("name"[0..]);
+    const value_b_id = @constCast("b"[0..]);
+    const value_b_name = @constCast("Beta"[0..]);
+    const id_c = @constCast("id"[0..]);
+    const name_c = @constCast("name"[0..]);
+    const value_c_id = @constCast("c"[0..]);
+    const value_c_name = @constCast("beta"[0..]);
+    const id_a = @constCast("id"[0..]);
+    const name_a = @constCast("name"[0..]);
+    const value_a_id = @constCast("a"[0..]);
+    const value_a_name = @constCast("alpha"[0..]);
+    var cells_b = [_]lake_rows.ProjectedCell{
+        .{ .name = id_b, .value = .{ .bytes = value_b_id } },
+        .{ .name = name_b, .value = .{ .bytes = value_b_name } },
+    };
+    var cells_c = [_]lake_rows.ProjectedCell{
+        .{ .name = id_c, .value = .{ .bytes = value_c_id } },
+        .{ .name = name_c, .value = .{ .bytes = value_c_name } },
+    };
+    var cells_a = [_]lake_rows.ProjectedCell{
+        .{ .name = id_a, .value = .{ .bytes = value_a_id } },
+        .{ .name = name_a, .value = .{ .bytes = value_a_name } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 0 } }, .cells = &cells_b },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 1 } }, .cells = &cells_c },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 2 } }, .cells = &cells_a },
+    };
+
+    var result = try buildRowsQueryResultFromLakeRowsWithSchemaAlloc(
+        alloc,
+        schema,
+        request,
+        .{
+            .rows = &projected,
+            .total = 3,
+        },
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name\":\"alpha\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name\":\"Beta\"}", result.rows[1]);
 }
 
 test "relational rows lake bridge applies doc key range before query limit" {
@@ -21714,6 +23066,112 @@ test "relational rows partial unique selector supports null predicate fields" {
     try std.testing.expectEqual(@as(usize, 1), resolver.calls);
 }
 
+test "relational rows unique selector resolves expression unique values with source collation" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]},{"name":"users_email_expr_key","expressions":[{"op":"expression","expression":{"field":"email"}}]}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        calls: usize = 0,
+        expected_constraint: []const u8 = "users_lower_email_key",
+        expected_text: ?[]const u8 = null,
+        forbidden_text: ?[]const u8 = null,
+        first_encoded: []u8 = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.first_encoded.len > 0) alloc.free(self.first_encoded);
+            self.* = undefined;
+        }
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings(self.expected_constraint, constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            if (self.expected_text) |text| {
+                try std.testing.expect(std.mem.indexOf(u8, encoded_value, text) != null);
+            }
+            if (self.forbidden_text) |text| {
+                try std.testing.expect(std.mem.indexOf(u8, encoded_value, text) == null);
+            }
+            if (self.first_encoded.len == 0) {
+                self.first_encoded = try alloc.dupe(u8, encoded_value);
+            } else {
+                try std.testing.expectEqualSlices(u8, self.first_encoded, encoded_value);
+            }
+            self.calls += 1;
+            return try alloc.dupe(u8, "\x00antfly-rel-pk:existing");
+        }
+    };
+
+    var resolver = Resolver{
+        .expected_constraint = "users_lower_email_key",
+        .expected_text = "ada@example.test",
+        .forbidden_text = "Ada@Example.Test",
+    };
+    defer resolver.deinit(std.testing.allocator);
+    var lower_req = try parseRowsGetRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_lower_email_key\",\"values\":{\"email\":\"Ada@Example.Test\"}}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer lower_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqualStrings("\x00antfly-rel-pk:existing", lower_req.keys[0].?);
+
+    if (resolver.first_encoded.len > 0) {
+        std.testing.allocator.free(resolver.first_encoded);
+        resolver.first_encoded = &.{};
+    }
+    resolver.expected_constraint = "users_email_expr_key";
+    resolver.expected_text = "ada@example.test";
+    resolver.forbidden_text = "Ada@Example.Test";
+    resolver.calls = 0;
+    var expr_upper_req = try parseRowsGetRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_email_expr_key\",\"values\":{\"email\":\"Ada@Example.Test\"}}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer expr_upper_req.deinit(std.testing.allocator);
+    var expr_lower_req = try parseRowsGetRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_email_expr_key\",\"values\":{\"email\":\"ada@example.test\"}}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer expr_lower_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqualStrings("\x00antfly-rel-pk:existing", expr_upper_req.keys[0].?);
+    try std.testing.expectEqualStrings("\x00antfly-rel-pk:existing", expr_lower_req.keys[0].?);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsGetRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_lower_email_key\",\"values\":{\"name\":\"Ada\"}}}]}",
+        schema,
+        resolver.iface(),
+    ));
+}
+
 test "relational rows conflict target upsert resolves expression unique owner" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]},{"name":"users_md5_email_key","expressions":[{"op":"md5","field":"email"}]}]}
@@ -22821,6 +24279,67 @@ test "relational rows json_set updates declared json columns" {
         "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:json-set\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"json_set\":[{\"field\":\"attrs\",\"path\":[\"billing\",\"plan\"],\"value\":\"pro\",\"expr\":{\"field\":\"status\",\"source\":\"existing\"}}]}",
         schema,
     ));
+}
+
+test "relational rows JSON plan full-row source helpers clear projection fields" {
+    const select = [_][]const u8{"id"};
+    const json_extract = [_]db_mod.types.RelationalRowsJsonExtractProjection{.{
+        .output = "plan",
+        .field = "attrs",
+        .path = "billing.plan",
+        .as_text = true,
+    }};
+    const array_length = [_]db_mod.types.RelationalRowsArrayLengthProjection{.{
+        .output = "tag_count",
+        .field = "tags",
+    }};
+    const coalesce = [_]db_mod.types.RelationalRowsCoalesceProjection{.{
+        .output = "display",
+        .operands = &.{},
+    }};
+    const aliases = [_]db_mod.types.RelationalRowsFieldAliasProjection{.{
+        .output = "shadow_id",
+        .field = "id",
+    }};
+    const expressions = [_]db_mod.types.RelationalRowsExpressionProjection{.{
+        .output = "amount",
+        .expression = .{ .kind = .value, .value_json = "0" },
+    }};
+    const query: OwnedRowsQueryRequest = .{
+        .select = select[0..],
+        .json_extract = json_extract[0..],
+        .array_length = array_length[0..],
+        .coalesce = coalesce[0..],
+        .field_aliases = aliases[0..],
+        .expressions = expressions[0..],
+        .select_all = false,
+        .limit = 1,
+        .offset = 1,
+    };
+
+    const full = rowsFullSourceQuery(query);
+    try std.testing.expectEqual(@as(usize, 0), full.select.len);
+    try std.testing.expectEqual(@as(usize, 0), full.json_extract.len);
+    try std.testing.expectEqual(@as(usize, 0), full.array_length.len);
+    try std.testing.expectEqual(@as(usize, 0), full.coalesce.len);
+    try std.testing.expectEqual(@as(usize, 0), full.field_aliases.len);
+    try std.testing.expectEqual(@as(usize, 0), full.expressions.len);
+    try std.testing.expect(full.select_all);
+    try std.testing.expectEqual(@as(?u32, 1), full.limit);
+    try std.testing.expectEqual(@as(u32, 1), full.offset);
+
+    const aggregate = rowsAggregateSourceQuery(query);
+    try std.testing.expectEqual(@as(usize, 0), aggregate.expressions.len);
+    try std.testing.expectEqual(@as(?u32, null), aggregate.limit);
+    try std.testing.expectEqual(@as(u32, 0), aggregate.offset);
+
+    const join = rowsJoinSideSourceQuery(query);
+    try std.testing.expectEqual(@as(usize, 0), join.expressions.len);
+    try std.testing.expectEqual(@as(?u32, 1), join.limit);
+
+    const lateral = rowsLateralLeftSourceQuery(query);
+    try std.testing.expectEqual(@as(usize, 0), lateral.expressions.len);
+    try std.testing.expect(lateral.select_all);
 }
 
 test "relational rows query contract filters orders paginates and projects rows" {
@@ -26995,6 +28514,16 @@ test "relational rows api query contract parses typed row claim request" {
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
+        "{\"row_claim\":{\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"row_claim\":{\"owner_id\":\"\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
         "{\"row_claim\":{\"transaction_id\":\"00112233445566778899aabbccddeefg\"}}",
         schema,
     ));
@@ -27010,23 +28539,23 @@ test "relational rows api query contract parses typed row claim request" {
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"wait_policy\":\"skip_locked\",\"skip_locked\":false,\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"wait_policy\":\"skip_locked\",\"skip_locked\":false,\"owner_id\":\"session:bad\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"wait_policy\":\"later\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"wait_policy\":\"later\",\"owner_id\":\"session:bad\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"lease_ms\":0,\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"lease_ms\":0,\"owner_id\":\"session:bad\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     ));
 
     var no_key_update_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"mode\":\"for_no_key_update\",\"wait_policy\":\"skip_locked\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"mode\":\"for_no_key_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:no-key\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     );
     defer no_key_update_request.deinit(std.testing.allocator);
@@ -27036,7 +28565,7 @@ test "relational rows api query contract parses typed row claim request" {
 
     var share_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"mode\":\"for_share\",\"wait_policy\":\"wait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"mode\":\"for_share\",\"wait_policy\":\"wait\",\"owner_id\":\"session:share\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     );
     defer share_request.deinit(std.testing.allocator);
@@ -27046,7 +28575,7 @@ test "relational rows api query contract parses typed row claim request" {
 
     var key_share_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"mode\":\"for_key_share\",\"wait_policy\":\"nowait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"mode\":\"for_key_share\",\"wait_policy\":\"nowait\",\"owner_id\":\"session:key-share\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     );
     defer key_share_request.deinit(std.testing.allocator);
@@ -27056,7 +28585,7 @@ test "relational rows api query contract parses typed row claim request" {
 
     var nowait_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"row_claim\":{\"wait_policy\":\"nowait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        "{\"row_claim\":{\"wait_policy\":\"nowait\",\"owner_id\":\"session:nowait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     );
     defer nowait_request.deinit(std.testing.allocator);
@@ -27253,6 +28782,134 @@ test "relational rows mutation source contract parses claimed update plans" {
     });
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings("{\"matched\":3,\"staged\":2,\"returning\":[{\"id\":\"a\"},{\"id\":\"b\"}]}", response);
+
+    const ops = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"claimed\"",
+    }};
+    var participant_predicates = [_]db_mod.types.TransactionVersionPredicate{.{ .key = "row:a", .expected_version = 41 }};
+    var participant_preimages = [_]db_mod.types.TransactionWrite{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\"}" }};
+    var participant_writes = [_]db_mod.types.TransactionWrite{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"claimed\"}" }};
+    var participant_deletes = [_][]const u8{"row:old"};
+    var participant_transforms = [_]db_mod.types.DocumentTransform{.{ .key = "row:a", .operations = &ops }};
+    const participant_response = try encodeRowsMutationSourceResponseAlloc(std.testing.allocator, .{
+        .matched = 1,
+        .staged = 1,
+        .participant_predicates = &participant_predicates,
+        .participant_preimages = &participant_preimages,
+        .participant_writes = &participant_writes,
+        .participant_deletes = &participant_deletes,
+        .participant_transforms = &participant_transforms,
+    });
+    defer std.testing.allocator.free(participant_response);
+    var parsed_participant = try parseRowsMutationSourceResponseAlloc(std.testing.allocator, participant_response);
+    defer parsed_participant.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), parsed_participant.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_participant.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_participant.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 41), parsed_participant.participant_predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\"}", parsed_participant.participant_preimages[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", parsed_participant.participant_writes[0].value);
+    try std.testing.expectEqualStrings("row:old", parsed_participant.participant_deletes[0]);
+    try std.testing.expectEqualStrings("status", parsed_participant.participant_transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"claimed\"", parsed_participant.participant_transforms[0].operations[0].value_json.?);
+
+    var candidate_order_keys = [_]db_mod.DB.RelationalRowsQueryOrderKey{
+        .{ .string = "ready" },
+        .{ .number = 7 },
+        .null,
+    };
+    const collect_candidates = [_]db_mod.DB.RelationalRowsMutationSourceCandidate{.{
+        .doc_key = @constCast("row:a"),
+        .json = @constCast("{\"id\":\"a\",\"status\":\"ready\"}"),
+        .version = 9,
+        .order_keys = candidate_order_keys[0..],
+        .ordinal = 3,
+        .group_id = 7,
+    }};
+    const collect_response = try encodeRowsJoinedMutationSourceCollectResponseAlloc(std.testing.allocator, collect_candidates[0..]);
+    defer std.testing.allocator.free(collect_response);
+    try std.testing.expectEqualStrings("{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":3,\"group_id\":7,\"order_keys\":[{\"type\":\"string\",\"value\":\"ready\"},{\"type\":\"number\",\"value\":7},{\"type\":\"null\"}]}]}", collect_response);
+    const parsed_collect = try parseRowsJoinedMutationSourceCollectResponseAlloc(std.testing.allocator, collect_response);
+    defer {
+        for (parsed_collect) |*candidate| candidate.deinit(std.testing.allocator);
+        if (parsed_collect.len > 0) std.testing.allocator.free(parsed_collect);
+    }
+    try std.testing.expectEqual(@as(usize, 1), parsed_collect.len);
+    try std.testing.expectEqualStrings("row:a", parsed_collect[0].doc_key);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\"}", parsed_collect[0].json);
+    try std.testing.expectEqual(@as(u64, 9), parsed_collect[0].version);
+    try std.testing.expectEqual(@as(usize, 3), parsed_collect[0].ordinal);
+    try std.testing.expectEqual(@as(u64, 7), parsed_collect[0].group_id);
+    try std.testing.expectEqual(@as(usize, 3), parsed_collect[0].order_keys.len);
+    try std.testing.expectEqualStrings("ready", parsed_collect[0].order_keys[0].string);
+    try std.testing.expectEqual(@as(f64, 7), parsed_collect[0].order_keys[1].number);
+    try std.testing.expectEqual(db_mod.DB.RelationalRowsQueryOrderKey.null, parsed_collect[0].order_keys[2]);
+
+    const planned_candidates = [_]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate{.{
+        .target = collect_candidates[0],
+        .source_json = @constCast("{\"id\":\"src:1\",\"status\":\"source\"}"),
+    }};
+    const planned_stage = try encodeRowsJoinedMutationSourcePlannedStageAlloc(std.testing.allocator, 5, planned_candidates[0..]);
+    defer std.testing.allocator.free(planned_stage);
+    try std.testing.expectEqualStrings("{\"matched\":5,\"candidates\":[{\"target\":{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":3,\"group_id\":7,\"order_keys\":[{\"type\":\"string\",\"value\":\"ready\"},{\"type\":\"number\",\"value\":7},{\"type\":\"null\"}]},\"source_json\":{\"id\":\"src:1\",\"status\":\"source\"}}]}", planned_stage);
+    var parsed_stage = try parseRowsJoinedMutationSourcePlannedStageAlloc(std.testing.allocator, planned_stage);
+    defer parsed_stage.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), parsed_stage.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_stage.candidates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_stage.candidates[0].target.doc_key);
+    try std.testing.expectEqual(@as(u64, 7), parsed_stage.candidates[0].target.group_id);
+    try std.testing.expectEqualStrings("{\"id\":\"src:1\",\"status\":\"source\"}", parsed_stage.candidates[0].source_json);
+}
+
+test "relational rows mutation source encoder round trips supported claimed requests" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    var request = try parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},{\"field\":\"amount\",\"op\":\"gte\",\"value\":1}],\"any\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}],\"not\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"blocked\"}]},\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":2,\"offset\":1,\"row_claim\":{\"mode\":\"for_no_key_update\",\"wait_policy\":\"nowait\",\"owner_id\":\"session:encode\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":45000},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    const encoded = try encodeRowsMutationSourceRequestAlloc(std.testing.allocator, request.req);
+    defer std.testing.allocator.free(encoded);
+
+    var reparsed = try parseRowsMutationSourceRequest(std.testing.allocator, encoded, schema);
+    defer reparsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, reparsed.req.kind);
+    try std.testing.expectEqual(@as(usize, 2), reparsed.req.source.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.source.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.source.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.source.order_by.len);
+    try std.testing.expectEqual(RowsQueryOrderDirection.desc, reparsed.req.source.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 2), reparsed.req.source.limit.?);
+    try std.testing.expectEqual(@as(u32, 1), reparsed.req.source.offset);
+    try std.testing.expectEqualStrings("a", reparsed.req.source.doc_key_range.?.start);
+    try std.testing.expectEqualStrings("z", reparsed.req.source.doc_key_range.?.end);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_no_key_update, reparsed.req.source.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, reparsed.req.source.row_claim.?.wait_policy);
+    try std.testing.expectEqual(@as(u64, 45_000), reparsed.req.source.row_claim.?.lease_ms);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.operations.len);
+    try std.testing.expectEqualStrings("status", reparsed.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"claimed\"", reparsed.req.operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), reparsed.req.returning.len);
+
+    var expression_request = try parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:encode\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch_expr\":{\"status\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\",\"source\":\"existing\"},{\"value\":\"-claimed\"}]}}}",
+        schema,
+    );
+    defer expression_request.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnsupportedOperation, encodeRowsMutationSourceRequestAlloc(std.testing.allocator, expression_request.req));
 }
 
 test "relational rows mutation source contract parses temporal portions" {
@@ -27457,15 +29114,23 @@ test "relational rows insert source contract parses typed source assignments" {
         .op = .eq,
         .value_json = "\"ready\"",
     }};
+    const cross_order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "archive_amount",
+        .direction = .desc,
+    }};
     const cross_returning = [_][]const u8{ "id", "status" };
     const cross_req: db_mod.types.RelationalRowsInsertSourceRequest = .{
         .source_table = "archived_records",
-        .source = .{ .predicates = cross_predicates[0..] },
+        .source = .{ .predicates = cross_predicates[0..], .order_by = cross_order_by[0..], .limit = 1 },
         .assignments = cross_assignments[0..],
         .returning = cross_returning[0..],
     };
     try db_mod.DB.validateRelationalRowsInsertSourceRequestWithSchemas(schema, source_schema, cross_req);
-    const source_rows = [_][]const u8{"{\"archive_id\":\"a1\",\"archive_status\":\"ready\",\"archive_amount\":7}"};
+    const source_rows = [_][]const u8{
+        "{\"archive_id\":\"a1\",\"archive_status\":\"ready\",\"archive_amount\":7}",
+        "{\"archive_id\":\"a2\",\"archive_status\":\"archived\",\"archive_amount\":9}",
+        "{\"archive_id\":\"a3\",\"archive_status\":\"ready\",\"archive_amount\":11}",
+    };
     var cross_batch = try buildRowsInsertSourceBatchWithSchemasAlloc(
         std.testing.allocator,
         "usage_records",
@@ -27477,9 +29142,9 @@ test "relational rows insert source contract parses typed source assignments" {
     );
     defer cross_batch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), cross_batch.writes.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a1\",\"status\":\"ready\",\"amount\":7}", cross_batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"a3\",\"status\":\"ready\",\"amount\":11}", cross_batch.writes[0].value);
     try std.testing.expectEqual(@as(usize, 1), cross_batch.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a1\",\"status\":\"ready\"}", cross_batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a3\",\"status\":\"ready\"}", cross_batch.returning_rows[0]);
 
     const ranged_source_rows = [_][]const u8{
         "{\"archive_id\":\"a0\",\"archive_status\":\"ready\",\"archive_amount\":5}",
@@ -27758,6 +29423,63 @@ test "relational rows joined mutation source validates target and source schemas
     ));
 }
 
+test "relational rows joined mutation source encoder round trips supported claimed requests" {
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"source_status":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["source_pk"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
+    ;
+    var parsed_target = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, target_schema_json);
+    defer parsed_target.deinit(std.testing.allocator);
+    const target_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed_target);
+    defer runtime_schema.freeSchema(std.testing.allocator, target_schema);
+    var parsed_source = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, source_schema_json);
+    defer parsed_source.deinit(std.testing.allocator);
+    const source_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed_source);
+    defer runtime_schema.freeSchema(std.testing.allocator, source_schema);
+
+    var request = try parseRowsJoinedMutationSourceRequestWithSchemas(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source_table\":\"source_records\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"order_by\":[{\"field\":\"id\"}],\"limit\":2,\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:joined-encode\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":45000}},\"right\":{\"where\":{\"field\":\"source_status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"source_pk\"}],\"order_by\":[{\"field\":\"id\",\"direction\":\"desc\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"source_quantity\"}],\"patch\":{\"status\":\"synced\"},\"returning\":[\"id\",\"quantity\"]}",
+        target_schema,
+        source_schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    const encoded = try encodeRowsJoinedMutationSourceRequestAlloc(std.testing.allocator, request.req);
+    defer std.testing.allocator.free(encoded);
+
+    var reparsed = try parseRowsJoinedMutationSourceRequestWithSchemas(std.testing.allocator, encoded, target_schema, source_schema);
+    defer reparsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, reparsed.req.kind);
+    try std.testing.expectEqualStrings("source_records", reparsed.req.source_table);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, reparsed.req.target_side);
+    try std.testing.expect(reparsed.req.join.left.row_claim != null);
+    try std.testing.expectEqualStrings("session:joined-encode", reparsed.req.join.left.row_claim.?.owner_id);
+    try std.testing.expectEqual(@as(u64, 45_000), reparsed.req.join.left.row_claim.?.lease_ms);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.join.on.len);
+    try std.testing.expectEqualStrings("source_id", reparsed.req.join.on[0].left_field);
+    try std.testing.expectEqualStrings("source_pk", reparsed.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.source_assignments.len);
+    try std.testing.expectEqualStrings("quantity", reparsed.req.source_assignments[0].field);
+    try std.testing.expectEqualStrings("source_quantity", reparsed.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.req.operations.len);
+    try std.testing.expectEqualStrings("status", reparsed.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"synced\"", reparsed.req.operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), reparsed.req.returning.len);
+
+    var expression_request = try parseRowsJoinedMutationSourceRequestWithSchemas(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source_table\":\"source_records\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:joined-encode\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"right\":{\"where\":{\"field\":\"source_status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"source_pk\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"source_quantity\"}],\"returning_expressions\":[{\"as\":\"source_status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"source_status\",\"source\":\"source\"}]}}]}",
+        target_schema,
+        source_schema,
+    );
+    defer expression_request.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnsupportedOperation, encodeRowsJoinedMutationSourceRequestAlloc(std.testing.allocator, expression_request.req));
+}
+
 test "relational rows api query contract parses typed json filters" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"text"},"status":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"},"rank":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -28019,6 +29741,37 @@ test "relational rows distinct on resolves field collation from schema" {
     var request = try parseRowsQueryRequest(
         std.testing.allocator,
         "{\"select\":[\"id\",\"name\"],\"distinct_on\":[\"name\"],\"order_by\":[{\"field\":\"name\"},{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"b\",\"name\":\"Beta\"}",
+        "{\"id\":\"c\",\"name\":\"beta\"}",
+        "{\"id\":\"a\",\"name\":\"alpha\"}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name\":\"alpha\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name\":\"Beta\"}", result.rows[1]);
+}
+
+test "relational rows distinct on direct field expression inherits collation" {
+    const schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "name", .path = "name", .field_type = .keyword, .collation = "antfly.case_insensitive" },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\",\"name\"],\"distinct_on_expressions\":[{\"field\":\"name\"}],\"order_by\":[{\"expr\":{\"field\":\"name\"}},{\"field\":\"id\"}]}",
         schema,
     );
     defer request.deinit(std.testing.allocator);

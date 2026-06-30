@@ -271,6 +271,13 @@ fn childRangeResponsesAlloc(alloc: std.mem.Allocator, child_ranges: []const db_m
 }
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
+    return handleImpl(ctx, req, path, query) catch |err| switch (err) {
+        error.NotLeader, error.LeaderUnavailable, error.ReadUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
+        else => return err,
+    };
+}
+
+fn handleImpl(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
     const alloc = ctx.alloc;
     const source = ctx.reads;
     if (req.method == .GET) {
@@ -563,11 +570,13 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 parsed.value.topology_epoch,
                 parsed.value.req,
                 parsed.value.doc_key_range,
+                parsed.value.system_time,
                 .read_index,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.SystemVersionedHistoryPruned => return try http_route_helpers.textResponse(alloc, 410, "system-versioned history pruned"),
                 error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -985,12 +994,21 @@ test "internal group read routes expose relational rows source group local" {
             topology_epoch: u64,
             req_inner: db_mod.types.RelationalRowsQueryRequest,
             doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+            system_time: ?table_reads.RelationalRowsSourceGroupSystemTime,
             consistency: @import("../raft/mod.zig").ReadConsistency,
         ) !?db_mod.types.RelationalRowsQueryResult {
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("{\"type\":\"object\"}", schema_json);
             if (topology_epoch == 99) return error.TopologyChanged;
+            if (topology_epoch == 76) return error.NotLeader;
+            if (topology_epoch == 77) return error.LeaderUnavailable;
+            if (topology_epoch == 78) return error.ReadUnavailable;
+            if (system_time) |selector| {
+                if (selector.sequence == 13) return error.SystemVersionedHistoryPruned;
+                try std.testing.expectEqual(@as(u64, 7), selector.sequence.?);
+                try std.testing.expect(selector.timestamp_ns == null);
+            }
             try std.testing.expectEqual(@as(u64, 42), topology_epoch);
             try std.testing.expect(req_inner.select_all);
             try std.testing.expectEqualStrings("a", doc_key_range.start);
@@ -1054,6 +1072,66 @@ test "internal group read routes expose relational rows source group local" {
 
     try std.testing.expectEqual(@as(u16, 409), stale_resp.status);
     try std.testing.expectEqualStrings("topology changed", stale_resp.body);
+
+    const UnavailableCase = struct {
+        topology_epoch: u64,
+    };
+    const unavailable_cases = [_]UnavailableCase{
+        .{ .topology_epoch = 76 },
+        .{ .topology_epoch = 77 },
+        .{ .topology_epoch = 78 },
+    };
+    for (unavailable_cases) |case| {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"schema_json\":\"{{\\\"type\\\":\\\"object\\\"}}\",\"topology_epoch\":{d},\"req\":{{\"select_all\":true}},\"doc_key_range\":{{\"start\":\"a\",\"end\":\"z\"}}}}",
+            .{case.topology_epoch},
+        );
+        defer alloc.free(body);
+        var unavailable_resp = (try handle(.{
+            .alloc = alloc,
+            .reads = FakeReads.source(),
+            .catalog = .{
+                .ptr = undefined,
+            },
+            .query_router = .{
+                .ptr = undefined,
+                .route_query_to_read_schema = struct {
+                    fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+                }.route,
+            },
+        }, .{
+            .method = .POST,
+            .uri = "/internal/v1/groups/7/tables/docs/rows/source",
+            .body = body,
+        }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
+        defer unavailable_resp.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+        try std.testing.expectEqualStrings("leader unavailable", unavailable_resp.body);
+    }
+
+    var pruned_resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/source",
+        .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":42,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"},\"system_time\":{\"sequence\":13}}",
+    }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
+    defer pruned_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 410), pruned_resp.status);
+    try std.testing.expectEqualStrings("system-versioned history pruned", pruned_resp.body);
 }
 
 test "internal group vector worker rejects unsupported identity generation" {

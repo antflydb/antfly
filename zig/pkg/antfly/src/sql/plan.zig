@@ -73,9 +73,37 @@ const GeneratedLimitValue = struct {
     value: ?u32,
 };
 
-fn generatedPaginationExpressionRange(expression: generated_parser.GeneratedSqlExpressionAst) !generated_parser.GeneratedSqlTokenRange {
-    if (expression.kind != .token_range) return error.UnsupportedSqlShape;
-    return expression.tokens orelse error.UnsupportedSqlShape;
+fn parseGeneratedPaginationNullableU32Expression(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    expected_range: generated_parser.GeneratedSqlTokenRange,
+    params: []const value_mod.SqlValue,
+) !?u32 {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(expression_tokens, expected_range)) return error.UnsupportedSqlShape;
+    switch (expression.kind) {
+        .token_range => {
+            var generated_pos = expected_range.start;
+            const value = try value_mod.parseNullableSqlU32Value(tokens, &generated_pos, params);
+            if (generated_pos != expected_range.end) return error.UnsupportedSqlShape;
+            return value;
+        },
+        .unary_positive => {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.start != expected_range.start or operator_tokens.end != expected_range.start + 1) return error.UnsupportedSqlShape;
+            if (operator_tokens.end > tokens.len or tokens[operator_tokens.start].kind != .plus) return error.UnsupportedSqlShape;
+            const value_range = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            if (value_range.start != operator_tokens.end or value_range.end != expected_range.end) return error.UnsupportedSqlShape;
+            const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (right_expression.kind != .token_range) return error.UnsupportedSqlShape;
+            if (!generatedTokenRangeEqual(right_expression.tokens orelse return error.UnsupportedSqlShape, value_range)) return error.UnsupportedSqlShape;
+            var generated_pos = value_range.start;
+            const value = try value_mod.parseNullableSqlU32Value(tokens, &generated_pos, params);
+            if (generated_pos != value_range.end) return error.UnsupportedSqlShape;
+            return value;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn generatedTokenRangeEqual(
@@ -258,6 +286,7 @@ pub const LoweredSelect = struct {
     query: db_mod.types.RelationalRowsQueryRequest,
     select_outputs: []const SelectOutputRef = &.{},
     system_time_as_of_sequence: ?u64 = null,
+    system_time_as_of_timestamp_ns: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -378,6 +407,7 @@ pub const LoweredQueryPlan = struct {
     table_name: []const u8,
     plan: db_mod.types.RelationalRowsQueryPlan,
     system_time_as_of_sequence: ?u64 = null,
+    system_time_as_of_timestamp_ns: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -1358,11 +1388,7 @@ fn parseGeneratedLimitValueForClause(
         pos.* = range.end;
         return .{ .value = null };
     }
-    const expression_range = try generatedPaginationExpressionRange(read.limit_expression);
-    if (expression_range.start != range.start or expression_range.end != range.end) return error.UnsupportedSqlShape;
-    var generated_pos = expression_range.start;
-    const limit = try value_mod.parseLimitValue(tokens, &generated_pos, params);
-    if (generated_pos != expression_range.end) return error.UnsupportedSqlShape;
+    const limit = try parseGeneratedPaginationNullableU32Expression(tokens, read.limit_expression, range, params);
     pos.* = range.end;
     return .{ .value = limit };
 }
@@ -1378,15 +1404,13 @@ fn parseGeneratedOffsetValueForClause(
     if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.offset)) return null;
     const range = read.offset_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
-    const expression_range = try generatedPaginationExpressionRange(read.offset_expression);
+    const expression_range = read.offset_expression.tokens orelse return error.UnsupportedSqlShape;
     if (expression_range.start != range.start or expression_range.end > range.end) return error.UnsupportedSqlShape;
     if (expression_range.end != range.end) {
         if (expression_range.end + 1 != range.end) return error.UnsupportedSqlShape;
         if (!tokens[expression_range.end].matchesKeywordTag(.row) and !tokens[expression_range.end].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
     }
-    var generated_pos = expression_range.start;
-    const offset = (try value_mod.parseNullableSqlU32Value(tokens, &generated_pos, params)) orelse 0;
-    if (generated_pos != expression_range.end) return error.UnsupportedSqlShape;
+    const offset = (try parseGeneratedPaginationNullableU32Expression(tokens, read.offset_expression, expression_range, params)) orelse 0;
     pos.* = range.end;
     return offset;
 }
@@ -1402,20 +1426,21 @@ fn parseGeneratedFetchLimitValueForClause(
     if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.fetch)) return null;
     const range = read.fetch_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
-    var clause_pos = range.start;
-    const clause_limit = try value_mod.parseFetchLimitValue(tokens, &clause_pos, params);
-    if (clause_pos != range.end) return error.UnsupportedSqlShape;
+    if (range.start >= range.end or (!tokens[range.start].matchesKeywordTag(.first) and !tokens[range.start].matchesKeywordTag(.next))) return error.UnsupportedSqlShape;
     const limit = if (read.fetch_count_tokens) |count_range| blk: {
-        const expression_range = try generatedPaginationExpressionRange(read.fetch_count_expression);
-        if (expression_range.start != count_range.start or expression_range.end != count_range.end) return error.UnsupportedSqlShape;
-        var generated_pos = expression_range.start;
-        const generated_limit = try value_mod.parseLimitValue(tokens, &generated_pos, params);
-        if (generated_pos != expression_range.end) return error.UnsupportedSqlShape;
-        if (generated_limit != clause_limit) return error.UnsupportedSqlShape;
+        const expression_range = read.fetch_count_expression.tokens orelse return error.UnsupportedSqlShape;
+        if (expression_range.start != count_range.start or expression_range.end != count_range.end or count_range.start != range.start + 1) return error.UnsupportedSqlShape;
+        const generated_limit = try parseGeneratedPaginationNullableU32Expression(tokens, read.fetch_count_expression, expression_range, params);
+        if (count_range.end + 2 != range.end) return error.UnsupportedSqlShape;
+        if (!tokens[count_range.end].matchesKeywordTag(.row) and !tokens[count_range.end].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
+        if (!tokens[count_range.end + 1].matchesKeywordTag(.only)) return error.UnsupportedSqlShape;
         break :blk generated_limit;
     } else blk: {
         if (read.fetch_count_expression.tokens != null) return error.UnsupportedSqlShape;
-        break :blk clause_limit;
+        if (range.start + 3 != range.end) return error.UnsupportedSqlShape;
+        if (!tokens[range.start + 1].matchesKeywordTag(.row) and !tokens[range.start + 1].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
+        if (!tokens[range.start + 2].matchesKeywordTag(.only)) return error.UnsupportedSqlShape;
+        break :blk @as(?u32, 1);
     };
     pos.* = range.end;
     return .{ .value = limit };
@@ -1450,6 +1475,33 @@ test "sql adapter plan parses generated pagination from expression AST ranges" {
     const fetch = (try parseGeneratedFetchLimitValueForClause(tokens, 9, &fetch_pos, &.{}, read_ast)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?u32, 3), fetch.value);
     try std.testing.expectEqual(@as(usize, tokens.len), fetch_pos);
+
+    var unary_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records LIMIT +5 OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY",
+    );
+    defer unary_parsed_sql.deinit(alloc);
+    const unary_generated_raw = unary_parsed_sql.generated_statement orelse return error.TestUnexpectedResult;
+    const unary_read_ast = switch (unary_generated_raw.ast orelse return error.TestUnexpectedResult) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    const unary_tokens = unary_parsed_sql.items();
+
+    var unary_limit_pos: usize = 5;
+    const unary_limit = (try parseGeneratedLimitValueForClause(unary_tokens, 4, &unary_limit_pos, &.{}, unary_read_ast)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 5), unary_limit.value);
+    try std.testing.expectEqual(@as(usize, 7), unary_limit_pos);
+
+    var unary_offset_pos: usize = 8;
+    const unary_offset = (try parseGeneratedOffsetValueForClause(unary_tokens, 7, &unary_offset_pos, &.{}, unary_read_ast)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 2), unary_offset);
+    try std.testing.expectEqual(@as(usize, 11), unary_offset_pos);
+
+    var unary_fetch_pos: usize = 12;
+    const unary_fetch = (try parseGeneratedFetchLimitValueForClause(unary_tokens, 11, &unary_fetch_pos, &.{}, unary_read_ast)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 3), unary_fetch.value);
+    try std.testing.expectEqual(@as(usize, unary_tokens.len), unary_fetch_pos);
 
     var malformed_limit_ast = read_ast.*;
     malformed_limit_ast.limit_expression.tokens = malformed_limit_ast.projection_items.expression_items[0];
@@ -2130,6 +2182,23 @@ fn parseSetOperationPlanWithCtesAlloc(
     };
     if (!std.mem.eql(u8, left.table_name, right.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
     if (!(try reconcileSetOperationOutputColumns(alloc, left_columns, right_columns))) return error.UnsupportedSqlShape;
+    const system_time_as_of_sequence = if (left.system_time_as_of_sequence) |left_sequence| blk: {
+        const right_sequence = right.system_time_as_of_sequence orelse return error.UnsupportedSqlShape;
+        if (left.system_time_as_of_timestamp_ns != null or right.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
+        if (left_sequence != right_sequence) return error.UnsupportedSqlShape;
+        break :blk left_sequence;
+    } else blk: {
+        if (right.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
+        break :blk null;
+    };
+    const system_time_as_of_timestamp_ns = if (left.system_time_as_of_timestamp_ns) |left_timestamp_ns| blk: {
+        const right_timestamp_ns = right.system_time_as_of_timestamp_ns orelse return error.UnsupportedSqlShape;
+        if (left_timestamp_ns != right_timestamp_ns) return error.UnsupportedSqlShape;
+        break :blk left_timestamp_ns;
+    } else blk: {
+        if (right.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
+        break :blk null;
+    };
 
     const left_table_name = left.table_name;
     left.table_name = "";
@@ -2141,6 +2210,8 @@ fn parseSetOperationPlanWithCtesAlloc(
     var left_plan = LoweredQueryPlan{
         .table_name = left_table_name,
         .plan = .{ .query = left.query },
+        .system_time_as_of_sequence = system_time_as_of_sequence,
+        .system_time_as_of_timestamp_ns = system_time_as_of_timestamp_ns,
     };
     left.query = .{};
     errdefer left_plan.deinit(alloc);
@@ -2148,6 +2219,8 @@ fn parseSetOperationPlanWithCtesAlloc(
     var right_plan = LoweredQueryPlan{
         .table_name = right_table_name,
         .plan = .{ .query = right.query },
+        .system_time_as_of_sequence = system_time_as_of_sequence,
+        .system_time_as_of_timestamp_ns = system_time_as_of_timestamp_ns,
     };
     right.query = .{};
     errdefer right_plan.deinit(alloc);
@@ -2175,8 +2248,12 @@ fn resolveSetOperationSelectSourceForPlanAlloc(
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: *?[]const u8,
 ) !void {
-    try resolveSelectSourceForPlanAlloc(alloc, lowered, ctes, base_table_name);
-    if (lowered.query.source_cte.len == 0) return;
+    if (findCteByName(ctes, lowered.table_name)) |cte| {
+        lowered.query.source_cte = try alloc.dupe(u8, lowered.table_name);
+        if (cte.table_function) |table_function| try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
+    } else {
+        return;
+    }
     const base = base_table_name.* orelse return error.UnsupportedSqlShape;
     const physical_table_name = try alloc.dupe(u8, base);
     alloc.free(lowered.table_name);

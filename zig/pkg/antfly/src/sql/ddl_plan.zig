@@ -12478,6 +12478,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .create_server => .create_server_not_planned_by_generated_parser,
         .create_subscription => .create_subscription_not_planned_by_generated_parser,
         .create_statistics => .create_statistics_not_planned_by_generated_parser,
+        .create_table_missing_as => .create_table_missing_as_not_planned_by_generated_parser,
         .create_text_search_configuration => .create_text_search_configuration_not_planned_by_generated_parser,
         .create_text_search_dictionary => .create_text_search_dictionary_not_planned_by_generated_parser,
         .create_text_search_parser => .create_text_search_parser_not_planned_by_generated_parser,

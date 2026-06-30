@@ -41,6 +41,20 @@ pub fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.Batc
         }
         try out.append(alloc, ']');
     }
+    if (req.relational_identity_rewrites.len > 0) {
+        try out.appendSlice(alloc, ",\"relational_identity_rewrites\":[");
+        for (req.relational_identity_rewrites, 0..) |rewrite, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "{\"old_key\":");
+            try appendJsonString(alloc, &out, rewrite.old_key);
+            try out.appendSlice(alloc, ",\"new_key\":");
+            try appendJsonString(alloc, &out, rewrite.new_key);
+            try out.appendSlice(alloc, ",\"value\":");
+            try out.appendSlice(alloc, rewrite.value);
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+    }
     if (req.transforms.len > 0) {
         try out.appendSlice(alloc, ",\"transforms\":[");
         for (req.transforms, 0..) |transform, i| {
@@ -66,6 +80,8 @@ pub fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.Batc
         }
         try out.append(alloc, ']');
     }
+    try out.appendSlice(alloc, ",\"sync_level\":");
+    try appendJsonString(alloc, &out, db_mod.types.publicSyncLevelText(req.sync_level));
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -87,7 +103,13 @@ test "remote batch request encoder preserves writes deletes transforms and escap
             .{ .key = "doc:\"quoted\"", .value = "{\"title\":\"alpha\"}" },
         },
         .deletes = &.{"doc:\nold"},
+        .relational_identity_rewrites = &.{.{
+            .old_key = "doc:old",
+            .new_key = "doc:new",
+            .value = "{\"title\":\"renamed\"}",
+        }},
         .transforms = &transforms,
+        .sync_level = .write,
     });
     defer alloc.free(body);
 
@@ -97,6 +119,11 @@ test "remote batch request encoder preserves writes deletes transforms and escap
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("alpha", root.get("inserts").?.object.get("doc:\"quoted\"").?.object.get("title").?.string);
     try std.testing.expectEqualStrings("doc:\nold", root.get("deletes").?.array.items[0].string);
+    try std.testing.expectEqualStrings("write", root.get("sync_level").?.string);
+    const rewrite = root.get("relational_identity_rewrites").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:old", rewrite.get("old_key").?.string);
+    try std.testing.expectEqualStrings("doc:new", rewrite.get("new_key").?.string);
+    try std.testing.expectEqualStrings("renamed", rewrite.get("value").?.object.get("title").?.string);
 
     const transform = root.get("transforms").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:transform", transform.get("key").?.string);

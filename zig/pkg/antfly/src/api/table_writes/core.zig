@@ -379,6 +379,26 @@ pub const TableWriteSource = struct {
             req: db_mod.types.RelationalRowsMutationSourceRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
+        rows_mutation_source_collect_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+        ) anyerror!?[]u8 = null,
+        rows_mutation_source_stage_planned_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+            matched: u32,
+            candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         table_emptying: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -402,6 +422,36 @@ pub const TableWriteSource = struct {
             req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
             source_rows: []const []const u8,
             sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
+        rows_joined_mutation_source_collect_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            target_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        ) anyerror!?[]u8 = null,
+        rows_joined_mutation_source_inputs_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        ) anyerror!?[]u8 = null,
+        rows_joined_mutation_source_stage_planned_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            matched: u32,
+            candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         merge_rows_from_source_rows: ?*const fn (
             ptr: *anyopaque,
@@ -859,6 +909,34 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, schema, req, sync_level);
     }
 
+    pub fn rowsMutationSourceCollectGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.rows_mutation_source_collect_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema, req);
+    }
+
+    pub fn rowsMutationSourceStagePlannedGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.rows_mutation_source_stage_planned_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema, req, matched, candidates);
+    }
+
     pub fn tableEmptying(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -931,6 +1009,48 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const fn_ptr = self.vtable.mutate_rows_joined_from_source_rows_autocommit orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, target_schema, source_schema, req, source_rows, sync_level);
+    }
+
+    pub fn rowsJoinedMutationSourceCollectGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.rows_joined_mutation_source_collect_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, target_schema, req);
+    }
+
+    pub fn rowsJoinedMutationSourceInputsGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.rows_joined_mutation_source_inputs_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, source_schema, req);
+    }
+
+    pub fn rowsJoinedMutationSourceStagePlannedGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.rows_joined_mutation_source_stage_planned_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, target_schema, source_schema, req, matched, candidates);
     }
 
     pub fn mergeRowsFromSourceRows(

@@ -58,10 +58,15 @@ pub const ParserState = struct {
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     generated_returning_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
+    generated_conflict_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_insert_column_items: ?*const generated_parser.GeneratedSqlListAst = null,
+    generated_conflict_target_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_target_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_conflict_target_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_target_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    generated_conflict_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_action_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_action_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
     generated_merge_arms: ?*const generated_parser.GeneratedSqlMergeArmListAst = null,
 };
@@ -273,6 +278,8 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .conflict_assignment_hooks = Accessors.conflictUpdateSetAssignmentParserOptions(ptr, &.{}, &.{}),
                 .generated_dml_ast = ptr.generated_dml_ast,
                 .generated_conflict_assignment_items = ptr.generated_assignment_items,
+                .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
+                .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
                 .generated_insert_column_items = ptr.generated_insert_column_items,
                 .conflict_condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
                 .conflict_dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
@@ -780,8 +787,10 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .case_expression_hooks = Accessors.caseExpressionParserHooks(ptr),
+                .generated_target_tokens = ptr.generated_conflict_target_tokens,
                 .generated_target_items = ptr.generated_conflict_target_items,
                 .generated_where_tokens = ptr.generated_conflict_target_where_tokens,
+                .generated_where_expression = ptr.generated_conflict_target_where_expression,
             };
         }
 
@@ -845,6 +854,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
                 .generated_action_where_tokens = ptr.generated_conflict_action_where_tokens,
+                .generated_expression_ast = ptr.generated_conflict_action_where_expression,
             };
         }
 
@@ -1053,6 +1063,8 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .target_options = Accessors.conflictTargetParserOptions(ptr),
                 .assignment_value_hooks = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, &.{}, &.{}),
                 .generated_conflict_assignment_items = ptr.generated_assignment_items,
+                .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
+                .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
                 .condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
                 .dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),

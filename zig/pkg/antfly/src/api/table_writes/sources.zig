@@ -81,6 +81,8 @@ const RaftBatcher = table_write_core.RaftBatcher;
 const GroupBatch = table_write_core.GroupBatch;
 const WriteCoalesceQueue = table_write_bulk_ingest.WriteCoalesceQueue;
 const max_cached_write_tables = 64;
+const hosted_mutation_source_topology_attempts = 2;
+const post_stage_topology_changed_error = error.TopologyChangedAfterMutationSourceStage;
 const freeBackupShards = table_write_backup_restore.freeBackupShards;
 const ProvisionedTableWriteCache = table_write_cache.ProvisionedTableWriteCache;
 const HostedManagedDbCache = table_write_cache.HostedManagedDbCache;
@@ -1516,7 +1518,7 @@ pub const ProvisionedTableWriteSource = struct {
         metadata_group_id: u64,
         hosted_group_ids: []const u64,
         tables: []const metadata_table_manager.TableRecord,
-        ranges: []const metadata_table_manager.RangeRecord,
+        ranges: []const *const metadata_table_manager.RangeRecord,
         backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     ) !metadata_table_provisioner.ProvisionSummary {
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
@@ -7370,8 +7372,14 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .batch_catalog = HostedProvisionedTableWriteSource.batchCatalogNative,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                .rows_mutation_source_collect_group_local = rowsMutationSourceCollectGroupLocal,
+                .rows_mutation_source_stage_planned_group_local = rowsMutationSourceStagePlannedGroupLocal,
                 .table_emptying = tableEmptying,
+                .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
                 .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
+                .rows_joined_mutation_source_collect_group_local = rowsJoinedMutationSourceCollectGroupLocal,
+                .rows_joined_mutation_source_inputs_group_local = rowsJoinedMutationSourceInputsGroupLocal,
+                .rows_joined_mutation_source_stage_planned_group_local = rowsJoinedMutationSourceStagePlannedGroupLocal,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -7804,11 +7812,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                         }
                     },
                     .remote => |remote| {
-                        if (group.relational_identity_rewrites.items.len != 0) return error.UnsupportedOperation;
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
+                            .relational_identity_rewrites = group.relational_identity_rewrites.items,
                             .transforms = group.transforms.items,
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
@@ -7873,13 +7881,35 @@ pub const HostedProvisionedTableWriteSource = struct {
         schema: storage_schema.TableSchema,
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        var attempt: usize = 0;
+        while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
+            return mutateRowsFromSourceOnce(ptr, alloc, table_name, schema, req) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt == 0) continue else return err,
+                post_stage_topology_changed_error => return error.TopologyChanged,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn mutateRowsFromSourceOnce(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
         const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
         defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len != 1) return error.UnsupportedOperation;
+        if (ranges.len == 0) return null;
+        const topology_epoch = table_catalog.tableTopologyEpochFromRanges(table.*, ranges);
+        if (ranges.len != 1) {
+            return try self.mutateRowsFromSourceAcrossTargetOwners(alloc, table_name, table.schema_json, ranges, topology_epoch, schema, req);
+        }
 
         const group_id = ranges[0].group_id;
         var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
@@ -7887,7 +7917,21 @@ pub const HostedProvisionedTableWriteSource = struct {
             defer route.deinit(alloc);
             switch (route.*) {
                 .local => return try self.mutateRowsFromSourceGroupLocal(alloc, group_id, table_name, schema, req),
-                .remote => return error.UnsupportedOperation,
+                .remote => |remote| {
+                    const request_body = try relational_rows_api.encodeRowsMutationSourceRequestAlloc(alloc, req);
+                    defer alloc.free(request_body);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .schema_json = table.schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .autocommit = false,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
             }
         }
 
@@ -7934,14 +7978,58 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsMutationSourceRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        _ = sync_level;
+        var attempt: usize = 0;
+        while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
+            return mutateRowsFromSourceAutocommitOnce(ptr, alloc, table_name, schema, req, sync_level) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt == 0) continue else return err,
+                post_stage_topology_changed_error => return error.TopologyChanged,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn mutateRowsFromSourceAutocommitOnce(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
         const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
         defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len != 1) return error.UnsupportedOperation;
+        if (ranges.len == 0) return null;
+        const topology_epoch = table_catalog.tableTopologyEpochFromRanges(table.*, ranges);
+        if (ranges.len != 1) {
+            const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
+            if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+            const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+            if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+
+            const begin_timestamp = nextTxnTimestamp();
+            var result = (try self.mutateRowsFromSourceAcrossTargetOwners(alloc, table_name, table.schema_json, ranges, topology_epoch, schema, req)) orelse return null;
+            errdefer result.deinit(alloc);
+
+            var commit = try RowsMutationSourceParticipantCommit.fromResultAlloc(alloc, table_name, result);
+            defer commit.deinit(alloc);
+            if (commit.hasParticipantWork()) {
+                const txn_tables = [_]distributed_txn.TableCommitRequest{commit.table};
+                const outcome = (self.source().commitTransactionWithId(alloc, txn_id, begin_timestamp, txn_tables[0..], sync_level) catch |err| switch (err) {
+                    error.TopologyChanged => return post_stage_topology_changed_error,
+                    else => return err,
+                }) orelse return error.UnsupportedOperation;
+                switch (outcome) {
+                    .committed => {},
+                    .conflict => return error.VersionConflict,
+                }
+            }
+            return result;
+        }
 
         const group_id = ranges[0].group_id;
         var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
@@ -7949,7 +8037,21 @@ pub const HostedProvisionedTableWriteSource = struct {
             defer route.deinit(alloc);
             switch (route.*) {
                 .local => return try self.mutateRowsFromSourceAutocommitGroupLocal(alloc, group_id, table_name, schema, req),
-                .remote => return error.UnsupportedOperation,
+                .remote => |remote| {
+                    const request_body = try relational_rows_api.encodeRowsMutationSourceRequestAlloc(alloc, req);
+                    defer alloc.free(request_body);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .schema_json = table.schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .sync_level = db_mod.types.publicSyncLevelText(sync_level),
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
             }
         }
 
@@ -7981,6 +8083,83 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try mutateRowsFromSourceAutocommitOnDb(alloc, cached.db, schema, req);
     }
 
+    fn mutateRowsFromSourceAcrossTargetOwners(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        ranges: []const *const metadata_table_manager.RangeRecord,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
+        const request_body = try relational_rows_api.encodeRowsMutationSourceRequestAlloc(alloc, req);
+        defer alloc.free(request_body);
+
+        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
+        defer {
+            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
+            target_candidates.deinit(alloc);
+        }
+
+        for (ranges) |range| {
+            const collected = try self.collectRowsMutationSourceTargetCandidatesForGroup(alloc, range.group_id, table_name, schema_json, request_body, topology_epoch, schema, req);
+            defer {
+                for (collected) |*candidate| candidate.deinit(alloc);
+                if (collected.len > 0) alloc.free(collected);
+            }
+            try target_candidates.ensureUnusedCapacity(alloc, collected.len);
+            for (collected) |*candidate| {
+                if (candidate.group_id != range.group_id) return error.TopologyChanged;
+                target_candidates.appendAssumeCapacity(candidate.*);
+                candidate.* = .{ .doc_key = &.{}, .json = &.{}, .order_keys = &.{}, .ordinal = 0 };
+            }
+        }
+
+        var target_slice = try target_candidates.toOwnedSlice(alloc);
+        target_candidates = .empty;
+        errdefer {
+            for (target_slice) |*candidate| candidate.deinit(alloc);
+            if (target_slice.len > 0) alloc.free(target_slice);
+        }
+
+        var plan = try db_mod.DB.selectPlannedRelationalRowsMutationSourceCandidatesAlloc(alloc, req, &target_slice);
+        defer plan.deinit(alloc);
+
+        var aggregate = RowsMutationSourceResultAccumulator{};
+        defer aggregate.deinit(alloc);
+        var staged_owner_work = false;
+        for (plan.candidates) |candidate| {
+            if (claim.effectiveSkipLocked()) {
+                if (req.source.limit) |max_staged| {
+                    if (aggregate.staged >= max_staged) break;
+                }
+            }
+            var single_candidate = [_]db_mod.DB.RelationalRowsMutationSourceCandidate{candidate};
+            var group_result = (self.stageRowsMutationSourcePlannedCandidateForGroup(
+                alloc,
+                candidate.group_id,
+                table_name,
+                schema_json,
+                request_body,
+                schema,
+                req,
+                topology_epoch,
+                plan.matched,
+                single_candidate[0..],
+            ) catch |err| switch (err) {
+                error.TopologyChanged => if (!staged_owner_work) return err else return post_stage_topology_changed_error,
+                else => return err,
+            }) orelse return null;
+            const group_staged_owner_work = rowsMutationSourceResultHasStagedOwnerWork(group_result);
+            defer group_result.deinit(alloc);
+            try aggregate.appendTransferred(alloc, &group_result);
+            staged_owner_work = staged_owner_work or group_staged_owner_work;
+        }
+        return try aggregate.toResult(alloc, plan.matched);
+    }
+
     fn tableEmptying(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7988,6 +8167,676 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         if (tableEmptyingRequiresCatalogBarrier(req)) return error.UnsupportedOperation;
         return try mutateRowsFromSourceAutocommit(ptr, alloc, req.primary_table_name, req.schema, req.mutation, req.sync_level);
+    }
+
+    fn mutateRowsJoinedFromSourceRows(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        var attempt: usize = 0;
+        while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
+            return mutateRowsJoinedFromSourceRowsOnce(ptr, alloc, table_name, target_schema, source_schema, req, source_rows) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt == 0) continue else return err,
+                post_stage_topology_changed_error => return error.TopologyChanged,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn mutateRowsJoinedFromSourceRowsOnce(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const source_schema_json = if (req.source_table.len == 0 or std.mem.eql(u8, req.source_table, table_name))
+            table.schema_json
+        else
+            (tables_api.findTableByName(&snapshot, req.source_table) orelse return null).schema_json;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+        const topology_epoch = table_catalog.tableTopologyEpochFromRanges(table.*, ranges);
+        if (ranges.len != 1) {
+            return try self.mutateRowsJoinedFromSourceRowsAcrossTargetOwners(alloc, table_name, table.schema_json, source_schema_json, ranges, topology_epoch, target_schema, source_schema, req, source_rows);
+        }
+
+        const group_id = ranges[0].group_id;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try self.mutateRowsJoinedFromSourceRowsGroupLocal(alloc, group_id, table_name, target_schema, source_schema, req, source_rows),
+                .remote => |remote| {
+                    const request_body = try relational_rows_api.encodeRowsJoinedMutationSourceRequestAlloc(alloc, req);
+                    defer alloc.free(request_body);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .target_schema_json = table.schema_json,
+                        .source_schema_json = source_schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .source_rows = source_rows,
+                        .autocommit = false,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsJoinedMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
+            }
+        }
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try self.mutateRowsJoinedFromSourceRowsGroupLocal(alloc, group_id, table_name, target_schema, source_schema, req, source_rows);
+    }
+
+    fn mutateRowsJoinedFromSourceRowsAcrossTargetOwners(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema_json: []const u8,
+        source_schema_json: []const u8,
+        ranges: []const *const metadata_table_manager.RangeRecord,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const claim = switch (req.target_side) {
+            .left => req.join.left.row_claim,
+            .right => req.join.right.row_claim,
+        } orelse return error.InvalidQueryRequest;
+
+        const request_body = try relational_rows_api.encodeRowsJoinedMutationSourceRequestAlloc(alloc, req);
+        defer alloc.free(request_body);
+
+        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
+        defer {
+            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
+            target_candidates.deinit(alloc);
+        }
+
+        for (ranges) |range| {
+            const collected = try self.collectRowsJoinedMutationSourceTargetCandidatesForGroup(alloc, range.group_id, table_name, target_schema_json, source_schema_json, request_body, topology_epoch, target_schema, req);
+            defer {
+                for (collected) |*candidate| candidate.deinit(alloc);
+                if (collected.len > 0) alloc.free(collected);
+            }
+            try target_candidates.ensureUnusedCapacity(alloc, collected.len);
+            for (collected) |*candidate| {
+                if (candidate.group_id != range.group_id) return error.TopologyChanged;
+                target_candidates.appendAssumeCapacity(candidate.*);
+                candidate.* = .{ .doc_key = &.{}, .json = &.{}, .order_keys = &.{}, .ordinal = 0 };
+            }
+        }
+
+        var target_slice = try target_candidates.toOwnedSlice(alloc);
+        target_candidates = .empty;
+        errdefer {
+            for (target_slice) |*candidate| candidate.deinit(alloc);
+            if (target_slice.len > 0) alloc.free(target_slice);
+        }
+
+        var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsWithColumnsAlloc(
+            alloc,
+            req,
+            &target_slice,
+            target_schema.relational_columns,
+            source_rows,
+            source_schema.relational_columns,
+        );
+        errdefer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+        var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
+        defer plan.deinit(alloc);
+
+        var aggregate = RowsMutationSourceResultAccumulator{};
+        defer aggregate.deinit(alloc);
+        var staged_owner_work = false;
+        for (plan.candidates) |candidate| {
+            if (claim.effectiveSkipLocked()) {
+                if (req.join.limit) |max_staged| {
+                    if (aggregate.staged >= max_staged) break;
+                }
+            }
+            var single_candidate = [_]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate{candidate};
+            var group_result = (self.stageRowsJoinedMutationSourcePlannedCandidateForGroup(
+                alloc,
+                candidate.target.group_id,
+                table_name,
+                target_schema_json,
+                source_schema_json,
+                request_body,
+                target_schema,
+                source_schema,
+                req,
+                topology_epoch,
+                plan.matched,
+                single_candidate[0..],
+            ) catch |err| switch (err) {
+                error.TopologyChanged => if (!staged_owner_work) return err else return post_stage_topology_changed_error,
+                else => return err,
+            }) orelse return null;
+            const group_staged_owner_work = rowsMutationSourceResultHasStagedOwnerWork(group_result);
+            defer group_result.deinit(alloc);
+            try aggregate.appendTransferred(alloc, &group_result);
+            staged_owner_work = staged_owner_work or group_staged_owner_work;
+        }
+        return try aggregate.toResult(alloc, plan.matched);
+    }
+
+    fn rowsMutationSourceResultHasStagedOwnerWork(result: db_mod.types.RelationalRowsMutationSourceResult) bool {
+        return result.staged > 0 or
+            result.participant_predicates.len > 0 or
+            result.participant_preimages.len > 0 or
+            result.participant_writes.len > 0 or
+            result.participant_deletes.len > 0 or
+            result.participant_transforms.len > 0;
+    }
+
+    const RowsMutationSourceResultAccumulator = struct {
+        staged: u32 = 0,
+        returning_rows: std.ArrayListUnmanaged([]const u8) = .empty,
+        participant_predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
+        participant_preimages: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
+        participant_writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
+        participant_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+        participant_transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.returning_rows.items) |row| alloc.free(@constCast(row));
+            self.returning_rows.deinit(alloc);
+            for (self.participant_predicates.items) |predicate| alloc.free(@constCast(predicate.key));
+            self.participant_predicates.deinit(alloc);
+            for (self.participant_preimages.items) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            self.participant_preimages.deinit(alloc);
+            for (self.participant_writes.items) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            self.participant_writes.deinit(alloc);
+            for (self.participant_deletes.items) |key| alloc.free(key);
+            self.participant_deletes.deinit(alloc);
+            for (self.participant_transforms.items) |transform| {
+                alloc.free(@constCast(transform.key));
+                for (transform.operations) |op| {
+                    alloc.free(@constCast(op.path));
+                    if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                }
+                if (transform.operations.len > 0) alloc.free(transform.operations);
+            }
+            self.participant_transforms.deinit(alloc);
+            self.* = undefined;
+        }
+
+        fn appendTransferred(self: *@This(), alloc: std.mem.Allocator, result: *db_mod.types.RelationalRowsMutationSourceResult) !void {
+            try self.returning_rows.ensureUnusedCapacity(alloc, result.returning_rows.len);
+            try self.participant_predicates.ensureUnusedCapacity(alloc, result.participant_predicates.len);
+            try self.participant_preimages.ensureUnusedCapacity(alloc, result.participant_preimages.len);
+            try self.participant_writes.ensureUnusedCapacity(alloc, result.participant_writes.len);
+            try self.participant_deletes.ensureUnusedCapacity(alloc, result.participant_deletes.len);
+            try self.participant_transforms.ensureUnusedCapacity(alloc, result.participant_transforms.len);
+            self.staged += result.staged;
+            self.returning_rows.appendSliceAssumeCapacity(result.returning_rows);
+            self.participant_predicates.appendSliceAssumeCapacity(result.participant_predicates);
+            self.participant_preimages.appendSliceAssumeCapacity(result.participant_preimages);
+            self.participant_writes.appendSliceAssumeCapacity(result.participant_writes);
+            self.participant_deletes.appendSliceAssumeCapacity(result.participant_deletes);
+            self.participant_transforms.appendSliceAssumeCapacity(result.participant_transforms);
+            if (result.returning_rows.len > 0) alloc.free(result.returning_rows);
+            if (result.participant_predicates.len > 0) alloc.free(result.participant_predicates);
+            if (result.participant_preimages.len > 0) alloc.free(result.participant_preimages);
+            if (result.participant_writes.len > 0) alloc.free(result.participant_writes);
+            if (result.participant_deletes.len > 0) alloc.free(result.participant_deletes);
+            if (result.participant_transforms.len > 0) alloc.free(result.participant_transforms);
+            result.returning_rows = &.{};
+            result.participant_predicates = &.{};
+            result.participant_preimages = &.{};
+            result.participant_writes = &.{};
+            result.participant_deletes = &.{};
+            result.participant_transforms = &.{};
+        }
+
+        fn toResult(self: *@This(), alloc: std.mem.Allocator, matched: u32) !db_mod.types.RelationalRowsMutationSourceResult {
+            const returning_rows = try self.returning_rows.toOwnedSlice(alloc);
+            errdefer {
+                for (returning_rows) |row| alloc.free(@constCast(row));
+                if (returning_rows.len > 0) alloc.free(returning_rows);
+            }
+            const participant_predicates = try self.participant_predicates.toOwnedSlice(alloc);
+            errdefer {
+                for (participant_predicates) |predicate| alloc.free(@constCast(predicate.key));
+                if (participant_predicates.len > 0) alloc.free(participant_predicates);
+            }
+            const participant_preimages = try self.participant_preimages.toOwnedSlice(alloc);
+            errdefer {
+                for (participant_preimages) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                if (participant_preimages.len > 0) alloc.free(participant_preimages);
+            }
+            const participant_writes = try self.participant_writes.toOwnedSlice(alloc);
+            errdefer {
+                for (participant_writes) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                if (participant_writes.len > 0) alloc.free(participant_writes);
+            }
+            const participant_deletes = try self.participant_deletes.toOwnedSlice(alloc);
+            errdefer {
+                for (participant_deletes) |key| alloc.free(key);
+                if (participant_deletes.len > 0) alloc.free(participant_deletes);
+            }
+            const participant_transforms = try self.participant_transforms.toOwnedSlice(alloc);
+            errdefer {
+                for (participant_transforms) |transform| {
+                    alloc.free(@constCast(transform.key));
+                    for (transform.operations) |op| {
+                        alloc.free(@constCast(op.path));
+                        if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                    }
+                    if (transform.operations.len > 0) alloc.free(transform.operations);
+                }
+                if (participant_transforms.len > 0) alloc.free(participant_transforms);
+            }
+            return .{
+                .matched = matched,
+                .staged = self.staged,
+                .returning_rows = returning_rows,
+                .participant_predicates = participant_predicates,
+                .participant_preimages = participant_preimages,
+                .participant_writes = participant_writes,
+                .participant_deletes = participant_deletes,
+                .participant_transforms = participant_transforms,
+            };
+        }
+    };
+
+    const RowsMutationSourceParticipantCommit = struct {
+        table: distributed_txn.TableCommitRequest,
+
+        fn fromResultAlloc(
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            result: db_mod.types.RelationalRowsMutationSourceResult,
+        ) !RowsMutationSourceParticipantCommit {
+            var self: RowsMutationSourceParticipantCommit = .{
+                .table = .{
+                    .table_name = try alloc.dupe(u8, table_name),
+                },
+            };
+            errdefer self.deinit(alloc);
+            self.table.predicates = try cloneRowsMutationSourceParticipantPredicates(alloc, result.participant_predicates);
+            self.table.preimages = try cloneRowsMutationSourceParticipantWrites(alloc, result.participant_preimages);
+            self.table.writes = try cloneRowsMutationSourceParticipantWrites(alloc, result.participant_writes);
+            self.table.deletes = try cloneRowsMutationSourceParticipantDeletes(alloc, result.participant_deletes);
+            self.table.transforms = try cloneRowsMutationSourceParticipantTransforms(alloc, result.participant_transforms);
+            return self;
+        }
+
+        fn hasParticipantWork(self: RowsMutationSourceParticipantCommit) bool {
+            return self.table.predicates.len != 0 or
+                self.table.preimages.len != 0 or
+                self.table.writes.len != 0 or
+                self.table.deletes.len != 0 or
+                self.table.transforms.len != 0;
+        }
+
+        fn deinit(self: *RowsMutationSourceParticipantCommit, alloc: std.mem.Allocator) void {
+            alloc.free(@constCast(self.table.table_name));
+            for (self.table.predicates) |predicate| alloc.free(@constCast(predicate.key));
+            if (self.table.predicates.len > 0) alloc.free(self.table.predicates);
+            freeRowsMutationSourceParticipantWrites(alloc, self.table.preimages);
+            freeRowsMutationSourceParticipantWrites(alloc, self.table.writes);
+            for (self.table.deletes) |key| alloc.free(@constCast(key));
+            if (self.table.deletes.len > 0) alloc.free(self.table.deletes);
+            for (self.table.transforms) |transform| freeRowsMutationSourceParticipantTransform(alloc, transform);
+            if (self.table.transforms.len > 0) alloc.free(self.table.transforms);
+            self.* = undefined;
+        }
+
+        fn cloneRowsMutationSourceParticipantPredicates(
+            alloc: std.mem.Allocator,
+            predicates: []const db_mod.types.TransactionVersionPredicate,
+        ) ![]const db_mod.types.TransactionVersionPredicate {
+            if (predicates.len == 0) return &.{};
+            const cloned = try alloc.alloc(db_mod.types.TransactionVersionPredicate, predicates.len);
+            var count: usize = 0;
+            errdefer {
+                for (cloned[0..count]) |predicate| alloc.free(@constCast(predicate.key));
+                alloc.free(cloned);
+            }
+            for (predicates) |predicate| {
+                cloned[count] = .{
+                    .key = try alloc.dupe(u8, predicate.key),
+                    .expected_version = predicate.expected_version,
+                };
+                count += 1;
+            }
+            return cloned;
+        }
+
+        fn cloneRowsMutationSourceParticipantWrites(
+            alloc: std.mem.Allocator,
+            writes: []const db_mod.types.TransactionWrite,
+        ) ![]const db_mod.types.TransactionWrite {
+            if (writes.len == 0) return &.{};
+            const cloned = try alloc.alloc(db_mod.types.TransactionWrite, writes.len);
+            var count: usize = 0;
+            errdefer {
+                for (cloned[0..count]) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                alloc.free(cloned);
+            }
+            for (writes) |write| {
+                cloned[count] = .{
+                    .key = try alloc.dupe(u8, write.key),
+                    .value = try alloc.dupe(u8, write.value),
+                };
+                count += 1;
+            }
+            return cloned;
+        }
+
+        fn freeRowsMutationSourceParticipantWrites(
+            alloc: std.mem.Allocator,
+            writes: []const db_mod.types.TransactionWrite,
+        ) void {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            if (writes.len > 0) alloc.free(writes);
+        }
+
+        fn cloneRowsMutationSourceParticipantDeletes(
+            alloc: std.mem.Allocator,
+            deletes: []const []const u8,
+        ) ![]const []const u8 {
+            if (deletes.len == 0) return &.{};
+            const cloned = try alloc.alloc([]const u8, deletes.len);
+            var count: usize = 0;
+            errdefer {
+                for (cloned[0..count]) |key| alloc.free(@constCast(key));
+                alloc.free(cloned);
+            }
+            for (deletes) |key| {
+                cloned[count] = try alloc.dupe(u8, key);
+                count += 1;
+            }
+            return cloned;
+        }
+
+        fn cloneRowsMutationSourceParticipantTransforms(
+            alloc: std.mem.Allocator,
+            transforms: []const db_mod.types.DocumentTransform,
+        ) ![]const db_mod.types.DocumentTransform {
+            if (transforms.len == 0) return &.{};
+            const cloned = try alloc.alloc(db_mod.types.DocumentTransform, transforms.len);
+            var count: usize = 0;
+            errdefer {
+                for (cloned[0..count]) |transform| freeRowsMutationSourceParticipantTransform(alloc, transform);
+                alloc.free(cloned);
+            }
+            for (transforms) |transform| {
+                cloned[count] = try cloneRowsMutationSourceParticipantTransform(alloc, transform);
+                count += 1;
+            }
+            return cloned;
+        }
+
+        fn cloneRowsMutationSourceParticipantTransform(
+            alloc: std.mem.Allocator,
+            transform: db_mod.types.DocumentTransform,
+        ) !db_mod.types.DocumentTransform {
+            const operations = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
+            var op_count: usize = 0;
+            errdefer {
+                for (operations[0..op_count]) |op| {
+                    alloc.free(@constCast(op.path));
+                    if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                }
+                if (operations.len > 0) alloc.free(operations);
+            }
+            for (transform.operations) |op| {
+                operations[op_count] = .{
+                    .op = op.op,
+                    .path = try alloc.dupe(u8, op.path),
+                    .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+                };
+                op_count += 1;
+            }
+            return .{
+                .key = try alloc.dupe(u8, transform.key),
+                .operations = operations,
+                .upsert = transform.upsert,
+            };
+        }
+
+        fn freeRowsMutationSourceParticipantTransform(
+            alloc: std.mem.Allocator,
+            transform: db_mod.types.DocumentTransform,
+        ) void {
+            alloc.free(@constCast(transform.key));
+            for (transform.operations) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (transform.operations.len > 0) alloc.free(transform.operations);
+        }
+    };
+
+    fn collectRowsMutationSourceTargetCandidatesForGroup(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        schema_json: []const u8,
+        request_body: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) ![]db_mod.DB.RelationalRowsMutationSourceCandidate {
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => {},
+                .remote => |remote| {
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .schema_json = schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsMutationSourceCollect(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceCollectResponseAlloc(alloc, response.body);
+                },
+            }
+        }
+        const response_body = (try rowsMutationSourceCollectGroupLocal(self, alloc, group_id, table_name, topology_epoch, schema, req)) orelse return error.TableNotFound;
+        defer alloc.free(response_body);
+        return try relational_rows_api.parseRowsMutationSourceCollectResponseAlloc(alloc, response_body);
+    }
+
+    fn stageRowsMutationSourcePlannedCandidateForGroup(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        schema_json: []const u8,
+        request_body: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+        topology_epoch: u64,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => {},
+                .remote => |remote| {
+                    const planned_stage = try relational_rows_api.encodeRowsMutationSourcePlannedStageAlloc(alloc, matched, candidates);
+                    defer alloc.free(planned_stage);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .schema_json = schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .planned_stage = planned_stage,
+                        .autocommit = false,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
+            }
+        }
+        return try rowsMutationSourceStagePlannedGroupLocal(self, alloc, group_id, table_name, topology_epoch, schema, req, matched, candidates);
+    }
+
+    fn collectRowsJoinedMutationSourceTargetCandidatesForGroup(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_schema_json: []const u8,
+        source_schema_json: []const u8,
+        request_body: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) ![]db_mod.DB.RelationalRowsMutationSourceCandidate {
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => {},
+                .remote => |remote| {
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .target_schema_json = target_schema_json,
+                        .source_schema_json = source_schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsJoinedMutationSourceCollect(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsJoinedMutationSourceCollectResponseAlloc(alloc, response.body);
+                },
+            }
+        }
+        const response_body = (try rowsJoinedMutationSourceCollectGroupLocal(self, alloc, group_id, table_name, topology_epoch, target_schema, req)) orelse return error.TableNotFound;
+        defer alloc.free(response_body);
+        return try relational_rows_api.parseRowsJoinedMutationSourceCollectResponseAlloc(alloc, response_body);
+    }
+
+    fn stageRowsJoinedMutationSourcePlannedCandidateForGroup(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_schema_json: []const u8,
+        source_schema_json: []const u8,
+        request_body: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        topology_epoch: u64,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => {},
+                .remote => |remote| {
+                    const planned_stage = try relational_rows_api.encodeRowsJoinedMutationSourcePlannedStageAlloc(alloc, matched, candidates);
+                    defer alloc.free(planned_stage);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .target_schema_json = target_schema_json,
+                        .source_schema_json = source_schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .planned_stage = planned_stage,
+                        .autocommit = false,
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsJoinedMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
+            }
+        }
+        return try rowsJoinedMutationSourceStagePlannedGroupLocal(self, alloc, group_id, table_name, topology_epoch, target_schema, source_schema, req, matched, candidates);
+    }
+
+    fn mutateRowsJoinedFromSourceRowsGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        return mutateRowsJoinedFromSourceRowsOnDb(alloc, cached.db, target_schema, source_schema, req, source_rows) catch |err| switch (err) {
+            error.TxnNotFound => {
+                const claim = switch (req.target_side) {
+                    .left => req.join.left.row_claim,
+                    .right => req.join.right.row_claim,
+                } orelse return err;
+                _ = try cached.db.beginTransactionWithIdAndParticipants(claim.txn_id orelse return err, nextTxnTimestamp(), &.{});
+                return try mutateRowsJoinedFromSourceRowsOnDb(alloc, cached.db, target_schema, source_schema, req, source_rows);
+            },
+            else => return err,
+        };
     }
 
     fn mutateRowsJoinedFromSourceRowsAutocommit(
@@ -8000,14 +8849,67 @@ pub const HostedProvisionedTableWriteSource = struct {
         source_rows: []const []const u8,
         sync_level: db_mod.types.SyncLevel,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        _ = sync_level;
+        var attempt: usize = 0;
+        while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
+            return mutateRowsJoinedFromSourceRowsAutocommitOnce(ptr, alloc, table_name, target_schema, source_schema, req, source_rows, sync_level) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt == 0) continue else return err,
+                post_stage_topology_changed_error => return error.TopologyChanged,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn mutateRowsJoinedFromSourceRowsAutocommitOnce(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const source_schema_json = if (req.source_table.len == 0 or std.mem.eql(u8, req.source_table, table_name))
+            table.schema_json
+        else
+            (tables_api.findTableByName(&snapshot, req.source_table) orelse return null).schema_json;
         const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
         defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len != 1) return error.UnsupportedOperation;
+        if (ranges.len == 0) return null;
+        const topology_epoch = table_catalog.tableTopologyEpochFromRanges(table.*, ranges);
+        if (ranges.len != 1) {
+            const claim = switch (req.target_side) {
+                .left => req.join.left.row_claim,
+                .right => req.join.right.row_claim,
+            } orelse return error.InvalidQueryRequest;
+            if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+            const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+            if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+
+            const begin_timestamp = nextTxnTimestamp();
+            var result = (try self.mutateRowsJoinedFromSourceRowsAcrossTargetOwners(alloc, table_name, table.schema_json, source_schema_json, ranges, topology_epoch, target_schema, source_schema, req, source_rows)) orelse return null;
+            errdefer result.deinit(alloc);
+
+            var commit = try RowsMutationSourceParticipantCommit.fromResultAlloc(alloc, table_name, result);
+            defer commit.deinit(alloc);
+            if (commit.hasParticipantWork()) {
+                const txn_tables = [_]distributed_txn.TableCommitRequest{commit.table};
+                const outcome = (self.source().commitTransactionWithId(alloc, txn_id, begin_timestamp, txn_tables[0..], sync_level) catch |err| switch (err) {
+                    error.TopologyChanged => return post_stage_topology_changed_error,
+                    else => return err,
+                }) orelse return error.UnsupportedOperation;
+                switch (outcome) {
+                    .committed => {},
+                    .conflict => return error.VersionConflict,
+                }
+            }
+            return result;
+        }
 
         const group_id = ranges[0].group_id;
         var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
@@ -8015,7 +8917,23 @@ pub const HostedProvisionedTableWriteSource = struct {
             defer route.deinit(alloc);
             switch (route.*) {
                 .local => return try self.mutateRowsJoinedFromSourceRowsAutocommitGroupLocal(alloc, group_id, table_name, target_schema, source_schema, req, source_rows),
-                .remote => return error.UnsupportedOperation,
+                .remote => |remote| {
+                    const request_body = try relational_rows_api.encodeRowsJoinedMutationSourceRequestAlloc(alloc, req);
+                    defer alloc.free(request_body);
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{
+                        .target_schema_json = table.schema_json,
+                        .source_schema_json = source_schema_json,
+                        .request_body = request_body,
+                        .topology_epoch = topology_epoch,
+                        .source_rows = source_rows,
+                        .sync_level = db_mod.types.publicSyncLevelText(sync_level),
+                    }, .{});
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = try client.fetchGroupRowsJoinedMutationSourceStage(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    return try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, response.body);
+                },
             }
         }
 
@@ -8047,6 +8965,144 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
         return try mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, cached.db, target_schema, source_schema, req, source_rows);
+    }
+
+    fn rowsMutationSourceCollectGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        const candidates = try cached.db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, null);
+        defer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+        for (candidates) |*candidate| candidate.group_id = group_id;
+        return try relational_rows_api.encodeRowsMutationSourceCollectResponseAlloc(alloc, candidates);
+    }
+
+    fn rowsMutationSourceStagePlannedGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        try validateMutationSourceCandidatesForGroup(group_id, candidates);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        return cached.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, matched, candidates) catch |err| switch (err) {
+            error.TxnNotFound => {
+                const claim = req.source.row_claim orelse return err;
+                _ = try cached.db.beginTransactionWithIdAndParticipants(claim.txn_id orelse return err, nextTxnTimestamp(), &.{});
+                return try cached.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, matched, candidates);
+            },
+            else => return err,
+        };
+    }
+
+    fn rowsJoinedMutationSourceCollectGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        const candidates = try cached.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+        defer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+        for (candidates) |*candidate| candidate.group_id = group_id;
+        return try relational_rows_api.encodeRowsJoinedMutationSourceCollectResponseAlloc(alloc, candidates);
+    }
+
+    fn rowsJoinedMutationSourceInputsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        var rows = try cached.db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, source_schema, req, null);
+        defer rows.deinit(alloc);
+        return try relational_rows_api.encodeRowsQueryResponseAlloc(alloc, rows);
+    }
+
+    fn rowsJoinedMutationSourceStagePlannedGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
+        try validateJoinedMutationSourceCandidatesForGroup(group_id, candidates);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        return cached.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, matched, candidates) catch |err| switch (err) {
+            error.TxnNotFound => {
+                const claim = switch (req.target_side) {
+                    .left => req.join.left.row_claim,
+                    .right => req.join.right.row_claim,
+                } orelse return err;
+                _ = try cached.db.beginTransactionWithIdAndParticipants(claim.txn_id orelse return err, nextTxnTimestamp(), &.{});
+                return try cached.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, matched, candidates);
+            },
+            else => return err,
+        };
     }
 
     fn commitTransaction(
@@ -10696,6 +11752,24 @@ fn recoverHostedTransactionsOnce(
     _ = try db.runTransactionRecoveryOnce(resolver.config());
 }
 
+fn validateMutationSourceCandidatesForGroup(
+    group_id: u64,
+    candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+) !void {
+    for (candidates) |candidate| {
+        if (candidate.group_id != group_id) return error.TopologyChanged;
+    }
+}
+
+fn validateJoinedMutationSourceCandidatesForGroup(
+    group_id: u64,
+    candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+) !void {
+    for (candidates) |candidate| {
+        if (candidate.target.group_id != group_id) return error.TopologyChanged;
+    }
+}
+
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
     db: *db_mod.DB,
@@ -10726,9 +11800,14 @@ pub const BoundTableWriteSource = struct {
                 .batch = batch,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                .rows_mutation_source_collect_group_local = rowsMutationSourceCollectGroupLocal,
+                .rows_mutation_source_stage_planned_group_local = rowsMutationSourceStagePlannedGroupLocal,
                 .table_emptying = tableEmptying,
                 .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
                 .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
+                .rows_joined_mutation_source_collect_group_local = rowsJoinedMutationSourceCollectGroupLocal,
+                .rows_joined_mutation_source_inputs_group_local = rowsJoinedMutationSourceInputsGroupLocal,
+                .rows_joined_mutation_source_stage_planned_group_local = rowsJoinedMutationSourceStagePlannedGroupLocal,
                 .merge_rows_from_source_rows = mergeRowsFromSourceRows,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
@@ -11587,6 +12666,103 @@ pub const BoundTableWriteSource = struct {
         return try mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, self.db, target_schema, source_schema, req, source_rows);
     }
 
+    fn rowsMutationSourceCollectGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?[]u8 {
+        _ = topology_epoch;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        const candidates = try self.db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, null);
+        defer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+        for (candidates) |*candidate| candidate.group_id = group_id;
+        return try relational_rows_api.encodeRowsMutationSourceCollectResponseAlloc(alloc, candidates);
+    }
+
+    fn rowsMutationSourceStagePlannedGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        _ = topology_epoch;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateMutationSourceCandidatesForGroup(group_id, candidates);
+        return try self.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, matched, candidates);
+    }
+
+    fn rowsJoinedMutationSourceCollectGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        _ = topology_epoch;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        const candidates = try self.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+        defer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+        for (candidates) |*candidate| candidate.group_id = group_id;
+        return try relational_rows_api.encodeRowsJoinedMutationSourceCollectResponseAlloc(alloc, candidates);
+    }
+
+    fn rowsJoinedMutationSourceInputsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    ) !?[]u8 {
+        _ = group_id;
+        _ = topology_epoch;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        var rows = try self.db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, source_schema, req, null);
+        defer rows.deinit(alloc);
+        return try relational_rows_api.encodeRowsQueryResponseAlloc(alloc, rows);
+    }
+
+    fn rowsJoinedMutationSourceStagePlannedGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        topology_epoch: u64,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        matched: u32,
+        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        _ = topology_epoch;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceCandidatesForGroup(group_id, candidates);
+        return try self.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, matched, candidates);
+    }
+
     fn mergeRowsFromSourceRows(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -11967,6 +13143,140 @@ test "api.table_writes.docid provisioned table write source routes same-owner id
             .value = "{\"id\":\"doc:z\"}",
         }},
     }));
+}
+
+test "hosted table write source sends same-owner identity rewrites to remote batch owners" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-remote-identity-rewrite-batch");
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        calls: usize = 0,
+        last_uri: ?[]u8 = null,
+        last_body: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc_inner: std.mem.Allocator) void {
+            if (self.last_uri) |uri| alloc_inner.free(uri);
+            if (self.last_body) |body| alloc_inner.free(body);
+        }
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            if (self.last_uri) |uri| alloc_inner.free(uri);
+            if (self.last_body) |body| alloc_inner.free(body);
+            self.last_uri = try alloc_inner.dupe(u8, request.uri);
+            self.last_body = try alloc_inner.dupe(u8, request.body);
+            self.calls += 1;
+            return .{
+                .status = 201,
+                .body = try alloc_inner.dupe(u8, "{\"inserted\":0,\"deleted\":1,\"transformed\":0}"),
+            };
+        }
+    };
+
+    var executor = ExecutorState{};
+    defer executor.deinit(alloc);
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "doc:a",
+            .new_key = "doc:b",
+            .value = "{\"id\":\"b\",\"status\":\"renamed\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expect(std.mem.endsWith(u8, executor.last_uri.?, "/internal/v1/groups/7001/tables/docs/batch"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, executor.last_body.?, .{});
+    defer parsed.deinit();
+    const rewrites = parsed.value.object.get("relational_identity_rewrites").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rewrites.len);
+    const rewrite = rewrites[0].object;
+    try std.testing.expectEqualStrings("doc:a", rewrite.get("old_key").?.string);
+    try std.testing.expectEqualStrings("doc:b", rewrite.get("new_key").?.string);
+    try std.testing.expectEqualStrings("renamed", rewrite.get("value").?.object.get("status").?.string);
+    try std.testing.expectEqualStrings("write", parsed.value.object.get("sync_level").?.string);
 }
 
 const ProvisionedWriteCoalesceTestCatalog = struct {
@@ -22238,6 +23548,1845 @@ test "hosted provisioned table read source serves profiled dense query after ext
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("responses") != null);
+}
+
+test "hosted mutation-source remote autocommit dispatches supported stage requests" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-remote-mutation-source-stage");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        calls: usize = 0,
+        last_uri: ?[]u8 = null,
+        last_body: ?[]u8 = null,
+        response_body: []const u8 =
+            \\{"matched":2,"staged":1,"returning":[{"id":"a","status":"claimed"}],"participant_predicates":[{"key":"row:a","expected_version":41}],"participant_preimages":[{"key":"row:a","value":{"id":"a","status":"ready"}}],"participant_writes":[{"key":"row:a","value":{"id":"a","status":"claimed"}}],"participant_deletes":["row:old"],"participant_transforms":[{"key":"row:a","operations":[{"op":"$set","path":"status","value":"claimed"}]}]}
+        ,
+
+        fn deinit(self: *@This(), alloc_inner: std.mem.Allocator) void {
+            if (self.last_uri) |value| alloc_inner.free(value);
+            if (self.last_body) |value| alloc_inner.free(value);
+        }
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            self.calls += 1;
+            if (self.last_uri) |value| alloc_inner.free(value);
+            if (self.last_body) |value| alloc_inner.free(value);
+            self.last_uri = try alloc_inner.dupe(u8, request.uri);
+            self.last_body = try alloc_inner.dupe(u8, request.body);
+            return .{
+                .status = 200,
+                .body = try alloc_inner.dupe(u8, self.response_body),
+            };
+        }
+    };
+
+    var executor = ExecutorState{};
+    defer executor.deinit(alloc);
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const req = db_mod.types.RelationalRowsMutationSourceRequest{
+        .kind = .update,
+        .source = .{
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:remote-fail-closed",
+                .txn_id = txn_id,
+                .lease_ms = 60_000,
+            },
+        },
+        .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"claimed\"" }},
+    };
+
+    var staged_result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, req)).?;
+    defer staged_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), staged_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), staged_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", staged_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", staged_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 41), staged_result.participant_predicates[0].expected_version);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.participant_preimages.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\"}", staged_result.participant_preimages[0].value);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.participant_writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", staged_result.participant_writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.participant_deletes.len);
+    try std.testing.expectEqualStrings("row:old", staged_result.participant_deletes[0]);
+    try std.testing.expectEqual(@as(usize, 1), staged_result.participant_transforms.len);
+    try std.testing.expectEqualStrings("\"claimed\"", staged_result.participant_transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expect(std.mem.startsWith(u8, executor.last_uri.?, "http://127.0.0.1:1"));
+    try std.testing.expect(std.mem.endsWith(u8, executor.last_uri.?, "/internal/v1/groups/7001/tables/docs/rows/mutation-source/stage"));
+
+    const StageBodyWire = struct {
+        schema_json: []const u8,
+        request_body: []const u8,
+        autocommit: ?bool = null,
+        sync_level: ?[]const u8 = null,
+    };
+    var parsed_txn_body = try std.json.parseFromSlice(StageBodyWire, alloc, executor.last_body.?, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_txn_body.deinit();
+    try std.testing.expectEqualStrings(schema_json, parsed_txn_body.value.schema_json);
+    try std.testing.expectEqual(false, parsed_txn_body.value.autocommit.?);
+    try std.testing.expect(parsed_txn_body.value.sync_level == null);
+    var round_tripped_txn_req = try relational_rows_api.parseRowsMutationSourceRequest(alloc, parsed_txn_body.value.request_body, runtime_schema);
+    defer round_tripped_txn_req.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, round_tripped_txn_req.req.kind);
+    try std.testing.expect(round_tripped_txn_req.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, round_tripped_txn_req.req.source.row_claim.?.mode);
+    try std.testing.expectEqualStrings("session:remote-fail-closed", round_tripped_txn_req.req.source.row_claim.?.owner_id);
+    try std.testing.expectEqual(@as(usize, 1), round_tripped_txn_req.req.operations.len);
+    try std.testing.expectEqualStrings("status", round_tripped_txn_req.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"claimed\"", round_tripped_txn_req.req.operations[0].value_json.?);
+
+    var result = (try source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, req, .write)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expect(std.mem.startsWith(u8, executor.last_uri.?, "http://127.0.0.1:1"));
+    try std.testing.expect(std.mem.endsWith(u8, executor.last_uri.?, "/internal/v1/groups/7001/tables/docs/rows/mutation-source/stage"));
+
+    var parsed_body = try std.json.parseFromSlice(StageBodyWire, alloc, executor.last_body.?, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_body.deinit();
+    try std.testing.expectEqualStrings(schema_json, parsed_body.value.schema_json);
+    try std.testing.expect(parsed_body.value.autocommit == null);
+    try std.testing.expectEqualStrings("write", parsed_body.value.sync_level.?);
+    var round_tripped_req = try relational_rows_api.parseRowsMutationSourceRequest(alloc, parsed_body.value.request_body, runtime_schema);
+    defer round_tripped_req.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, round_tripped_req.req.kind);
+    try std.testing.expect(round_tripped_req.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, round_tripped_req.req.source.row_claim.?.mode);
+    try std.testing.expectEqualStrings("session:remote-fail-closed", round_tripped_req.req.source.row_claim.?.owner_id);
+    try std.testing.expectEqual(@as(usize, 1), round_tripped_req.req.operations.len);
+    try std.testing.expectEqualStrings("status", round_tripped_req.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"claimed\"", round_tripped_req.req.operations[0].value_json.?);
+
+    var expression_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:remote-fail-closed\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch_expr\":{\"status\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\",\"source\":\"existing\"},{\"value\":\"-claimed\"}]}}}",
+        runtime_schema,
+    );
+    defer expression_request.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedOperation, source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, expression_request.req, .write));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+    var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:remote-fail-closed\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"patch\":{\"status\":\"joined\"},\"returning\":[\"id\",\"quantity\"]}",
+        runtime_schema,
+    );
+    defer joined_request.deinit(alloc);
+    const source_rows = [_][]const u8{
+        "{\"id\":\"source:a\",\"status\":\"source\",\"quantity\":7}",
+    };
+
+    var joined_staged_result = (try source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, source_rows[0..])).?;
+    defer joined_staged_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), joined_staged_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), joined_staged_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), joined_staged_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", joined_staged_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
+    try std.testing.expect(std.mem.endsWith(u8, executor.last_uri.?, "/internal/v1/groups/7001/tables/docs/rows/joined-mutation-source/stage"));
+
+    const JoinedStageBodyWire = struct {
+        target_schema_json: []const u8,
+        source_schema_json: []const u8,
+        request_body: []const u8,
+        source_rows: []const []const u8,
+        autocommit: ?bool = null,
+        sync_level: ?[]const u8 = null,
+    };
+    var parsed_joined_txn_body = try std.json.parseFromSlice(JoinedStageBodyWire, alloc, executor.last_body.?, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_joined_txn_body.deinit();
+    try std.testing.expectEqualStrings(schema_json, parsed_joined_txn_body.value.target_schema_json);
+    try std.testing.expectEqualStrings(schema_json, parsed_joined_txn_body.value.source_schema_json);
+    try std.testing.expectEqual(false, parsed_joined_txn_body.value.autocommit.?);
+    try std.testing.expect(parsed_joined_txn_body.value.sync_level == null);
+    try std.testing.expectEqual(@as(usize, 1), parsed_joined_txn_body.value.source_rows.len);
+    try std.testing.expectEqualStrings(source_rows[0], parsed_joined_txn_body.value.source_rows[0]);
+
+    var joined_result = (try source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, source_rows[0..], .write)).?;
+    defer joined_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), joined_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), joined_result.staged);
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    try std.testing.expect(std.mem.endsWith(u8, executor.last_uri.?, "/internal/v1/groups/7001/tables/docs/rows/joined-mutation-source/stage"));
+
+    var parsed_joined_body = try std.json.parseFromSlice(JoinedStageBodyWire, alloc, executor.last_body.?, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_joined_body.deinit();
+    try std.testing.expectEqualStrings(schema_json, parsed_joined_body.value.target_schema_json);
+    try std.testing.expectEqualStrings(schema_json, parsed_joined_body.value.source_schema_json);
+    try std.testing.expect(parsed_joined_body.value.autocommit == null);
+    try std.testing.expectEqualStrings("write", parsed_joined_body.value.sync_level.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed_joined_body.value.source_rows.len);
+    try std.testing.expectEqualStrings(source_rows[0], parsed_joined_body.value.source_rows[0]);
+    var round_tripped_joined_req = try relational_rows_api.parseRowsJoinedMutationSourceRequestWithSchemas(alloc, parsed_joined_body.value.request_body, runtime_schema, runtime_schema);
+    defer round_tripped_joined_req.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, round_tripped_joined_req.req.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, round_tripped_joined_req.req.target_side);
+    try std.testing.expect(round_tripped_joined_req.req.join.left.row_claim != null);
+    try std.testing.expectEqualStrings("source_id", round_tripped_joined_req.req.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", round_tripped_joined_req.req.join.on[0].right_field);
+    try std.testing.expectEqualStrings("quantity", round_tripped_joined_req.req.source_assignments[0].field);
+    try std.testing.expectEqualStrings("quantity", round_tripped_joined_req.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), round_tripped_joined_req.req.operations.len);
+    try std.testing.expectEqualStrings("status", round_tripped_joined_req.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"joined\"", round_tripped_joined_req.req.operations[0].value_json.?);
+
+    var joined_expression_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:remote-fail-closed\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"returning_expressions\":[{\"as\":\"source_status_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\",\"source\":\"source\"}]}}]}",
+        runtime_schema,
+    );
+    defer joined_expression_request.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedOperation, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, joined_expression_request.req, source_rows[0..], .write));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+}
+
+test "hosted joined mutation source stages global planned candidates across remote owners" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-remote-planned-stage");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        txn_resolve_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/rows/joined-mutation-source/collect")) {
+                self.collect_calls += 1;
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request.body, .{
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\",\"source_id\":\"source:a\",\"quantity\":0},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"source_id\":\"source:z\",\"quantity\":0},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/rows/joined-mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    request_body: []const u8,
+                    planned_stage: []const u8,
+                    autocommit: bool,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(!parsed.value.autocommit);
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                var planned = try relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].target.group_id);
+                var parsed_request = try std.json.parseFromSlice(std.json.Value, alloc_inner, parsed.value.request_body, .{});
+                defer parsed_request.deinit();
+                const request_obj = switch (parsed_request.value) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const join_obj = switch ((request_obj.get("join") orelse return error.TestUnexpectedResult)) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const left_obj = switch ((join_obj.get("left") orelse return error.TestUnexpectedResult)) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const row_claim_obj = switch ((left_obj.get("row_claim") orelse return error.TestUnexpectedResult)) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const wait_policy = if (row_claim_obj.get("wait_policy")) |value| switch (value) {
+                    .string => |text| text,
+                    else => return error.TestUnexpectedResult,
+                } else "";
+                if (std.mem.eql(u8, wait_policy, "skip_locked") and group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                }
+                const body = if (group_id == 7001)
+                    "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"a\",\"quantity\":7}],\"participant_predicates\":[{\"key\":\"row:a\",\"expected_version\":9}]}"
+                else
+                    "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"quantity\":13}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                var parsed = try distributed_txn.parseTxnBeginRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnBeginRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                var parsed = try distributed_txn.parseTxnPrepareRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnPrepareRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                if (group_id == 7001) {
+                    try std.testing.expectEqualStrings("row:a", parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 9), parsed.req.predicates[0].expected_version);
+                } else {
+                    try std.testing.expectEqualStrings("row:z", parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 11), parsed.req.predicates[0].expected_version);
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-resolve")) {
+                self.txn_resolve_calls += 1;
+                const parsed = try distributed_txn.parseTxnResolveRequest(alloc_inner, request.body);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, parsed.status);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:remote-planned\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"returning\":[\"id\",\"quantity\"]}",
+        runtime_schema,
+    );
+    defer joined_request.deinit(alloc);
+    const source_rows = [_][]const u8{
+        "{\"id\":\"source:a\",\"status\":\"source\",\"quantity\":7}",
+        "{\"id\":\"source:z\",\"status\":\"source\",\"quantity\":13}",
+    };
+
+    var result = (try source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, source_rows[0..])).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.matched);
+    try std.testing.expectEqual(@as(u32, 2), result.staged);
+    try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"quantity\":7}", result.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"quantity\":13}", result.returning_rows[1]);
+    try std.testing.expectEqual(@as(usize, 2), result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", result.participant_predicates[0].key);
+    try std.testing.expectEqualStrings("row:z", result.participant_predicates[1].key);
+    try std.testing.expectEqual(@as(usize, 2), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.stage_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.txn_resolve_calls);
+
+    var committed = (try source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, source_rows[0..], .write)).?;
+    defer committed.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), committed.matched);
+    try std.testing.expectEqual(@as(u32, 2), committed.staged);
+    try std.testing.expectEqual(@as(usize, 2), committed.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"quantity\":7}", committed.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"quantity\":13}", committed.returning_rows[1]);
+    try std.testing.expectEqual(@as(usize, 2), committed.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", committed.participant_predicates[0].key);
+    try std.testing.expectEqualStrings("row:z", committed.participant_predicates[1].key);
+    try std.testing.expectEqual(@as(usize, 4), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 4), executor.stage_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
+
+    var skip_locked_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:remote-planned-skip\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"returning\":[\"id\",\"quantity\"]}",
+        runtime_schema,
+    );
+    defer skip_locked_request.deinit(alloc);
+
+    var skip_locked_result = (try source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, skip_locked_request.req, source_rows[0..])).?;
+    defer skip_locked_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), skip_locked_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), skip_locked_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), skip_locked_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"quantity\":13}", skip_locked_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), skip_locked_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:z", skip_locked_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 6), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 6), executor.stage_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
+}
+
+test "hosted mutation source local owner calls reject stale topology epoch" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-stale-topology");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 1) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var mutation_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:stale\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"patch\":{\"status\":\"claimed\"}}",
+        runtime_schema,
+    );
+    defer mutation_request.deinit(alloc);
+
+    var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:stale\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"patch\":{\"status\":\"joined\"}}",
+        runtime_schema,
+    );
+    defer joined_request.deinit(alloc);
+
+    const current_epoch = try table_catalog.topologyEpoch(alloc, Catalog.iface(), "docs");
+    const stale_epoch = current_epoch +% 1;
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsMutationSourceCollectGroupLocal(alloc, 7001, "docs", stale_epoch, runtime_schema, mutation_request.req));
+
+    var mutation_candidates = [_]db_mod.DB.RelationalRowsMutationSourceCandidate{.{
+        .doc_key = @constCast("row:a"),
+        .json = @constCast("{\"id\":\"a\",\"status\":\"ready\"}"),
+        .version = 9,
+        .ordinal = 0,
+        .group_id = 7001,
+    }};
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", stale_epoch, runtime_schema, mutation_request.req, 1, mutation_candidates[0..]));
+    mutation_candidates[0].group_id = 7002;
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", current_epoch, runtime_schema, mutation_request.req, 1, mutation_candidates[0..]));
+
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsJoinedMutationSourceCollectGroupLocal(alloc, 7001, "docs", stale_epoch, runtime_schema, joined_request.req));
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsJoinedMutationSourceInputsGroupLocal(alloc, 7001, "docs", stale_epoch, runtime_schema, joined_request.req));
+
+    var joined_candidates = [_]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate{.{
+        .target = .{
+            .doc_key = @constCast("row:a"),
+            .json = @constCast("{\"id\":\"a\",\"status\":\"ready\",\"source_id\":\"source:a\"}"),
+            .version = 9,
+            .ordinal = 0,
+            .group_id = 7001,
+        },
+        .source_json = @constCast("{\"id\":\"source:a\",\"status\":\"source\",\"quantity\":7}"),
+    }};
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsJoinedMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", stale_epoch, runtime_schema, runtime_schema, joined_request.req, 1, joined_candidates[0..]));
+    joined_candidates[0].target.group_id = 7002;
+    try std.testing.expectError(error.TopologyChanged, source.source().rowsJoinedMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", current_epoch, runtime_schema, runtime_schema, joined_request.req, 1, joined_candidates[0..]));
+}
+
+test "hosted joined mutation source retries remote collect before stage only" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-mutation-topology-retry");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        snapshot_calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_calls += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = if (self.snapshot_calls == 1)
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                    })[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:n" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:n", .end_key = null },
+                    })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const RetryExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        first_epoch: ?u64 = null,
+        retry_epoch: ?u64 = null,
+        wrong_group_candidate: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn recordTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.first_epoch == null) {
+                self.first_epoch = epoch;
+                return;
+            }
+            if (self.retry_epoch == null) {
+                try std.testing.expect(epoch != self.first_epoch.?);
+                self.retry_epoch = epoch;
+                return;
+            }
+            try std.testing.expectEqual(self.retry_epoch.?, epoch);
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/rows/joined-mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.recordTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                if (!self.wrong_group_candidate and self.collect_calls == 1) {
+                    return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+                }
+                if (self.wrong_group_candidate) {
+                    const body = if (group_id == 7001)
+                        "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\",\"source_id\":\"source:a\",\"quantity\":0},\"version\":9,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                    else
+                        "{\"candidates\":[]}";
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+                }
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"source_id\":\"source:z\",\"quantity\":0},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/rows/joined-mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expectEqual(self.retry_epoch.?, parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 1), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(@as(u64, 7002), planned.candidates[0].target.group_id);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"returning\":[{\"id\":\"z\",\"quantity\":13}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:joined-topology-retry\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"returning\":[\"id\",\"quantity\"]}",
+        runtime_schema,
+    );
+    defer joined_request.deinit(alloc);
+    const retry_source_rows = [_][]const u8{
+        "{\"id\":\"source:z\",\"status\":\"source\",\"quantity\":13}",
+    };
+
+    var catalog = Catalog{};
+    var executor = RetryExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    var result = (try source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, retry_source_rows[0..])).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"quantity\":13}", result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 2), catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.stage_calls);
+
+    const wrong_group_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-mutation-topology-wrong-owner");
+    defer alloc.free(wrong_group_replica_root_dir);
+    var wrong_group_catalog = Catalog{};
+    var wrong_group_executor = RetryExecutorState{ .wrong_group_candidate = true };
+    var wrong_group_source = HostedProvisionedTableWriteSource.init(wrong_group_replica_root_dir, wrong_group_catalog.iface(), RemoteRouter.iface(), wrong_group_executor.iface());
+    defer wrong_group_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, wrong_group_source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, retry_source_rows[0..]));
+    try std.testing.expectEqual(@as(usize, 2), wrong_group_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 2), wrong_group_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 0), wrong_group_executor.stage_calls);
+
+    const PartialStageExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        topology_epoch: ?u64 = null,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn expectTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.topology_epoch) |expected| {
+                try std.testing.expectEqual(expected, epoch);
+            } else {
+                self.topology_epoch = epoch;
+            }
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\",\"source_id\":\"source:a\",\"quantity\":0},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"source_id\":\"source:z\",\"quantity\":0},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].target.group_id);
+                if (group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"participant_predicates\":[{\"key\":\"row:a\",\"expected_version\":9}]}") };
+                }
+                return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var partial_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:joined-topology-partial-stage\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}],\"limit\":2},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"returning\":[\"id\",\"quantity\"]}",
+        runtime_schema,
+    );
+    defer partial_request.deinit(alloc);
+    const partial_source_rows = [_][]const u8{
+        "{\"id\":\"source:a\",\"status\":\"source\",\"quantity\":7}",
+        "{\"id\":\"source:z\",\"status\":\"source\",\"quantity\":13}",
+    };
+
+    const partial_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-mutation-topology-partial-stage");
+    defer alloc.free(partial_replica_root_dir);
+    var partial_catalog = Catalog{};
+    var partial_executor = PartialStageExecutorState{};
+    var partial_source = HostedProvisionedTableWriteSource.init(partial_replica_root_dir, partial_catalog.iface(), RemoteRouter.iface(), partial_executor.iface());
+    defer partial_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, partial_source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, partial_request.req, partial_source_rows[0..]));
+    try std.testing.expectEqual(@as(usize, 1), partial_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 2), partial_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 2), partial_executor.stage_calls);
+
+    const ZeroStageTopologyExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\",\"source_id\":\"source:a\",\"quantity\":0},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"source_id\":\"source:z\",\"quantity\":0},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                var planned = try relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].target.group_id);
+                if (group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                }
+                if (self.stage_calls == 2) {
+                    return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"quantity\":13}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const zero_stage_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-mutation-topology-zero-stage-retry");
+    defer alloc.free(zero_stage_replica_root_dir);
+    var zero_stage_catalog = Catalog{};
+    var zero_stage_executor = ZeroStageTopologyExecutorState{};
+    var zero_stage_source = HostedProvisionedTableWriteSource.init(zero_stage_replica_root_dir, zero_stage_catalog.iface(), RemoteRouter.iface(), zero_stage_executor.iface());
+    defer zero_stage_source.invalidateManagedCache("docs");
+
+    var zero_stage_result = (try zero_stage_source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, partial_request.req, partial_source_rows[0..])).?;
+    defer zero_stage_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), zero_stage_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), zero_stage_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), zero_stage_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"quantity\":13}", zero_stage_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 2), zero_stage_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 4), zero_stage_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 4), zero_stage_executor.stage_calls);
+
+    const CommitTopologyExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        topology_epoch: ?u64 = null,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn expectTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.topology_epoch) |expected| {
+                try std.testing.expectEqual(expected, epoch);
+            } else {
+                self.topology_epoch = epoch;
+            }
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"source_id\":\"source:z\",\"quantity\":0},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/joined-mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 1), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(@as(u64, 7002), planned.candidates[0].target.group_id);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const commit_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-mutation-topology-commit-no-replay");
+    defer alloc.free(commit_replica_root_dir);
+    var commit_catalog = Catalog{};
+    var commit_executor = CommitTopologyExecutorState{};
+    var commit_source = HostedProvisionedTableWriteSource.init(commit_replica_root_dir, commit_catalog.iface(), RemoteRouter.iface(), commit_executor.iface());
+    defer commit_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, commit_source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, joined_request.req, retry_source_rows[0..], .write));
+    try std.testing.expectEqual(@as(usize, 2), commit_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 1), commit_executor.stage_calls);
+    try std.testing.expect(commit_executor.txn_begin_calls >= 1);
+    try std.testing.expect(commit_executor.txn_prepare_calls >= 1);
+}
+
+test "hosted mutation source retries remote collect after topology change" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-retry");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        snapshot_calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_calls += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = if (self.snapshot_calls == 1)
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                    })[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:n" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:n", .end_key = null },
+                    })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        first_epoch: ?u64 = null,
+        retry_epoch: ?u64 = null,
+        always_topology_changed: bool = false,
+        wrong_group_candidate: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn recordTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.first_epoch == null) {
+                self.first_epoch = epoch;
+                return;
+            }
+            if (self.retry_epoch == null) {
+                try std.testing.expect(epoch != self.first_epoch.?);
+                self.retry_epoch = epoch;
+                return;
+            }
+            try std.testing.expectEqual(self.retry_epoch.?, epoch);
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.recordTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                if (self.always_topology_changed or (!self.wrong_group_candidate and self.collect_calls == 1)) {
+                    return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+                }
+                if (self.wrong_group_candidate) {
+                    const body = if (group_id == 7001)
+                        "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                    else
+                        "{\"candidates\":[]}";
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+                }
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\"},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expectEqual(self.retry_epoch.?, parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 1), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(@as(u64, 7002), planned.candidates[0].group_id);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var catalog = Catalog{};
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    var request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:topology-retry\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer request.deinit(alloc);
+
+    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 2), catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.stage_calls);
+
+    const failing_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-retry-fail");
+    defer alloc.free(failing_replica_root_dir);
+    var failing_catalog = Catalog{};
+    var failing_executor = ExecutorState{ .always_topology_changed = true };
+    var failing_source = HostedProvisionedTableWriteSource.init(failing_replica_root_dir, failing_catalog.iface(), RemoteRouter.iface(), failing_executor.iface());
+    defer failing_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, failing_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req));
+    try std.testing.expectEqual(@as(usize, 2), failing_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 2), failing_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 0), failing_executor.stage_calls);
+
+    const wrong_group_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-wrong-owner");
+    defer alloc.free(wrong_group_replica_root_dir);
+    var wrong_group_catalog = Catalog{};
+    var wrong_group_executor = ExecutorState{ .wrong_group_candidate = true };
+    var wrong_group_source = HostedProvisionedTableWriteSource.init(wrong_group_replica_root_dir, wrong_group_catalog.iface(), RemoteRouter.iface(), wrong_group_executor.iface());
+    defer wrong_group_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, wrong_group_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req));
+    try std.testing.expectEqual(@as(usize, 2), wrong_group_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 2), wrong_group_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 0), wrong_group_executor.stage_calls);
+
+    const PartialStageExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        topology_epoch: ?u64 = null,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn expectTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.topology_epoch) |expected| {
+                try std.testing.expectEqual(expected, epoch);
+            } else {
+                self.topology_epoch = epoch;
+            }
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\"},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].group_id);
+                if (group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"participant_predicates\":[{\"key\":\"row:a\",\"expected_version\":9}]}") };
+                }
+                return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var partial_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:topology-partial-stage\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":2},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer partial_request.deinit(alloc);
+
+    const partial_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-partial-stage");
+    defer alloc.free(partial_replica_root_dir);
+    var partial_catalog = Catalog{};
+    var partial_executor = PartialStageExecutorState{};
+    var partial_source = HostedProvisionedTableWriteSource.init(partial_replica_root_dir, partial_catalog.iface(), RemoteRouter.iface(), partial_executor.iface());
+    defer partial_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, partial_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, partial_request.req));
+    try std.testing.expectEqual(@as(usize, 1), partial_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 2), partial_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 2), partial_executor.stage_calls);
+
+    const ZeroStageTopologyExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\"},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].group_id);
+                if (group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                }
+                if (self.stage_calls == 2) {
+                    return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const zero_stage_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-zero-stage-retry");
+    defer alloc.free(zero_stage_replica_root_dir);
+    var zero_stage_catalog = Catalog{};
+    var zero_stage_executor = ZeroStageTopologyExecutorState{};
+    var zero_stage_source = HostedProvisionedTableWriteSource.init(zero_stage_replica_root_dir, zero_stage_catalog.iface(), RemoteRouter.iface(), zero_stage_executor.iface());
+    defer zero_stage_source.invalidateManagedCache("docs");
+
+    var zero_stage_result = (try zero_stage_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, partial_request.req)).?;
+    defer zero_stage_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), zero_stage_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), zero_stage_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), zero_stage_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", zero_stage_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 2), zero_stage_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 4), zero_stage_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 4), zero_stage_executor.stage_calls);
+
+    const CommitTopologyExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        topology_epoch: ?u64 = null,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn expectTopologyEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.topology_epoch) |expected| {
+                try std.testing.expectEqual(expected, epoch);
+            } else {
+                self.topology_epoch = epoch;
+            }
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request_inner: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request_inner.method);
+            try std.testing.expectEqualStrings("application/json", request_inner.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request_inner.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request_inner.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/collect")) {
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request_inner.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                self.collect_calls += 1;
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\"},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request_inner.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try self.expectTopologyEpoch(parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 1), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(@as(u64, 7002), planned.candidates[0].group_id);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request_inner.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var autocommit_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:topology-commit\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer autocommit_request.deinit(alloc);
+
+    const commit_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-topology-commit-no-replay");
+    defer alloc.free(commit_replica_root_dir);
+    var commit_catalog = Catalog{};
+    var commit_executor = CommitTopologyExecutorState{};
+    var commit_source = HostedProvisionedTableWriteSource.init(commit_replica_root_dir, commit_catalog.iface(), RemoteRouter.iface(), commit_executor.iface());
+    defer commit_source.invalidateManagedCache("docs");
+
+    try std.testing.expectError(error.TopologyChanged, commit_source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, autocommit_request.req, .write));
+    try std.testing.expectEqual(@as(usize, 2), commit_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 1), commit_executor.stage_calls);
+    try std.testing.expect(commit_executor.txn_begin_calls >= 1);
+    try std.testing.expect(commit_executor.txn_prepare_calls >= 1);
+}
+
+test "hosted mutation source stages global planned candidates across remote owners" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-remote-planned-stage");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/collect")) {
+                self.collect_calls += 1;
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request.body, .{
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\",\"quantity\":1},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\",\"quantity\":2},\"version\":11,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                const StageWire = struct {
+                    request_body: []const u8,
+                    planned_stage: []const u8,
+                    autocommit: bool,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expect(!parsed.value.autocommit);
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 2), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].group_id);
+                var parsed_request = try std.json.parseFromSlice(std.json.Value, alloc_inner, parsed.value.request_body, .{});
+                defer parsed_request.deinit();
+                const request_obj = switch (parsed_request.value) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const source_obj = switch ((request_obj.get("source") orelse return error.TestUnexpectedResult)) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const row_claim_obj = switch ((source_obj.get("row_claim") orelse return error.TestUnexpectedResult)) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const wait_policy = switch ((row_claim_obj.get("wait_policy") orelse return error.TestUnexpectedResult)) {
+                    .string => |text| text,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqualStrings("skip_locked", wait_policy);
+                if (group_id == 7001) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    var request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:remote-planned-skip\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer request.deinit(alloc);
+
+    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:z", result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 2), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.stage_calls);
 }
 
 test "provisioned table read source survives many external write-sync batches before first profiled dense query" {

@@ -1775,6 +1775,7 @@ pub const RelationalRowsConflictAction = enum {
 };
 
 pub const RelationalRowsConflictTargetKind = enum {
+    any,
     primary,
     unique,
 };

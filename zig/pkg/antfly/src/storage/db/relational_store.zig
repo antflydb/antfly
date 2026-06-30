@@ -5431,7 +5431,7 @@ fn uniqueConstraintKeysTupleValueAlloc(
         try internal_keys.appendEncodedComponent(&out, alloc, component);
     }
     for (expressions) |expression| {
-        const component = (try uniqueConstraintExpressionValueAlloc(alloc, row_value, expression)) orelse {
+        const component = (try uniqueConstraintExpressionValueWithColumnsAlloc(alloc, row_value, expression, relational_columns)) orelse {
             if (!include_nulls) {
                 out.deinit(alloc);
                 return null;
@@ -5572,6 +5572,15 @@ fn uniqueConstraintColumnValueWithCollationAlloc(
 }
 
 fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8, expression: schema_mod.UniqueExpression) !?[]u8 {
+    return try uniqueConstraintExpressionValueWithColumnsAlloc(alloc, row_value, expression, &.{});
+}
+
+fn uniqueConstraintExpressionValueWithColumnsAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.UniqueExpression,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
     return switch (expression.op) {
         .lower, .upper, .md5 => blk: {
             const cell = (try relational_row_codec.findCellByPath(row_value, expression.field)) orelse return null;
@@ -5611,12 +5620,17 @@ fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8,
             const row_expression = expression.expression orelse return error.InvalidColumnValue;
             const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, row_expression);
             defer alloc.free(value_json);
-            break :blk try uniqueConstraintJsonValueAlloc(alloc, value_json);
+            const collation = rowExpressionDirectFieldCollation(columns, row_expression);
+            break :blk try uniqueConstraintJsonValueWithCollationAlloc(alloc, value_json, collation);
         },
     };
 }
 
 fn uniqueConstraintJsonValueAlloc(alloc: Allocator, value_json: []const u8) !?[]u8 {
+    return try uniqueConstraintJsonValueWithCollationAlloc(alloc, value_json, null);
+}
+
+fn uniqueConstraintJsonValueWithCollationAlloc(alloc: Allocator, value_json: []const u8, collation: ?[]const u8) !?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
     defer parsed.deinit();
     const cell: relational_row_codec.Cell = switch (parsed.value) {
@@ -5658,7 +5672,15 @@ fn uniqueConstraintJsonValueAlloc(alloc: Allocator, value_json: []const u8) !?[]
         },
         else => return error.InvalidColumnValue,
     };
-    return try uniqueConstraintCellValueAlloc(alloc, cell);
+    return try uniqueConstraintCellValueWithCollationAlloc(alloc, cell, collation);
+}
+
+fn rowExpressionDirectFieldCollation(
+    columns: []const schema_mod.RelationalColumn,
+    expression: schema_mod.RelationalRowsExpression,
+) ?[]const u8 {
+    if (expression.kind != .field or expression.field_source != .row) return null;
+    return relationalColumnCollation(columns, expression.field);
 }
 
 fn uniqueConstraintCellValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
@@ -9254,6 +9276,74 @@ test "relational unique constraints encode ast expression tuple components" {
 
     try std.testing.expectEqualSlices(u8, old_tuple, new_tuple);
     try std.testing.expect(!std.mem.eql(u8, old_tuple, other_tuple));
+}
+
+test "relational unique ast field expressions honor source column collation and null distinctness" {
+    const alloc = std.testing.allocator;
+
+    const row_upper = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "Ada@Example.test" },
+        },
+    });
+    defer alloc.free(row_upper);
+    const row_lower = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "ada@example.test" },
+        },
+    });
+    defer alloc.free(row_lower);
+    const row_null = try relational_row_codec.serialize(alloc, &.{});
+    defer alloc.free(row_null);
+
+    const columns = [_]schema_mod.RelationalColumn{.{
+        .name = "email",
+        .path = "email",
+        .field_type = .keyword,
+        .collation = "antfly.case_insensitive",
+    }};
+    const expression = schema_mod.RelationalRowsExpression{
+        .kind = .field,
+        .field = "email",
+    };
+    const default_unique = schema_mod.UniqueConstraint{
+        .name = "users_email_expr_key",
+        .expressions = &.{.{ .op = .expression, .expression = expression }},
+    };
+
+    const upper_tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_upper, default_unique, columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(upper_tuple);
+    const lower_tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_lower, default_unique, columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(lower_tuple);
+    try std.testing.expectEqualSlices(u8, upper_tuple, lower_tuple);
+    try std.testing.expect((try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_null, default_unique, columns[0..])) == null);
+
+    const nulls_not_distinct_unique = schema_mod.UniqueConstraint{
+        .name = "users_email_expr_key",
+        .expressions = &.{.{ .op = .expression, .expression = expression }},
+        .nulls_not_distinct = true,
+    };
+    const null_tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_null, nulls_not_distinct_unique, columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(null_tuple);
+    var expected_null_tuple = std.ArrayListUnmanaged(u8).empty;
+    defer expected_null_tuple.deinit(alloc);
+    try internal_keys.appendEncodedComponent(&expected_null_tuple, alloc, typedJsonNullValue());
+    try std.testing.expectEqualSlices(u8, expected_null_tuple.items, null_tuple);
+
+    const exact_columns = [_]schema_mod.RelationalColumn{.{
+        .name = "email",
+        .path = "email",
+        .field_type = .keyword,
+    }};
+    const exact_upper_tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_upper, default_unique, exact_columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(exact_upper_tuple);
+    const exact_lower_tuple = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_lower, default_unique, exact_columns[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(exact_lower_tuple);
+    try std.testing.expect(!std.mem.eql(u8, exact_upper_tuple, exact_lower_tuple));
 }
 
 test "relational bytes tuple helper matches row unique tuple encoding" {

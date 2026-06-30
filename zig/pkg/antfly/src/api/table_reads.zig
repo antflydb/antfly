@@ -38,6 +38,7 @@ pub const GroupVisibleRootGenerationSource = table_read_core.GroupVisibleRootGen
 pub const PrimaryLookupDbLease = table_read_core.PrimaryLookupDbLease;
 pub const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
 pub const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
+pub const RelationalRowsSourceGroupSystemTime = table_read_core.RelationalRowsSourceGroupSystemTime;
 pub const TableReadSource = table_read_core.TableReadSource;
 
 pub const testing = table_read_sources.testing;

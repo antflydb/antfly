@@ -5890,7 +5890,14 @@ pub const ApiHttpServer = struct {
         if (publicSqlLogicalPlanUsesDurableExecution(logical_plan.*)) {
             return .{ .durable = try sql_adapter.takeDurableSqlPlanFromLogical(logical_plan) };
         }
-        const plan = logical_plan.*;
+        var plan = logical_plan.*;
+        switch (plan) {
+            .catalog_write => |*write| {
+                write.options.unique_resolver = null;
+                write.options.default_context.sequence_resolver = null;
+            },
+            else => {},
+        }
         logical_plan.* = .{ .other_ddl = .{ .moved = {} } };
         return .{ .logical = plan };
     }
@@ -5986,6 +5993,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
                 error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
                 error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound, error.UnknownGroup => {
                     std.log.err("public sql write transaction not found table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 404, "not found");
@@ -6009,6 +6017,7 @@ pub const ApiHttpServer = struct {
             _ = (source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
                 error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound => {
                     std.log.err("public sql write batch not found table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 404, "not found");
@@ -6191,6 +6200,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
                 std.log.err("public sql insert source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
@@ -6602,6 +6612,216 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(
+        tokens: []const sql_adapter.Token,
+        expression: sql_adapter.generated_parser.GeneratedSqlExpressionAst,
+    ) bool {
+        if (expression.kind == .function_call) {
+            if (expression.function_name_tokens) |name_tokens| {
+                if (publicSqlGeneratedFunctionNameRangeIsAntflyNativeSearch(tokens, name_tokens)) return true;
+            }
+        }
+        switch (expression.kind) {
+            .logical_or, .logical_and => {
+                for (expression.boolean_condition_items.expressions) |condition| {
+                    if (publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, condition)) return true;
+                }
+            },
+            .logical_not => if (expression.right_expression) |right| {
+                if (publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, right.*)) return true;
+            },
+            .grouped => if (expression.inner_expression) |inner| {
+                if (publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, inner.*)) return true;
+            },
+            else => {},
+        }
+        if (expression.left_expression) |left| {
+            if (publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, left.*)) return true;
+        }
+        if (expression.right_expression) |right| {
+            if (publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, right.*)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlTokenMatchesNativeAntflySearchMember(token: sql_adapter.Token) bool {
+        return token.matchesKeywordTag(.full_text_search) or
+            token.matchesKeywordTag(.semantic_search) or
+            token.matchesKeywordTag(.vector_search) or
+            token.matchesKeywordTag(.hybrid_search) or
+            token.matchesKeywordTag(.graph_traverse) or
+            token.matchesKeywordTag(.graph_neighbors) or
+            token.matchesKeywordTag(.graph_shortest_path) or
+            token.matchesKeywordTag(.graph_k_shortest_paths) or
+            token.matchesKeywordTag(.graph_match) or
+            token.matchesKeywordTag(.graph_metric) or
+            token.matchesKeywordTag(.graph_metric_rerank);
+    }
+
+    fn publicSqlTokenMatchesQualifiedNativeAntflySearchFunction(token: sql_adapter.Token) bool {
+        return token.matchesQualifiedKeywordTag("antfly", .full_text_search) or
+            token.matchesQualifiedKeywordTag("antfly", .semantic_search) or
+            token.matchesQualifiedKeywordTag("antfly", .vector_search) or
+            token.matchesQualifiedKeywordTag("antfly", .hybrid_search) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_traverse) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_neighbors) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_match) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_metric) or
+            token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank);
+    }
+
+    fn publicSqlGeneratedFunctionNameRangeIsAntflyNativeSearch(
+        tokens: []const sql_adapter.Token,
+        range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+    ) bool {
+        if (range.end > tokens.len or range.start >= range.end) return false;
+        if (range.end == range.start + 1) {
+            return publicSqlTokenMatchesQualifiedNativeAntflySearchFunction(tokens[range.start]);
+        }
+        var saw_antfly = false;
+        for (tokens[range.start..range.end]) |token| {
+            if (!saw_antfly and std.ascii.eqlIgnoreCase(token.text, "antfly")) {
+                saw_antfly = true;
+                continue;
+            }
+            if (saw_antfly and publicSqlTokenMatchesNativeAntflySearchMember(token)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlTokensHaveAntflyNativeSearchFunction(tokens: []const sql_adapter.Token) bool {
+        var saw_antfly = false;
+        for (tokens) |token| {
+            if (publicSqlTokenMatchesQualifiedNativeAntflySearchFunction(token)) return true;
+            if (!saw_antfly and std.ascii.eqlIgnoreCase(token.text, "antfly")) {
+                saw_antfly = true;
+                continue;
+            }
+            if (saw_antfly and publicSqlTokenMatchesNativeAntflySearchMember(token)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlGeneratedReadHasAntflyNativeSearchPredicate(
+        tokens: []const sql_adapter.Token,
+        read: sql_adapter.generated_parser.GeneratedSqlReadAst,
+    ) bool {
+        if (read.where_tokens) |where_tokens| {
+            if (publicSqlGeneratedRangeHasAntflyNativeSearchFunction(tokens, where_tokens) or
+                publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, read.where_expression)) return true;
+        }
+        if (read.having_tokens) |having_tokens| {
+            if (publicSqlGeneratedRangeHasAntflyNativeSearchFunction(tokens, having_tokens) or
+                publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, read.having_expression)) return true;
+        }
+        if (read.set_operation.right_where_tokens) |where_tokens| {
+            if (publicSqlGeneratedRangeHasAntflyNativeSearchFunction(tokens, where_tokens) or
+                publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, read.set_operation.right_where_expression)) return true;
+        }
+        for (read.join_items) |join| {
+            if (join.predicate_tokens) |predicate_tokens| {
+                if (publicSqlGeneratedRangeHasAntflyNativeSearchFunction(tokens, predicate_tokens) or
+                    publicSqlGeneratedExpressionHasAntflyNativeSearchFunction(tokens, join.predicate_expression)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn publicSqlGeneratedRangeHasAntflyNativeSearchFunction(
+        tokens: []const sql_adapter.Token,
+        range: sql_adapter.generated_parser.GeneratedSqlTokenRange,
+    ) bool {
+        if (range.end > tokens.len or range.start > range.end) return false;
+        var saw_antfly = false;
+        for (tokens[range.start..range.end]) |token| {
+            if (publicSqlTokenMatchesQualifiedNativeAntflySearchFunction(token)) return true;
+            if (!saw_antfly and std.ascii.eqlIgnoreCase(token.text, "antfly")) {
+                saw_antfly = true;
+                continue;
+            }
+            if (saw_antfly and publicSqlTokenMatchesNativeAntflySearchMember(token)) return true;
+        }
+        return false;
+    }
+
+    fn publicSqlGeneratedReadSourceTableNameAlloc(
+        alloc: std.mem.Allocator,
+        tokens: []const sql_adapter.Token,
+        read: sql_adapter.generated_parser.GeneratedSqlReadAst,
+    ) !?[]const u8 {
+        const table_tokens = read.source_table_tokens orelse return null;
+        if (table_tokens.end > tokens.len or table_tokens.start >= table_tokens.end or table_tokens.end != table_tokens.start + 1) return null;
+        const table_token = tokens[table_tokens.start];
+        if (table_token.kind != .identifier) return null;
+        return try sql_adapter.normalizeSqlObjectIdentifierAlloc(alloc, table_token.text);
+    }
+
+    fn publicSqlGeneratedDocumentNativeSearchPredicateDiagnostic(
+        parsed_sql: *const sql_adapter.ParsedSql,
+        schema: runtime_schema_mod.TableSchema,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
+    ) ?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        if (schema.storage_mode != .document) return null;
+        const generated_statement = parsed_sql.generated_statement orelse return null;
+        const generated_ast = generated_statement.ast orelse return null;
+        switch (generated_ast) {
+            .read => |read| {
+                if (!publicSqlGeneratedReadHasAntflyNativeSearchPredicate(parsed_sql.items(), read.*) and
+                    !publicSqlTokensHaveAntflyNativeSearchFunction(parsed_sql.items())) return null;
+            },
+            else => return null,
+        }
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .invalid_sql_request)
+            .withMessage("document_sql_native_search_requires_table_function")
+            .withMissingNativeModel("document SQL read shape");
+    }
+
+    fn publicSqlGeneratedDocumentNativeSearchPredicateDiagnosticFromCatalog(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
+    ) !?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        const generated_statement = parsed_sql.generated_statement orelse return null;
+        const generated_ast = generated_statement.ast orelse return null;
+        const read = switch (generated_ast) {
+            .read => |read| blk: {
+                if (!publicSqlGeneratedReadHasAntflyNativeSearchPredicate(parsed_sql.items(), read.*) and
+                    !publicSqlTokensHaveAntflyNativeSearchFunction(parsed_sql.items())) return null;
+                break :blk read.*;
+            },
+            else => return null,
+        };
+
+        var table_name: []const u8 = undefined;
+        var table_name_owned = false;
+        if (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql)) |maybe_tables| {
+            var tables = maybe_tables orelse return null;
+            defer tables.deinit(self.alloc);
+            table_name = try self.alloc.dupe(u8, tables.left);
+            table_name_owned = true;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {
+                table_name = (try publicSqlGeneratedReadSourceTableNameAlloc(self.alloc, parsed_sql.items(), read)) orelse return null;
+                table_name_owned = true;
+            },
+            else => return err,
+        }
+        defer if (table_name_owned) self.alloc.free(table_name);
+
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource(), table_name, session) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return null,
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+        if (schema.storage_mode != .document) return null;
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .invalid_sql_request)
+            .withMessage("document_sql_native_search_requires_table_function")
+            .withMissingNativeModel("document SQL read shape");
+    }
+
     fn publicSqlGeneratedReadUnsupportedSubqueryPredicateMissingNativeModel(
         read: sql_adapter.generated_parser.GeneratedSqlReadAst,
     ) ?[]const u8 {
@@ -6672,6 +6892,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.WriteUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") },
             error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
@@ -6740,6 +6961,7 @@ pub const ApiHttpServer = struct {
             error.InvalidArgument, error.InvalidQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
             error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.WriteUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") },
             error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
@@ -6837,6 +7059,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
                 std.log.err("public sql joined mutation source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
@@ -6857,6 +7080,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.WriteUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") },
             error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
@@ -6911,6 +7135,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.ReadUnavailable, error.WriteUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "write unavailable") },
             error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
             error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
@@ -7004,6 +7229,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
                 std.log.err("public sql merge plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
@@ -7056,6 +7282,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
             error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
             error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.LeaderUnavailable, error.ReadUnavailable => return .{ .failure = try textResponse(self.alloc, 503, "read unavailable") },
             else => {
                 std.log.err("public sql recursive merge plan failed table={s} cte={s} err={}", .{ target_table_name, lowered.recursive.cte_name, err });
                 return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
@@ -7096,6 +7323,10 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(target_table);
         const schema = try clonePublicSqlRuntimeSchemaAlloc(self.alloc, target_binding.schema());
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        var sequence_resolver_ctx = RowsSequenceDefaultResolverContext{ .source = self.source };
+        write_catalog.options.unique_resolver = unique_resolver_ctx.resolver();
+        write_catalog.options.default_context.sequence_resolver = sequence_resolver_ctx.resolver();
 
         const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
         defer sql_routines.freeExpressionRoutineBindings(self.alloc, routine_bindings);
@@ -7402,6 +7633,9 @@ pub const ApiHttpServer = struct {
         };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const statement_kind = (publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) catch return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) }) orelse {
+            if (publicSqlGeneratedDocumentNativeSearchPredicateDiagnostic(parsed_sql, target_binding.schema(), .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+            }
             if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
                 return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
             }
@@ -7444,6 +7678,9 @@ pub const ApiHttpServer = struct {
                 error.MissingSqlParameter => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlGeneratedDocumentNativeSearchPredicateDiagnostic(parsed_sql, schema, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+                    }
                     if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
                         return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
                     }
@@ -7499,8 +7736,10 @@ pub const ApiHttpServer = struct {
                 },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
                 error.RelationalRowsCteSpillRequired => return .{ .response = try self.publicSqlDiagnosticResponse(429, .init(.execute, .sql_read_backpressured)) },
+                error.SystemVersionedHistoryPruned => return .{ .response = try self.publicSqlDiagnosticResponse(410, .init(.execute, .system_versioned_history_pruned)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
                 error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
                 else => return err,
             }
         }) orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) };
@@ -7870,6 +8109,9 @@ pub const ApiHttpServer = struct {
         };
         const target_binding = read_catalog.target_binding orelse return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.bind, .unsupported_sql_statement)) };
         const statement_kind = (publicSqlReadStatementKindForCatalogRead(read_catalog, parsed_sql) catch return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) }) orelse {
+            if (publicSqlGeneratedDocumentNativeSearchPredicateDiagnostic(parsed_sql, target_binding.schema(), .plan)) |diagnostic| {
+                return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+            }
             if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
                 return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
             }
@@ -7908,6 +8150,9 @@ pub const ApiHttpServer = struct {
                 error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) },
                 error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
                 error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                    if (publicSqlGeneratedDocumentNativeSearchPredicateDiagnostic(parsed_sql, schema, .plan)) |diagnostic| {
+                        return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+                    }
                     if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
                         return .{ .response = try self.publicSqlDiagnosticResponse(501, diagnostic) };
                     }
@@ -8196,6 +8441,7 @@ pub const ApiHttpServer = struct {
                 error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
                 error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
                 error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unique_owner_unavailable).withMessage("doc identity unavailable")) },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
                 else => return err,
             }
             const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, target);
@@ -8205,6 +8451,7 @@ pub const ApiHttpServer = struct {
                 error.ModelNotFound => return .{ .response = try modelNotFoundResponse(self.alloc) },
                 error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
                 error.DocIdentityNamespaceMismatch => return .{ .response = try self.publicSqlDiagnosticResponse(503, sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.execute, .unique_owner_unavailable).withMessage("doc identity unavailable")) },
+                error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
                 else => return err,
             });
         } orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) };
@@ -10108,6 +10355,9 @@ pub const ApiHttpServer = struct {
             },
             error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                if (try self.publicSqlGeneratedDocumentNativeSearchPredicateDiagnosticFromCatalog(parsed_sql, session.session(), .plan)) |diagnostic| {
+                    return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+                }
                 if (publicSqlGeneratedReadRowClaimDiagnostic(parsed_sql, .plan)) |diagnostic| {
                     return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, diagnostic) };
                 }
@@ -12810,6 +13060,7 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
+                    error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                     error.DecisionConflict => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -13090,6 +13341,7 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
+                    error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                     error.DecisionConflict => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -13540,6 +13792,7 @@ pub const ApiHttpServer = struct {
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
@@ -14320,7 +14573,10 @@ pub const ApiHttpServer = struct {
         var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, query);
         defer lookup_opts.deinit(self.alloc);
 
-        var result = (try source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+        var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, .read_index) catch |err| switch (err) {
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
+            else => return err,
+        }) orelse {
             return try textResponse(self.alloc, 404, "not found");
         };
         defer result.deinit(self.alloc);
@@ -14352,7 +14608,10 @@ pub const ApiHttpServer = struct {
         var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, query);
         defer lookup_opts.deinit(self.alloc);
 
-        var result = (try source.lookupCatalog(self.alloc, target, decoded_key, lookup_opts.opts, .read_index)) orelse {
+        var result = (source.lookupCatalog(self.alloc, target, decoded_key, lookup_opts.opts, .read_index) catch |err| switch (err) {
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
+            else => return err,
+        }) orelse {
             return try textResponse(self.alloc, 404, "not found");
         };
         defer result.deinit(self.alloc);
@@ -14871,6 +15130,7 @@ pub const ApiHttpServer = struct {
                 var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
                     error.NotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.LeaderUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
                     error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
                     else => {
                         std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
@@ -14985,14 +15245,17 @@ pub const ApiHttpServer = struct {
                 var scan_req = try http_route_helpers.parseScanKeysRequest(self.alloc, req.body);
                 defer scan_req.deinit(self.alloc);
 
-                var result = (try source.scan(
+                var result = (source.scan(
                     self.alloc,
                     table_name,
                     scan_req.from,
                     scan_req.to,
                     scan_req.opts,
                     .read_index,
-                )) orelse return try textResponse(self.alloc, 404, "not found");
+                ) catch |err| switch (err) {
+                    error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
+                    else => return err,
+                }) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
                 const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
@@ -16675,7 +16938,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
-            error.LeaderUnavailable => return error.WriteUnavailable,
+            error.LeaderUnavailable, error.WriteUnavailable => return error.WriteUnavailable,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,
@@ -16699,6 +16962,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.LeaderUnavailable => return error.LeaderUnavailable,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -16807,6 +17071,7 @@ pub const ApiHttpServer = struct {
                 error.ModelNotFound => return error.ModelNotFound,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+                error.LeaderUnavailable, error.ReadUnavailable => return err,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -16825,6 +17090,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.LeaderUnavailable, error.ReadUnavailable => return err,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
@@ -16862,6 +17128,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.LeaderUnavailable, error.ReadUnavailable => return err,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -16892,6 +17159,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+                error.LeaderUnavailable, error.ReadUnavailable => return err,
                 else => {
                     std.log.err("public catalog table query execution failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                     return error.InternalFailure;
@@ -16907,6 +17175,7 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicCatalogTableQueryIfAny(alloc, source, target, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.LeaderUnavailable, error.ReadUnavailable => return err,
             else => {
                 std.log.err("foreign public catalog table query execution failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                 return error.InternalFailure;
@@ -16943,6 +17212,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.LeaderUnavailable, error.ReadUnavailable => return err,
             else => {
                 std.log.err("public catalog table query execution failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                 return error.InternalFailure;
@@ -17797,7 +18067,8 @@ pub const ApiHttpServer = struct {
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
+            error.LeaderUnavailable => return error.LeaderUnavailable,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -17817,7 +18088,8 @@ pub const ApiHttpServer = struct {
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
+            error.LeaderUnavailable => return error.LeaderUnavailable,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -17837,6 +18109,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return error.NotFound;
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.LeaderUnavailable, error.WriteUnavailable => return error.WriteUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact reprocess failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -17859,6 +18132,7 @@ pub const ApiHttpServer = struct {
         return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument => return error.InvalidRequest,
+            error.LeaderUnavailable, error.WriteUnavailable => return error.WriteUnavailable,
             error.NotFound => return error.NotFound,
             else => {
                 std.log.err("public document artifact range reprocess failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
@@ -18162,6 +18436,7 @@ pub const ApiHttpServer = struct {
         _ = (source.batchCatalog(self.alloc, target, batch_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid batch request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
             else => {
@@ -18238,6 +18513,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
                 error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
                 error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18258,6 +18534,7 @@ pub const ApiHttpServer = struct {
             _ = (source.batch(self.alloc, table_name, rows_req.req) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
                 error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                 error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18320,6 +18597,7 @@ pub const ApiHttpServer = struct {
         _ = (source.batchCatalog(self.alloc, target, rows_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
             error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+            error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18571,6 +18849,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
             error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
             error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18633,6 +18912,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public table rows insert source read failed table={s} source={s} err={}", .{ table_name, source_table_name, err });
                 return try textResponse(self.alloc, 500, "rows mutation source failed");
@@ -18687,6 +18967,7 @@ pub const ApiHttpServer = struct {
                     error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
                     error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
                     error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                     error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
                     error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                     error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18707,6 +18988,7 @@ pub const ApiHttpServer = struct {
                 _ = (write_source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
                     error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
                     error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                    error.LeaderUnavailable, error.WriteUnavailable => return try textResponse(self.alloc, 503, "write unavailable"),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                     error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
@@ -18994,7 +19276,10 @@ pub const ApiHttpServer = struct {
             };
             initialized += 1;
             const key = maybe_key orelse continue;
-            var lookup = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse continue;
+            var lookup = (source.lookup(self.alloc, table_name, key, .{}, .read_index) catch |err| switch (err) {
+                error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
+                else => return err,
+            }) orelse continue;
             defer lookup.deinit(self.alloc);
             if (row_filter_json) |value| {
                 if (!(try self.docJsonMatchesRowFilter(key, lookup.json, value))) continue;
@@ -20053,6 +20338,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => {
                 std.log.err("public table rows query failed table={s} err={}", .{ table_name, err });
@@ -20115,6 +20401,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => {
                 std.log.err("public table rows aggregate failed table={s} err={}", .{ table_name, err });
@@ -20156,6 +20443,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows window plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public table rows window failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "rows window failed");
@@ -20218,6 +20506,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows join plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public table rows join failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "rows join failed");
@@ -20280,6 +20569,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows lateral plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public table rows lateral failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "rows lateral failed");
@@ -21511,6 +21801,7 @@ pub const ApiHttpServer = struct {
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -21542,6 +21833,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
             else => {
                 std.log.err("public catalog table query execution failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -21636,6 +21928,7 @@ pub const ApiHttpServer = struct {
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.LeaderUnavailable, error.ReadUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
                 else => {
                     std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -21996,6 +22289,11 @@ pub const ApiHttpServer = struct {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 return try textResponse(self.alloc, 404, "not found");
+            },
+            error.LeaderUnavailable, error.WriteUnavailable => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 503, "write unavailable");
             },
             error.MethodNotAllowed => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
@@ -34068,6 +34366,249 @@ test "api http server maps relational CTE spill admission to rows backpressure" 
     try std.testing.expectEqualStrings("rows query backpressured", response.body);
 }
 
+test "api http server maps public row owner unavailability to service unavailable" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .query_catalog = queryCatalog,
+                    .document_artifact_manifest = documentArtifactManifest,
+                    .document_artifact_manifests = documentArtifactManifests,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.ReadUnavailable;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.LeaderUnavailable;
+        }
+
+        fn queryCatalog(_: *anyopaque, _: std.mem.Allocator, _: catalog_resources.TableTarget, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.LeaderUnavailable;
+        }
+
+        fn documentArtifactManifest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            return error.LeaderUnavailable;
+        }
+
+        fn documentArtifactManifests(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            return error.LeaderUnavailable;
+        }
+
+        fn rowsQueryPlan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: runtime_schema_mod.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            return error.ReadUnavailable;
+        }
+    };
+
+    const FakeWrites = struct {
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .commit_transaction = commitTransaction,
+                    .batch = batch,
+                    .reprocess_document_artifact = reprocessDocumentArtifact,
+                    .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                },
+            };
+        }
+
+        fn commitTransaction(_: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) !?distributed_txn.CommitOutcome {
+            return error.LeaderUnavailable;
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.WriteUnavailable;
+        }
+
+        fn reprocessDocumentArtifact(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?bool {
+            return error.LeaderUnavailable;
+        }
+
+        fn reprocessDocumentArtifactRange(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+            return error.WriteUnavailable;
+        }
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var reads = FakeReads{};
+    var writes = FakeWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
+
+    var read_response = try server.handlePublicTableRowsQuery(
+        "events",
+        "{\"query\":{\"select\":[\"id\"]}}",
+        null,
+    );
+    defer read_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), read_response.status);
+    try std.testing.expectEqualStrings("read unavailable", read_response.body);
+
+    var table_query_response = try server.handlePublicTableQuery(
+        "events",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+    );
+    defer table_query_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), table_query_response.status);
+    try std.testing.expectEqualStrings("read unavailable", table_query_response.body);
+
+    var catalog_query_response = try server.handlePublicCatalogTableQuery(.{
+        .database_name = tables_api.default_database_name,
+        .namespace_name = tables_api.default_namespace_name,
+        .table_name = "events",
+    }, "{\"query\":{\"match_all\":{}}}", null);
+    defer catalog_query_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), catalog_query_response.status);
+    try std.testing.expectEqualStrings("read unavailable", catalog_query_response.body);
+
+    var rows_get_response = try server.handlePublicTableRowsGet(
+        "events",
+        "{\"keys\":[{\"primary\":{\"id\":\"evt-1\"}}]}",
+        null,
+    );
+    defer rows_get_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), rows_get_response.status);
+    try std.testing.expectEqualStrings("read unavailable", rows_get_response.body);
+
+    var document_lookup_response = try server.handlePublicTableDocumentLookup(
+        "events",
+        "evt-1",
+        "",
+        null,
+    );
+    defer document_lookup_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), document_lookup_response.status);
+    try std.testing.expectEqualStrings("read unavailable", document_lookup_response.body);
+
+    var artifact_manifest_response = try public_table_http.handleDocumentArtifactManifest(
+        alloc,
+        "events",
+        "evt-1",
+        "embedding",
+        .{},
+        server.tableApi(),
+    );
+    defer artifact_manifest_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), artifact_manifest_response.status);
+    try std.testing.expectEqualStrings("standby read unavailable", artifact_manifest_response.body);
+
+    var artifact_manifests_response = try public_table_http.handleDocumentArtifactManifests(
+        alloc,
+        "events",
+        "evt-1",
+        .{},
+        server.tableApi(),
+    );
+    defer artifact_manifests_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), artifact_manifests_response.status);
+    try std.testing.expectEqualStrings("standby read unavailable", artifact_manifests_response.body);
+
+    var batch_response = try public_table_http.handleTableBatch(
+        alloc,
+        "events",
+        "{\"inserts\":{\"evt-1\":{\"id\":\"evt-1\",\"status\":\"open\"}}}",
+        server.tableApi(),
+    );
+    defer batch_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), batch_response.status);
+    try std.testing.expectEqualStrings("write unavailable", batch_response.body);
+
+    var reprocess_response = try public_table_http.handleReprocessDocumentArtifact(
+        alloc,
+        "events",
+        "evt-1",
+        "embedding",
+        server.tableApi(),
+    );
+    defer reprocess_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), reprocess_response.status);
+    try std.testing.expectEqualStrings("write unavailable", reprocess_response.body);
+
+    var reprocess_range_response = try public_table_http.handleReprocessDocumentArtifactRange(
+        alloc,
+        "events",
+        "embedding",
+        "{}",
+        server.tableApi(),
+    );
+    defer reprocess_range_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), reprocess_range_response.status);
+    try std.testing.expectEqualStrings("write unavailable", reprocess_range_response.body);
+
+    var write_response = try server.handlePublicTableRowsBatch(
+        "events",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"evt-1\",\"status\":\"open\"}}]}",
+        null,
+    );
+    defer write_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), write_response.status);
+    try std.testing.expectEqualStrings("write unavailable", write_response.body);
+}
+
 test "api http server exposes SQL routine bindings to catalog read planning" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -36334,6 +36875,7 @@ test "api http server serves fielded full-text search through mcp tools" {
 test "api http server serves table scan as ndjson" {
     const ScanRow = struct {
         key: []const u8,
+        version: u64,
         title: []const u8,
     };
     const alloc = std.testing.allocator;
@@ -36352,6 +36894,7 @@ test "api http server serves table scan as ndjson" {
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
         },
+        .timestamp_ns = 1234,
     });
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
@@ -36386,6 +36929,7 @@ test "api http server serves table scan as ndjson" {
     var parsed = try std.json.parseFromSlice(ScanRow, std.testing.allocator, resp.body[0..newline], .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed.value.key);
+    try std.testing.expectEqual(@as(u64, 1234), parsed.value.version);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 

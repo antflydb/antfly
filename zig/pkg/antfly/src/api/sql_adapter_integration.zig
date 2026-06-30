@@ -4714,7 +4714,14 @@ test "postgres sql adapter merge mutation batch collects CTE source preimages" {
         .merge_mutation => |merge| {
             try std.testing.expectEqual(@as(usize, 1), merge.ctes.len);
             try std.testing.expectEqualStrings("ready_sources", merge.source.source_cte);
-            var batch = try buildMergeMutationBatchFromDbAcrossRangesAlloc(alloc, &db, schema, schema, merge, target_query, &.{}, .{}, source_ranges[0..]);
+            const source_projection_collision = [_]db_mod.types.RelationalRowsExpressionProjection{.{
+                .output = "source_id",
+                .expression = .{ .kind = .value, .value_json = "\"shadowed\"" },
+            }};
+            var projected_merge = merge;
+            projected_merge.source.expressions = source_projection_collision[0..];
+
+            var batch = try buildMergeMutationBatchFromDbAcrossRangesAlloc(alloc, &db, schema, schema, projected_merge, target_query, &.{}, .{}, source_ranges[0..]);
             defer batch.deinit(alloc);
             try std.testing.expectEqual(@as(u32, 1), batch.inserted);
             try std.testing.expectEqual(@as(u32, 0), batch.deleted);

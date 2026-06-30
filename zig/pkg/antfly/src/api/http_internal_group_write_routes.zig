@@ -24,6 +24,9 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_mod = @import("../raft/mod.zig");
 const routes = @import("http_routes.zig");
+const relational_rows_api = @import("relational_rows.zig");
+const schema_api = @import("../schema/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const table_writes = @import("table_writes.zig");
 
 pub const BatchValidator = struct {
@@ -109,6 +112,46 @@ const ForeignKeyActionScheduleRequestWire = struct {
     requeue_only: bool = false,
 };
 
+const RowsMutationSourceStageWire = struct {
+    schema_json: []const u8,
+    request_body: []const u8,
+    topology_epoch: u64 = 0,
+    planned_stage: ?[]const u8 = null,
+    autocommit: bool = true,
+    sync_level: ?[]const u8 = null,
+};
+
+const RowsMutationSourceCollectWire = struct {
+    schema_json: []const u8,
+    request_body: []const u8,
+    topology_epoch: u64 = 0,
+};
+
+const RowsJoinedMutationSourceStageWire = struct {
+    target_schema_json: []const u8,
+    source_schema_json: []const u8,
+    request_body: []const u8,
+    topology_epoch: u64 = 0,
+    source_rows: []const []const u8 = &.{},
+    planned_stage: ?[]const u8 = null,
+    autocommit: bool = true,
+    sync_level: ?[]const u8 = null,
+};
+
+const RowsJoinedMutationSourceCollectWire = struct {
+    target_schema_json: []const u8,
+    source_schema_json: []const u8,
+    request_body: []const u8,
+    topology_epoch: u64 = 0,
+};
+
+const RowsJoinedMutationSourceInputsWire = struct {
+    target_schema_json: []const u8,
+    source_schema_json: []const u8,
+    request_body: []const u8,
+    topology_epoch: u64 = 0,
+};
+
 fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
     const text = value orelse "validate";
     if (enumTokenEql(text, "plan")) return .plan;
@@ -150,7 +193,24 @@ fn enumTokenSeparator(ch: u8) bool {
     return ch == ' ' or ch == '_' or ch == '-';
 }
 
+fn runtimeSchemaFromJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !storage_schema.TableSchema {
+    var parsed = schema_api.parseValidatedTableSchema(alloc, schema_json) catch return error.InvalidRowsMutationSourceRequest;
+    defer parsed.deinit(alloc);
+    return schema_api.deriveRuntimeTableSchema(alloc, parsed) catch return error.InvalidRowsMutationSourceRequest;
+}
+
+fn parseSyncLevel(text: ?[]const u8) !db_mod.types.SyncLevel {
+    return db_mod.types.parsePublicSyncLevelText(text orelse "write") orelse error.InvalidRowsMutationSourceRequest;
+}
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
+    return handleImpl(ctx, req, path) catch |err| switch (err) {
+        error.NotLeader, error.LeaderUnavailable, error.WriteUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
+        else => return err,
+    };
+}
+
+fn handleImpl(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method == .GET) {
         if (routes.Routes.matchGroupDbMedianKey(path)) |route| {
             const adapter = ctx.shard_db_adapter orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -661,6 +721,219 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         defer status.deinit(ctx.alloc);
         return try http_route_helpers.jsonResponse(ctx.alloc, status);
     }
+    if (routes.Routes.matchGroupRowsMutationSourceCollect(path)) |mutation_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(RowsMutationSourceCollectWire, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        defer parsed.deinit();
+
+        const schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, schema);
+
+        var rows_req = relational_rows_api.parseRowsMutationSourceRequest(ctx.alloc, parsed.value.request_body, schema) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer rows_req.deinit(ctx.alloc);
+
+        const response_body = (writes.rowsMutationSourceCollectGroupLocal(ctx.alloc, mutation_route.group_id, mutation_route.table_name, parsed.value.topology_epoch, schema, rows_req.req) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer ctx.alloc.free(response_body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = try ctx.alloc.dupe(u8, response_body),
+        };
+    }
+    if (routes.Routes.matchGroupRowsMutationSourceStage(path)) |mutation_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(RowsMutationSourceStageWire, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        defer parsed.deinit();
+
+        const sync_level = if (parsed.value.autocommit) parseSyncLevel(parsed.value.sync_level) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        } else db_mod.types.SyncLevel.write;
+        const schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, schema);
+
+        var rows_req = relational_rows_api.parseRowsMutationSourceRequest(ctx.alloc, parsed.value.request_body, schema) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer rows_req.deinit(ctx.alloc);
+
+        var planned_stage = if (parsed.value.planned_stage) |planned_body| relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(ctx.alloc, planned_body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        } else null;
+        defer if (planned_stage) |*stage| stage.deinit(ctx.alloc);
+        if (planned_stage != null and parsed.value.autocommit) return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+
+        var result = ((if (planned_stage) |stage|
+            writes.rowsMutationSourceStagePlannedGroupLocal(ctx.alloc, mutation_route.group_id, mutation_route.table_name, parsed.value.topology_epoch, schema, rows_req.req, stage.matched, stage.candidates)
+        else if (parsed.value.autocommit)
+            writes.mutateRowsFromSourceAutocommit(ctx.alloc, mutation_route.table_name, schema, rows_req.req, sync_level)
+        else
+            writes.mutateRowsFromSource(ctx.alloc, mutation_route.table_name, schema, rows_req.req)) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try http_route_helpers.textResponse(ctx.alloc, 409, "version conflict"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+
+        const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(ctx.alloc, result);
+        defer ctx.alloc.free(response_body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = try ctx.alloc.dupe(u8, response_body),
+        };
+    }
+    if (routes.Routes.matchGroupRowsJoinedMutationSourceCollect(path)) |mutation_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(RowsJoinedMutationSourceCollectWire, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        defer parsed.deinit();
+
+        const target_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.target_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, target_schema);
+        const source_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.source_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, source_schema);
+
+        var rows_req = relational_rows_api.parseRowsJoinedMutationSourceRequestWithSchemas(ctx.alloc, parsed.value.request_body, target_schema, source_schema) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer rows_req.deinit(ctx.alloc);
+
+        const response_body = (writes.rowsJoinedMutationSourceCollectGroupLocal(ctx.alloc, mutation_route.group_id, mutation_route.table_name, parsed.value.topology_epoch, target_schema, rows_req.req) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer ctx.alloc.free(response_body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = try ctx.alloc.dupe(u8, response_body),
+        };
+    }
+    if (routes.Routes.matchGroupRowsJoinedMutationSourceInputs(path)) |mutation_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(RowsJoinedMutationSourceInputsWire, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        defer parsed.deinit();
+
+        const target_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.target_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, target_schema);
+        const source_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.source_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, source_schema);
+
+        var rows_req = relational_rows_api.parseRowsJoinedMutationSourceRequestWithSchemas(ctx.alloc, parsed.value.request_body, target_schema, source_schema) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer rows_req.deinit(ctx.alloc);
+
+        const response_body = (writes.rowsJoinedMutationSourceInputsGroupLocal(ctx.alloc, mutation_route.group_id, mutation_route.table_name, parsed.value.topology_epoch, source_schema, rows_req.req) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer ctx.alloc.free(response_body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = try ctx.alloc.dupe(u8, response_body),
+        };
+    }
+    if (routes.Routes.matchGroupRowsJoinedMutationSourceStage(path)) |mutation_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(RowsJoinedMutationSourceStageWire, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        defer parsed.deinit();
+
+        const sync_level = if (parsed.value.autocommit) parseSyncLevel(parsed.value.sync_level) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        } else db_mod.types.SyncLevel.write;
+        const target_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.target_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, target_schema);
+        const source_schema = runtimeSchemaFromJsonAlloc(ctx.alloc, parsed.value.source_schema_json) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer storage_schema.freeSchema(ctx.alloc, source_schema);
+
+        var rows_req = relational_rows_api.parseRowsJoinedMutationSourceRequestWithSchemas(ctx.alloc, parsed.value.request_body, target_schema, source_schema) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        };
+        defer rows_req.deinit(ctx.alloc);
+
+        var planned_stage = if (parsed.value.planned_stage) |planned_body| relational_rows_api.parseRowsJoinedMutationSourcePlannedStageAlloc(ctx.alloc, planned_body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+        } else null;
+        defer if (planned_stage) |*stage| stage.deinit(ctx.alloc);
+        if (planned_stage != null and parsed.value.autocommit) return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request");
+
+        var result = ((if (planned_stage) |stage|
+            writes.rowsJoinedMutationSourceStagePlannedGroupLocal(ctx.alloc, mutation_route.group_id, mutation_route.table_name, parsed.value.topology_epoch, target_schema, source_schema, rows_req.req, stage.matched, stage.candidates)
+        else if (parsed.value.autocommit)
+            writes.mutateRowsJoinedFromSourceRowsAutocommit(ctx.alloc, mutation_route.table_name, target_schema, source_schema, rows_req.req, parsed.value.source_rows, sync_level)
+        else
+            writes.mutateRowsJoinedFromSourceRows(ctx.alloc, mutation_route.table_name, target_schema, source_schema, rows_req.req, parsed.value.source_rows)) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try http_route_helpers.textResponse(ctx.alloc, 409, "version conflict"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+
+        const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(ctx.alloc, result);
+        defer ctx.alloc.free(response_body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = try ctx.alloc.dupe(u8, response_body),
+        };
+    }
     if (routes.Routes.matchGroupTxnBegin(path)) |txn_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var txn_req = distributed_txn.parseTxnBeginRequest(ctx.alloc, req.body) catch {
@@ -921,6 +1194,78 @@ test "internal group write routes validate batch requests" {
     try std.testing.expectEqualStrings("invalid batch request", resp.body);
 }
 
+test "internal group write routes forward batch identity rewrites" {
+    const alloc = std.testing.allocator;
+
+    const CaptureWriteSource = struct {
+        calls: usize = 0,
+        group_id: u64 = 0,
+        table_name: ?[]u8 = null,
+        old_key: ?[]u8 = null,
+        new_key: ?[]u8 = null,
+        value: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc_inner: std.mem.Allocator) void {
+            if (self.table_name) |value| alloc_inner.free(value);
+            if (self.old_key) |value| alloc_inner.free(value);
+            if (self.new_key) |value| alloc_inner.free(value);
+            if (self.value) |value| alloc_inner.free(value);
+        }
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .batch_group_local = batchGroupLocal,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return null;
+        }
+
+        fn batchGroupLocal(ptr: *anyopaque, alloc_inner: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
+            try std.testing.expectEqual(@as(usize, 1), req.relational_identity_rewrites.len);
+            try std.testing.expectEqual(@as(usize, 0), req.transforms.len);
+            self.calls += 1;
+            self.group_id = group_id;
+            self.table_name = try alloc_inner.dupe(u8, table_name);
+            self.old_key = try alloc_inner.dupe(u8, req.relational_identity_rewrites[0].old_key);
+            self.new_key = try alloc_inner.dupe(u8, req.relational_identity_rewrites[0].new_key);
+            self.value = try alloc_inner.dupe(u8, req.relational_identity_rewrites[0].value);
+            return {};
+        }
+    };
+
+    var capture = CaptureWriteSource{};
+    defer capture.deinit(alloc);
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = capture.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .body = "{\"relational_identity_rewrites\":[{\"old_key\":\"doc:a\",\"new_key\":\"doc:b\",\"value\":{\"id\":\"b\",\"status\":\"renamed\"}}],\"sync_level\":\"write\"}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7), capture.group_id);
+    try std.testing.expectEqualStrings("docs", capture.table_name.?);
+    try std.testing.expectEqualStrings("doc:a", capture.old_key.?);
+    try std.testing.expectEqualStrings("doc:b", capture.new_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.value.?, "\"renamed\"") != null);
+}
+
 test "internal group write routes validate transaction status requests" {
     const alloc = std.testing.allocator;
 
@@ -1161,6 +1506,28 @@ test "internal group write routes expose unique integrity" {
     defer parsed.deinit();
     try std.testing.expectEqual(table_writes.UniqueConstraintIntegrityAction.repair, parsed.value.action);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.groups[0].group_id);
+
+    const unavailable_bodies = [_][]const u8{
+        "{\"action\":\"validate\",\"lower_doc_key\":\"leader\"}",
+        "{\"action\":\"validate\",\"lower_doc_key\":\"write\"}",
+    };
+    for (unavailable_bodies) |body| {
+        var unavailable_resp = (try handle(.{
+            .alloc = alloc,
+            .shard_ops = null,
+            .writes = TestWriteSource.source(),
+            .batch_validator = TestWriteSource.batchValidator(),
+            .txn_validator = TestWriteSource.txnValidator(),
+        }, .{
+            .method = .POST,
+            .uri = "/internal/v1/groups/7/tables/docs/unique-integrity",
+            .body = body,
+        }, "/internal/v1/groups/7/tables/docs/unique-integrity")).?;
+        defer unavailable_resp.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+        try std.testing.expectEqualStrings("leader unavailable", unavailable_resp.body);
+    }
 }
 
 test "internal group write routes expose table emptying" {
@@ -1191,6 +1558,576 @@ test "internal group write routes expose table emptying" {
     try std.testing.expect(parsed.value.completed);
     try std.testing.expectEqual(@as(u64, 4), parsed.value.result.matched);
     try std.testing.expectEqual(@as(u64, 4), parsed.value.result.staged);
+}
+
+test "internal group write routes stage rows mutation source envelopes" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const MutationSource = struct {
+        const route_topology_epoch: u64 = 4242;
+
+        calls: usize = 0,
+        mutation_collect_calls: usize = 0,
+        mutation_planned_stage_calls: usize = 0,
+        joined_calls: usize = 0,
+        planned_stage_calls: usize = 0,
+        collect_calls: usize = 0,
+        inputs_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .mutate_rows_from_source = mutateRowsFromSource,
+                    .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                    .rows_mutation_source_collect_group_local = rowsMutationSourceCollectGroupLocal,
+                    .rows_mutation_source_stage_planned_group_local = rowsMutationSourceStagePlannedGroupLocal,
+                    .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
+                    .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
+                    .rows_joined_mutation_source_collect_group_local = rowsJoinedMutationSourceCollectGroupLocal,
+                    .rows_joined_mutation_source_inputs_group_local = rowsJoinedMutationSourceInputsGroupLocal,
+                    .rows_joined_mutation_source_stage_planned_group_local = rowsJoinedMutationSourceStagePlannedGroupLocal,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return null;
+        }
+
+        fn mutationResult(alloc_inner: std.mem.Allocator, row: []const u8) !db_mod.types.RelationalRowsMutationSourceResult {
+            const returning = try alloc_inner.alloc([]const u8, 1);
+            errdefer alloc_inner.free(returning);
+            returning[0] = try alloc_inner.dupe(u8, row);
+            return .{
+                .matched = 2,
+                .staged = 1,
+                .returning_rows = returning,
+            };
+        }
+
+        fn mutationParticipantResult(alloc_inner: std.mem.Allocator) !db_mod.types.RelationalRowsMutationSourceResult {
+            var result = try mutationResult(alloc_inner, "{\"id\":\"a\",\"status\":\"claimed\"}");
+            errdefer result.deinit(alloc_inner);
+            const predicates = try alloc_inner.alloc(db_mod.types.TransactionVersionPredicate, 1);
+            errdefer alloc_inner.free(predicates);
+            predicates[0] = .{
+                .key = try alloc_inner.dupe(u8, "row:a"),
+                .expected_version = 41,
+            };
+            const preimages = try alloc_inner.alloc(db_mod.types.TransactionWrite, 1);
+            errdefer alloc_inner.free(preimages);
+            preimages[0] = .{
+                .key = try alloc_inner.dupe(u8, "row:a"),
+                .value = try alloc_inner.dupe(u8, "{\"id\":\"a\",\"status\":\"ready\"}"),
+            };
+            const deletes = try alloc_inner.alloc([]const u8, 1);
+            errdefer alloc_inner.free(deletes);
+            deletes[0] = try alloc_inner.dupe(u8, "row:old");
+            const ops = try alloc_inner.alloc(db_mod.types.TransformOp, 1);
+            errdefer alloc_inner.free(ops);
+            ops[0] = .{
+                .op = .set,
+                .path = try alloc_inner.dupe(u8, "status"),
+                .value_json = try alloc_inner.dupe(u8, "\"claimed\""),
+            };
+            const transforms = try alloc_inner.alloc(db_mod.types.DocumentTransform, 1);
+            errdefer alloc_inner.free(transforms);
+            transforms[0] = .{
+                .key = try alloc_inner.dupe(u8, "row:a"),
+                .operations = ops,
+            };
+            result.participant_predicates = predicates;
+            result.participant_preimages = preimages;
+            result.participant_deletes = deletes;
+            result.participant_transforms = transforms;
+            return result;
+        }
+
+        fn mutateRowsFromSource(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expect(req.source.row_claim != null);
+            return try mutationParticipantResult(alloc_inner);
+        }
+
+        fn mutateRowsFromSourceAutocommit(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            switch (sync_level) {
+                .propose => return error.NotLeader,
+                .full_text => return error.LeaderUnavailable,
+                .enrichments => return error.WriteUnavailable,
+                else => {},
+            }
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expectEqual(@as(usize, 1), req.source.predicates.len);
+            try std.testing.expectEqualStrings("status", req.source.predicates[0].field);
+            try std.testing.expectEqual(@as(usize, 1), req.operations.len);
+            try std.testing.expectEqualStrings("status", req.operations[0].path);
+            return try mutationResult(alloc_inner, "{\"id\":\"a\",\"status\":\"claimed\"}");
+        }
+
+        fn rowsMutationSourceCollectGroupLocal(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutation_collect_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(route_topology_epoch, topology_epoch);
+            try std.testing.expect(schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            return try alloc_inner.dupe(u8, "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7,\"order_keys\":[]}]}");
+        }
+
+        fn rowsMutationSourceStagePlannedGroupLocal(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+            matched: u32,
+            candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutation_planned_stage_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(route_topology_epoch, topology_epoch);
+            try std.testing.expect(schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expectEqual(@as(u32, 2), matched);
+            try std.testing.expectEqual(@as(usize, 1), candidates.len);
+            try std.testing.expectEqualStrings("row:a", candidates[0].doc_key);
+            try std.testing.expectEqual(@as(u64, 7), candidates[0].group_id);
+            return try mutationParticipantResult(alloc_inner);
+        }
+
+        fn mutateRowsJoinedFromSourceRowsAutocommit(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            source_rows: []const []const u8,
+            sync_level: db_mod.types.SyncLevel,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.joined_calls += 1;
+            switch (sync_level) {
+                .propose => return error.NotLeader,
+                .full_text => return error.LeaderUnavailable,
+                .enrichments => return error.WriteUnavailable,
+                else => {},
+            }
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(target_schema.primary_key != null);
+            try std.testing.expect(source_schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, req.target_side);
+            try std.testing.expectEqual(@as(usize, 1), source_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}", source_rows[0]);
+            return try mutationResult(alloc_inner, "{\"id\":\"a\",\"status\":\"synced\"}");
+        }
+
+        fn mutateRowsJoinedFromSourceRows(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            table_name: []const u8,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            source_rows: []const []const u8,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.joined_calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(target_schema.primary_key != null);
+            try std.testing.expect(source_schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, req.target_side);
+            try std.testing.expectEqual(@as(usize, 1), source_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}", source_rows[0]);
+            return try mutationParticipantResult(alloc_inner);
+        }
+
+        fn rowsJoinedMutationSourceStagePlannedGroupLocal(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            matched: u32,
+            candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
+        ) !?db_mod.types.RelationalRowsMutationSourceResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.planned_stage_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(route_topology_epoch, topology_epoch);
+            try std.testing.expect(target_schema.primary_key != null);
+            try std.testing.expect(source_schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
+            try std.testing.expectEqual(@as(u32, 2), matched);
+            try std.testing.expectEqual(@as(usize, 1), candidates.len);
+            try std.testing.expectEqualStrings("row:a", candidates[0].target.doc_key);
+            try std.testing.expectEqual(@as(u64, 7), candidates[0].target.group_id);
+            try std.testing.expectEqualStrings("{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}", candidates[0].source_json);
+            return try mutationParticipantResult(alloc_inner);
+        }
+
+        fn rowsJoinedMutationSourceCollectGroupLocal(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            target_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.collect_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(route_topology_epoch, topology_epoch);
+            try std.testing.expect(target_schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, req.target_side);
+            return try alloc_inner.dupe(u8, "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\"},\"version\":9,\"ordinal\":0,\"group_id\":7,\"order_keys\":[]}]}");
+        }
+
+        fn rowsJoinedMutationSourceInputsGroupLocal(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            topology_epoch: u64,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.inputs_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(route_topology_epoch, topology_epoch);
+            try std.testing.expect(source_schema.primary_key != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, req.target_side);
+            return try alloc_inner.dupe(u8, "{\"total\":1,\"rows\":[{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}]}");
+        }
+    };
+
+    var source = MutationSource{};
+    const ctx: Context = .{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = source.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    };
+
+    const mutation_body =
+        \\{"op":"update","source":{"where":{"field":"status","op":"eq","value":"ready"},"row_claim":{"mode":"for_update","owner_id":"session:mutation","transaction_id":"00112233445566778899aabbccddeeff"}},"patch":{"status":"claimed"},"returning":["id","status"]}
+    ;
+    const collect_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .schema_json = schema_json,
+        .request_body = mutation_body,
+        .topology_epoch = MutationSource.route_topology_epoch,
+    }, .{})});
+    defer alloc.free(collect_body);
+
+    var collect_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/collect",
+        .body = collect_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/collect")).?;
+    defer collect_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), collect_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.mutation_collect_calls);
+    try std.testing.expectEqualStrings("{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7,\"order_keys\":[]}]}", collect_resp.body);
+
+    const stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .schema_json = schema_json,
+        .request_body = mutation_body,
+        .sync_level = "write",
+    }, .{})});
+    defer alloc.free(stage_body);
+
+    var resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage",
+        .body = stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqualStrings("{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"a\",\"status\":\"claimed\"}]}", resp.body);
+
+    const txn_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .schema_json = schema_json,
+        .request_body = mutation_body,
+        .autocommit = false,
+    }, .{})});
+    defer alloc.free(txn_stage_body);
+
+    var txn_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage",
+        .body = txn_stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage")).?;
+    defer txn_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), txn_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    var parsed_txn_resp = try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, txn_resp.body);
+    defer parsed_txn_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), parsed_txn_resp.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_txn_resp.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_txn_resp.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 41), parsed_txn_resp.participant_predicates[0].expected_version);
+    try std.testing.expectEqual(@as(usize, 1), parsed_txn_resp.participant_preimages.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\"}", parsed_txn_resp.participant_preimages[0].value);
+    try std.testing.expectEqual(@as(usize, 1), parsed_txn_resp.participant_deletes.len);
+    try std.testing.expectEqualStrings("row:old", parsed_txn_resp.participant_deletes[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed_txn_resp.participant_transforms.len);
+    try std.testing.expectEqualStrings("\"claimed\"", parsed_txn_resp.participant_transforms[0].operations[0].value_json.?);
+
+    var planned_mutation_candidates = [_]db_mod.DB.RelationalRowsMutationSourceCandidate{.{
+        .doc_key = @constCast("row:a"),
+        .json = @constCast("{\"id\":\"a\",\"status\":\"ready\"}"),
+        .version = 9,
+        .ordinal = 0,
+        .group_id = 7,
+    }};
+    const planned_mutation_stage = try relational_rows_api.encodeRowsMutationSourcePlannedStageAlloc(alloc, 2, planned_mutation_candidates[0..]);
+    defer alloc.free(planned_mutation_stage);
+    const planned_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .schema_json = schema_json,
+        .request_body = mutation_body,
+        .topology_epoch = MutationSource.route_topology_epoch,
+        .planned_stage = planned_mutation_stage,
+        .autocommit = false,
+    }, .{})});
+    defer alloc.free(planned_stage_body);
+
+    var planned_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage",
+        .body = planned_stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage")).?;
+    defer planned_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), planned_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.mutation_planned_stage_calls);
+    var parsed_planned_resp = try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, planned_resp.body);
+    defer parsed_planned_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), parsed_planned_resp.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_planned_resp.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_planned_resp.participant_predicates[0].key);
+
+    const joined_body =
+        \\{"op":"update","target_side":"left","join":{"left":{"where":{"field":"status","op":"eq","value":"ready"},"row_claim":{"mode":"for_update","owner_id":"session:joined","transaction_id":"00112233445566778899aabbccddeeff"}},"right":{"where":{"field":"status","op":"eq","value":"source"}},"on":[{"left_field":"source_id","right_field":"id"}]},"patch":{"status":"synced"},"returning":["id","status"]}
+    ;
+    const joined_collect_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .topology_epoch = MutationSource.route_topology_epoch,
+    }, .{})});
+    defer alloc.free(joined_collect_body);
+
+    var joined_collect_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/collect",
+        .body = joined_collect_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/collect")).?;
+    defer joined_collect_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), joined_collect_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.collect_calls);
+    try std.testing.expectEqualStrings("{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\"},\"version\":9,\"ordinal\":0,\"group_id\":7,\"order_keys\":[]}]}", joined_collect_resp.body);
+
+    const joined_inputs_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .topology_epoch = MutationSource.route_topology_epoch,
+    }, .{})});
+    defer alloc.free(joined_inputs_body);
+
+    var joined_inputs_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/inputs",
+        .body = joined_inputs_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/inputs")).?;
+    defer joined_inputs_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), joined_inputs_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.inputs_calls);
+    try std.testing.expectEqualStrings("{\"total\":1,\"rows\":[{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}]}", joined_inputs_resp.body);
+
+    const joined_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .source_rows = &[_][]const u8{"{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}"},
+        .sync_level = "write",
+    }, .{})});
+    defer alloc.free(joined_stage_body);
+
+    var joined_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage",
+        .body = joined_stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage")).?;
+    defer joined_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), joined_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.joined_calls);
+    try std.testing.expectEqualStrings("{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"a\",\"status\":\"synced\"}]}", joined_resp.body);
+
+    const joined_txn_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .source_rows = &[_][]const u8{"{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}"},
+        .autocommit = false,
+    }, .{})});
+    defer alloc.free(joined_txn_stage_body);
+
+    var joined_txn_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage",
+        .body = joined_txn_stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage")).?;
+    defer joined_txn_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), joined_txn_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), source.joined_calls);
+    var parsed_joined_txn_resp = try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, joined_txn_resp.body);
+    defer parsed_joined_txn_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), parsed_joined_txn_resp.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_joined_txn_resp.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_joined_txn_resp.participant_predicates[0].key);
+
+    var planned_candidates = [_]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate{.{
+        .target = .{
+            .doc_key = @constCast("row:a"),
+            .json = @constCast("{\"id\":\"a\"}"),
+            .version = 9,
+            .ordinal = 0,
+            .group_id = 7,
+        },
+        .source_json = @constCast("{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}"),
+    }};
+    const planned_stage = try relational_rows_api.encodeRowsJoinedMutationSourcePlannedStageAlloc(alloc, 2, planned_candidates[0..]);
+    defer alloc.free(planned_stage);
+    const joined_planned_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .topology_epoch = MutationSource.route_topology_epoch,
+        .planned_stage = planned_stage,
+        .autocommit = false,
+    }, .{})});
+    defer alloc.free(joined_planned_stage_body);
+
+    var joined_planned_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage",
+        .body = joined_planned_stage_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage")).?;
+    defer joined_planned_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), joined_planned_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.planned_stage_calls);
+    var parsed_joined_planned_resp = try relational_rows_api.parseRowsMutationSourceResponseAlloc(alloc, joined_planned_resp.body);
+    defer parsed_joined_planned_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), parsed_joined_planned_resp.matched);
+    try std.testing.expectEqual(@as(usize, 1), parsed_joined_planned_resp.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", parsed_joined_planned_resp.participant_predicates[0].key);
+
+    const UnavailableCase = struct {
+        sync_level: []const u8,
+    };
+    const unavailable_cases = [_]UnavailableCase{
+        .{ .sync_level = "propose" },
+        .{ .sync_level = "query" },
+        .{ .sync_level = "enrichments" },
+    };
+    for (unavailable_cases) |case| {
+        const unavailable_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+            .schema_json = schema_json,
+            .request_body = mutation_body,
+            .sync_level = case.sync_level,
+        }, .{})});
+        defer alloc.free(unavailable_stage_body);
+
+        var unavailable_resp = (try handle(ctx, .{
+            .method = .POST,
+            .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage",
+            .body = unavailable_stage_body,
+        }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/stage")).?;
+        defer unavailable_resp.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+        try std.testing.expectEqualStrings("leader unavailable", unavailable_resp.body);
+
+        const joined_unavailable_stage_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+            .target_schema_json = schema_json,
+            .source_schema_json = schema_json,
+            .request_body = joined_body,
+            .source_rows = &[_][]const u8{"{\"id\":\"src:1\",\"status\":\"source\",\"quantity\":3}"},
+            .sync_level = case.sync_level,
+        }, .{})});
+        defer alloc.free(joined_unavailable_stage_body);
+
+        var joined_unavailable_resp = (try handle(ctx, .{
+            .method = .POST,
+            .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage",
+            .body = joined_unavailable_stage_body,
+        }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/stage")).?;
+        defer joined_unavailable_resp.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 503), joined_unavailable_resp.status);
+        try std.testing.expectEqualStrings("leader unavailable", joined_unavailable_resp.body);
+    }
 }
 
 test "internal group write routes reject mismatched shard execute requests" {
@@ -1604,9 +2541,11 @@ const TestWriteSource = struct {
         group_id: u64,
         _: []const u8,
         action: table_writes.UniqueConstraintIntegrityAction,
-        _: []const u8,
+        lower_doc_key: []const u8,
         _: []const u8,
     ) !?table_writes.UniqueConstraintIntegrityResult {
+        if (std.mem.eql(u8, lower_doc_key, "leader")) return error.LeaderUnavailable;
+        if (std.mem.eql(u8, lower_doc_key, "write")) return error.WriteUnavailable;
         const groups = try alloc.alloc(table_writes.UniqueConstraintIntegrityGroupReport, 1);
         groups[0] = .{ .group_id = group_id, .report = .{} };
         return .{

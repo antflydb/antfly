@@ -277,6 +277,12 @@ pub const RelationalRowsSourceGroupRequest = struct {
     topology_epoch: u64,
     req: db_mod.types.RelationalRowsQueryRequest,
     doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+    system_time: ?RelationalRowsSourceGroupSystemTime = null,
+};
+
+pub const RelationalRowsSourceGroupSystemTime = struct {
+    sequence: ?u64 = null,
+    timestamp_ns: ?u64 = null,
 };
 
 pub const TableReadSource = struct {
@@ -462,6 +468,24 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsQueryPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_query_plan_system_time_as_of_timestamp_ns: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            timestamp_ns: u64,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_query_plan_catalog_system_time_as_of_timestamp_ns: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            timestamp_ns: u64,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         rows_set_operation_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -535,6 +559,7 @@ pub const TableReadSource = struct {
             topology_epoch: u64,
             req: db_mod.types.RelationalRowsQueryRequest,
             doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+            system_time: ?RelationalRowsSourceGroupSystemTime,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         scan_group_local: ?*const fn (
@@ -885,6 +910,32 @@ pub const TableReadSource = struct {
         return try fn_ptr(self.ptr, alloc, target, runtime_schema, commit_sequence, plan, consistency);
     }
 
+    pub fn rowsQueryPlanSystemTimeAsOfTimestampNs(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        timestamp_ns: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan_system_time_as_of_timestamp_ns orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, timestamp_ns, plan, consistency);
+    }
+
+    pub fn rowsQueryPlanCatalogSystemTimeAsOfTimestampNs(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        timestamp_ns: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan_catalog_system_time_as_of_timestamp_ns orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, runtime_schema, timestamp_ns, plan, consistency);
+    }
+
     pub fn rowsSetOperationPlan(
         self: TableReadSource,
         alloc: std.mem.Allocator,
@@ -990,10 +1041,11 @@ pub const TableReadSource = struct {
         topology_epoch: u64,
         req: db_mod.types.RelationalRowsQueryRequest,
         doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+        system_time: ?RelationalRowsSourceGroupSystemTime,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.RelationalRowsQueryResult {
         const fn_ptr = self.vtable.relational_rows_source_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, consistency);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, system_time, consistency);
     }
 
     pub fn preflightQueryGroupLocal(

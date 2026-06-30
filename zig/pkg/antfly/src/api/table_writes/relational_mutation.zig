@@ -35,6 +35,27 @@ const TableWriteSource = table_write_core.TableWriteSource;
 const normalizeRelationalConstraintError = table_write_core.normalizeRelationalConstraintError;
 const nextTxnTimestamp = table_write_core.nextTxnTimestamp;
 
+fn recursiveDmlFullRowSourceQuery(req: db_mod.types.RelationalRowsQueryRequest) db_mod.types.RelationalRowsQueryRequest {
+    var query = req;
+    query.source_cte = "";
+    query.select = &.{};
+    query.json_extract = &.{};
+    query.array_length = &.{};
+    query.coalesce = &.{};
+    query.field_aliases = &.{};
+    query.expressions = &.{};
+    query.select_all = true;
+    query.row_claim = null;
+    return query;
+}
+
+fn requireAutocommitMutationClaim(claim: db_mod.types.RowClaimRequest) !db_mod.types.TxnId {
+    if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+    return txn_id;
+}
+
 pub fn mutateRowsJoinedFromSourceRowsOnDb(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -68,8 +89,7 @@ pub fn mutateRowsFromSourceAutocommitOnDb(
     req: db_mod.types.RelationalRowsMutationSourceRequest,
 ) !db_mod.types.RelationalRowsMutationSourceResult {
     const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
-    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+    const txn_id = try requireAutocommitMutationClaim(claim);
 
     const begin_timestamp = nextTxnTimestamp();
     const commit_version = begin_timestamp + 1;
@@ -92,6 +112,12 @@ fn joinedMutationSourceTargetClaim(req: db_mod.types.RelationalRowsJoinedMutatio
     };
 }
 
+fn rejectMaterializedCteSourceControls(query: db_mod.types.RelationalRowsQueryRequest) !void {
+    if (query.source_cte.len == 0) return;
+    if (query.row_claim != null) return error.UnsupportedRowsQuery;
+    if (query.doc_key_range != null) return error.InvalidRowsRequest;
+}
+
 pub fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -101,8 +127,7 @@ pub fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(
     source_rows: []const []const u8,
 ) !db_mod.types.RelationalRowsMutationSourceResult {
     const claim = joinedMutationSourceTargetClaim(req) orelse return error.InvalidQueryRequest;
-    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+    const txn_id = try requireAutocommitMutationClaim(claim);
 
     const begin_timestamp = nextTxnTimestamp();
     const commit_version = begin_timestamp + 1;
@@ -185,6 +210,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
 ) !?db_mod.types.RelationalRowsMutationSourceResult {
     const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
     if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
+    try rejectMaterializedCteSourceControls(source_query);
 
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
@@ -203,11 +229,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
     cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
 
-    var filtered_source_query = source_query;
-    filtered_source_query.source_cte = "";
-    filtered_source_query.select = &.{};
-    filtered_source_query.select_all = true;
-    filtered_source_query.row_claim = null;
+    const filtered_source_query = recursiveDmlFullRowSourceQuery(source_query);
     var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, filtered_source_query, materialized.rows);
     defer source_rows.deinit(alloc);
 
@@ -260,6 +282,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
 ) !?db_mod.types.RelationalRowsMutationSourceResult {
     const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
     if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
+    try rejectMaterializedCteSourceControls(source_query);
 
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
@@ -278,11 +301,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
     const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
     cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
 
-    var filtered_source_query = source_query;
-    filtered_source_query.source_cte = "";
-    filtered_source_query.select = &.{};
-    filtered_source_query.select_all = true;
-    filtered_source_query.row_claim = null;
+    const filtered_source_query = recursiveDmlFullRowSourceQuery(source_query);
     var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, filtered_source_query, materialized.rows);
     defer source_rows.deinit(alloc);
 
@@ -335,6 +354,7 @@ pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
     consistency: raft_mod.ReadConsistency,
 ) !?relational_rows_api.OwnedRowsBatchRequest {
     if (!std.mem.eql(u8, lowered.merge.source.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
+    try rejectMaterializedCteSourceControls(lowered.merge.source);
 
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
@@ -353,11 +373,7 @@ pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
     const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
     cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
 
-    var source_query = lowered.merge.source;
-    source_query.source_cte = "";
-    source_query.select = &.{};
-    source_query.select_all = true;
-    source_query.row_claim = null;
+    const source_query = recursiveDmlFullRowSourceQuery(lowered.merge.source);
     var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, source_query, materialized.rows);
     defer source_rows.deinit(alloc);
 
@@ -546,6 +562,80 @@ const LocalRelationalMutationWriteSource = struct {
     }
 };
 
+test "mutation source autocommit rejects non-exclusive claims before opening transaction" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-mutation-source-autocommit-claim-admission";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"target_rows","enforce_types":true,"document_schemas":{"target_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const target_schema = try parseTestRuntimeSchema(alloc, target_schema_json);
+    defer storage_schema.freeSchema(alloc, target_schema);
+    try db.applyTableSchemaJson(alloc, target_schema_json, .{});
+
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"source_rows","enforce_types":true,"document_schemas":{"source_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"state":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema = try parseTestRuntimeSchema(alloc, source_schema_json);
+    defer storage_schema.freeSchema(alloc, source_schema);
+
+    const single_txn_id: db_mod.types.TxnId = .{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf };
+    try std.testing.expectError(error.InvalidQueryRequest, mutateRowsFromSourceAutocommitOnDb(alloc, &db, target_schema, .{
+        .kind = .update,
+        .source = .{
+            .row_claim = .{
+                .mode = .for_share,
+                .owner_id = "session:invalid-single-autocommit",
+                .txn_id = single_txn_id,
+            },
+        },
+        .operations = &.{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"done\"",
+        }},
+    }));
+    try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(single_txn_id));
+
+    const joined_txn_id: db_mod.types.TxnId = .{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf };
+    const on = [_]db_mod.types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "id",
+    }};
+    const source_assignments = [_]db_mod.types.RelationalRowsJoinedMutationFieldAssignment{.{
+        .field = "quantity",
+        .source_side = .right,
+        .source_field = "source_quantity",
+    }};
+    const source_rows = [_][]const u8{
+        "{\"id\":\"s1\",\"state\":\"source\",\"source_quantity\":42}",
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, &db, target_schema, source_schema, .{
+        .kind = .update,
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .row_claim = .{
+                    .mode = .for_key_share,
+                    .owner_id = "session:invalid-joined-autocommit",
+                    .txn_id = joined_txn_id,
+                },
+            },
+            .right = .{},
+            .on = on[0..],
+        },
+        .source_assignments = source_assignments[0..],
+    }, source_rows[0..]));
+    try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(joined_txn_id));
+}
+
 test "bound table write source stages joined mutation from materialized source rows" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-bound-joined-mutation-source-rows";
@@ -695,6 +785,47 @@ test "recursive cte joined mutation source executes through typed read materiali
     var catalog = EmptyCatalogSource{};
     var read_source = RecursiveMutationReadSource{ .db = &db };
     var write_source = LocalRelationalMutationWriteSource{ .table_name = "usage_records", .db = &db };
+
+    switch (lowered) {
+        .recursive_update_joined_source => |recursive| {
+            var claimed_cte_source = recursive;
+            claimed_cte_source.mutation.mutation.req.join.right.row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:illegal-cte-source-claim",
+                .txn_id = txn_id,
+            };
+            const calls_before = read_source.calls;
+            try std.testing.expectError(error.UnsupportedRowsQuery, mutateRowsJoinedFromRecursiveCtePlanAlloc(
+                alloc,
+                read_source.source(),
+                write_source.source(),
+                catalog.iface(),
+                "usage_records",
+                schema,
+                schema,
+                claimed_cte_source,
+                .read_index,
+            ));
+            try std.testing.expectEqual(calls_before, read_source.calls);
+
+            var ranged_cte_source = recursive;
+            ranged_cte_source.mutation.mutation.req.join.right.doc_key_range = .{ .start = "row:a", .end = "row:z" };
+            try std.testing.expectError(error.InvalidRowsRequest, mutateRowsJoinedFromRecursiveCtePlanAlloc(
+                alloc,
+                read_source.source(),
+                write_source.source(),
+                catalog.iface(),
+                "usage_records",
+                schema,
+                schema,
+                ranged_cte_source,
+                .read_index,
+            ));
+            try std.testing.expectEqual(calls_before, read_source.calls);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var result = switch (lowered) {
         .recursive_update_joined_source => |recursive| (try mutateRowsJoinedFromRecursiveCtePlanAlloc(
             alloc,
@@ -758,28 +889,84 @@ test "recursive cte merge mutation executes through typed read materialization a
     var catalog = EmptyCatalogSource{};
     var read_source = RecursiveMutationReadSource{ .db = &db };
     var write_source = LocalRelationalMutationWriteSource{ .table_name = "usage_records", .db = &db };
+
+    switch (lowered) {
+        .recursive_merge_mutation => |recursive| {
+            var claimed_cte_source = recursive;
+            claimed_cte_source.merge.source.row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:illegal-merge-cte-source-claim",
+                .txn_id = [_]u8{ 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f },
+            };
+            const calls_before = read_source.calls;
+            try std.testing.expectError(error.UnsupportedRowsQuery, mergeRowsFromRecursiveCtePlanAlloc(
+                alloc,
+                read_source.source(),
+                write_source.source(),
+                catalog.iface(),
+                "usage_records",
+                schema,
+                schema,
+                claimed_cte_source,
+                .read_index,
+            ));
+            try std.testing.expectEqual(calls_before, read_source.calls);
+
+            var ranged_cte_source = recursive;
+            ranged_cte_source.merge.source.doc_key_range = .{ .start = "row:a", .end = "row:z" };
+            try std.testing.expectError(error.InvalidRowsRequest, mergeRowsFromRecursiveCtePlanAlloc(
+                alloc,
+                read_source.source(),
+                write_source.source(),
+                catalog.iface(),
+                "usage_records",
+                schema,
+                schema,
+                ranged_cte_source,
+                .read_index,
+            ));
+            try std.testing.expectEqual(calls_before, read_source.calls);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var batch_result = switch (lowered) {
-        .recursive_merge_mutation => |recursive| (try mergeRowsFromRecursiveCtePlanAlloc(
-            alloc,
-            read_source.source(),
-            write_source.source(),
-            catalog.iface(),
-            "usage_records",
-            schema,
-            schema,
-            recursive,
-            .read_index,
-        )) orelse return error.TestUnexpectedResult,
+        .recursive_merge_mutation => |recursive| blk: {
+            const source_order = [_]db_mod.types.RelationalRowsQueryOrder{.{
+                .field = "id",
+                .direction = .desc,
+            }};
+            const source_projection = [_]db_mod.types.RelationalRowsExpressionProjection{.{
+                .output = "id",
+                .expression = .{ .kind = .value, .value_json = "\"shadowed\"" },
+            }};
+            var projected_recursive = recursive;
+            projected_recursive.merge.source.order_by = source_order[0..];
+            projected_recursive.merge.source.limit = 1;
+            projected_recursive.merge.source.expressions = source_projection[0..];
+
+            break :blk (try mergeRowsFromRecursiveCtePlanAlloc(
+                alloc,
+                read_source.source(),
+                write_source.source(),
+                catalog.iface(),
+                "usage_records",
+                schema,
+                schema,
+                projected_recursive,
+                .read_index,
+            )) orelse return error.TestUnexpectedResult;
+        },
         else => return error.TestUnexpectedResult,
     };
     defer batch_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), read_source.calls);
-    try std.testing.expectEqual(@as(u32, 2), batch_result.transformed);
+    try std.testing.expectEqual(@as(u32, 1), batch_result.transformed);
 
     var rows = try db.queryRelationalRows(alloc, schema, .{ .select_all = true, .order_by = &.{.{ .field = "id" }} });
     defer rows.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"organization_id\":\"root\",\"status\":\"done\"}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"organization_id\":\"root\",\"status\":\"open\"}", rows.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"organization_id\":\"a\",\"status\":\"done\"}", rows.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"organization_id\":\"other\",\"status\":\"open\"}", rows.rows[2]);
 }

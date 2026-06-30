@@ -612,6 +612,14 @@ pub const DB = struct {
         return try relational_rows_impl.scanSystemVersionedHistoryAlloc(self, alloc);
     }
 
+    pub fn pruneSystemVersionedHistoryBeforeTimestampNs(
+        self: *DB,
+        alloc: Allocator,
+        timestamp_ns: u64,
+    ) !usize {
+        return try relational_rows_impl.pruneSystemVersionedHistoryBeforeTimestampNs(self, alloc, timestamp_ns);
+    }
+
     pub fn querySystemVersionedRelationalRowsAsOfSequence(
         self: *DB,
         alloc: Allocator,
@@ -620,6 +628,24 @@ pub const DB = struct {
         req: types.RelationalRowsQueryRequest,
     ) !types.RelationalRowsQueryResult {
         return try relational_rows_impl.querySystemVersionedRelationalRowsAsOfSequence(self, alloc, runtime_schema, commit_sequence, req);
+    }
+
+    pub fn resolveSystemVersionedCommitSequenceAtTimestampNs(
+        self: *DB,
+        alloc: Allocator,
+        timestamp_ns: u64,
+    ) !u64 {
+        return try relational_rows_impl.resolveSystemVersionedCommitSequenceAtTimestampNs(self, alloc, timestamp_ns);
+    }
+
+    pub fn querySystemVersionedRelationalRowsAsOfTimestampNs(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        timestamp_ns: u64,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        return try relational_rows_impl.querySystemVersionedRelationalRowsAsOfTimestampNs(self, alloc, runtime_schema, timestamp_ns, req);
     }
 
     pub fn lookupRelationalTemporalUniqueOwner(
@@ -3246,6 +3272,15 @@ pub const DB = struct {
     }
 
     pub const RelationalRowsMutationSourceCandidate = relational_rows.MutationSourceCandidate;
+    pub const RelationalRowsQueryOrderKey = relational_rows.QueryOrderKey;
+
+    pub fn freeRelationalRowsQueryOrderKeys(alloc: Allocator, keys: []const RelationalRowsQueryOrderKey) void {
+        relational_rows.freeQueryOrderKeys(alloc, keys);
+    }
+
+    pub fn freeRelationalRowsQueryOrderKeySlice(alloc: Allocator, keys: []const RelationalRowsQueryOrderKey) void {
+        relational_rows.freeQueryOrderKeySlice(alloc, keys);
+    }
 
     pub const RelationalRowsQueryCandidate = relational_rows.QueryCandidate;
 
@@ -3261,8 +3296,6 @@ pub const DB = struct {
     pub const RelationalRowsJoinedMutationSourceCandidate = relational_rows.JoinedMutationSourceCandidate;
 
     pub const RelationalRowsJoinedMutationSourcePlan = relational_rows.JoinedMutationSourcePlan;
-
-    pub const RelationalRowsQueryOrderKey = relational_rows.QueryOrderKey;
 
     pub fn validateRelationalRowsExpressionAgainstSchema(
         self: *DB,
@@ -3621,6 +3654,16 @@ pub const DB = struct {
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         return try relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
+    }
+
+    pub fn resolveRelationalRowsPredicateDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        predicate: schema_mod.RelationalCheck,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        return try relational_rows_impl.resolveRelationalRowsPredicateDocSetAlloc(self, alloc, runtime_schema, predicate, generation);
     }
 
     pub fn searchRuntimeLiveFilterDocSet(

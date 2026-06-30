@@ -54,6 +54,14 @@ fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8
     return try out.toOwnedSlice(alloc);
 }
 
+fn publicServiceUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "read unavailable") or
+        std.mem.eql(u8, body, "standby read unavailable")) return error.ReadUnavailable;
+    if (std.mem.eql(u8, body, "write unavailable")) return error.WriteUnavailable;
+    if (std.mem.eql(u8, body, "doc identity unavailable")) return error.DocIdentityNamespaceMismatch;
+    return error.LeaderUnavailable;
+}
+
 pub const LookupResponse = struct {
     version: ?[]u8 = null,
     body: []u8,
@@ -272,7 +280,11 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            503 => return publicServiceUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
 
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
@@ -320,6 +332,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         const version = for (resp.headers) |header| {
@@ -495,6 +508,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -550,6 +564,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.UniqueOwnerTopologyUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -577,7 +592,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            503 => return publicServiceUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{
             .content_type = if (resp.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
             .body = try self.alloc.dupe(u8, resp.body),
@@ -633,6 +652,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -681,6 +701,7 @@ pub const ApiHttpClient = struct {
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
             409 => return remotePreflightError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
 
@@ -782,7 +803,9 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            410 => return error.SystemVersionedHistoryPruned,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -816,6 +839,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -849,6 +873,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -882,6 +907,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -915,6 +941,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -948,6 +975,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -984,6 +1012,7 @@ pub const ApiHttpClient = struct {
             424 => return remoteDocumentAlgebraicAggregateUnavailableError(resp.body),
             404 => return remoteDocumentAlgebraicAggregateNotFoundError(resp.body),
             400 => return remoteDocumentAlgebraicAggregateBadRequestError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1017,6 +1046,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1050,6 +1080,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1084,6 +1115,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1118,6 +1150,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1152,6 +1185,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1186,6 +1220,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1214,6 +1249,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 503) return publicServiceUnavailableError(resp.body);
             std.debug.print("fetchBatch unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
             return error.UnexpectedHttpStatus;
         }
@@ -1239,6 +1275,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200, 409 => {},
+            503 => return publicServiceUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{
@@ -1640,6 +1677,7 @@ pub const ApiHttpClient = struct {
             400 => return error.InvalidQueryRequest,
             404 => return error.UnknownGroup,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1680,6 +1718,7 @@ pub const ApiHttpClient = struct {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1715,6 +1754,7 @@ pub const ApiHttpClient = struct {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1757,6 +1797,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1795,6 +1836,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1838,6 +1880,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1881,6 +1924,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1914,6 +1958,7 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1948,6 +1993,7 @@ pub const ApiHttpClient = struct {
             400 => return error.InvalidBatchRequest,
             404 => return error.UnknownGroup,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1992,6 +2038,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2027,6 +2074,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2062,6 +2110,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2097,6 +2146,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2132,6 +2182,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2168,6 +2219,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2204,6 +2256,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2240,6 +2293,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2274,6 +2328,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2308,6 +2363,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2344,6 +2400,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2377,6 +2434,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2474,6 +2532,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2502,6 +2561,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2526,6 +2586,7 @@ pub const ApiHttpClient = struct {
             200 => return try self.alloc.dupe(u8, resp.body),
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
+            503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -3016,20 +3077,131 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupQueryPreflight(base_uri, 7, "docs", "{}", 0));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsSource(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinPartition(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinRows(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinUnmatched(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinFinalize(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsJoinedMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsJoinedMutationSourceInputs(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupRowsJoinedMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyIntegrity(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupUniqueIntegrity(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupSecondaryIndexRebuild(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupSchemaRewrite(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTableEmptying(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyRefChildren(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyActionJob(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyActionJobProgress(base_uri, 7, "docs"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyActionScheduleProgress(base_uri, 7, "docs"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupForeignKeyActionSchedule(base_uri, 7, "docs", "{}"));
 
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceInputs(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceStage(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupLookup(base_uri, 7, "docs", "a", null));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, client.fetchGroupTemporalUniqueOwner(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, client.fetchGroupTemporalUniqueOverlapOwner(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupScan(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupQueryPreflight(base_uri, 7, "docs", "{}", 0));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsSource(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupJoinPartition(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupJoinRows(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupJoinUnmatched(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTextStats(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupAlgebraicPartials(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentAlgebraicAggregate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupJoinFinalize(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsJoinedMutationSourceCollect(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsJoinedMutationSourceInputs(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupRowsJoinedMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactManifest(base_uri, 7, "docs", "doc:a", "units"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactManifests(base_uri, 7, "docs", "doc:a"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactReprocess(base_uri, 7, "docs", "doc:a", "units"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactRangeReprocess(base_uri, 7, "docs", "units", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactChildRangePlacementUpdate(base_uri, 7, "docs", "doc:a", "units", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDocumentArtifactChildRangeBatchApply(base_uri, 7, "docs", "doc:a", "units", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyIntegrity(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupUniqueIntegrity(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupSecondaryIndexRebuild(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupSchemaRewrite(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupTableEmptying(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyRefChildren(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyActionJob(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyActionJobProgress(base_uri, 7, "docs"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyActionScheduleProgress(base_uri, 7, "docs"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupForeignKeyActionSchedule(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupDbMedianKey(base_uri, 7));
+}
+
+test "api http client preserves public service unavailable response classes" {
+    const UnavailableExecutor = struct {
+        body: []const u8,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const base_uri = "http://127.0.0.1:1";
+    var executor = UnavailableExecutor{ .body = "read unavailable" };
+    var client = ApiHttpClient.init(alloc, executor.executor());
+
+    try std.testing.expectError(error.ReadUnavailable, client.fetchLookup(base_uri, "docs", "doc:a", null));
+    try std.testing.expectError(error.ReadUnavailable, client.fetchQuery(base_uri, "docs", "{}"));
+
+    executor.body = "write unavailable";
+    try std.testing.expectError(error.WriteUnavailable, client.fetchBatch(base_uri, "docs", "{}"));
+    try std.testing.expectError(error.WriteUnavailable, client.fetchTransactionCommit(base_uri, "{}"));
+
+    executor.body = "doc identity unavailable";
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchLookup(base_uri, "docs", "doc:a", null));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {
