@@ -211,71 +211,50 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     const read_kind = try generatedReadStatementKind(parsed_sql.items(), read_ast);
     const published_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     if (read_kind != published_kind) return error.UnsupportedSqlShape;
-    try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
+    try validateGeneratedReadAstForStatement(parsed_sql.items(), read_ast);
     return switch (read_ast.kind) {
-        .query => blk: {
-            try validateGeneratedSimpleQueryReadAst(parsed_sql.items(), read_ast);
-            break :blk .{ .query = try context.callbacks.lower_query_plan(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.params,
-                context.function_bindings,
-            ) };
-        },
-        .aggregate => blk: {
-            try validateGeneratedAggregateReadAst(parsed_sql.items(), read_ast);
-            break :blk .{ .aggregate = try context.callbacks.lower_aggregate_plan(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.params,
-            ) };
-        },
-        .join => blk: {
-            try validateGeneratedJoinedReadAst(parsed_sql.items(), read_ast, .join);
-            break :blk .{ .join = try context.callbacks.lower_join_with_schemas(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.source_schema orelse context.schema,
-                context.params,
-            ) };
-        },
-        .lateral => blk: {
-            try validateGeneratedJoinedReadAst(parsed_sql.items(), read_ast, .lateral);
-            break :blk .{ .lateral = try context.callbacks.lower_lateral_with_schemas(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.source_schema orelse context.schema,
-                context.params,
-            ) };
-        },
-        .window => blk: {
-            try validateGeneratedWindowReadAst(parsed_sql.items(), read_ast);
-            break :blk .{ .window = try context.callbacks.lower_window(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.params,
-            ) };
-        },
-        .set_operation => blk: {
-            try validateGeneratedSetOperationReadAst(parsed_sql.items(), read_ast);
-            break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
-                context.alloc,
-                parsed_sql,
-                context.schema,
-                context.source_schema,
-                context.params,
-                context.function_bindings,
-            ) };
-        },
-        .cte => blk: {
-            try validateGeneratedCteReadAst(parsed_sql.items(), read_ast);
-            break :blk try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind);
-        },
+        .query => .{ .query = try context.callbacks.lower_query_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+            context.function_bindings,
+        ) },
+        .aggregate => .{ .aggregate = try context.callbacks.lower_aggregate_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+        ) },
+        .join => .{ .join = try context.callbacks.lower_join_with_schemas(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema orelse context.schema,
+            context.params,
+        ) },
+        .lateral => .{ .lateral = try context.callbacks.lower_lateral_with_schemas(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema orelse context.schema,
+            context.params,
+        ) },
+        .window => .{ .window = try context.callbacks.lower_window(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+        ) },
+        .set_operation => .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema,
+            context.params,
+            context.function_bindings,
+        ) },
+        .cte => try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind),
     };
 }
 
@@ -284,6 +263,7 @@ pub fn validateGeneratedReadAstForStatement(
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     _ = try generatedReadStatementKind(tokens, read_ast);
+    try lower_expr.validateGeneratedReadAstPayloads(tokens, read_ast.*);
     try validateGeneratedReadAstRanges(tokens, read_ast);
     switch (read_ast.kind) {
         .query => try validateGeneratedSimpleQueryReadAst(tokens, read_ast),
@@ -728,16 +708,13 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
             if (range.start < body.start or range.end > body.end) return error.UnsupportedSqlShape;
         }
     }
-    if (cte.body_distinct_tokens) |distinct_tokens| {
-        if (distinct_tokens.start != select_tokens.end or projection_tokens.start != distinct_tokens.end) {
-            return error.UnsupportedSqlShape;
-        }
-        try validateGeneratedDistinctOnListMetadata(cte.body_distinct_tokens, cte.body_distinct_on_items);
-    } else if (projection_tokens.start != select_tokens.end) {
-        return error.UnsupportedSqlShape;
-    } else if (cte.body_distinct_on_items.count != 0) {
-        return error.UnsupportedSqlShape;
-    }
+    try validateGeneratedProjectionStartAfterSelectModifier(
+        tokens,
+        select_tokens,
+        projection_tokens,
+        cte.body_distinct_tokens,
+        cte.body_distinct_on_items,
+    );
     if (cte.body_source_tokens) |source_tokens| {
         if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
         try validateGeneratedReadRangePrecededByKeyword(tokens, source_tokens, .from);
@@ -1150,6 +1127,28 @@ fn optionalGeneratedTokenRangeEql(
     return rhs == null;
 }
 
+fn validateGeneratedProjectionStartAfterSelectModifier(
+    tokens: []const tokenized.Token,
+    select_tokens: generated_parser.GeneratedSqlTokenRange,
+    projection_tokens: generated_parser.GeneratedSqlTokenRange,
+    distinct_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    distinct_on_items: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (distinct_tokens) |distinct| {
+        if (distinct.start != select_tokens.end or projection_tokens.start != distinct.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, distinct, .select);
+        try validateGeneratedDistinctOnListMetadata(distinct_tokens, distinct_on_items);
+        return;
+    }
+    if (select_tokens.end < tokens.len and tokens[select_tokens.end].matchesKeywordTag(.all)) {
+        if (projection_tokens.start != select_tokens.end + 1) return error.UnsupportedSqlShape;
+        if (distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (projection_tokens.start != select_tokens.end) return error.UnsupportedSqlShape;
+    if (distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedReadClauseOrder(
     projection_end: usize,
     ranges: []const ?generated_parser.GeneratedSqlTokenRange,
@@ -1179,16 +1178,13 @@ fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast
     if (!generatedExpressionAstHasMetadata(read_ast.projection_first_expression)) return error.UnsupportedSqlShape;
     if (!generatedExpressionAstHasMetadata(read_ast.projection_last_expression)) return error.UnsupportedSqlShape;
 
-    if (read_ast.distinct_tokens) |distinct_tokens| {
-        if (distinct_tokens.start != select_tokens.end or projection_tokens.start != distinct_tokens.end) {
-            return error.UnsupportedSqlShape;
-        }
-        try validateGeneratedReadRangePrecededByKeyword(tokens, distinct_tokens, .select);
-        try validateGeneratedDistinctOnListMetadata(read_ast.distinct_tokens, read_ast.distinct_on_items);
-    } else {
-        if (projection_tokens.start != select_tokens.end) return error.UnsupportedSqlShape;
-        if (read_ast.distinct_on_items.count != 0) return error.UnsupportedSqlShape;
-    }
+    try validateGeneratedProjectionStartAfterSelectModifier(
+        tokens,
+        select_tokens,
+        projection_tokens,
+        read_ast.distinct_tokens,
+        read_ast.distinct_on_items,
+    );
 
     if (read_ast.source_tokens) |source_tokens| {
         if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
@@ -4484,6 +4480,8 @@ fn validateGeneratedSetOperationAstRanges(
     const projection = set_operation.right_projection_tokens orelse return error.UnsupportedSqlShape;
     if (set_operation.right_distinct_tokens) |distinct| {
         if (distinct.start != right_select.end or projection.start != distinct.end) return error.UnsupportedSqlShape;
+    } else if (right_select.end < right_query.end and tokens[right_select.end].matchesKeywordTag(.all)) {
+        if (projection.start != right_select.end + 1) return error.UnsupportedSqlShape;
     } else if (projection.start != right_select.end) {
         return error.UnsupportedSqlShape;
     }
@@ -5446,6 +5444,58 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
             .lower_set_operation_optional_source_schema = lowerSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
+
+    var select_all_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT ALL id, status FROM usage_records",
+    );
+    defer select_all_parsed_sql.deinit(alloc);
+    const select_all_generated_raw = select_all_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var select_all_read_ast = switch (select_all_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast.*,
+        else => return error.UnsupportedSqlShape,
+    };
+    try validateGeneratedReadAstForStatement(select_all_parsed_sql.items(), &select_all_read_ast);
+    const select_all_projection = select_all_read_ast.projection_tokens orelse return error.TestUnexpectedResult;
+    select_all_read_ast.projection_tokens = .{ .start = select_all_projection.start - 1, .end = select_all_projection.end };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(select_all_parsed_sql.items(), &select_all_read_ast),
+    );
+
+    var cte_select_all_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT ALL id, status FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer cte_select_all_parsed_sql.deinit(alloc);
+    const cte_select_all_generated_raw = cte_select_all_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var cte_select_all_read_ast = switch (cte_select_all_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast.*,
+        else => return error.UnsupportedSqlShape,
+    };
+    try validateGeneratedReadAstForStatement(cte_select_all_parsed_sql.items(), &cte_select_all_read_ast);
+    const cte_select_all_projection = cte_select_all_read_ast.cte_items[0].body_projection_tokens orelse return error.TestUnexpectedResult;
+    cte_select_all_read_ast.cte_items[0].body_projection_tokens = .{
+        .start = cte_select_all_projection.start - 1,
+        .end = cte_select_all_projection.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(cte_select_all_parsed_sql.items(), &cte_select_all_read_ast),
+    );
+
+    var missing_where_read_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast.*,
+        else => return error.UnsupportedSqlShape,
+    };
+    _ = missing_where_read_ast.where_tokens orelse return error.TestUnexpectedResult;
+    _ = missing_where_read_ast.where_expression.tokens orelse return error.TestUnexpectedResult;
+    missing_where_read_ast.where_tokens = null;
+    missing_where_read_ast.where_expression = .{};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, &missing_where_read_ast),
+    );
 
     read_ast.statement_span.start += 1;
     try std.testing.expectError(
@@ -8546,6 +8596,26 @@ test "sql adapter lowering context rejects stale generated read clause order met
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         validateGeneratedReadAstForStatement(parsed_sql.items(), &read_ast),
+    );
+
+    var missing_final_where_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open'",
+    );
+    defer missing_final_where_parsed_sql.deinit(alloc);
+    const missing_final_where_generated_raw = missing_final_where_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var missing_final_where_read_ast = switch (missing_final_where_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast.*,
+        else => return error.UnsupportedSqlShape,
+    };
+    try validateGeneratedReadAstForStatement(missing_final_where_parsed_sql.items(), &missing_final_where_read_ast);
+    _ = missing_final_where_read_ast.where_tokens orelse return error.TestUnexpectedResult;
+    _ = missing_final_where_read_ast.where_expression.tokens orelse return error.TestUnexpectedResult;
+    missing_final_where_read_ast.where_tokens = null;
+    missing_final_where_read_ast.where_expression = .{};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(missing_final_where_parsed_sql.items(), &missing_final_where_read_ast),
     );
 
     var cte_body_parsed_sql = try tokenized.ParsedSql.initAlloc(

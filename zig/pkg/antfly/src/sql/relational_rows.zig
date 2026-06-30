@@ -25822,6 +25822,21 @@ test "relational rows cte plan contract accepts ordered typed subplans" {
         "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"row_claim\":{\"transaction_id\":\"00000000000000000000000000000000\"}}}],\"window\":{\"source\":{\"source_cte\":\"open_rows\"},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"order_by\":[{\"field\":\"created_at\"}]}]}}",
         schema,
     ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregatePlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"row_claim\":{\"transaction_id\":\"00000000000000000000000000000000\"}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_rows\"},\"aggregations\":[{\"name\":\"count\",\"op\":\"count\"}]}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"row_claim\":{\"transaction_id\":\"00000000000000000000000000000000\"}}}],\"join\":{\"left\":{\"source_cte\":\"open_rows\"},\"right\":{},\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}]}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsLateralPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"row_claim\":{\"transaction_id\":\"00000000000000000000000000000000\"}}}],\"lateral\":{\"left\":{\"source_cte\":\"open_rows\"},\"right\":{\"limit\":1},\"correlations\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}]}}",
+        schema,
+    ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinPlanRequest(
         std.testing.allocator,
         "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}}}],\"join\":{\"left\":{\"source_cte\":\"missing_rows\"},\"right\":{},\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}]}}",

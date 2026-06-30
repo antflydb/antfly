@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const raft_mod = @import("../raft/mod.zig");
+const document_sql_corpus = @import("document_sql_corpus.zig");
 const sql_adapter = @import("document_plan.zig");
 const storage_schema = @import("../storage/schema.zig");
 
@@ -300,8 +301,9 @@ pub fn executeReadPlanAlloc(
             defer query_response.deinit(alloc);
             try appendDocumentSqlRowsFromQueryResponseAlloc(alloc, source, native_table_name, public_table_name, query_response.json, lowered.projection, query.residual_filter_json, lowered.limit, consistency, &rows);
             if (query.residual_filter_json != null and rows.items.len < (lowered.limit orelse std.math.maxInt(u32))) {
+                const max_candidate_rows = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
                 const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-                if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(total_hits, max_candidate_rows);
             }
         },
         .bounded_scan => |scan_plan| {
@@ -334,9 +336,7 @@ pub fn executeReadPlanAlloc(
                     if (rows.items.len >= limit) break;
                 }
             }
-            if (scan_plan.residual_filter_json != null and lowered.limit != null and rows.items.len < lowered.limit.? and scanned >= scan_plan.max_rows) {
-                return error.DocumentSqlRequiresBoundedScan;
-            }
+            if (scan_plan.residual_filter_json != null and lowered.limit != null and rows.items.len < lowered.limit.?) try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
     }
 
@@ -352,12 +352,20 @@ fn documentSqlAdmitBoundedScanPayload(
     payload: []const u8,
 ) !void {
     const max_bytes = scan_plan.max_bytes orelse return;
-    if (payload.len > max_bytes) return error.DocumentSqlRequiresBoundedScan;
+    if (payload.len > max_bytes) return error.DocumentSqlBoundedScanByteCapExceeded;
 }
 
 fn documentSqlBoundedScanProbeLimit(max_rows: u32) u32 {
     if (max_rows == std.math.maxInt(u32)) return max_rows;
     return max_rows + 1;
+}
+
+fn documentSqlAdmitBoundedRowCount(row_count: u32, max_rows: u32) !void {
+    if (row_count > max_rows) return error.DocumentSqlBoundedScanRowCapExceeded;
+}
+
+fn documentSqlAdmitBoundedRowProbeCount(row_count: u32, max_rows: u32) !void {
+    if (row_count >= max_rows) return error.DocumentSqlBoundedScanRowCapExceeded;
 }
 
 pub fn executeAggregatePlanAlloc(
@@ -431,8 +439,9 @@ pub fn executeAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             if (query.residual_filter_json == null) break :blk try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            const max_candidate_rows = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowCount(total_hits, max_candidate_rows);
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -469,7 +478,7 @@ pub fn executeAggregatePlanAlloc(
                 var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
-                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
@@ -498,7 +507,7 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
         .materialization_name = materialization_name,
         .aggregate_op = lowered.aggregate.op,
         .group_by = lowered.group_by,
-        .limit = lowered.limit,
+        .limit = if (lowered.order_by == null and lowered.having.len == 0) lowered.limit else null,
     };
     var response = if (source.algebraicAggregateCatalog(alloc, req, consistency)) |result|
         result orelse return null
@@ -515,6 +524,8 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
             lowered.aggregate.output,
             response.rows,
             response.total_groups,
+            lowered.having,
+            lowered.order_by,
             lowered.limit,
         );
     }
@@ -560,7 +571,7 @@ fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(total_hits, query_limit);
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -628,7 +639,7 @@ fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
                 var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
-                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
@@ -672,8 +683,9 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             if (query.residual_filter_json != null) {
+                const max_candidate_rows = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
                 const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-                if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(total_hits, max_candidate_rows);
             }
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -710,7 +722,7 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
                 var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
-                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
@@ -719,7 +731,7 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
         },
     }
 
-    return try documentSqlGroupedCountAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, groups.items, lowered.limit);
+    return try documentSqlGroupedCountAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, groups.items, lowered.having, lowered.order_by, lowered.limit);
 }
 
 fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
@@ -756,7 +768,7 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(total_hits, query_limit);
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -792,7 +804,7 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
                 var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
-                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
@@ -801,7 +813,7 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
         },
     }
 
-    return try documentSqlGroupedNumericAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, lowered.aggregate.op, groups.items, lowered.limit);
+    return try documentSqlGroupedNumericAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, lowered.aggregate.op, groups.items, lowered.having, lowered.order_by, lowered.limit);
 }
 
 const DocumentSqlCountGroup = struct {
@@ -1036,14 +1048,14 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 }
                 try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key_value.string, lookup.json, order_by);
             }
-            if (scanned >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
         .indexed_query => |query| {
             const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(total_hits, query_limit);
             try appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
                 alloc,
                 source,
@@ -1608,21 +1620,262 @@ fn documentSqlNumericAggregateResultAlloc(
     };
 }
 
+const DocumentSqlCountGroupSortContext = struct {
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+};
+
+const DocumentSqlNumericAggregateGroupSortContext = struct {
+    op: sql_adapter.DocumentAggregateOp,
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+};
+
+const DocumentSqlMaterializedAggregateSortContext = struct {
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+};
+
+fn filteredDocumentSqlCountGroupsAlloc(
+    alloc: std.mem.Allocator,
+    groups: []const DocumentSqlCountGroup,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+) ![]DocumentSqlCountGroup {
+    var out = std.ArrayListUnmanaged(DocumentSqlCountGroup).empty;
+    errdefer out.deinit(alloc);
+    for (groups) |group| {
+        if (documentSqlCountGroupMatchesHaving(group, having)) try out.append(alloc, group);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn filteredDocumentSqlNumericAggregateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    groups: []const DocumentSqlNumericAggregateGroup,
+    op: sql_adapter.DocumentAggregateOp,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+) ![]DocumentSqlNumericAggregateGroup {
+    var out = std.ArrayListUnmanaged(DocumentSqlNumericAggregateGroup).empty;
+    errdefer out.deinit(alloc);
+    for (groups) |group| {
+        if (documentSqlNumericAggregateGroupMatchesHaving(group, op, having)) try out.append(alloc, group);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn filteredDocumentSqlMaterializedAggregateRowsAlloc(
+    alloc: std.mem.Allocator,
+    rows: []const AlgebraicAggregateRow,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+) ![]AlgebraicAggregateRow {
+    var out = std.ArrayListUnmanaged(AlgebraicAggregateRow).empty;
+    errdefer out.deinit(alloc);
+    for (rows) |row| {
+        if (documentSqlMaterializedAggregateRowMatchesHaving(row, having)) try out.append(alloc, row);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn orderedDocumentSqlCountGroupsAlloc(
+    alloc: std.mem.Allocator,
+    groups: []const DocumentSqlCountGroup,
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+) ![]DocumentSqlCountGroup {
+    const out = try alloc.alloc(DocumentSqlCountGroup, groups.len);
+    @memcpy(out, groups);
+    std.mem.sort(DocumentSqlCountGroup, out, DocumentSqlCountGroupSortContext{ .order_by = order_by }, documentSqlCountGroupLessThan);
+    return out;
+}
+
+fn orderedDocumentSqlNumericAggregateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    groups: []const DocumentSqlNumericAggregateGroup,
+    op: sql_adapter.DocumentAggregateOp,
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+) ![]DocumentSqlNumericAggregateGroup {
+    const out = try alloc.alloc(DocumentSqlNumericAggregateGroup, groups.len);
+    @memcpy(out, groups);
+    std.mem.sort(DocumentSqlNumericAggregateGroup, out, DocumentSqlNumericAggregateGroupSortContext{ .op = op, .order_by = order_by }, documentSqlNumericAggregateGroupLessThan);
+    return out;
+}
+
+fn orderedDocumentSqlMaterializedAggregateRowsAlloc(
+    alloc: std.mem.Allocator,
+    rows: []const AlgebraicAggregateRow,
+    order_by: sql_adapter.DocumentAggregateOrderBy,
+) ![]AlgebraicAggregateRow {
+    const out = try alloc.alloc(AlgebraicAggregateRow, rows.len);
+    @memcpy(out, rows);
+    std.mem.sort(AlgebraicAggregateRow, out, DocumentSqlMaterializedAggregateSortContext{ .order_by = order_by }, documentSqlMaterializedAggregateRowLessThan);
+    return out;
+}
+
+fn documentSqlCountGroupMatchesHaving(group: DocumentSqlCountGroup, having: []const sql_adapter.DocumentAggregateHavingPredicate) bool {
+    for (having) |predicate| {
+        if (!documentSqlCountGroupMatchesHavingPredicate(group, predicate)) return false;
+    }
+    return true;
+}
+
+fn documentSqlCountGroupMatchesHavingPredicate(group: DocumentSqlCountGroup, having: sql_adapter.DocumentAggregateHavingPredicate) bool {
+    return switch (having.key) {
+        .group => documentSqlAggregateHavingMatchesJson(group.key_json, having),
+        .aggregate => blk: {
+            var buf: [32]u8 = undefined;
+            const value_json = std.fmt.bufPrint(&buf, "{d}", .{group.count}) catch return false;
+            break :blk documentSqlAggregateHavingMatchesJson(value_json, having);
+        },
+    };
+}
+
+fn documentSqlNumericAggregateGroupMatchesHaving(
+    group: DocumentSqlNumericAggregateGroup,
+    op: sql_adapter.DocumentAggregateOp,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+) bool {
+    for (having) |predicate| {
+        if (!documentSqlNumericAggregateGroupMatchesHavingPredicate(group, op, predicate)) return false;
+    }
+    return true;
+}
+
+fn documentSqlNumericAggregateGroupMatchesHavingPredicate(
+    group: DocumentSqlNumericAggregateGroup,
+    op: sql_adapter.DocumentAggregateOp,
+    having: sql_adapter.DocumentAggregateHavingPredicate,
+) bool {
+    return switch (having.key) {
+        .group => documentSqlAggregateHavingMatchesJson(group.key_json, having),
+        .aggregate => blk: {
+            if (!group.aggregate.seen) break :blk documentSqlAggregateHavingMatchesJson("null", having);
+            var buf: [64]u8 = undefined;
+            const value_json = std.fmt.bufPrint(&buf, "{d}", .{documentSqlNumericAggregateResultValue(group.aggregate, op)}) catch return false;
+            break :blk documentSqlAggregateHavingMatchesJson(value_json, having);
+        },
+    };
+}
+
+fn documentSqlMaterializedAggregateRowMatchesHaving(row: AlgebraicAggregateRow, having: []const sql_adapter.DocumentAggregateHavingPredicate) bool {
+    for (having) |predicate| {
+        if (!documentSqlMaterializedAggregateRowMatchesHavingPredicate(row, predicate)) return false;
+    }
+    return true;
+}
+
+fn documentSqlMaterializedAggregateRowMatchesHavingPredicate(row: AlgebraicAggregateRow, having: sql_adapter.DocumentAggregateHavingPredicate) bool {
+    const value_json = switch (having.key) {
+        .group => row.group_json orelse "null",
+        .aggregate => row.value_json,
+    };
+    return documentSqlAggregateHavingMatchesJson(value_json, having);
+}
+
+fn documentSqlAggregateHavingMatchesJson(value_json: []const u8, having: sql_adapter.DocumentAggregateHavingPredicate) bool {
+    const order = documentSqlJsonSortOrder(value_json, having.value_json, having.field_type);
+    return switch (having.op) {
+        .eq => order == .eq,
+        .neq => order != .eq,
+        .gt => order == .gt,
+        .gte => order == .gt or order == .eq,
+        .lt => order == .lt,
+        .lte => order == .lt or order == .eq,
+    };
+}
+
+fn documentSqlCountGroupLessThan(ctx: DocumentSqlCountGroupSortContext, lhs: DocumentSqlCountGroup, rhs: DocumentSqlCountGroup) bool {
+    const order = switch (ctx.order_by.key) {
+        .group => documentSqlJsonSortOrder(lhs.key_json, rhs.key_json, ctx.order_by.field_type),
+        .aggregate => std.math.order(lhs.count, rhs.count),
+    };
+    return documentSqlAggregateSortOrderLessThan(ctx.order_by.direction, order, lhs.key_json, rhs.key_json);
+}
+
+fn documentSqlNumericAggregateGroupLessThan(ctx: DocumentSqlNumericAggregateGroupSortContext, lhs: DocumentSqlNumericAggregateGroup, rhs: DocumentSqlNumericAggregateGroup) bool {
+    const order = switch (ctx.order_by.key) {
+        .group => documentSqlJsonSortOrder(lhs.key_json, rhs.key_json, ctx.order_by.field_type),
+        .aggregate => documentSqlNumericAggregateSortOrder(lhs.aggregate, rhs.aggregate, ctx.op),
+    };
+    return documentSqlAggregateSortOrderLessThan(ctx.order_by.direction, order, lhs.key_json, rhs.key_json);
+}
+
+fn documentSqlMaterializedAggregateRowLessThan(ctx: DocumentSqlMaterializedAggregateSortContext, lhs: AlgebraicAggregateRow, rhs: AlgebraicAggregateRow) bool {
+    const lhs_group = lhs.group_json orelse "null";
+    const rhs_group = rhs.group_json orelse "null";
+    const order = switch (ctx.order_by.key) {
+        .group => documentSqlJsonSortOrder(lhs_group, rhs_group, ctx.order_by.field_type),
+        .aggregate => documentSqlJsonSortOrder(lhs.value_json, rhs.value_json, ctx.order_by.field_type),
+    };
+    return documentSqlAggregateSortOrderLessThan(ctx.order_by.direction, order, lhs_group, rhs_group);
+}
+
+fn documentSqlNumericAggregateSortOrder(lhs: DocumentSqlNumericAggregate, rhs: DocumentSqlNumericAggregate, op: sql_adapter.DocumentAggregateOp) std.math.Order {
+    if (!lhs.seen) return if (!rhs.seen) .eq else .gt;
+    if (!rhs.seen) return .lt;
+    return std.math.order(documentSqlNumericAggregateResultValue(lhs, op), documentSqlNumericAggregateResultValue(rhs, op));
+}
+
+fn documentSqlJsonSortOrder(lhs_json: []const u8, rhs_json: []const u8, field_type: storage_schema.AntflyType) std.math.Order {
+    if (std.mem.eql(u8, lhs_json, "null")) return if (std.mem.eql(u8, rhs_json, "null")) .eq else .gt;
+    if (std.mem.eql(u8, rhs_json, "null")) return .lt;
+    return switch (field_type) {
+        .numeric => blk: {
+            const left = std.fmt.parseFloat(f64, lhs_json) catch break :blk std.mem.order(u8, lhs_json, rhs_json);
+            const right = std.fmt.parseFloat(f64, rhs_json) catch break :blk std.mem.order(u8, lhs_json, rhs_json);
+            break :blk std.math.order(left, right);
+        },
+        .boolean => blk: {
+            const left = std.mem.eql(u8, lhs_json, "true");
+            const right = std.mem.eql(u8, rhs_json, "true");
+            break :blk std.math.order(@intFromBool(left), @intFromBool(right));
+        },
+        else => std.mem.order(u8, lhs_json, rhs_json),
+    };
+}
+
+fn documentSqlAggregateSortOrderLessThan(
+    direction: sql_adapter.DocumentOrderDirection,
+    order: std.math.Order,
+    lhs_tie: []const u8,
+    rhs_tie: []const u8,
+) bool {
+    if (order == .eq) {
+        const tie = std.mem.order(u8, lhs_tie, rhs_tie);
+        return tie == .lt;
+    }
+    return switch (direction) {
+        .asc => order == .lt,
+        .desc => order == .gt,
+    };
+}
+
+test "document SQL aggregate ordering uses stable ascending group tie break" {
+    try std.testing.expect(documentSqlAggregateSortOrderLessThan(.asc, .eq, "\"active\"", "\"archived\""));
+    try std.testing.expect(documentSqlAggregateSortOrderLessThan(.desc, .eq, "\"active\"", "\"archived\""));
+    try std.testing.expect(!documentSqlAggregateSortOrderLessThan(.desc, .eq, "\"archived\"", "\"active\""));
+    try std.testing.expect(documentSqlAggregateSortOrderLessThan(.desc, .gt, "\"active\"", "\"archived\""));
+    try std.testing.expect(!documentSqlAggregateSortOrderLessThan(.desc, .lt, "\"active\"", "\"archived\""));
+}
+
 fn documentSqlGroupedCountAggregateResultAlloc(
     alloc: std.mem.Allocator,
     group_output: []const u8,
     aggregate_output: []const u8,
     groups: []const DocumentSqlCountGroup,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+    order_by: ?sql_adapter.DocumentAggregateOrderBy,
     limit: ?u32,
 ) !RowsAggregateResult {
-    const output_count = if (limit) |value| @min(groups.len, value) else groups.len;
+    const filtered_groups = if (having.len > 0) try filteredDocumentSqlCountGroupsAlloc(alloc, groups, having) else null;
+    defer if (filtered_groups) |items| alloc.free(items);
+    const candidate_groups = filtered_groups orelse groups;
+    const ordered_groups = if (order_by) |order| try orderedDocumentSqlCountGroupsAlloc(alloc, candidate_groups, order) else null;
+    defer if (ordered_groups) |items| alloc.free(items);
+    const result_groups = ordered_groups orelse candidate_groups;
+    const output_count = if (limit) |value| @min(result_groups.len, value) else result_groups.len;
     const rows = try alloc.alloc([]const u8, output_count);
     errdefer alloc.free(rows);
     var initialized: usize = 0;
     errdefer {
         for (rows[0..initialized]) |row| alloc.free(@constCast(row));
     }
-    for (groups[0..output_count], 0..) |group, i| {
+    for (result_groups[0..output_count], 0..) |group, i| {
         var row: std.Io.Writer.Allocating = .init(alloc);
         errdefer row.deinit();
         const writer = &row.writer;
@@ -1637,7 +1890,7 @@ fn documentSqlGroupedCountAggregateResultAlloc(
     }
     return .{
         .rows = rows,
-        .total_groups = @intCast(groups.len),
+        .total_groups = @intCast(result_groups.len),
     };
 }
 
@@ -1667,16 +1920,24 @@ fn documentSqlMaterializedGroupedAggregateResultAlloc(
     aggregate_output: []const u8,
     materialized_rows: []const AlgebraicAggregateRow,
     total_groups: u32,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+    order_by: ?sql_adapter.DocumentAggregateOrderBy,
     limit: ?u32,
 ) !RowsAggregateResult {
-    const output_count = if (limit) |value| @min(materialized_rows.len, value) else materialized_rows.len;
+    const filtered_rows = if (having.len > 0) try filteredDocumentSqlMaterializedAggregateRowsAlloc(alloc, materialized_rows, having) else null;
+    defer if (filtered_rows) |items| alloc.free(items);
+    const candidate_rows = filtered_rows orelse materialized_rows;
+    const ordered_rows = if (order_by) |order| try orderedDocumentSqlMaterializedAggregateRowsAlloc(alloc, candidate_rows, order) else null;
+    defer if (ordered_rows) |items| alloc.free(items);
+    const result_rows = ordered_rows orelse candidate_rows;
+    const output_count = if (limit) |value| @min(result_rows.len, value) else result_rows.len;
     const rows = try alloc.alloc([]const u8, output_count);
     errdefer alloc.free(rows);
     var initialized: usize = 0;
     errdefer {
         for (rows[0..initialized]) |row| alloc.free(@constCast(row));
     }
-    for (materialized_rows[0..output_count], 0..) |materialized, i| {
+    for (result_rows[0..output_count], 0..) |materialized, i| {
         const group_json = materialized.group_json orelse return error.InvalidRowsRequest;
         var row: std.Io.Writer.Allocating = .init(alloc);
         errdefer row.deinit();
@@ -1691,7 +1952,7 @@ fn documentSqlMaterializedGroupedAggregateResultAlloc(
     }
     return .{
         .rows = rows,
-        .total_groups = total_groups,
+        .total_groups = if (having.len == 0) total_groups else @intCast(candidate_rows.len),
     };
 }
 
@@ -1701,16 +1962,24 @@ fn documentSqlGroupedNumericAggregateResultAlloc(
     aggregate_output: []const u8,
     op: sql_adapter.DocumentAggregateOp,
     groups: []const DocumentSqlNumericAggregateGroup,
+    having: []const sql_adapter.DocumentAggregateHavingPredicate,
+    order_by: ?sql_adapter.DocumentAggregateOrderBy,
     limit: ?u32,
 ) !RowsAggregateResult {
-    const output_count = if (limit) |value| @min(groups.len, value) else groups.len;
+    const filtered_groups = if (having.len > 0) try filteredDocumentSqlNumericAggregateGroupsAlloc(alloc, groups, op, having) else null;
+    defer if (filtered_groups) |items| alloc.free(items);
+    const candidate_groups = filtered_groups orelse groups;
+    const ordered_groups = if (order_by) |order| try orderedDocumentSqlNumericAggregateGroupsAlloc(alloc, candidate_groups, op, order) else null;
+    defer if (ordered_groups) |items| alloc.free(items);
+    const result_groups = ordered_groups orelse candidate_groups;
+    const output_count = if (limit) |value| @min(result_groups.len, value) else result_groups.len;
     const rows = try alloc.alloc([]const u8, output_count);
     errdefer alloc.free(rows);
     var initialized: usize = 0;
     errdefer {
         for (rows[0..initialized]) |row| alloc.free(@constCast(row));
     }
-    for (groups[0..output_count], 0..) |group, i| {
+    for (result_groups[0..output_count], 0..) |group, i| {
         var row: std.Io.Writer.Allocating = .init(alloc);
         errdefer row.deinit();
         const writer = &row.writer;
@@ -1730,7 +1999,7 @@ fn documentSqlGroupedNumericAggregateResultAlloc(
     }
     return .{
         .rows = rows,
-        .total_groups = @intCast(groups.len),
+        .total_groups = @intCast(result_groups.len),
     };
 }
 
@@ -1844,14 +2113,14 @@ fn executeOrderedLoweredDocumentSqlUnnestReadPlanAlloc(
                 }
                 try appendOrderedDocumentSqlUnnestCandidatesAlloc(alloc, &candidates, key_value.string, lookup.json, lowered.projection, unnest, order_by);
             }
-            if (scanned >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
         .indexed_query => |query| {
             const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
+            try documentSqlAdmitBoundedRowProbeCount(total_hits, query_limit);
             try appendOrderedDocumentSqlUnnestCandidatesFromQueryResponseAlloc(
                 alloc,
                 source,
@@ -1950,9 +2219,7 @@ fn executeLoweredDocumentSqlUnnestReadPlanAlloc(
                     if (rows.items.len >= limit) break;
                 }
             }
-            if ((lowered.limit == null or rows.items.len < lowered.limit.?) and scanned >= scan_plan.max_rows) {
-                return error.DocumentSqlRequiresBoundedScan;
-            }
+            if (lowered.limit == null or rows.items.len < lowered.limit.?) try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
         .indexed_query => |query| {
             const query_limit = query.max_candidate_rows orelse lowered.limit orelse return error.DocumentSqlRequiresBoundedScan;
@@ -1973,7 +2240,7 @@ fn executeLoweredDocumentSqlUnnestReadPlanAlloc(
                 &rows,
             );
             const row_limit = lowered.limit orelse std.math.maxInt(u32);
-            if (rows.items.len < row_limit and total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            if (rows.items.len < row_limit) try documentSqlAdmitBoundedRowCount(total_hits, query_limit);
         },
     }
 
@@ -2179,10 +2446,18 @@ fn appendOrderedDocumentSqlUnnestCandidatesAlloc(
     else
         null;
     defer if (filter_value) |*value| value.deinit();
+    var filter_values = if (unnest.filter_values_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_values) |*value| value.deinit();
 
     for (array_value.array.items) |item| {
         if (filter_value) |value| {
             if (!documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_values) |values| {
+            if (!documentSqlJsonValueInArray(item, values.value)) continue;
         }
         const owned_id = try alloc.dupe(u8, key);
         errdefer alloc.free(owned_id);
@@ -2340,10 +2615,18 @@ fn appendDocumentSqlUnnestRowsAlloc(
     else
         null;
     defer if (filter_value) |*value| value.deinit();
+    var filter_values = if (unnest.filter_values_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_values) |*value| value.deinit();
 
     for (array_value.array.items) |item| {
         if (filter_value) |value| {
             if (!documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        if (filter_values) |values| {
+            if (!documentSqlJsonValueInArray(item, values.value)) continue;
         }
         try rows.append(alloc, try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, item));
         if (row_limit) |limit| {
@@ -2436,6 +2719,20 @@ fn documentSqlFilterValueMatches(
         const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
         return documentSqlJsonValuesEqual(actual, field_value.value);
     }
+    if (filter.object.get("text_lower_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiLowerEqualsAlloc(alloc, actual, field_value.value.string);
+    }
+    if (filter.object.get("text_upper_term")) |term| {
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        if (field_value.value != .string) return error.InvalidRowsRequest;
+        if (!documentSqlAsciiOnly(field_value.value.string)) return error.UnsupportedSqlShape;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return try documentSqlAsciiUpperEqualsAlloc(alloc, actual, field_value.value.string);
+    }
     if (filter.object.get("terms")) |terms| {
         const field_value = try documentSqlFilterFieldValue(terms, "values");
         if (field_value.value != .array) return error.InvalidRowsRequest;
@@ -2465,6 +2762,11 @@ fn documentSqlFilterValueMatches(
         const path = try documentSqlFilterPath(range);
         const actual = documentSqlProjectedValue(doc, path) orelse return false;
         return try documentSqlNumericRangeMatches(actual, range);
+    }
+    if (filter.object.get("numeric_abs_range")) |range| {
+        const path = try documentSqlFilterPath(range);
+        const actual = documentSqlProjectedValue(doc, path) orelse return false;
+        return try documentSqlNumericAbsRangeMatches(actual, range);
     }
     if (filter.object.get("date_range")) |range| {
         const path = try documentSqlFilterPath(range);
@@ -2587,6 +2889,14 @@ fn documentSqlJsonValuesEqual(actual: std.json.Value, expected: std.json.Value) 
     };
 }
 
+fn documentSqlJsonValueInArray(actual: std.json.Value, expected_values: std.json.Value) bool {
+    if (expected_values != .array) return false;
+    for (expected_values.array.items) |expected| {
+        if (documentSqlJsonValuesEqual(actual, expected)) return true;
+    }
+    return false;
+}
+
 fn documentSqlJsonNumber(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |item| @floatFromInt(item),
@@ -2604,9 +2914,42 @@ fn documentSqlFilterStringValue(value: std.json.Value) ![]const u8 {
     };
 }
 
+fn documentSqlAsciiLowerEqualsAlloc(alloc: std.mem.Allocator, actual: std.json.Value, expected: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const lowered = try std.ascii.allocLowerString(alloc, text);
+    defer alloc.free(lowered);
+    return std.mem.eql(u8, lowered, expected);
+}
+
+fn documentSqlAsciiUpperEqualsAlloc(alloc: std.mem.Allocator, actual: std.json.Value, expected: []const u8) !bool {
+    const text = try documentSqlFilterStringValue(actual);
+    if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
+    const uppered = try std.ascii.allocUpperString(alloc, text);
+    defer alloc.free(uppered);
+    return std.mem.eql(u8, uppered, expected);
+}
+
+fn documentSqlAsciiOnly(text: []const u8) bool {
+    for (text) |ch| {
+        if (ch >= 0x80) return false;
+    }
+    return true;
+}
+
 fn documentSqlNumericRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
     if (range != .object) return error.InvalidRowsRequest;
     const value = try documentSqlJsonNumber(actual);
+    return try documentSqlNumericRangeValueMatches(value, range);
+}
+
+fn documentSqlNumericAbsRangeMatches(actual: std.json.Value, range: std.json.Value) !bool {
+    if (range != .object) return error.InvalidRowsRequest;
+    const value = try documentSqlJsonNumber(actual);
+    return try documentSqlNumericRangeValueMatches(@abs(value), range);
+}
+
+fn documentSqlNumericRangeValueMatches(value: f64, range: std.json.Value) !bool {
     if (range.object.get("min")) |min| {
         const bound = try documentSqlJsonNumber(min);
         const inclusive = documentSqlFilterBool(range, "inclusive_min", true);
@@ -2704,6 +3047,24 @@ test "document sql native filter rewrite canonicalizes row filter conjunctions" 
         "{\"bool\":{\"should\":[{\"term\":{\"tier\":\"gold\"}},{\"terms\":{\"status\":[\"trial\",\"active\"]}}],\"minimum_should_match\":1}}",
         native_disjunction,
     );
+}
+
+test "document SQL residual filters match corpus cases" {
+    const alloc = std.testing.allocator;
+    var corpus = try document_sql_corpus.parseDocumentSqlCorpusAlloc(alloc);
+    defer corpus.deinit();
+    for (corpus.value.residual_filter_cases) |case| {
+        errdefer std.debug.print("document SQL residual corpus case failed: {s}\n", .{case.name});
+        if (case.expected.matches) |expected| {
+            if (case.expected.@"error" != null) return error.InvalidSqlCorpusFixture;
+            try std.testing.expectEqual(expected, try residualFilterMatchesAlloc(alloc, case.document_json, case.filter_json));
+        } else if (case.expected.@"error") |expected_error_name| {
+            const expected_error = try document_sql_corpus.errorFromName(expected_error_name);
+            try std.testing.expectError(expected_error, residualFilterMatchesAlloc(alloc, case.document_json, case.filter_json));
+        } else {
+            return error.InvalidSqlCorpusFixture;
+        }
+    }
 }
 
 test "document SQL bounded aggregate scan admits only lookup-backed document keys" {
@@ -2943,7 +3304,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         },
     };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_plan, .stale),
     );
 
@@ -2962,7 +3323,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         },
     };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_plan, .stale),
     );
 
@@ -2982,7 +3343,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         },
     };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_sum_plan, .stale),
     );
 
@@ -2996,7 +3357,7 @@ test "document SQL bounded aggregate scan admits only lookup-backed document key
         },
     };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_max_plan, .stale),
     );
 }
@@ -3104,97 +3465,115 @@ test "document SQL executes algebraic materialized aggregate rows" {
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"status\":\"active\",\"total_amount\":22}", result.rows[0]);
-}
 
-test "document SQL residual filter supports bool must not" {
-    const alloc = std.testing.allocator;
-    const active_west_doc =
-        \\{"status":"active","region":"west"}
-    ;
-    const archived_west_doc =
-        \\{"status":"archived","region":"west"}
-    ;
-    const active_east_doc =
-        \\{"status":"active","region":"east"}
-    ;
-    const filter =
-        \\{"bool":{"filter":[{"term":{"path":"/region","value":"west"}}],"must_not":[{"term":{"path":"/status","value":"archived"}}]}}
-    ;
+    const ordered_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .index_name = "alg",
+        .materialization_name = "sum_by_status",
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+        .order_by = .{
+            .key = .aggregate,
+            .field_type = .numeric,
+            .direction = .desc,
+        },
+        .limit = 1,
+    };
 
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_west_doc, filter));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, archived_west_doc, filter));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, active_east_doc, filter));
+    var ordered_result = (try executeAggregatePlanAlloc(alloc, source.source(), ordered_plan, .stale)).?;
+    defer ordered_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), ordered_result.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), ordered_result.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":30}", ordered_result.rows[0]);
 
-    const exclusion_only =
-        \\{"bool":{"must_not":[{"term":{"path":"/status","value":"archived"}}]}}
-    ;
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_west_doc, exclusion_only));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, archived_west_doc, exclusion_only));
-}
+    const having_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .index_name = "alg",
+        .materialization_name = "sum_by_status",
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+        .having = &.{
+            .{
+                .key = .aggregate,
+                .field_type = .numeric,
+                .op = .gt,
+                .value_json = "25",
+            },
+        },
+        .order_by = .{
+            .key = .aggregate,
+            .field_type = .numeric,
+            .direction = .desc,
+        },
+        .limit = 1,
+    };
 
-test "document SQL residual filter supports null and existence predicates" {
-    const alloc = std.testing.allocator;
-    const active_doc =
-        \\{"status":"active"}
-    ;
-    const null_doc =
-        \\{"status":null}
-    ;
-    const missing_doc =
-        \\{"region":"west"}
-    ;
-    const is_null_filter =
-        \\{"bool":{"should":[{"term":{"path":"/status","value":null}},{"bool":{"must_not":[{"exists":{"path":"/status"}}]}}],"minimum_should_match":1}}
-    ;
+    var having_result = (try executeAggregatePlanAlloc(alloc, source.source(), having_plan, .stale)).?;
+    defer having_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), having_result.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), having_result.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":30}", having_result.rows[0]);
 
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, active_doc, is_null_filter));
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, null_doc, is_null_filter));
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, missing_doc, is_null_filter));
+    const having_conjunction_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .index_name = "alg",
+        .materialization_name = "sum_by_status",
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+        .having = &.{
+            .{
+                .key = .aggregate,
+                .field_type = .numeric,
+                .op = .gt,
+                .value_json = "20",
+            },
+            .{
+                .key = .group,
+                .field_type = .keyword,
+                .op = .eq,
+                .value_json = "\"archived\"",
+            },
+        },
+        .order_by = .{
+            .key = .aggregate,
+            .field_type = .numeric,
+            .direction = .desc,
+        },
+        .limit = 1,
+    };
 
-    const is_not_null_filter =
-        \\{"bool":{"filter":[{"exists":{"path":"/status"}}],"must_not":[{"term":{"path":"/status","value":null}}]}}
-    ;
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_doc, is_not_null_filter));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, null_doc, is_not_null_filter));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, missing_doc, is_not_null_filter));
-}
-
-test "document SQL residual filter supports match all and match none" {
-    const alloc = std.testing.allocator;
-    const doc =
-        \\{"status":"active"}
-    ;
-
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, doc, "{\"match_all\":{}}"));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, doc, "{\"match_none\":{}}"));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, doc, "{\"bool\":{\"filter\":[{\"match_none\":{}},{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}]}}"));
-}
-
-test "document SQL residual filter supports native conjuncts and disjuncts" {
-    const alloc = std.testing.allocator;
-    const active_tenant_doc =
-        \\{"status":"active","tenant_id":"tenant-a"}
-    ;
-    const inactive_tenant_doc =
-        \\{"status":"archived","tenant_id":"tenant-a"}
-    ;
-    const active_other_tenant_doc =
-        \\{"status":"active","tenant_id":"tenant-b"}
-    ;
-    const conjuncts =
-        \\{"conjuncts":[{"term":{"path":"/status","value":"active"}},{"term":{"tenant_id":"tenant-a"}}]}
-    ;
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_tenant_doc, conjuncts));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, inactive_tenant_doc, conjuncts));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, active_other_tenant_doc, conjuncts));
-
-    const disjuncts =
-        \\{"disjuncts":[{"term":{"path":"/status","value":"active"}},{"term":{"tenant_id":"tenant-a"}}]}
-    ;
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_tenant_doc, disjuncts));
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, inactive_tenant_doc, disjuncts));
-    try std.testing.expect(try residualFilterMatchesAlloc(alloc, active_other_tenant_doc, disjuncts));
-    try std.testing.expect(!try residualFilterMatchesAlloc(alloc, "{\"status\":\"archived\",\"tenant_id\":\"tenant-b\"}", disjuncts));
+    var having_conjunction_result = (try executeAggregatePlanAlloc(alloc, source.source(), having_conjunction_plan, .stale)).?;
+    defer having_conjunction_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), having_conjunction_result.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), having_conjunction_result.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":30}", having_conjunction_result.rows[0]);
 }
 
 fn documentSqlWildcardMatches(pattern: []const u8, text: []const u8) bool {

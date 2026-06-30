@@ -205,7 +205,7 @@ fn parseSyncLevel(text: ?[]const u8) !db_mod.types.SyncLevel {
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     return handleImpl(ctx, req, path) catch |err| switch (err) {
-        error.NotLeader, error.LeaderUnavailable, error.WriteUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
+        error.NotLeader, error.LeaderUnavailable, error.ReadUnavailable, error.WriteUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
         else => return err,
     };
 }
@@ -1703,6 +1703,7 @@ test "internal group write routes stage rows mutation source envelopes" {
             self.mutation_collect_calls += 1;
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
+            if (topology_epoch == route_topology_epoch + 1) return error.ReadUnavailable;
             try std.testing.expectEqual(route_topology_epoch, topology_epoch);
             try std.testing.expect(schema.primary_key != null);
             try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, req.kind);
@@ -1844,6 +1845,7 @@ test "internal group write routes stage rows mutation source envelopes" {
             self.inputs_calls += 1;
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
+            if (topology_epoch == route_topology_epoch + 1) return error.ReadUnavailable;
             try std.testing.expectEqual(route_topology_epoch, topology_epoch);
             try std.testing.expect(source_schema.primary_key != null);
             try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, req.target_side);
@@ -2082,6 +2084,41 @@ test "internal group write routes stage rows mutation source envelopes" {
     try std.testing.expectEqual(@as(u32, 2), parsed_joined_planned_resp.matched);
     try std.testing.expectEqual(@as(usize, 1), parsed_joined_planned_resp.participant_predicates.len);
     try std.testing.expectEqualStrings("row:a", parsed_joined_planned_resp.participant_predicates[0].key);
+
+    const read_unavailable_collect_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .schema_json = schema_json,
+        .request_body = mutation_body,
+        .topology_epoch = MutationSource.route_topology_epoch + 1,
+    }, .{})});
+    defer alloc.free(read_unavailable_collect_body);
+
+    var read_unavailable_collect_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/mutation-source/collect",
+        .body = read_unavailable_collect_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/mutation-source/collect")).?;
+    defer read_unavailable_collect_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), read_unavailable_collect_resp.status);
+    try std.testing.expectEqualStrings("leader unavailable", read_unavailable_collect_resp.body);
+
+    const read_unavailable_inputs_body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .target_schema_json = schema_json,
+        .source_schema_json = schema_json,
+        .request_body = joined_body,
+        .topology_epoch = MutationSource.route_topology_epoch + 1,
+    }, .{})});
+    defer alloc.free(read_unavailable_inputs_body);
+
+    var read_unavailable_inputs_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/inputs",
+        .body = read_unavailable_inputs_body,
+    }, "/internal/v1/groups/7/tables/docs/rows/joined-mutation-source/inputs")).?;
+    defer read_unavailable_inputs_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), read_unavailable_inputs_resp.status);
+    try std.testing.expectEqualStrings("leader unavailable", read_unavailable_inputs_resp.body);
 
     const UnavailableCase = struct {
         sync_level: []const u8,

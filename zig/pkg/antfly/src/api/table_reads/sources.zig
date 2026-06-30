@@ -8154,7 +8154,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer capped_ordered_document_plan.deinit(alloc);
     const capped_ordered_scan_plan = sql_adapter.LoweredReadPlan{ .document_query = capped_ordered_document_plan };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),
@@ -8175,7 +8175,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer byte_capped_ordered_document_plan.deinit(alloc);
     const byte_capped_ordered_scan_plan = sql_adapter.LoweredReadPlan{ .document_query = byte_capped_ordered_document_plan };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanByteCapExceeded,
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),
@@ -8261,7 +8261,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer capped_ordered_full_text_document_plan.deinit(alloc);
     const capped_ordered_full_text_plan = sql_adapter.LoweredReadPlan{ .document_query = capped_ordered_full_text_document_plan };
     try std.testing.expectError(
-        error.DocumentSqlRequiresBoundedScan,
+        error.DocumentSqlBoundedScanRowCapExceeded,
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),

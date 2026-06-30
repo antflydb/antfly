@@ -236,6 +236,44 @@ test "relational rows scalar predicates honor case-insensitive collation" {
     }));
 }
 
+test "relational rows grouped predicates resolve collation from columns" {
+    const alloc = std.testing.allocator;
+    const columns = [_]schema_mod.RelationalColumn{.{
+        .name = "state",
+        .path = "state",
+        .field_type = .keyword,
+        .collation = "antfly.case_insensitive",
+    }};
+    const source_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "state",
+        .op = .eq,
+        .value_json = "\"source\"",
+    }};
+    const grouped_predicates = [_]types.RelationalRowsPredicateGroup{.{
+        .predicates = source_predicates[0..],
+    }};
+    const access_grouped_predicates = [_]types.RelationalRowsAccessPredicateGroup{.{
+        .predicates = source_predicates[0..],
+    }};
+
+    try std.testing.expect(try queryJsonMatchesRequestWithColumns(alloc, "{\"state\":\"SOURCE\"}", .{
+        .predicates = source_predicates[0..],
+    }, columns[0..], 0));
+    try std.testing.expect(try queryJsonMatchesRequestWithColumns(alloc, "{\"state\":\"SOURCE\"}", .{
+        .or_predicates = grouped_predicates[0..],
+    }, columns[0..], 0));
+    try std.testing.expect(!try queryJsonMatchesRequestWithColumns(alloc, "{\"state\":\"SOURCE\"}", .{
+        .not_predicates = grouped_predicates[0..],
+    }, columns[0..], 0));
+    try std.testing.expect(try queryJsonMatchesRequestWithColumns(alloc, "{\"state\":\"SOURCE\"}", .{
+        .access_or_predicates = access_grouped_predicates[0..],
+    }, columns[0..], 0));
+    try std.testing.expect(!try queryJsonMatchesRequestWithColumns(alloc, "{\"state\":\"SOURCE\"}", .{
+        .access_not_predicates = access_grouped_predicates[0..],
+    }, columns[0..], 0));
+}
+
 fn queryOrderKeyRank(key: QueryOrderKey) u8 {
     return switch (key) {
         .bool => 0,
@@ -1344,12 +1382,12 @@ pub fn queryJsonMatchesRequestWithColumns(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     for (req.predicates) |predicate| {
-        if (!(try queryPredicatePasses(alloc, parsed.value, predicate))) return false;
+        if (!(try queryPredicatePassesWithColumns(alloc, parsed.value, predicate, source_columns))) return false;
     }
-    if (!(try queryOrPredicateGroupsPass(alloc, parsed.value, req.or_predicates))) return false;
-    if (!(try queryNotPredicateGroupsPass(alloc, parsed.value, req.not_predicates))) return false;
-    if (!(try queryAccessOrPredicateGroupsPass(alloc, parsed.value, req.access_or_predicates))) return false;
-    if (!(try queryAccessNotPredicateGroupsPass(alloc, parsed.value, req.access_not_predicates))) return false;
+    if (!(try queryOrPredicateGroupsPassWithColumns(alloc, parsed.value, req.or_predicates, source_columns))) return false;
+    if (!(try queryNotPredicateGroupsPassWithColumns(alloc, parsed.value, req.not_predicates, source_columns))) return false;
+    if (!(try queryAccessOrPredicateGroupsPassWithColumns(alloc, parsed.value, req.access_or_predicates, source_columns))) return false;
+    if (!(try queryAccessNotPredicateGroupsPassWithColumns(alloc, parsed.value, req.access_not_predicates, source_columns))) return false;
     for (req.expression_predicates) |condition| {
         if (!(try expressionConditionMatchesWithColumns(alloc, parsed.value, condition, source_columns, now_ns))) return false;
     }
@@ -1566,16 +1604,36 @@ pub fn queryPredicatePasses(
     };
 }
 
+pub fn queryPredicatePassesWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    predicate: schema_mod.RelationalCheck,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
+    var resolved = predicate;
+    if (resolved.collation == null) resolved.collation = distinctFieldCollation(source_columns, resolved.field);
+    return try queryPredicatePasses(alloc, row, resolved);
+}
+
 pub fn queryOrPredicateGroupsPass(
     alloc: Allocator,
     row: std.json.Value,
     groups: []const types.RelationalRowsPredicateGroup,
 ) !bool {
+    return try queryOrPredicateGroupsPassWithColumns(alloc, row, groups, &.{});
+}
+
+pub fn queryOrPredicateGroupsPassWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    groups: []const types.RelationalRowsPredicateGroup,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
     if (groups.len == 0) return true;
     for (groups) |group| {
         var group_passes = true;
         for (group.predicates) |predicate| {
-            if (!(try queryPredicatePasses(alloc, row, predicate))) {
+            if (!(try queryPredicatePassesWithColumns(alloc, row, predicate, source_columns))) {
                 group_passes = false;
                 break;
             }
@@ -1590,10 +1648,19 @@ pub fn queryNotPredicateGroupsPass(
     row: std.json.Value,
     groups: []const types.RelationalRowsPredicateGroup,
 ) !bool {
+    return try queryNotPredicateGroupsPassWithColumns(alloc, row, groups, &.{});
+}
+
+pub fn queryNotPredicateGroupsPassWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    groups: []const types.RelationalRowsPredicateGroup,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
     for (groups) |group| {
         var group_passes = true;
         for (group.predicates) |predicate| {
-            if (!(try queryPredicatePasses(alloc, row, predicate))) {
+            if (!(try queryPredicatePassesWithColumns(alloc, row, predicate, source_columns))) {
                 group_passes = false;
                 break;
             }
@@ -1608,8 +1675,17 @@ pub fn queryAccessPredicateGroupPasses(
     row: std.json.Value,
     group: types.RelationalRowsAccessPredicateGroup,
 ) !bool {
+    return try queryAccessPredicateGroupPassesWithColumns(alloc, row, group, &.{});
+}
+
+pub fn queryAccessPredicateGroupPassesWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    group: types.RelationalRowsAccessPredicateGroup,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
     for (group.predicates) |predicate| {
-        if (!(try queryPredicatePasses(alloc, row, predicate))) return false;
+        if (!(try queryPredicatePassesWithColumns(alloc, row, predicate, source_columns))) return false;
     }
     for (group.array_any) |predicate| {
         if (!(try queryArrayAnyPredicatePasses(alloc, row, predicate))) return false;
@@ -1643,9 +1719,18 @@ pub fn queryAccessOrPredicateGroupsPass(
     row: std.json.Value,
     groups: []const types.RelationalRowsAccessPredicateGroup,
 ) !bool {
+    return try queryAccessOrPredicateGroupsPassWithColumns(alloc, row, groups, &.{});
+}
+
+pub fn queryAccessOrPredicateGroupsPassWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    groups: []const types.RelationalRowsAccessPredicateGroup,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
     if (groups.len == 0) return true;
     for (groups) |group| {
-        if (try queryAccessPredicateGroupPasses(alloc, row, group)) return true;
+        if (try queryAccessPredicateGroupPassesWithColumns(alloc, row, group, source_columns)) return true;
     }
     return false;
 }
@@ -1655,8 +1740,17 @@ pub fn queryAccessNotPredicateGroupsPass(
     row: std.json.Value,
     groups: []const types.RelationalRowsAccessPredicateGroup,
 ) !bool {
+    return try queryAccessNotPredicateGroupsPassWithColumns(alloc, row, groups, &.{});
+}
+
+pub fn queryAccessNotPredicateGroupsPassWithColumns(
+    alloc: Allocator,
+    row: std.json.Value,
+    groups: []const types.RelationalRowsAccessPredicateGroup,
+    source_columns: []const schema_mod.RelationalColumn,
+) !bool {
     for (groups) |group| {
-        if (try queryAccessPredicateGroupPasses(alloc, row, group)) return false;
+        if (try queryAccessPredicateGroupPassesWithColumns(alloc, row, group, source_columns)) return false;
     }
     return true;
 }

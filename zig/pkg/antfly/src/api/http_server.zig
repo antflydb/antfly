@@ -6554,9 +6554,15 @@ pub const ApiHttpServer = struct {
         parsed_sql: *const sql_adapter.ParsedSql,
     ) !?sql_adapter.SqlReadStatementKind {
         const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
-        if (parsed_sql.generatedStatementKind() == .read) return parsed_kind orelse error.UnsupportedSqlShape;
-        if (read_catalog.statement.readKind()) |kind| return kind;
         const target_binding = read_catalog.target_binding orelse return null;
+        if (parsed_sql.generatedStatementKind() == .read) {
+            if (parsed_kind) |kind| return kind;
+            return switch (target_binding) {
+                .document => parsed_sql.generatedReadStatementKind() orelse parsed_sql.readStatementKind() orelse error.UnsupportedSqlShape,
+                else => error.UnsupportedSqlShape,
+            };
+        }
+        if (read_catalog.statement.readKind()) |kind| return kind;
         switch (target_binding) {
             .document => {},
             else => return null,
@@ -6819,6 +6825,54 @@ pub const ApiHttpServer = struct {
         if (schema.storage_mode != .document) return null;
         return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .invalid_sql_request)
             .withMessage("document_sql_native_search_requires_table_function")
+            .withMissingNativeModel("document SQL read shape");
+    }
+
+    fn publicSqlDocumentUnsupportedReadDiagnosticFromCatalog(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+        phase: sql_adapter.diagnostics.SqlDiagnosticPhase,
+    ) !?sql_adapter.diagnostics.SqlDiagnosticEnvelope {
+        var saw_window = false;
+        for (parsed_sql.items()) |token| {
+            if (token.matchesKeywordTag(.window)) {
+                saw_window = true;
+                break;
+            }
+        }
+        if (!saw_window) return null;
+
+        var table_name: []const u8 = undefined;
+        var table_name_owned = false;
+        if (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql)) |maybe_tables| {
+            var tables = maybe_tables orelse return null;
+            defer tables.deinit(self.alloc);
+            table_name = try self.alloc.dupe(u8, tables.left);
+            table_name_owned = true;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {
+                const generated_statement = parsed_sql.generated_statement orelse return null;
+                const generated_ast = generated_statement.ast orelse return null;
+                const read = switch (generated_ast) {
+                    .read => |read| read.*,
+                    else => return null,
+                };
+                table_name = (try publicSqlGeneratedReadSourceTableNameAlloc(self.alloc, parsed_sql.items(), read)) orelse return null;
+                table_name_owned = true;
+            },
+            else => return err,
+        }
+        defer if (table_name_owned) self.alloc.free(table_name);
+
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource(), table_name, session) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return null,
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+        if (schema.storage_mode != .document) return null;
+        return sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(phase, .invalid_sql_request)
+            .withMessage("document_sql_window_unsupported")
             .withMissingNativeModel("document SQL read shape");
     }
 
@@ -8743,8 +8797,12 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.DocumentSqlIndexUnavailable => "document_sql_index_unavailable",
             error.DocumentSqlRequiresBoundedScan => "document_sql_requires_bounded_scan",
+            error.DocumentSqlBoundedScanRowCapExceeded => "document_sql_bounded_scan_row_cap_exceeded",
+            error.DocumentSqlBoundedScanByteCapExceeded => "document_sql_bounded_scan_byte_cap_exceeded",
             error.DocumentSqlArrayRequiresUnnest => "document_sql_array_requires_unnest",
+            error.DocumentSqlUnnestUnsupported => "document_sql_unnest_unsupported",
             error.DocumentSqlUnsupportedJoin => "document_sql_unsupported_join",
+            error.DocumentSqlAggregateUnsupported => "document_sql_aggregate_unsupported",
             error.DocumentSqlNativeSearchRequiresTableFunction => "document_sql_native_search_requires_table_function",
             error.DocumentSqlProjectionModifierUnsupported => "document_sql_projection_modifier_unsupported",
             error.DocumentSqlPaginationUnsupported => "document_sql_pagination_unsupported",
@@ -10355,6 +10413,9 @@ pub const ApiHttpServer = struct {
             },
             error.PermissionDenied => return .{ .response = try self.publicSqlParsedDiagnosticResponse(403, parsed_sql, .init(.bind, .permission_denied)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => {
+                if (try self.publicSqlDocumentUnsupportedReadDiagnosticFromCatalog(parsed_sql, session.session(), .plan)) |diagnostic| {
+                    return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
+                }
                 if (try self.publicSqlGeneratedDocumentNativeSearchPredicateDiagnosticFromCatalog(parsed_sql, session.session(), .plan)) |diagnostic| {
                     return .{ .response = try self.publicSqlDiagnosticResponse(400, diagnostic) };
                 }
@@ -10465,13 +10526,7 @@ pub const ApiHttpServer = struct {
             }
             return outcome;
         }
-        const maybe_read_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse blk: {
-            if (parsed_sql.generatedStatementKind() == .read) {
-                self.markPublicSqlTransactionFailedIfActive(session);
-                return .{ .response = try self.publicSqlParsedDiagnosticResponse(501, parsed_sql, .init(.plan, .unsupported_sql_statement)) };
-            }
-            break :blk null;
-        };
+        const maybe_read_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
         if (maybe_read_kind) |read_kind| {
             if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, request.authenticated_identity, read_kind)) |outcome_value| {
                 var outcome = outcome_value;
@@ -32654,6 +32709,29 @@ test "api http server executes document SQL reads through typed document plan in
     try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
     try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
 
+    var unnest_in_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') LIMIT 10;\"}",
+    });
+    defer unnest_in_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_in_resp.status);
+    try std.testing.expectEqualStrings("application/json", unnest_in_resp.content_type.?);
+
+    var unnest_in_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_in_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_in_parsed.deinit();
+    try std.testing.expectEqualStrings("read", unnest_in_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", unnest_in_parsed.value.object.get("statement_kind").?.string);
+    const unnest_in_result = unnest_in_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), unnest_in_result.get("total").?.integer);
+    const unnest_in_rows = unnest_in_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), unnest_in_rows.len);
+    try std.testing.expectEqualStrings("doc:a", unnest_in_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_in_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", unnest_in_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", unnest_in_rows[1].object.get("tag").?.string);
+
     var indexed_unnest_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -32859,6 +32937,16 @@ test "api http server executes document SQL reads through typed document plan in
     try std.testing.expectEqual(@as(u16, 400), array_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, array_resp.body, "plan", "invalid_sql_request", "document_sql_array_requires_unnest", 0, 0);
 
+    var unsupported_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag, label FROM docs AS d, UNNEST(d.tags) AS tag, UNNEST(d.labels) AS label LIMIT 10;\"}",
+    });
+    defer unsupported_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), unsupported_unnest_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, unsupported_unnest_resp.body, "plan", "invalid_sql_request", "document_sql_unnest_unsupported", 0, 0);
+
     var join_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -32898,6 +32986,36 @@ test "api http server executes document SQL reads through typed document plan in
     defer locking_tail_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
     try expectPublicSqlDiagnosticBody(alloc, locking_tail_resp.body, "plan", "invalid_sql_request", "document_sql_locking_unsupported", 0, 0);
+
+    var window_tail_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WINDOW w AS () LIMIT 10;\"}",
+    });
+    defer window_tail_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), window_tail_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, window_tail_resp.body, "plan", "invalid_sql_request", "document_sql_window_unsupported", 0, 0);
+
+    var aggregate_unsupported_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs HAVING count(*) > 0;\"}",
+    });
+    defer aggregate_unsupported_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), aggregate_unsupported_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, aggregate_unsupported_resp.body, "plan", "invalid_sql_request", "document_sql_aggregate_unsupported", 0, 0);
+
+    var aggregate_filter_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT count(*) FILTER (WHERE status = 'active') AS row_count FROM docs GROUP BY status LIMIT 10;\"}",
+    });
+    defer aggregate_filter_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), aggregate_filter_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, aggregate_filter_resp.body, "plan", "invalid_sql_request", "document_sql_aggregate_unsupported", 0, 0);
 
     var native_search_predicate_resp = try server.handle(.{
         .method = .POST,

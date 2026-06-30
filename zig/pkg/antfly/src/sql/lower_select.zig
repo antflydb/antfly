@@ -809,7 +809,11 @@ fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
     virtual_schema: source_binding.DocumentSqlSchema,
     capabilities: source_binding.DocumentSqlCapabilities,
 ) !LoweredReadPlan {
-    return switch (parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape) {
+    const read_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse
+        parsed_sql.generatedReadStatementKind() orelse
+        parsed_sql.readStatementKind() orelse
+        return error.UnsupportedSqlShape;
+    return switch (read_kind) {
         .aggregate => .{
             .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
@@ -844,7 +848,8 @@ fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
                 .document_query = document_query,
             };
         },
-        else => error.UnsupportedSqlShape,
+        .window => error.DocumentSqlWindowUnsupported,
+        .set_operation, .recursive_cte => error.DocumentSqlUnsupportedJoin,
     };
 }
 

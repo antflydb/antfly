@@ -272,7 +272,7 @@ fn childRangeResponsesAlloc(alloc: std.mem.Allocator, child_ranges: []const db_m
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
     return handleImpl(ctx, req, path, query) catch |err| switch (err) {
-        error.NotLeader, error.LeaderUnavailable, error.ReadUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
+        error.NotLeader, error.LeaderUnavailable, error.ReadUnavailable, error.WriteUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "leader unavailable"),
         else => return err,
     };
 }
@@ -1004,6 +1004,7 @@ test "internal group read routes expose relational rows source group local" {
             if (topology_epoch == 76) return error.NotLeader;
             if (topology_epoch == 77) return error.LeaderUnavailable;
             if (topology_epoch == 78) return error.ReadUnavailable;
+            if (topology_epoch == 79) return error.WriteUnavailable;
             if (system_time) |selector| {
                 if (selector.sequence == 13) return error.SystemVersionedHistoryPruned;
                 try std.testing.expectEqual(@as(u64, 7), selector.sequence.?);
@@ -1080,6 +1081,7 @@ test "internal group read routes expose relational rows source group local" {
         .{ .topology_epoch = 76 },
         .{ .topology_epoch = 77 },
         .{ .topology_epoch = 78 },
+        .{ .topology_epoch = 79 },
     };
     for (unavailable_cases) |case| {
         const body = try std.fmt.allocPrint(

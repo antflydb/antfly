@@ -539,6 +539,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
+                .generated_read_ast = ptr.generated_read_ast,
             };
         }
 

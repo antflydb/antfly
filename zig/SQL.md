@@ -541,10 +541,13 @@ typed row plans.
 
 ## Document Table SQL
 
-Today the executable SQL read/write path is relational-only: SQL lowerers
-require `storage_mode = relational` and a declared primary key before they
-produce typed row plans. Non-relational document tables continue to use the
-native document, query, lookup, index, retrieval, and serverless segment APIs.
+Today the executable SQL path has two source families. Relational tables still
+lower through typed row plans and require `storage_mode = relational` plus a
+declared primary key before row writes or row reads are planned. Document tables
+now have a separate read-only SQL source family for selected document-table
+queries, while document SQL writes remain unsupported and native document,
+query, lookup, index, retrieval, and serverless segment APIs remain the
+authoritative document storage interfaces.
 
 The long-term shape should let SQL read document tables without turning
 document tables into relational tables. The adapter needs a separate
@@ -562,8 +565,8 @@ https://www.mongodb.com/docs/sql-interface/.
 
 ### Source Binding
 
-The planner should introduce an explicit source-binding layer after parse and
-before semantic lowering:
+The planner uses an explicit source-binding layer after parse and before
+semantic lowering:
 
 ```zig
 const SqlSourceBinding = union(enum) {
@@ -596,10 +599,11 @@ SQL comparison type semantics only; it is not a managed scalar index family and
 does not prove readiness. A declared or typed document field is not enough to
 prove native scalar-filter capability unless the binding can identify a
 compatible ready producer. `src/sql/document_plan.zig` defines the document
-read-plan family for `_id` lookup, indexed document query producers, and
-explicitly bounded scans. Public SQL execution can route simple document reads
-through the document plan family, and later lowerers no longer need to invent
-this source-family boundary.
+read-plan family for `_id` lookup, indexed document query producers,
+explicitly bounded scans, single-field `UNNEST`, and narrow aggregate plans.
+Public SQL execution can route supported document reads and aggregates through
+the document plan family, and later lowerers no longer need to invent this
+source-family boundary.
 
 Those capability bits are an access-path inventory, not the SQL language
 definition. Full-text/default document query producers, future physical
@@ -669,6 +673,37 @@ WHERE metadata->>'status' = 'active'
 LIMIT 10;
 ```
 
+PostgreSQL-style JSON path functions are accepted for the same exact document
+path subset as the JSON arrow operators. For example,
+`jsonb_extract_path_text(metadata, 'billing', 'plan')` lowers to the same path
+as `metadata#>>'{billing,plan}'`, and uses the same typed-path proof,
+producer-readiness, bounded-scan, projection, ordering, and aggregate rules.
+`CAST(path_expression AS numeric|text|boolean|datetime)` is admitted only when
+the resolved document field, declared path, or `typed_paths` metadata already
+proves that target type. The cast is therefore a SQL-facing type assertion over
+the same native path, not an instruction to coerce arbitrary JSON values during
+index lookup or bounded residual evaluation.
+ASCII `lower(path_expression) = 'literal'` and
+`upper(path_expression) = 'literal'` predicates are admitted as residual-only
+text helpers over `keyword`, `text`, and `search_as_you_type` document fields.
+They can run after an `_id` lookup, after a bounded native candidate producer,
+or inside a policy-bounded scan; they do not satisfy scalar index readiness by
+themselves. Non-ASCII literals or row values fail closed until the document
+residual evaluator has a full Unicode case-folding contract.
+`date_utc(datetime_path_expression) <op> 'YYYY-MM-DD'` is admitted over proven
+datetime document fields and lowers to exact UTC day-boundary `date_range`
+filters. Equality maps to `[day_start, next_day_start)`, ordered comparisons use
+the same UTC day edges, invalid calendar dates fail closed, and no local
+timezone conversion is inferred.
+`abs(numeric_path_expression) <op> non_negative_number` is admitted as a
+residual-only numeric helper over proven numeric document fields for equality,
+inequality, and range comparisons. Negative helper bounds and non-numeric
+fields fail closed instead of approximating SQL numeric function semantics.
+Boolean `path_expression IS TRUE|FALSE|NOT TRUE|NOT FALSE` predicates are
+admitted over proven boolean document fields and lower to exact term or
+negated-term filters. Non-boolean fields fail closed rather than treating JSON
+truthiness as SQL boolean semantics.
+
 The virtual schema should be built from durable Antfly facts in priority order:
 
 1. declared document schema;
@@ -704,7 +739,7 @@ nullable unless a durable schema constraint proves otherwise.
 
 ### Supported Query Shape
 
-The first document SQL milestone should be read-only. SQL writes over schemaless
+The current document SQL milestone is read-only. SQL writes over schemaless
 documents raise durable semantics questions that should not be answered by the
 SQL adapter alone: missing fields, partial update behavior, JSON merge
 semantics, array mutation, generated fields, constraint interaction, trigger
@@ -719,7 +754,7 @@ endpoint maps that to `document_sql_write_unsupported`. That keeps document SQL
 read-only until writes are explicitly lowered through native document write
 semantics rather than relational row batches.
 
-Initial document reads should support:
+The current read-only milestone supports:
 
 - single-table `SELECT` over one document table;
 - `_id`, `_doc`, declared field, and JSON-path projection;
@@ -736,16 +771,20 @@ Initial document reads should support:
 - `LIMIT` with a required bounded-scan policy when there is no selective
   lookup/index predicate;
 - simple `ORDER BY` only when backed by an index, an explicitly bounded result,
-  or a future materialized sidecar.
+  or a future materialized sidecar;
+- narrow `COUNT(*)`, numeric `SUM`/`AVG`/`MIN`/`MAX`, single-field `GROUP BY`,
+  grouped aggregate `ORDER BY`, and simple grouped `HAVING` predicates over the
+  aggregate output or group key;
+- single-field array expansion through `UNNEST(d.array_field) AS item` over an
+  exact or explicitly bounded producer.
 
-The first milestone should reject joins, windows, recursive CTEs, set
+The current milestone rejects joins, windows, recursive CTEs, set
 operations, data-modifying CTEs, `DISTINCT`/explicit `SELECT ALL` modifiers,
 pagination tails beyond the initial `LIMIT` shape, locking tails such as
-`FOR UPDATE`, and broad ordered scans for document tables. Aggregates start with
-narrow `COUNT(*)` shapes and grouped counts only when they lower to an exact
-native aggregate, candidate, algebraic, or bounded-scan plan. Wider aggregate
-families can be added only when they lower to a typed aggregate or
-materialized-sidecar plan with an explicit cost model.
+`FOR UPDATE`, and broad ordered scans for document tables. Wider aggregate
+families, aggregate expressions, multi-key grouping, aggregate `FILTER`
+clauses, and broader `HAVING` expressions can be added only when they lower to
+a typed aggregate or materialized-sidecar plan with an explicit cost model.
 
 Document SQL lowering should push down only behavior that Antfly can execute
 natively:
@@ -1014,6 +1053,19 @@ materialized aggregates, distributed materialization merging, and adaptive
 partial/result execution still fail closed until their producer-specific
 executors are implemented.
 
+Grouped document aggregates can also run SQL-side post-processing for simple
+`ORDER BY` and `HAVING` clauses. `ORDER BY` may reference the aggregate output
+alias or the group key; `HAVING` may compare the aggregate output alias, the
+matching aggregate expression, or the group key against a scalar literal, and
+may combine those exact comparisons with top-level `AND`. Table or
+alias-qualified group-key references such as `d.status` are accepted in
+`GROUP BY`, `HAVING`, and grouped aggregate `ORDER BY`; qualified aggregate
+aliases such as `d.row_count` are rejected because aggregate outputs are not
+source columns. Materialized aggregate execution disables producer-side `LIMIT`
+whenever `HAVING` or grouped aggregate `ORDER BY` needs SQL-side
+post-processing, so rows are filtered and sorted before the SQL `LIMIT` is
+applied.
+
 Read execution now also has a policy-gated bounded residual scan path for simple
 scalar document predicates. If a predicate cannot use a ready document query,
 full-text, scalar, or `_id` producer but the catalog binding supplies a
@@ -1055,6 +1107,21 @@ or `_id = ...` lookup, after a bounded full-text candidate query, or after a
 bounded scalar/path candidate query, or after a limit-governed scan. It should
 not become a hidden table scan path.
 
+Current residual predicate coverage is deliberately the same structured JSON
+subset used by document SQL planning rather than arbitrary SQL expressions:
+
+| Residual predicate family | Current status |
+| --- | --- |
+| `match_all` / `match_none` | exact residual evaluation |
+| `conjuncts` / `disjuncts` and `bool` must/filter/should/must_not | exact boolean composition |
+| `exists`, `term`, `terms` | exact JSON-value comparison over projected paths |
+| `prefix`, `wildcard`, `term_range` | exact bytewise string evaluation |
+| `numeric_range` | exact JSON numeric comparison using the document SQL numeric parser |
+| `numeric_abs_range` | exact absolute-value comparison for proven numeric paths and non-negative bounds |
+| `date_range` | exact string range evaluation for date/datetime values already represented in comparable form |
+| `text_lower_term`, `text_upper_term` | exact ASCII `lower(path) = literal` / `upper(path) = literal`; non-ASCII input fails closed |
+| any other operator or expression helper | unsupported until a native producer or exact bounded residual evaluator exists |
+
 Arrays must be explicit. Document tables should not pretend nested arrays are
 ordinary scalar columns. The SQL surface should require `UNNEST` or an
 Antfly-named equivalent for array expansion:
@@ -1073,11 +1140,13 @@ fields as JSON values, but scalar predicates over array paths fail closed with
 `DocumentSqlArrayRequiresUnnest`. `UNNEST(d.array_field) AS item` is the first
 explicit array-expansion shape: it expands a single declared array field over an
 `_id` lookup, a bounded native document-query candidate producer, or a
-policy-bounded scan producer; can apply an equality predicate on the unnest
-alias; projects the expanded item as a SQL row value; and supports bounded
-`ORDER BY` over either the unnest alias or a document field before applying
-`LIMIT`. Broader array operators, nested unnests, and true indexed
-array-element producers remain future work.
+policy-bounded scan producer; can apply equality and `IN` predicates on the
+unnest alias; projects the expanded item as a SQL row value; and supports
+bounded `ORDER BY` over either the unnest alias or a document field before
+applying `LIMIT`. Multiple `UNNEST` sources, nested `UNNEST`, and
+multi-argument `UNNEST` fail closed with `DocumentSqlUnnestUnsupported`.
+Broader array operators and true indexed array-element producers remain future
+work.
 
 ### Execution Contract
 
@@ -1146,7 +1215,15 @@ native capability. Examples:
 
 - `document_sql_requires_bounded_scan` for an unindexed predicate without an
   explicit bounded scan policy;
+- `document_sql_bounded_scan_row_cap_exceeded` when execution cannot prove a
+  complete result inside the bounded row budget;
+- `document_sql_bounded_scan_byte_cap_exceeded` when the bounded scan payload
+  exceeds the configured byte budget before exact residual evaluation can
+  complete;
 - `document_sql_array_requires_unnest` for scalar treatment of an array path;
+- `document_sql_unnest_unsupported` for multiple, nested, or multi-argument
+  document-table `UNNEST` shapes outside the current single-array expansion
+  contract;
 - `document_sql_unsupported_join` until there is a cross-source join plan;
 - `document_sql_native_search_requires_table_function` when ranked native
   search functions such as `antfly.semantic_search`, `antfly.hybrid_search`, or
@@ -1155,6 +1232,8 @@ native capability. Examples:
 - `document_sql_projection_modifier_unsupported` for document-table
   `DISTINCT`, `DISTINCT ON`, or explicit `SELECT ALL` until those shapes lower
   to exact aggregate/materialized plans;
+- `document_sql_aggregate_unsupported` for aggregate shapes outside the current
+  exact document aggregate subset;
 - `document_sql_pagination_unsupported` for `OFFSET`/`FETCH` tails until
   cursor-backed document pagination has a bounded native plan;
 - `document_sql_locking_unsupported` and `document_sql_window_unsupported` for
@@ -1187,25 +1266,35 @@ and lake bindings. It lets Antfly share parser, session, auth, response, and
 expression infrastructure while keeping storage-specific execution efficient
 and auditable.
 
-Implementation should be scaffolded in small steps:
+Implementation should continue in small steps. Completed/current pieces include:
 
 1. Route current relational SQL binder entrypoints through `SqlSourceBinding`
    without behavior change.
-2. Expand document virtual-schema construction from declared document schemas
-   and `_id` / `_doc`.
-3. Finish document read lowering for `_id` lookup, projection, `LIMIT`, and simple
-   scalar field predicates.
-4. Add JSON-path expression nodes shared with relational `json` / `jsonb`
-   columns.
-5. Add explicit bounded-scan and residual-filter limits.
-6. Add initial array expansion through single-field `UNNEST`.
-7. Add full-text, semantic, vector, hybrid, graph, graph-metric, and rerank SQL
-   functions that lower to native derived-index plans.
-8. Add optional SQL view definitions as stable document-to-SQL schema mappings.
-9. Add e2e parity showing SQL document reads and native document query APIs
-   reach the same storage/query path.
-10. Consider explicit document writes only after the read path, authorization,
-    row filters, and audit semantics are shared with native document writes.
+2. Build document virtual-schema mappings from declared document schemas,
+   `_id`, `_doc`, typed paths, and virtual field metadata.
+3. Lower document reads for `_id` lookup, projection, `LIMIT`, qualified names,
+   scalar field predicates, JSON-path predicates/projections, and full-text
+   predicates.
+4. Enforce explicit bounded-scan and residual-filter limits.
+5. Add initial array expansion through single-field `UNNEST`.
+6. Lower and execute narrow document aggregates, including grouped aggregate
+   `ORDER BY` and simple grouped `HAVING`.
+
+Remaining large pieces are:
+
+1. Add broader document query shapes, including more expression forms, broader
+   array expansion, multi-key grouping, aggregate `FILTER`, and richer
+   `HAVING`.
+2. Add full native derived-index parity for semantic, vector, hybrid, graph,
+   graph-metric, and rerank SQL functions where the corresponding native
+   producer can prove exact semantics.
+3. Add optional SQL view definitions as stable document-to-SQL schema mappings.
+4. Add e2e parity showing SQL document reads and native document query APIs
+   reach the same storage/query path for each supported producer.
+5. Tighten exact residual and bounded-scan diagnostics as more producers and
+   query shapes are admitted.
+6. Consider explicit document writes only after the read path, authorization,
+   row filters, and audit semantics are shared with native document writes.
 
 ## Expressions
 
