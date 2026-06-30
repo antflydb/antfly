@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const byte_copy = @import("common/byte_copy.zig");
 const platform_time = @import("platform/time.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
@@ -907,7 +908,7 @@ pub const MemorySegmentSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *MemorySegmentSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.alloc, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.alloc, bytes);
     }
 
     fn appendByte(ptr: *anyopaque, byte: u8) !void {
@@ -923,7 +924,7 @@ pub const MemorySegmentSink = struct {
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *MemorySegmentSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidSegment;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {

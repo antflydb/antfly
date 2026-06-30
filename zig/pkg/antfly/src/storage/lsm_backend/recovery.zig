@@ -42,6 +42,25 @@ fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) v
     if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
 }
 
+fn cleanupRecoveredRunFiles(comptime BackendType: type, backend: *BackendType, stage: []const u8, before_wal_replay: bool) void {
+    if (!@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) return;
+
+    const phase_start = beginOpenPhase(BackendType, backend, .cleaning_recovered_run_temps);
+    defer finishOpenPhase(BackendType, backend, .cleaning_recovered_run_temps, phase_start);
+
+    const stats = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+        std.log.warn("lsm backend open skipped recovered run cleanup root={?s} stage={s} err={}", .{ backend.root_dir, stage, err });
+        return;
+    };
+    if (@hasDecl(BackendType, "recordRecoveredRunFileCleanup")) backend.recordRecoveredRunFileCleanup(stats, before_wal_replay);
+    if (stats.files_deleted > 0) {
+        std.log.warn(
+            "lsm backend open recovered run cleanup complete root={s} stage={s} files_deleted={d} bytes_deleted={d}",
+            .{ backend.root_dir.?, stage, stats.files_deleted, stats.bytes_deleted },
+        );
+    }
+}
+
 fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
     if (@hasDecl(BackendType, "finishOpenSuccess")) backend.finishOpenSuccess();
 }
@@ -103,6 +122,8 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         try backend.prepareWalOperationLockFile();
     }
 
+    cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
+
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
         defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
@@ -161,11 +182,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
     }
-    if (@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) {
-        _ = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
-            std.log.warn("lsm backend open skipped recovered run cleanup root={?s} err={}", .{ backend.root_dir, err });
-        };
-    }
+    cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }

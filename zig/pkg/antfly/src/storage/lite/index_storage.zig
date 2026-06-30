@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const byte_copy = @import("../../common/byte_copy.zig");
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
@@ -263,13 +264,13 @@ const NativeAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {

@@ -406,6 +406,7 @@ pub const Backend = struct {
     pub const OpenPhase = enum {
         idle,
         initializing_storage,
+        cleaning_recovered_run_temps,
         opening_manifest,
         ensuring_dirs,
         replaying_wal,
@@ -421,6 +422,7 @@ pub const Backend = struct {
         failed: u64 = 0,
         total_ns: u64 = 0,
         initializing_storage_ns: u64 = 0,
+        cleaning_recovered_run_temps_ns: u64 = 0,
         opening_manifest_ns: u64 = 0,
         ensuring_dirs_ns: u64 = 0,
         replaying_wal_ns: u64 = 0,
@@ -435,6 +437,10 @@ pub const Backend = struct {
         wal_replay_bytes: u64 = 0,
         wal_replay_ns: u64 = 0,
         wal_replay_truncated_tail_bytes: u64 = 0,
+        recovered_table_temp_files_deleted: u64 = 0,
+        recovered_table_temp_bytes_deleted: u64 = 0,
+        recovered_table_temp_files_deleted_before_replay: u64 = 0,
+        recovered_table_temp_bytes_deleted_before_replay: u64 = 0,
     };
 
     pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
@@ -444,6 +450,7 @@ pub const Backend = struct {
         dst.failed +|= src.failed;
         dst.total_ns +|= src.total_ns;
         dst.initializing_storage_ns +|= src.initializing_storage_ns;
+        dst.cleaning_recovered_run_temps_ns +|= src.cleaning_recovered_run_temps_ns;
         dst.opening_manifest_ns +|= src.opening_manifest_ns;
         dst.ensuring_dirs_ns +|= src.ensuring_dirs_ns;
         dst.replaying_wal_ns +|= src.replaying_wal_ns;
@@ -458,7 +465,20 @@ pub const Backend = struct {
         dst.wal_replay_bytes +|= src.wal_replay_bytes;
         dst.wal_replay_ns +|= src.wal_replay_ns;
         dst.wal_replay_truncated_tail_bytes +|= src.wal_replay_truncated_tail_bytes;
+        dst.recovered_table_temp_files_deleted +|= src.recovered_table_temp_files_deleted;
+        dst.recovered_table_temp_bytes_deleted +|= src.recovered_table_temp_bytes_deleted;
+        dst.recovered_table_temp_files_deleted_before_replay +|= src.recovered_table_temp_files_deleted_before_replay;
+        dst.recovered_table_temp_bytes_deleted_before_replay +|= src.recovered_table_temp_bytes_deleted_before_replay;
     }
+
+    pub const RecoveredRunFileCleanupStats = struct {
+        files_deleted: u64 = 0,
+        bytes_deleted: u64 = 0,
+
+        pub fn cleaned(self: @This()) bool {
+            return self.files_deleted > 0;
+        }
+    };
 
     pub const CompactionStats = struct {
         compactions: usize = 0,
@@ -1350,11 +1370,21 @@ pub const Backend = struct {
         const elapsed = self.openStatsElapsedNs(start_ns);
         switch (phase) {
             .initializing_storage => self.open_stats.initializing_storage_ns +|= elapsed,
+            .cleaning_recovered_run_temps => self.open_stats.cleaning_recovered_run_temps_ns +|= elapsed,
             .opening_manifest => self.open_stats.opening_manifest_ns +|= elapsed,
             .ensuring_dirs => self.open_stats.ensuring_dirs_ns +|= elapsed,
             .replaying_wal => self.open_stats.replaying_wal_ns +|= elapsed,
             .mounting_runs => self.open_stats.mounting_runs_ns +|= elapsed,
             .idle, .ready, .failed => {},
+        }
+    }
+
+    pub fn recordRecoveredRunFileCleanup(self: *Backend, stats: RecoveredRunFileCleanupStats, before_wal_replay: bool) void {
+        self.open_stats.recovered_table_temp_files_deleted +|= stats.files_deleted;
+        self.open_stats.recovered_table_temp_bytes_deleted +|= stats.bytes_deleted;
+        if (before_wal_replay) {
+            self.open_stats.recovered_table_temp_files_deleted_before_replay +|= stats.files_deleted;
+            self.open_stats.recovered_table_temp_bytes_deleted_before_replay +|= stats.bytes_deleted;
         }
     }
 
@@ -4219,6 +4249,16 @@ pub const Backend = struct {
         return std.fmt.parseUnsigned(u64, stem, 10) catch null;
     }
 
+    fn parseRunIdFromRecoveredTableTempFileName(name: []const u8) ?u64 {
+        const marker = ".tbl.tmp-";
+        const marker_index = std.mem.indexOf(u8, name, marker) orelse return null;
+        if (marker_index == 0) return null;
+        const nonce = name[marker_index + marker.len ..];
+        if (nonce.len == 0) return null;
+        _ = std.fmt.parseUnsigned(u64, nonce, 10) catch return null;
+        return std.fmt.parseUnsigned(u64, name[0..marker_index], 10) catch null;
+    }
+
     fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
         for (self.runs.items) |run| {
             if (run.id == run_id) return true;
@@ -4243,9 +4283,40 @@ pub const Backend = struct {
         return false;
     }
 
-    pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !bool {
-        _ = self;
-        return false;
+    pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !RecoveredRunFileCleanupStats {
+        const root_dir = self.root_dir orelse return .{};
+        if (self.storage == null or self.options.backend.read_only) return .{};
+        if (!std.fs.path.isAbsolute(root_dir)) return .{};
+
+        const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
+        defer self.allocator.free(runs_dir);
+
+        var io_impl = std.Io.Threaded.init(self.allocator, .{});
+        defer io_impl.deinit();
+
+        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => return err,
+        };
+        defer dir.close(io_impl.io());
+
+        var stats = RecoveredRunFileCleanupStats{};
+        var it = dir.iterate();
+        while (try it.next(io_impl.io())) |entry| {
+            if (entry.kind != .file) continue;
+            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            defer self.allocator.free(path);
+            const size = self.storage.?.fileSize(path) catch 0;
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            stats.files_deleted += 1;
+            stats.bytes_deleted += size;
+        }
+        return stats;
     }
 
     fn cleanupOrphanedRunFilesForManifest(self: *Backend) !bool {
@@ -11572,6 +11643,97 @@ test "lsm backend close reclaims eligible queued obsolete files" {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
     try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024));
+}
+
+test "lsm backend open removes recovered atomic table temp files" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "recovered-table-temp");
+    defer repository_mod.cleanupTmp(path);
+
+    var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+
+    const root_dir = std.mem.span(path);
+    const runs_dir = try std.fs.path.join(std.testing.allocator, &.{ root_dir, "runs" });
+    defer std.testing.allocator.free(runs_dir);
+    try native.storage().createDirPath(runs_dir);
+
+    const live_run_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "1.tbl" });
+    defer std.testing.allocator.free(live_run_path);
+    const stale_tmp_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "1.tbl.tmp-42" });
+    defer std.testing.allocator.free(stale_tmp_path);
+    const malformed_tmp_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "not-a-run.tbl.tmp-42" });
+    defer std.testing.allocator.free(malformed_tmp_path);
+
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), live_run_path, "live");
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), stale_tmp_path, "stale");
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), malformed_tmp_path, "malformed");
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{});
+    const open_stats = backend.snapshotOpenStats();
+    try std.testing.expectEqual(@as(u64, 1), open_stats.recovered_table_temp_files_deleted);
+    try std.testing.expect(open_stats.recovered_table_temp_bytes_deleted > 0);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.recovered_table_temp_files_deleted_before_replay);
+    try std.testing.expect(open_stats.recovered_table_temp_bytes_deleted_before_replay > 0);
+    try std.testing.expect(open_stats.cleaning_recovered_run_temps_ns > 0);
+    backend.close();
+
+    try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, stale_tmp_path, 1024));
+    const live = try native.storage().readFileAlloc(std.testing.allocator, live_run_path, 1024);
+    defer std.testing.allocator.free(live);
+    try std.testing.expectEqualStrings("live", live);
+    const malformed = try native.storage().readFileAlloc(std.testing.allocator, malformed_tmp_path, 1024);
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectEqualStrings("malformed", malformed);
+}
+
+test "lsm backend cleans recovered table temp files before wal replay" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "recovered-table-temp-before-replay");
+    defer repository_mod.cleanupTmp(path);
+
+    var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+
+    const root_dir = std.mem.span(path);
+    try native.storage().createDirPath(root_dir);
+    const runs_dir = try std.fs.path.join(std.testing.allocator, &.{ root_dir, "runs" });
+    defer std.testing.allocator.free(runs_dir);
+    try native.storage().createDirPath(runs_dir);
+
+    const stale_tmp_path = try std.fs.path.join(std.testing.allocator, &.{ runs_dir, "1.tbl.tmp-42" });
+    defer std.testing.allocator.free(stale_tmp_path);
+    try repository_mod.writeFileAbsoluteWithStorage(native.storage(), stale_tmp_path, "stale");
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    try state.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "alpha", false);
+    _ = try wal_mod.appendStateWithOptions(
+        native.storage(),
+        std.testing.allocator,
+        root_dir,
+        &state,
+        false,
+        .{ .segment_bytes = 512 },
+    );
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .storage = native.storage(),
+    });
+    defer backend.close();
+
+    const open_stats = backend.snapshotOpenStats();
+    try std.testing.expect(open_stats.wal_replay_records > 0);
+    try std.testing.expect(open_stats.wal_replay_entries > 0);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.mutable_entries_after_replay);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.recovered_table_temp_files_deleted);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.recovered_table_temp_files_deleted_before_replay);
+    try std.testing.expect(open_stats.recovered_table_temp_bytes_deleted_before_replay > 0);
+    try std.testing.expect(open_stats.cleaning_recovered_run_temps_ns > 0);
+
+    try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, stale_tmp_path, 1024));
+    try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
 test "lsm repository run readers request cap above 64 MiB" {

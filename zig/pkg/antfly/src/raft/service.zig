@@ -411,6 +411,7 @@ pub const ManagedHttpHostService = struct {
     pending_updates: std.ArrayListUnmanaged(metadata_view.MetadataUpdate) = .empty,
     transition_svc: ?transition_service.TransitionService = null,
     metrics: ManagedServiceMetrics = .{},
+    last_runtime_round: ?raft_engine.runtime.multi_raft.HostRound = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -592,6 +593,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_tick_groups,
             self.cfg.max_ready_groups,
         );
+        self.last_runtime_round = result.runtime;
         try self.enqueueTransitionUpdates(self.pending_updates.items);
         self.metrics.applied_updates += self.pending_updates.items.len;
         self.metrics.sync_rounds += 1;
@@ -608,6 +610,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_tick_groups,
             self.cfg.max_ready_groups,
         );
+        self.last_runtime_round = result.runtime;
         try self.enqueueTransitionUpdates(self.pending_updates.items);
         self.metrics.applied_updates += self.pending_updates.items.len;
         self.metrics.sync_rounds += 1;
@@ -617,7 +620,7 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn runRound(self: *ManagedHttpHostService) !void {
-        _ = try self.host.runRoundBounded(
+        self.last_runtime_round = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
             self.cfg.max_ready_groups,
@@ -627,12 +630,20 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn runRaftRoundOnly(self: *ManagedHttpHostService) !void {
-        _ = try self.host.runRoundBounded(
+        self.last_runtime_round = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
             self.cfg.max_ready_groups,
         );
         self.metrics.sync_rounds += 1;
+    }
+
+    pub fn lastRuntimeRound(self: *const ManagedHttpHostService) ?raft_engine.runtime.multi_raft.HostRound {
+        return self.last_runtime_round;
+    }
+
+    pub fn raftStatus(self: *ManagedHttpHostService, group_id: u64) ?raft_engine.core.Status {
+        return self.host.http_host.raftStatus(group_id);
     }
 
     pub fn stepTransitions(self: *ManagedHttpHostService) !transition_service.TransitionStepResult {

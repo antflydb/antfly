@@ -2465,6 +2465,8 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.lsm_open_total_ns);
     try out.appendSlice(alloc, ",\"lsm_open_initializing_storage_ns\":");
     try appendIntValue(alloc, out, stats.lsm_open_initializing_storage_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_cleanup_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_cleanup_ns);
     try out.appendSlice(alloc, ",\"lsm_open_manifest_ns\":");
     try appendIntValue(alloc, out, stats.lsm_open_manifest_ns);
     try out.appendSlice(alloc, ",\"lsm_open_ensuring_dirs_ns\":");
@@ -2481,6 +2483,10 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.lsm_open_mutable_entries_after_replay);
     try out.appendSlice(alloc, ",\"lsm_open_immutable_memtables_after_replay\":");
     try appendIntValue(alloc, out, stats.lsm_open_immutable_memtables_after_replay);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_files_deleted\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_files_deleted);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_bytes_deleted\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_bytes_deleted);
     try out.appendSlice(alloc, ",\"wal_replay_records\":");
     try appendIntValue(alloc, out, stats.wal_replay_records);
     try out.appendSlice(alloc, ",\"wal_replay_entries\":");
@@ -2951,8 +2957,11 @@ test "index encoders expose local shard runtime status" {
                     .wal_replay_retained_bytes = 44,
                     .wal_replay_current_segment = 6,
                     .lsm_open_stores = 2,
+                    .lsm_open_recovered_temp_cleanup_ns = 77,
                     .lsm_open_wal_replay_ns = 123,
                     .lsm_open_loaded_runs = 6,
+                    .lsm_open_recovered_temp_files_deleted = 4,
+                    .lsm_open_recovered_temp_bytes_deleted = 2048,
                     .wal_replay_bytes = 456,
                     .wal_replay_truncated_tail_bytes = 7,
                 },
@@ -3016,8 +3025,11 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_bytes\":44") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_cleanup_ns\":77") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_files_deleted\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_bytes_deleted\":2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_truncated_tail_bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);

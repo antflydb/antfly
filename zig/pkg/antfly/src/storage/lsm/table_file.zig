@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const bloom = @import("bloom");
+const byte_copy = @import("../../common/byte_copy.zig");
 const snappy = @import("../../encoding/snappy.zig");
 
 pub const magic = "ALSMTBL2";
@@ -697,7 +698,7 @@ pub const MemoryTableSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *MemoryTableSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn appendByte(ptr: *anyopaque, byte: u8) !void {
@@ -708,7 +709,7 @@ pub const MemoryTableSink = struct {
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *MemoryTableSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidTableFile;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 };
 
@@ -718,6 +719,19 @@ const memory_table_sink_vtable = TableSink.VTable{
     .append_byte = MemoryTableSink.appendByte,
     .write_at = MemoryTableSink.writeAt,
 };
+
+test "memory table sink supports overlapping writes and appends" {
+    var sink_impl = MemoryTableSink.init(std.testing.allocator);
+    defer sink_impl.deinit();
+    var sink = sink_impl.sink();
+
+    try sink.appendSlice("abcdef");
+    try sink.writeAt(2, sink_impl.out.items[0..4]);
+    try std.testing.expectEqualStrings("ababcd", sink_impl.out.items);
+
+    try sink.appendSlice(sink_impl.out.items[1..5]);
+    try std.testing.expectEqualStrings("ababcdbabc", sink_impl.out.items);
+}
 
 pub fn encodeAlloc(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
     var filter = try buildFilterAlloc(allocator, entries, default_filter_config);
