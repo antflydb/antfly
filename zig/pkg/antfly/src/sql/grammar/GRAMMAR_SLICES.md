@@ -4,11 +4,19 @@ Ordered largest first. Check a slice only when the implementation, diagnostics,
 and verification evidence are all in place.
 
 - [ ] Full generated read-plan lowering cutover
-  - [ ] Replace remaining typed-token query-body parsing with generated AST payloads for projection expressions, predicates, grouping, ordering, pagination, row locks, and result tails.
+  - [x] Replace remaining typed-token query-body parsing with generated AST payloads for projection expressions, predicates, grouping, ordering, pagination, row locks, and result tails.
+    - [x] Add fail-closed simple, aggregate, and window read coverage for corrupted retained generated `OFFSET` expression payloads.
+    - [x] Add fail-closed CTE body read coverage for corrupted retained generated `OFFSET` expression payloads.
+    - [x] Add fail-closed CTE body read coverage for corrupted retained generated counted `FETCH` expression payloads.
+    - [x] Add lowerer fail-closed coverage for corrupted retained generated CTE body row-lock payloads.
+    - [x] Parse simple and CTE-final set-operation operators from retained generated result-tail metadata instead of reparsing the token operator.
+    - [x] Require retained generated pagination and row-lock metadata in generated-backed lowering paths instead of falling back to typed clause parsing.
   - [ ] Lower aggregates directly from generated aggregate/function/list payloads instead of using range-validated token reparsing.
   - [ ] Lower window reads from generated inline and named-window payloads, including frame semantics beyond exact range validation.
-  - [ ] Build native generated recursive CTE plans from retained generated CTE/member payloads instead of relying on typed recursive body parsing.
-  - [ ] Carry complete per-CTE body AST arrays through generated validation, binding, and lowering.
+    - [x] Validate retained generated child expression payloads for bounded inline and named window frame offsets before typed frame acceptance.
+  - [x] Build native generated recursive CTE plans from retained generated CTE/member payloads instead of relying on typed recursive body parsing.
+  - [x] Carry complete per-CTE body AST arrays through generated validation, binding, and lowering.
+    - [x] Pass the exact non-recursive generated CTE item into body lowering and clone/rebase its retained body AST arrays before typed body parsing.
   - [ ] Add parity and fail-closed regression coverage for each read family after direct generated lowering.
 
 - [ ] Full generated DML semantic lowering cutover

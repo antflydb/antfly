@@ -6560,6 +6560,22 @@ fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u
     return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
+fn expectSingleNativeQueryHitId(alloc: std.mem.Allocator, body: []const u8, expected_id: []const u8) !void {
+    var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
+    const hits = parsed.value.responses.?[0].hits.?.hits.?;
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqualStrings(expected_id, hits[0]._id);
+}
+
+fn expectNativeQueryTotal(alloc: std.mem.Allocator, body: []const u8, expected_total: i64) !void {
+    var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
+    try std.testing.expectEqual(expected_total, parsed.value.responses.?[0].hits.?.total.?);
+}
+
 fn parseNdjsonTestRowsAlloc(comptime T: type, alloc: std.mem.Allocator, ndjson: []const u8) ![]T {
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, ndjson, '\n');
@@ -7003,11 +7019,23 @@ test "provisioned table read source composes local system-time as-of with cte pl
     const row_2_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, versioned_schema, "{\"id\":\"row:2\"}");
     defer alloc.free(row_2_key);
     try db.applyTableSchemaJson(alloc, versioned_schema_json, .{});
-    try db.batch(.{ .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"first\"}" }} });
-    try db.batch(.{ .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"second\"}" }} });
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"first\"}" }},
+        .timestamp_ns = 10_000,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"second\"}" }},
+        .timestamp_ns = 20_000,
+    });
     try db_2.applyTableSchemaJson(alloc, versioned_schema_json, .{});
-    try db_2.batch(.{ .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"group-two-first\"}" }} });
-    try db_2.batch(.{ .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"group-two-second\"}" }} });
+    try db_2.batch(.{
+        .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"group-two-first\"}" }},
+        .timestamp_ns = 10_000,
+    });
+    try db_2.batch(.{
+        .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"group-two-second\"}" }},
+        .timestamp_ns = 20_000,
+    });
 
     const history = try db.scanSystemVersionedHistoryForDocKeyAlloc(alloc, "row:1");
     defer db_mod.docstore.DocStore.freeResults(alloc, history);
@@ -7126,11 +7154,11 @@ test "provisioned table read source composes local system-time as-of with cte pl
     const group_two_predicates = [_]storage_schema.RelationalCheck{
         .{ .name = "", .field = "name", .op = .eq, .value_json = "\"group-two-first\"" },
     };
-    var multi_range_result = (try source.source().rowsQueryPlanSystemTimeAsOfSequence(
+    var multi_range_result = (try source.source().rowsQueryPlanSystemTimeAsOfTimestampNs(
         alloc,
         "docs",
         versioned_schema,
-        commit_sequence,
+        10_000,
         .{
             .query = .{
                 .predicates = group_two_predicates[0..],
@@ -7932,6 +7960,11 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
 
     var catalog = FakeCatalog{};
     var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    const NativeTitleScanRow = struct {
+        key: []const u8,
+        version: u64,
+        title: []const u8,
+    };
 
     var lookup_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
@@ -7984,6 +8017,80 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
         else => return error.TestUnexpectedResult,
     }
+    var native_lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
+    defer native_lookup.deinit(alloc);
+    const expected_lookup_parity = try std.fmt.allocPrint(alloc, "{{\"_id\":\"doc:a\",\"_doc\":{s}}}", .{native_lookup.json});
+    defer alloc.free(expected_lookup_parity);
+    switch (doc_projection_result) {
+        .document_query => |query| try std.testing.expectEqualStrings(expected_lookup_parity, query.rows[0]),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var scalar_filter_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id FROM docs WHERE key = 'document-key-field' LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer scalar_filter_plan.deinit(alloc);
+    var scalar_filter_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        scalar_filter_plan,
+        .read_index,
+    )).?;
+    defer scalar_filter_result.deinit(alloc);
+    switch (scalar_filter_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\"}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var native_scalar_filter = (try source.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"field\":\"key\",\"term\":\"document-key-field\"}}",
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_scalar_filter.deinit(alloc);
+    try expectSingleNativeQueryHitId(alloc, native_scalar_filter.json, "doc:a");
+
+    var json_path_filter_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id FROM docs WHERE metadata#>>'{billing,plan}' = 'pro' LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer json_path_filter_plan.deinit(alloc);
+    var json_path_filter_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        json_path_filter_plan,
+        .read_index,
+    )).?;
+    defer json_path_filter_result.deinit(alloc);
+    switch (json_path_filter_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\"}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var native_json_path_filter = (try source.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"metadata.billing.plan\":\"pro\"}}",
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_json_path_filter.deinit(alloc);
+    try expectSingleNativeQueryHitId(alloc, native_json_path_filter.json, "doc:a");
 
     var scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
@@ -8011,6 +8118,20 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
         else => return error.TestUnexpectedResult,
     }
+    var native_scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .limit = 2,
+    }, .read_index)).?;
+    defer native_scan.deinit(alloc);
+    const native_scan_rows = try parseNdjsonTestRowsAlloc(NativeTitleScanRow, alloc, native_scan.ndjson);
+    defer alloc.free(native_scan_rows);
+    try std.testing.expectEqual(@as(usize, 2), native_scan_rows.len);
+    try std.testing.expectEqualStrings("doc:a", native_scan_rows[0].key);
+    try std.testing.expectEqualStrings("alpha", native_scan_rows[0].title);
+    try std.testing.expectEqualStrings("doc:b", native_scan_rows[1].key);
+    try std.testing.expectEqualStrings("beta", native_scan_rows[1].title);
 
     var star_scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
@@ -8213,6 +8334,38 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
+    var full_text_parity_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id, title FROM docs WHERE full_text_search('title:beta') LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer full_text_parity_plan.deinit(alloc);
+    var full_text_parity_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        full_text_parity_plan,
+        .read_index,
+    )).?;
+    defer full_text_parity_result.deinit(alloc);
+    switch (full_text_parity_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var native_full_text = (try source.source().query(alloc, "docs", .{
+        .query = .{ .match = .{ .field = "title", .text = "beta" } },
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_full_text.deinit(alloc);
+    try expectSingleNativeQueryHitId(alloc, native_full_text.json, "doc:b");
+
     var ordered_full_text_sql = try sql_adapter.ParsedSql.initAlloc(
         alloc,
         "SELECT _id, key FROM docs WHERE full_text_search('title:alpha') ORDER BY key DESC LIMIT 2",
@@ -8299,6 +8452,32 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
         else => return error.TestUnexpectedResult,
     }
+    var native_residual_scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_residual_scan.deinit(alloc);
+    const native_residual_rows = try parseNdjsonTestRowsAlloc(NativeTitleScanRow, alloc, native_residual_scan.ndjson);
+    defer alloc.free(native_residual_rows);
+    var native_residual_matches: usize = 0;
+    for (native_residual_rows) |row| {
+        if (!std.mem.startsWith(u8, row.title, "alp")) continue;
+        switch (native_residual_matches) {
+            0 => {
+                try std.testing.expectEqualStrings("doc:a", row.key);
+                try std.testing.expectEqualStrings("alpha", row.title);
+            },
+            1 => {
+                try std.testing.expectEqualStrings("doc:c", row.key);
+                try std.testing.expectEqualStrings("alpha", row.title);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        native_residual_matches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), native_residual_matches);
 
     var full_text_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
@@ -8325,6 +8504,12 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
         else => return error.TestUnexpectedResult,
     }
+    var native_full_text_alpha = (try source.source().query(alloc, "docs", .{
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_full_text_alpha.deinit(alloc);
+    try expectNativeQueryTotal(alloc, native_full_text_alpha.json, 2);
 
     var full_text_grouped_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
@@ -8353,6 +8538,51 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
+    var full_text_grouped_having_order_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+        alloc,
+        "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha') GROUP BY key HAVING row_count = 1 ORDER BY key ASC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer full_text_grouped_having_order_plan.deinit(alloc);
+    var full_text_grouped_having_order_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        full_text_grouped_having_order_plan,
+        .read_index,
+    )).?;
+    defer full_text_grouped_having_order_result.deinit(alloc);
+    switch (full_text_grouped_having_order_result) {
+        .aggregate => |aggregate| {
+            try std.testing.expectEqual(@as(u32, 2), aggregate.total_groups);
+            try std.testing.expectEqual(@as(usize, 2), aggregate.rows.len);
+            try std.testing.expectEqualStrings("{\"key\":\"document-key-field\",\"row_count\":1}", aggregate.rows[0]);
+            try std.testing.expectEqualStrings("{\"key\":\"second-key\",\"row_count\":1}", aggregate.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    {
+        var parsed_native_alpha = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, native_full_text_alpha.json);
+        defer parsed_native_alpha.deinit();
+        const hits = parsed_native_alpha.value.responses.?[0].hits.?.hits.?;
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        try std.testing.expectEqualStrings("doc:a", hits[0]._id);
+        try std.testing.expectEqualStrings("doc:c", hits[1]._id);
+        var native_alpha_a = (try source.source().lookup(alloc, "docs", hits[0]._id, .{}, .read_index)).?;
+        defer native_alpha_a.deinit(alloc);
+        var native_alpha_c = (try source.source().lookup(alloc, "docs", hits[1]._id, .{}, .read_index)).?;
+        defer native_alpha_c.deinit(alloc);
+        var parsed_alpha_a = try parseJsonTestBody(std.json.Value, alloc, native_alpha_a.json);
+        defer parsed_alpha_a.deinit();
+        var parsed_alpha_c = try parseJsonTestBody(std.json.Value, alloc, native_alpha_c.json);
+        defer parsed_alpha_c.deinit();
+        try std.testing.expectEqualStrings("document-key-field", parsed_alpha_a.value.object.get("key").?.string);
+        try std.testing.expectEqualStrings("second-key", parsed_alpha_c.value.object.get("key").?.string);
+    }
+
     var scalar_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE key = 'document-key-field'",
@@ -8378,6 +8608,130 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         },
         else => return error.TestUnexpectedResult,
     }
+    try expectNativeQueryTotal(alloc, native_scalar_filter.json, 1);
+}
+
+test "api.table_reads.docid lowered document sql unnest read plan matches native scan expansion" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-document-sql-unnest-parity";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"tags\":[\"normal\"]}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"tags\":[\"urgent\"]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = FakeCatalog{};
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10",
+    );
+    defer parsed_sql.deinit(alloc);
+    var document_plan = try sql_adapter.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        .{ .max_rows = 10 },
+    );
+    defer document_plan.deinit(alloc);
+    const plan = sql_adapter.LoweredReadPlan{ .document_query = document_plan };
+
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        plan,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+    switch (result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 2), query.total);
+            try std.testing.expectEqual(@as(usize, 2), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"tag\":\"urgent\"}", query.rows[0]);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:c\",\"tag\":\"urgent\"}", query.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var native_scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{"tags"},
+        .include_all_fields = false,
+        .limit = 10,
+    }, .read_index)).?;
+    defer native_scan.deinit(alloc);
+
+    var urgent_matches: usize = 0;
+    var lines = std.mem.splitScalar(u8, native_scan.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try parseJsonTestBody(std.json.Value, alloc, line);
+        defer parsed.deinit();
+        const key = parsed.value.object.get("key").?.string;
+        const tags = parsed.value.object.get("tags").?.array.items;
+        for (tags) |tag| {
+            if (tag != .string or !std.mem.eql(u8, tag.string, "urgent")) continue;
+            switch (urgent_matches) {
+                0 => try std.testing.expectEqualStrings("doc:a", key),
+                1 => try std.testing.expectEqualStrings("doc:c", key),
+                else => return error.TestUnexpectedResult,
+            }
+            urgent_matches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), urgent_matches);
 }
 
 test "api.table_reads.docid document sql catalog read producers treat catalog misses as terminal" {

@@ -88,11 +88,11 @@ SQL/API parity coverage.
         longer satisfies the view contract.
 
 - [ ] **Document SQL/native e2e parity**
-  - [ ] Prove `_id` lookup parity.
-  - [ ] Prove scalar filter and JSON-path predicate parity.
-  - [ ] Prove full-text producer parity.
-  - [ ] Prove bounded-scan and residual-filter parity.
-  - [ ] Prove aggregate, aggregate `ORDER BY`, `HAVING`, and `UNNEST` parity.
+  - [x] Prove `_id` lookup parity.
+  - [x] Prove scalar filter and JSON-path predicate parity.
+  - [x] Prove full-text producer parity.
+  - [x] Prove bounded-scan and residual-filter parity.
+  - [x] Prove aggregate, aggregate `ORDER BY`, `HAVING`, and `UNNEST` parity.
 
 - [ ] **Document writes**
   - [ ] Start only after read path, authorization, row filters, and audit

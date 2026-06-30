@@ -1265,7 +1265,7 @@ fn parseMergeCtesForPlanAlloc(
                 else => return err,
             }
         }
-        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], read_ctes.items);
+        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], read_ctes.items, null);
         errdefer lowered.deinit(alloc);
         pos.* = close_index + 1;
         try plan_mod.applyCteColumnAliasesAlloc(alloc, &lowered, cte_column_aliases);

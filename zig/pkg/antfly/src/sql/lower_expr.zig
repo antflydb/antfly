@@ -3356,6 +3356,28 @@ fn generatedExpressionFunctionNameToken(
     return tokens[name_tokens.start];
 }
 
+fn generatedAggregateOpForExpression(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsAggregateOp {
+    try validateGeneratedExpressionPayloads(tokens, expression.*);
+    if (expression.kind != .function_call) return null;
+    const function_token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+    return aggregateOpForName(function_token.text);
+}
+
+fn generatedWindowFunctionForExpression(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !?db_mod.types.RelationalRowsWindowFunction {
+    try validateGeneratedExpressionPayloads(tokens, expression.*);
+    if (expression.kind != .function_call) return null;
+    const function_token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+    const function = windowFunctionForName(function_token.text) orelse return null;
+    if (expression.over_tokens == null) return null;
+    return function;
+}
+
 fn validateGeneratedSelectItemStartFunctionName(
     tokens: []const Token,
     start: SelectItemStart,
@@ -3707,6 +3729,7 @@ fn validateGeneratedWindowFrameBoundLayout(
         return error.UnsupportedSqlShape;
     }
     if (!generatedTokenRangeEqual(child.tokens orelse return error.UnsupportedSqlShape, value_tokens)) return error.UnsupportedSqlShape;
+    try validateGeneratedChildExpressionPayloads(tokens, value_tokens, expression_kind, expression);
     if (!tokens[value_tokens.end].matchesKeywordTag(.preceding) and !tokens[value_tokens.end].matchesKeywordTag(.following)) {
         return error.UnsupportedSqlShape;
     }
@@ -3959,6 +3982,42 @@ fn parseGeneratedFetchLimitValueForClause(
     };
     pos.* = range.end;
     return .{ .value = limit };
+}
+
+fn parseLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !GeneratedLimitValue {
+    if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| return generated_limit;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return .{ .value = try value_mod.parseLimitValue(tokens, pos, params) };
+}
+
+fn parseOffsetValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !u32 {
+    if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset| return generated_offset;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return try value_mod.parseOffsetValue(tokens, pos, params);
+}
+
+fn parseFetchLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !GeneratedLimitValue {
+    if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| return generated_limit;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return .{ .value = try value_mod.parseFetchLimitValue(tokens, pos, params) };
 }
 
 fn validateGeneratedSingleJoinForClause(
@@ -4638,6 +4697,7 @@ pub const WindowDefinitionParserOptions = struct {
     order_expression_hooks: OrderExpressionParserOptions,
     generated_window_items: []const generated_parser.GeneratedSqlWindowAst = &.{},
     generated_window_ast: ?*const generated_parser.GeneratedSqlWindowAst = null,
+    generated_over_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const WindowSpecParserOptions = struct {
@@ -5119,6 +5179,61 @@ fn validateGeneratedJsonExtractPathFunctionOperandsStrict(
     return true;
 }
 
+fn generatedJsonKeySetArrayExpression(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    var current = expression;
+    while (true) {
+        switch (current.kind) {
+            .grouped => current = current.inner_expression orelse return null,
+            .cast => current = current.cast_expression orelse return null,
+            .array_constructor => return current,
+            else => return null,
+        }
+    }
+}
+
+fn validateGeneratedJsonKeySetExpressionOperandsStrict(
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    const expected_compound_kind: db_mod.types.RelationalRowsExpressionKind = switch (generated_expression.kind) {
+        .json_key_any => .bool_or,
+        .json_key_all => .bool_and,
+        else => return false,
+    };
+    if (parsed_expression.kind != expected_compound_kind and parsed_expression.kind != .json_path_exists) return false;
+    const left_tokens = generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
+    const right_expression = generated_expression.right_expression orelse return error.UnsupportedSqlShape;
+    const array_expression = generatedJsonKeySetArrayExpression(right_expression) orelse return error.UnsupportedSqlShape;
+    if (array_expression.array_items.count == 0 or
+        array_expression.array_items.items.len != array_expression.array_items.count or
+        array_expression.array_items.expressions.len != array_expression.array_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const path_exists_operands = if (parsed_expression.kind == .json_path_exists) blk: {
+        if (parsed_expression.operands.len != 1) return error.UnsupportedSqlShape;
+        break :blk parsed_expression.operands[0..1];
+    } else parsed_expression.operands;
+    if (path_exists_operands.len != array_expression.array_items.items.len) return error.UnsupportedSqlShape;
+    for (path_exists_operands, array_expression.array_items.items) |path_exists, item_tokens| {
+        if (path_exists.kind != .json_path_exists or path_exists.operands.len != 1) return error.UnsupportedSqlShape;
+        if (item_tokens.end != item_tokens.start + 1 or tokens[item_tokens.start].kind != .string) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, path_exists.json_path, tokens[item_tokens.start].text)) return error.UnsupportedSqlShape;
+        try validateGeneratedRowExpressionIdentityStrict(
+            tokens,
+            left_tokens.start,
+            left_tokens.end,
+            path_exists.operands[0],
+            generated_expression,
+        );
+    }
+    return true;
+}
+
 fn validateGeneratedRowExpressionOperandsStrict(
     tokens: []const Token,
     parsed_expression: db_mod.types.RelationalRowsExpression,
@@ -5131,6 +5246,7 @@ fn validateGeneratedRowExpressionOperandsStrict(
     }
     if (try validateGeneratedPositionFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedJsonExtractPathFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedJsonKeySetExpressionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
     var expected_operand_count: usize = 0;
     if (generated_expression.left_tokens) |left_tokens| {
         if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
@@ -13503,8 +13619,18 @@ pub fn parseAggregateSpecAlloc(
     options: AggregateSpecParserOptions,
 ) !db_mod.types.RelationalRowsAggregateSpec {
     const function_start = pos.*;
+    const generated_op = if (options.generated_expression_ast) |expression| blk: {
+        const op = try generatedAggregateOpForExpression(tokens, expression) orelse return error.UnsupportedSqlShape;
+        const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+        if (expression_tokens.start != function_start) return error.UnsupportedSqlShape;
+        break :blk op;
+    } else null;
     const function_name = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
-    const op = aggregateOpForName(function_name.text) orelse return error.UnsupportedSqlShape;
+    const token_op = aggregateOpForName(function_name.text) orelse return error.UnsupportedSqlShape;
+    const op = if (generated_op) |op| blk: {
+        if (op != token_op) return error.UnsupportedSqlShape;
+        break :blk op;
+    } else token_op;
     try parser.expectToken(tokens, pos, .lparen);
     const argument_start = pos.*;
     const distinct = parser.matchKeyword(tokens, pos, "distinct");
@@ -16651,11 +16777,20 @@ pub fn parseAggregateSelectListAlloc(
     errdefer outputs.deinit(alloc);
 
     while (true) {
-        if (nextIsAggregateFunction(tokens, pos.*)) {
-            const item_start = pos.*;
-            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, generated_read_ast);
-            if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
-            const generated_expression = if (generated_item) |item| item.expression else null;
+        const item_start = pos.*;
+        const generated_item = try generatedProjectionItemAtStart(tokens, item_start, generated_read_ast);
+        if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
+        const generated_aggregate_op = if (generated_expression) |expression|
+            try generatedAggregateOpForExpression(tokens, expression)
+        else
+            null;
+        const parse_aggregate = if (generated_read_ast != null) blk: {
+            if (nextIsAggregateFunction(tokens, pos.*) and generated_aggregate_op == null) return error.UnsupportedSqlShape;
+            break :blk generated_aggregate_op != null;
+        } else nextIsAggregateFunction(tokens, pos.*);
+
+        if (parse_aggregate) {
             var spec_options = aggregate_spec_options;
             spec_options.generated_expression_ast = generated_expression;
             const parsed_spec = try parseAggregateSpecAlloc(
@@ -16696,10 +16831,6 @@ pub fn parseAggregateSelectListAlloc(
             try aggregations.append(alloc, spec);
             spec_transferred = true;
         } else {
-            const item_start = pos.*;
-            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, generated_read_ast);
-            if (generated_item == null and generated_read_ast != null) return error.UnsupportedSqlShape;
-            const generated_expression = if (generated_item) |item| item.expression else null;
             var item_options = select_item_options;
             item_options.generated_expression_ast = generated_expression;
             const item = try parseSelectItemAlloc(
@@ -17084,6 +17215,28 @@ pub fn windowFunctionName(function: db_mod.types.RelationalRowsWindowFunction) [
     };
 }
 
+fn windowFunctionForName(name: []const u8) ?db_mod.types.RelationalRowsWindowFunction {
+    if (std.ascii.eqlIgnoreCase(name, "row_number")) return .row_number;
+    if (std.ascii.eqlIgnoreCase(name, "rank")) return .rank;
+    if (std.ascii.eqlIgnoreCase(name, "dense_rank")) return .dense_rank;
+    if (std.ascii.eqlIgnoreCase(name, "percent_rank")) return .percent_rank;
+    if (std.ascii.eqlIgnoreCase(name, "cume_dist")) return .cume_dist;
+    if (std.ascii.eqlIgnoreCase(name, "ntile")) return .ntile;
+    if (std.ascii.eqlIgnoreCase(name, "lag")) return .lag;
+    if (std.ascii.eqlIgnoreCase(name, "lead")) return .lead;
+    if (std.ascii.eqlIgnoreCase(name, "first_value")) return .first_value;
+    if (std.ascii.eqlIgnoreCase(name, "last_value")) return .last_value;
+    if (std.ascii.eqlIgnoreCase(name, "nth_value")) return .nth_value;
+    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
+    if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
+    if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
+    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
+    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
+    if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
+    if (std.ascii.eqlIgnoreCase(name, "bool_and")) return .bool_and;
+    return null;
+}
+
 pub fn windowFunctionSupportsFilter(function: db_mod.types.RelationalRowsWindowFunction) bool {
     return switch (function) {
         .count, .sum, .avg, .min, .max, .bool_or, .bool_and => true,
@@ -17168,6 +17321,66 @@ pub fn parseWindowFrameBound(
     return error.UnsupportedSqlShape;
 }
 
+fn generatedWindowDefinitionPartitionTokens(options: WindowDefinitionParserOptions) ?generated_parser.GeneratedSqlTokenRange {
+    if (options.generated_window_ast) |window| return window.partition_tokens;
+    if (options.generated_over_expression_ast) |expression| return expression.over_partition_tokens;
+    return null;
+}
+
+fn generatedWindowDefinitionPartitionItems(options: WindowDefinitionParserOptions) ?*const generated_parser.GeneratedSqlListAst {
+    if (options.generated_window_ast) |window| return &window.partition_items;
+    if (options.generated_over_expression_ast) |expression| return &expression.over_partition_items;
+    return null;
+}
+
+fn generatedWindowDefinitionOrderTokens(options: WindowDefinitionParserOptions) ?generated_parser.GeneratedSqlTokenRange {
+    if (options.generated_window_ast) |window| return window.order_tokens;
+    if (options.generated_over_expression_ast) |expression| return expression.over_order_tokens;
+    return null;
+}
+
+fn generatedWindowDefinitionOrderItems(options: WindowDefinitionParserOptions) ?*const generated_parser.GeneratedSqlListAst {
+    if (options.generated_window_ast) |window| return &window.order_items;
+    if (options.generated_over_expression_ast) |expression| return &expression.over_order_items;
+    return null;
+}
+
+fn generatedWindowDefinitionFrameTokens(options: WindowDefinitionParserOptions) ?generated_parser.GeneratedSqlTokenRange {
+    if (options.generated_window_ast) |window| return window.frame_tokens;
+    if (options.generated_over_expression_ast) |expression| return expression.over_frame_tokens;
+    return null;
+}
+
+fn validateGeneratedWindowDefinitionFrameLayout(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    options: WindowDefinitionParserOptions,
+) !void {
+    if (options.generated_window_ast) |window| {
+        return try validateGeneratedWindowFrameClauseLayout(
+            tokens,
+            range,
+            window.frame_start_expression_kind,
+            window.frame_start_expression_tokens,
+            window.frame_start_expression,
+            window.frame_end_expression_kind,
+            window.frame_end_expression_tokens,
+            window.frame_end_expression,
+        );
+    }
+    const expression = options.generated_over_expression_ast orelse return error.UnsupportedSqlShape;
+    return try validateGeneratedWindowFrameClauseLayout(
+        tokens,
+        range,
+        expression.over_frame_start_expression_kind,
+        expression.over_frame_start_expression_tokens,
+        expression.over_frame_start_expression,
+        expression.over_frame_end_expression_kind,
+        expression.over_frame_end_expression_tokens,
+        expression.over_frame_end_expression,
+    );
+}
+
 pub fn parseWindowPartitionByAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -17176,6 +17389,15 @@ pub fn parseWindowPartitionByAlloc(
     options: WindowDefinitionParserOptions,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_items = generatedWindowDefinitionPartitionItems(options);
+        const generated_item = if (generated_items) |items|
+            try generatedExpressionListItemAtStart(tokens, item_start, items)
+        else
+            null;
+        if (generated_item == null and generated_items != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
+        try validateGeneratedSimpleGroupExpression(tokens, generated_expression);
         const parsed_field = try parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
@@ -17190,6 +17412,7 @@ pub fn parseWindowPartitionByAlloc(
         var field_transferred = false;
         errdefer if (!field_transferred) alloc.free(field);
         if (binder.relationalColumnForField(options.schema, field, null) == null) return error.InvalidSqlCatalog;
+        try validateGeneratedExpressionItemEnd(generated_item, pos.*);
         try partition_by.append(alloc, field);
         field_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
@@ -17211,10 +17434,10 @@ pub fn parseWindowDefinitionAlloc(
     }
     if (parser.matchKeyword(tokens, pos, "partition")) {
         try parser.expectKeyword(tokens, pos, "by");
-        const generated_partition_end = if (options.generated_window_ast) |window| blk: {
-            const range = window.partition_tokens orelse return error.UnsupportedSqlShape;
+        const generated_partition_end = if (generatedWindowDefinitionPartitionTokens(options)) |range| blk: {
             if (range.start != pos.*) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionListForClause(tokens, range, window.partition_items);
+            const items = generatedWindowDefinitionPartitionItems(options) orelse return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionListForClause(tokens, range, items.*);
             break :blk range.end;
         } else null;
         try parseWindowPartitionByAlloc(
@@ -17227,8 +17450,8 @@ pub fn parseWindowDefinitionAlloc(
         if (generated_partition_end) |end| {
             if (pos.* != end) return error.UnsupportedSqlShape;
         }
-    } else if (options.generated_window_ast) |window| {
-        if (window.partition_tokens != null) return error.UnsupportedSqlShape;
+    } else if (generatedWindowDefinitionPartitionTokens(options) != null) {
+        return error.UnsupportedSqlShape;
     }
 
     var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
@@ -17238,11 +17461,11 @@ pub fn parseWindowDefinitionAlloc(
     }
     if (parser.matchKeyword(tokens, pos, "order")) {
         try parser.expectKeyword(tokens, pos, "by");
-        const generated_order_items, const generated_order_end = if (options.generated_window_ast) |window| blk: {
-            const range = window.order_tokens orelse return error.UnsupportedSqlShape;
+        const generated_order_items, const generated_order_end = if (generatedWindowDefinitionOrderTokens(options)) |range| blk: {
             if (range.start != pos.*) return error.UnsupportedSqlShape;
-            try validateGeneratedOrderListForClause(tokens, range, window.order_items);
-            break :blk .{ &window.order_items, range.end };
+            const items = generatedWindowDefinitionOrderItems(options) orelse return error.UnsupportedSqlShape;
+            try validateGeneratedOrderListForClause(tokens, range, items.*);
+            break :blk .{ items, range.end };
         } else .{ null, null };
         try parseOrderByAlloc(
             alloc,
@@ -17264,11 +17487,21 @@ pub fn parseWindowDefinitionAlloc(
             if (pos.* != end) return error.UnsupportedSqlShape;
         }
         if (order_by.items.len == 0) return error.UnsupportedSqlShape;
-    } else if (options.generated_window_ast) |window| {
-        if (window.order_tokens != null) return error.UnsupportedSqlShape;
+    } else if (generatedWindowDefinitionOrderTokens(options) != null) {
+        return error.UnsupportedSqlShape;
     }
 
+    const frame_start = pos.*;
     const frame = try parseOptionalWindowFrame(tokens, pos, params);
+    if (options.generated_window_ast != null or options.generated_over_expression_ast != null) {
+        if (frame != null) {
+            const range = generatedWindowDefinitionFrameTokens(options) orelse return error.UnsupportedSqlShape;
+            if (range.start != frame_start or range.end != pos.*) return error.UnsupportedSqlShape;
+            try validateGeneratedWindowDefinitionFrameLayout(tokens, range, options);
+        } else if (generatedWindowDefinitionFrameTokens(options) != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
     if (frame != null and order_by.items.len == 0) return error.UnsupportedSqlShape;
     if (frame) |parsed_frame| try validateWindowFrameForOrder(options.schema, options.type_context, parsed_frame, order_by.items);
 
@@ -17295,6 +17528,7 @@ pub fn parseNamedWindowSpecsAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
+    end: usize,
     params: []const value_mod.SqlValue,
     window_definition_options: WindowDefinitionParserOptions,
 ) ![]const plan_mod.NamedWindowSpec {
@@ -17304,22 +17538,38 @@ pub fn parseNamedWindowSpecsAlloc(
         specs.deinit(alloc);
     }
 
+    var generated_index: usize = 0;
     while (true) {
+        var spec_options = window_definition_options;
+        if (window_definition_options.generated_window_items.len != 0) {
+            if (generated_index >= window_definition_options.generated_window_items.len) return error.UnsupportedSqlShape;
+            const generated_window = &window_definition_options.generated_window_items[generated_index];
+            if (generated_window.tokens.start != pos.*) return error.UnsupportedSqlShape;
+            spec_options.generated_window_ast = generated_window;
+            spec_options.generated_window_items = &.{};
+        }
+        const spec_start = pos.*;
         const spec = try parseNamedWindowSpecAlloc(
             alloc,
             tokens,
             pos,
             params,
             specs.items,
-            window_definition_options,
+            spec_options,
         );
+        if (spec_options.generated_window_ast) |generated_window| {
+            if (generated_window.tokens.start != spec_start or generated_window.tokens.end != pos.*) return error.UnsupportedSqlShape;
+        }
         var spec_transferred = false;
         errdefer if (!spec_transferred) plan_mod.freeNamedWindowSpec(alloc, spec);
         try specs.append(alloc, spec);
         spec_transferred = true;
+        generated_index += 1;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
+        if (pos.* >= end) return error.UnsupportedSqlShape;
     }
-    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (window_definition_options.generated_window_items.len != 0 and generated_index != window_definition_options.generated_window_items.len) return error.UnsupportedSqlShape;
+    if (pos.* != end) return error.UnsupportedSqlShape;
     return try specs.toOwnedSlice(alloc);
 }
 
@@ -17329,16 +17579,24 @@ pub fn parseTopLevelNamedWindowSpecsAlloc(
     pos: usize,
     params: []const value_mod.SqlValue,
     window_definition_options: WindowDefinitionParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) ![]const plan_mod.NamedWindowSpec {
     const start = topLevelWindowClauseStart(tokens, pos) orelse return &.{};
     const end = topLevelWindowClauseEnd(tokens, start + 1);
-    var window_pos: usize = 0;
+    var window_pos: usize = start + 1;
+    var generated_options = window_definition_options;
+    if (generated_read_ast) |read| {
+        const generated_end = try generatedWindowClauseEnd(tokens, start, window_pos, read);
+        if (generated_end == null or generated_end.? != end) return error.UnsupportedSqlShape;
+        generated_options.generated_window_items = read.window_items;
+    }
     return try parseNamedWindowSpecsAlloc(
         alloc,
-        tokens[start + 1 .. end],
+        tokens,
         &window_pos,
+        end,
         params,
-        window_definition_options,
+        generated_options,
     );
 }
 
@@ -17350,7 +17608,14 @@ pub fn parseNamedWindowSpecAlloc(
     existing: []const plan_mod.NamedWindowSpec,
     window_definition_options: WindowDefinitionParserOptions,
 ) !plan_mod.NamedWindowSpec {
+    const spec_start = pos.*;
+    if (window_definition_options.generated_window_ast) |window| {
+        if (window.tokens.start != spec_start or window.name_tokens.start != spec_start) return error.UnsupportedSqlShape;
+    }
     const name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    if (window_definition_options.generated_window_ast) |window| {
+        if (window.name_tokens.end != pos.*) return error.UnsupportedSqlShape;
+    }
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
     for (existing) |spec| {
@@ -17359,6 +17624,9 @@ pub fn parseNamedWindowSpecAlloc(
 
     try parser.expectKeyword(tokens, pos, "as");
     try parser.expectToken(tokens, pos, .lparen);
+    if (window_definition_options.generated_window_ast) |window| {
+        if (window.definition_tokens.start != pos.*) return error.UnsupportedSqlShape;
+    }
     const definition = try parseWindowDefinitionAlloc(
         alloc,
         tokens,
@@ -17368,7 +17636,13 @@ pub fn parseNamedWindowSpecAlloc(
     );
     var definition_transferred = false;
     errdefer if (!definition_transferred) plan_mod.freeNamedWindowDefinition(alloc, definition);
+    if (window_definition_options.generated_window_ast) |window| {
+        if (window.definition_tokens.end != pos.*) return error.UnsupportedSqlShape;
+    }
     try parser.expectToken(tokens, pos, .rparen);
+    if (window_definition_options.generated_window_ast) |window| {
+        if (window.tokens.end != pos.*) return error.UnsupportedSqlShape;
+    }
 
     name_transferred = true;
     definition_transferred = true;
@@ -17389,6 +17663,15 @@ pub fn parseWindowDefinitionReferenceAlloc(
     window_definition_options: WindowDefinitionParserOptions,
 ) !plan_mod.NamedWindowDefinition {
     if (parser.matchToken(tokens, pos, .lparen) != null) {
+        const definition_start = pos.*;
+        if (window_definition_options.generated_over_expression_ast) |expression| {
+            if (expression.over_name_tokens != null) return error.UnsupportedSqlShape;
+            if (expression.over_definition_tokens) |range| {
+                if (range.start != definition_start) return error.UnsupportedSqlShape;
+            } else if (expression.over_partition_tokens != null or expression.over_order_tokens != null or expression.over_frame_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+        }
         const definition = try parseWindowDefinitionAlloc(
             alloc,
             tokens,
@@ -17397,11 +17680,23 @@ pub fn parseWindowDefinitionReferenceAlloc(
             window_definition_options,
         );
         errdefer plan_mod.freeNamedWindowDefinition(alloc, definition);
+        if (window_definition_options.generated_over_expression_ast) |expression| {
+            if (expression.over_definition_tokens) |range| {
+                if (range.end != pos.*) return error.UnsupportedSqlShape;
+            } else if (pos.* != definition_start) {
+                return error.UnsupportedSqlShape;
+            }
+        }
         try parser.expectToken(tokens, pos, .rparen);
         return definition;
     }
 
+    const name_start = pos.*;
     const name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    if (window_definition_options.generated_over_expression_ast) |expression| {
+        const range = expression.over_name_tokens orelse return error.UnsupportedSqlShape;
+        if (range.start != name_start or range.end != pos.*) return error.UnsupportedSqlShape;
+    }
     defer alloc.free(name);
     for (named_window_specs) |spec| {
         if (std.ascii.eqlIgnoreCase(spec.name, name)) {
@@ -17448,7 +17743,17 @@ pub fn parseWindowSpecAlloc(
     options: WindowSpecParserOptions,
 ) !db_mod.types.RelationalRowsWindowSpec {
     const function_start = pos.*;
-    const function = try parseWindowFunction(tokens, pos);
+    const generated_function = if (options.generated_expression_ast) |expression| blk: {
+        const function = try generatedWindowFunctionForExpression(tokens, expression) orelse return error.UnsupportedSqlShape;
+        const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+        if (expression_tokens.start != function_start) return error.UnsupportedSqlShape;
+        break :blk function;
+    } else null;
+    const parsed_function = try parseWindowFunction(tokens, pos);
+    const function = if (generated_function) |function| blk: {
+        if (function != parsed_function) return error.UnsupportedSqlShape;
+        break :blk function;
+    } else parsed_function;
     try parser.expectToken(tokens, pos, .lparen);
     const argument_start = pos.*;
     const value_expression: ?db_mod.types.RelationalRowsExpression = switch (function) {
@@ -17533,6 +17838,8 @@ pub fn parseWindowSpecAlloc(
     if (!windowFunctionSupportsFilter(function) and !aggregateFilterIsEmpty(filter)) return error.UnsupportedSqlShape;
     try parser.expectKeyword(tokens, pos, "over");
     const over_start = pos.* - 1;
+    var generated_window_definition_options = window_definition_options;
+    generated_window_definition_options.generated_over_expression_ast = options.generated_expression_ast;
 
     const definition = try parseWindowDefinitionReferenceAlloc(
         alloc,
@@ -17540,7 +17847,7 @@ pub fn parseWindowSpecAlloc(
         pos,
         params,
         named_window_specs,
-        window_definition_options,
+        generated_window_definition_options,
     );
     var definition_transferred = false;
     errdefer if (!definition_transferred) plan_mod.freeNamedWindowDefinition(alloc, definition);
@@ -21613,29 +21920,20 @@ pub fn parseSelectAlloc(
             if (distinct_on.len > 0) try validateDistinctOnOrder(distinct_on, order_by.items);
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "for")) {
             const allowed_targets = [_][]const u8{ table_ref.name, table_ref.alias };
             const keyword_index = pos.* - 1;
             row_claim = if (try parseGeneratedRowClaimForClauseAlloc(alloc, tokens, keyword_index, pos, &allowed_targets, options.generated_read_ast)) |generated_claim|
                 generated_claim
+            else if (options.generated_read_ast != null)
+                return error.UnsupportedSqlShape
             else
                 sqlRowClaimForClause(try grammar.parseCheckedForRowClaimClauseAlloc(alloc, tokens, pos, &allowed_targets));
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
@@ -22075,24 +22373,13 @@ pub fn parseAggregateAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else if (nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
@@ -22225,6 +22512,7 @@ pub fn parseWindowSelectAlloc(
             .function_bindings = options.function_bindings,
             .order_expression_hooks = options.order_expression_hooks,
         },
+        options.generated_read_ast,
     );
     defer plan_mod.freeNamedWindowSpecs(alloc, parsed_named_windows);
     const previous_named_window_specs = options.named_window_hooks.get_specs(options.named_window_hooks.ptr);
@@ -22435,22 +22723,25 @@ pub fn parseWindowSelectAlloc(
             const keyword_index = pos.* - 1;
             const generated_window_end = try generatedWindowClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
             const end = topLevelWindowClauseEnd(tokens, pos.*);
-            var window_pos: usize = 0;
+            var window_pos: usize = pos.*;
             const window_context = options.context_hooks.get_context(options.context_hooks.ptr);
+            var generated_window_options = WindowDefinitionParserOptions{
+                .schema = window_context.schema,
+                .field_expression_qualifiers = window_context.field_expression_qualifiers,
+                .returning_expression_qualifiers = window_context.returning_expression_qualifiers,
+                .defer_row_expression_field_validation = window_context.defer_row_expression_field_validation,
+                .type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+                .function_bindings = options.function_bindings,
+                .order_expression_hooks = options.order_expression_hooks,
+            };
+            if (options.generated_read_ast) |read| generated_window_options.generated_window_items = read.window_items;
             const discarded_named_windows = try parseNamedWindowSpecsAlloc(
                 alloc,
-                tokens[pos.*..end],
+                tokens,
                 &window_pos,
+                end,
                 options.params,
-                .{
-                    .schema = window_context.schema,
-                    .field_expression_qualifiers = window_context.field_expression_qualifiers,
-                    .returning_expression_qualifiers = window_context.returning_expression_qualifiers,
-                    .defer_row_expression_field_validation = window_context.defer_row_expression_field_validation,
-                    .type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
-                    .function_bindings = options.function_bindings,
-                    .order_expression_hooks = options.order_expression_hooks,
-                },
+                generated_window_options,
             );
             defer plan_mod.freeNamedWindowSpecs(alloc, discarded_named_windows);
             pos.* = end;
@@ -22480,24 +22771,13 @@ pub fn parseWindowSelectAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "for")) {
             return error.UnsupportedSqlShape;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
@@ -23009,24 +23289,13 @@ pub fn parseJoinAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else if (nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
@@ -23374,24 +23643,13 @@ pub fn parseLateralSubqueryAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else {
             return error.UnsupportedSqlShape;
         }
@@ -23740,24 +23998,13 @@ pub fn parseLateralAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, options.params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)).value;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {
@@ -23921,7 +24168,10 @@ pub fn parseQueryPlanAlloc(
         errdefer lowered.deinit(alloc);
         if (!parser.atEnd(tokens, pos.*)) {
             if (lowered.ctes.len != 0) return error.UnsupportedSqlShape;
-            const op = try grammar.parseSelectSetOperation(tokens, pos);
+            const op = if (try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast)) |generated_op|
+                generated_op
+            else
+                try grammar.parseSelectSetOperation(tokens, pos);
             var rhs = try parseQueryPlanSelectWithContext(query_hooks, &.{}, false, true);
             defer rhs.deinit(alloc);
             if (rhs.ctes.len != 0) return error.UnsupportedSqlShape;
@@ -23970,7 +24220,10 @@ pub fn parseQueryPlanAlloc(
     errdefer final.deinit(alloc);
     try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
     if (!parser.atEnd(tokens, pos.*)) {
-        const op = try grammar.parseSelectSetOperation(tokens, pos);
+        const op = if (try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast)) |generated_op|
+            generated_op
+        else
+            try grammar.parseSelectSetOperation(tokens, pos);
         var rhs = try parseQueryPlanSelectWithContext(query_hooks, ctes, false, true);
         defer rhs.deinit(alloc);
         try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &rhs, ctes, &base_table_name);
@@ -23999,6 +24252,49 @@ pub fn parseQueryPlanAlloc(
         .system_time_as_of_sequence = system_time_as_of_sequence,
         .system_time_as_of_timestamp_ns = system_time_as_of_timestamp_ns,
     };
+}
+
+fn parseGeneratedSelectSetOperation(
+    tokens: []const Token,
+    pos: *usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?ast.SelectSetOperation {
+    const read = generated_read_ast orelse return null;
+    const range = read.set_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const operator_tokens = read.set_operation.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.start != range.start or operator_tokens.end != operator_tokens.start + 1 or operator_tokens.end > range.end) return error.UnsupportedSqlShape;
+    const right_query = read.set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
+    if (right_query.start < operator_tokens.end or right_query.end > range.end) return error.UnsupportedSqlShape;
+    if (!tokens[right_query.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+
+    const op: ast.SelectSetOperation = switch (read.set_operation.kind orelse return error.UnsupportedSqlShape) {
+        .@"union" => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.@"union")) return error.UnsupportedSqlShape;
+            if (read.set_operation.all_tokens) |all_tokens| {
+                if (all_tokens.start != operator_tokens.end or all_tokens.end != all_tokens.start + 1 or all_tokens.end != right_query.start) return error.UnsupportedSqlShape;
+                if (!tokens[all_tokens.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+                break :blk .union_all;
+            }
+            if (right_query.start == operator_tokens.end) break :blk .union_distinct;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .union_distinct;
+            return error.UnsupportedSqlShape;
+        },
+        .intersect => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.intersect) or read.set_operation.all_tokens != null) return error.UnsupportedSqlShape;
+            if (right_query.start == operator_tokens.end) break :blk .intersect;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .intersect;
+            return error.UnsupportedSqlShape;
+        },
+        .except => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.except) or read.set_operation.all_tokens != null) return error.UnsupportedSqlShape;
+            if (right_query.start == operator_tokens.end) break :blk .except;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .except;
+            return error.UnsupportedSqlShape;
+        },
+    };
+    pos.* = right_query.start;
+    return op;
 }
 
 fn parseQueryPlanSelectWithContext(
@@ -27195,11 +27491,20 @@ pub fn parseWindowSelectListAlloc(
     errdefer outputs.deinit(alloc);
 
     while (true) {
-        if (peekWindowFunction(tokens, pos.*)) {
-            const item_start = pos.*;
-            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
-            if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
-            const generated_expression = if (generated_item) |item| item.expression else null;
+        const item_start = pos.*;
+        const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
+        if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        const generated_expression = if (generated_item) |item| item.expression else null;
+        const generated_window_function = if (generated_expression) |expression|
+            try generatedWindowFunctionForExpression(tokens, expression)
+        else
+            null;
+        const parse_window = if (options.generated_read_ast != null) blk: {
+            if (peekWindowFunction(tokens, pos.*) and generated_window_function == null) return error.UnsupportedSqlShape;
+            break :blk generated_window_function != null;
+        } else peekWindowFunction(tokens, pos.*);
+
+        if (parse_window) {
             var window_spec_options = options.window_spec_options;
             window_spec_options.generated_expression_ast = generated_expression;
             const parsed_spec = try parseWindowSpecAlloc(
@@ -27241,10 +27546,6 @@ pub fn parseWindowSelectListAlloc(
             try windows.append(alloc, spec);
             spec_transferred = true;
         } else {
-            const item_start = pos.*;
-            const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
-            if (generated_item == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
-            const generated_expression = if (generated_item) |item| item.expression else null;
             if (generated_expression) |expression| {
                 if (expression.kind != .token_range) return error.UnsupportedSqlShape;
             }
@@ -33335,6 +33636,48 @@ test "sql adapter lower expr lowers recursive cte stream contract" {
         &.{},
     ));
 
+    var malformed_generated_recursive_operation = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer malformed_generated_recursive_operation.deinit(alloc);
+    if (malformed_generated_recursive_operation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_set_operation.kind == null) return error.TestUnexpectedResult;
+                read.cte_items[0].body_set_operation.kind = .except;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_recursive_operation,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_recursive_member_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer malformed_generated_recursive_member_range.deinit(alloc);
+    if (malformed_generated_recursive_member_range.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_set_operation.right_query_tokens == null or read.cte_items[0].body_set_operation.operator_tokens == null) return error.TestUnexpectedResult;
+                read.cte_items[0].body_set_operation.right_query_tokens.?.start = read.cte_items[0].body_set_operation.operator_tokens.?.start;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_recursive_member_range,
+        schema,
+        &.{},
+    ));
+
     var malformed_generated_recursive_member_join = try tokenized.ParsedSql.initAlloc(
         alloc,
         "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
@@ -33412,6 +33755,45 @@ test "sql adapter lower expr lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("id", disjoint_union.plan.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), disjoint_union.plan.query.limit.?);
     try std.testing.expectEqual(@as(u32, 2), disjoint_union.plan.query.offset);
+
+    const generated_set_operation_sql = "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'";
+    var malformed_generated_set_operation_kind = try tokenized.ParsedSql.initAlloc(alloc, generated_set_operation_sql);
+    defer malformed_generated_set_operation_kind.deinit(alloc);
+    if (malformed_generated_set_operation_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.set_operation.kind == null) return error.TestUnexpectedResult;
+                read_ast.set_operation.kind = .except;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_kind,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_right_range = try tokenized.ParsedSql.initAlloc(alloc, generated_set_operation_sql);
+    defer malformed_generated_set_operation_right_range.deinit(alloc);
+    if (malformed_generated_set_operation_right_range.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.set_operation.right_query_tokens == null or read_ast.set_operation.operator_tokens == null) return error.TestUnexpectedResult;
+                read_ast.set_operation.right_query_tokens.?.start = read_ast.set_operation.operator_tokens.?.start;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_right_range,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var malformed_tail_order_hook = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -36957,6 +37339,28 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expectEqual(@as(u32, 5), unary_pagination_query.plan.query.limit.?);
     try std.testing.expectEqual(@as(u32, 2), unary_pagination_query.plan.query.offset);
 
+    var malformed_generated_offset_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC LIMIT +5 OFFSET +2 ROWS",
+    );
+    defer malformed_generated_offset_payload.deinit(alloc);
+    if (malformed_generated_offset_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.offset_tokens == null or read.offset_expression.tokens == null) return error.TestUnexpectedResult;
+                read.offset_expression.kind = .function_call;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_offset_payload,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var fetch_query = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY",
@@ -37371,6 +37775,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expect(aggregate.aggregate.limit == null);
     try std.testing.expectEqual(@as(u32, 3), aggregate.aggregate.offset);
 
+    var malformed_generated_aggregate_offset_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT ALL OFFSET 3 ROWS",
+    );
+    defer malformed_generated_aggregate_offset_payload.deinit(alloc);
+    if (malformed_generated_aggregate_offset_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.offset_tokens == null or read.offset_expression.tokens == null) return error.TestUnexpectedResult;
+                read.offset_expression.kind = .function_call;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_aggregate_offset_payload,
+        schema,
+        &.{},
+    ));
+
     var malformed_generated_aggregate_pagination = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status LIMIT 10",
@@ -37421,6 +37846,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     defer window.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), window.plan.window.limit.?);
     try std.testing.expectEqual(@as(u32, 4), window.plan.window.offset);
+
+    var malformed_generated_window_offset_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rn FROM usage_records WHERE status = 'open' ORDER BY rn ASC OFFSET 4 ROWS FETCH FIRST 2 ROWS ONLY",
+    );
+    defer malformed_generated_window_offset_payload.deinit(alloc);
+    if (malformed_generated_window_offset_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.offset_tokens == null or read.offset_expression.tokens == null) return error.TestUnexpectedResult;
+                read.offset_expression.kind = .function_call;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_window_offset_payload,
+        schema,
+        &.{},
+    ));
 
     var malformed_generated_window_pagination = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -38506,6 +38952,92 @@ fn corruptGeneratedReadFirstWindowOrderExpressionItem(parsed_sql: *tokenized.Par
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstWindowOrderExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.window_items.len == 0 or read.window_items[0].order_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    read.window_items[0].order_items.expressions[0].kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstWindowPartitionExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.window_items.len == 0 or read.window_items[0].partition_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    read.window_items[0].partition_items.expressions[0].kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadNamedWindowItemsDropLeading(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.window_items.len < 2) return error.TestUnexpectedResult;
+                    read.window_count = read.window_items.len - 1;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstNamedWindowNameRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.window_items.len == 0 or read.window_items[0].order_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.window_items[0].name_tokens = read.window_items[0].order_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstNamedWindowFrameStartChildPayload(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const frame_start = read.window_items[0].frame_start_expression orelse return error.TestUnexpectedResult;
+                    frame_start.argument_items.count = 1;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstProjectionWindowOverRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -38536,6 +39068,47 @@ fn corruptGeneratedReadFirstProjectionWindowOrderExpressionItem(parsed_sql: *tok
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.over_order_items.items.len == 0 or expression.over_order_items.expression_items.len == 0) continue;
                         expression.over_order_items.expression_items[0] = read.projection_items.items[0];
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionWindowPartitionExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.over_partition_items.expressions.len == 0) continue;
+                        expression.over_partition_items.expressions[0].kind = kind;
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionWindowFrameStartChildPayload(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    for (read.projection_items.expressions) |*expression| {
+                        const frame_start = expression.over_frame_start_expression orelse continue;
+                        frame_start.argument_items.count = 1;
                         return;
                     }
                     return error.TestUnexpectedResult;
@@ -45482,6 +46055,34 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("created_at", lowered.plan.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 2), lowered.plan.query.limit.?);
 
+    var malformed_second_cte_body_where_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, status, amount, created_at FROM orders WHERE status = 'open'), expensive_open_orders AS (SELECT id, amount, created_at FROM open_orders WHERE amount > 10) SELECT id FROM expensive_open_orders ORDER BY created_at DESC LIMIT 2",
+    );
+    defer malformed_second_cte_body_where_payload.deinit(alloc);
+    if (malformed_second_cte_body_where_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len < 2 or
+                    read.cte_items[0].body_projection_items.expression_items.len == 0 or
+                    read.cte_items[1].body_where_tokens == null or
+                    read.cte_items[1].body_where_expression.tokens == null)
+                {
+                    return error.TestUnexpectedResult;
+                }
+                read.cte_items[1].body_where_expression.tokens = read.cte_items[0].body_projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_second_cte_body_where_payload,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var direct_select = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "WITH open_orders AS (SELECT id, status, created_at FROM orders WHERE status = 'open') SELECT id FROM open_orders ORDER BY created_at DESC LIMIT 5",
@@ -45501,6 +46102,40 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("created_at", direct_select.plan.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), direct_select.plan.query.limit.?);
 
+    var cte_body_row_lock = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH claimed_orders AS (SELECT id FROM orders FOR UPDATE SKIP LOCKED) SELECT id FROM claimed_orders",
+        schema,
+        &.{},
+    );
+    defer cte_body_row_lock.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cte_body_row_lock.plan.ctes.len);
+    try std.testing.expect(cte_body_row_lock.plan.ctes[0].query.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, cte_body_row_lock.plan.ctes[0].query.row_claim.?.wait_policy);
+    try std.testing.expectEqualStrings("claimed_orders", cte_body_row_lock.plan.query.source_cte);
+
+    var malformed_cte_body_row_lock = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH claimed_orders AS (SELECT id FROM orders FOR UPDATE SKIP LOCKED) SELECT id FROM claimed_orders",
+    );
+    defer malformed_cte_body_row_lock.deinit(alloc);
+    if (malformed_cte_body_row_lock.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.cte_items.len == 0) return error.TestUnexpectedResult;
+                read_ast.cte_items[0].body_row_lock_tokens = read_ast.cte_items[0].body_source_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_cte_body_row_lock,
+        schema,
+        &.{},
+        .{},
+    ));
+
     const final_set_operation_sql = "WITH all_orders AS (SELECT id, status FROM orders) SELECT id FROM all_orders WHERE status = 'open' UNION ALL SELECT id FROM all_orders WHERE status = 'closed'";
     var final_set_operation = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
@@ -45515,6 +46150,27 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("all_orders", final_set_operation.plan.query.source_cte);
     try std.testing.expectEqual(@as(usize, 0), final_set_operation.plan.query.predicates.len);
     try std.testing.expectEqual(@as(usize, 2), final_set_operation.plan.query.or_predicates.len);
+
+    var malformed_final_set_operation_kind = try tokenized.ParsedSql.initAlloc(alloc, final_set_operation_sql);
+    defer malformed_final_set_operation_kind.deinit(alloc);
+    if (malformed_final_set_operation_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read_ast| {
+                    if (read_ast.set_operation.kind == null) return error.TestUnexpectedResult;
+                    read_ast.set_operation.kind = .except;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_final_set_operation_kind,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var malformed_final_set_operation = try tokenized.ParsedSql.initAlloc(alloc, final_set_operation_sql);
     defer malformed_final_set_operation.deinit(alloc);
@@ -45669,6 +46325,71 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_cte_body_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var cte_body_offset = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH skipped_orders AS (SELECT id FROM orders OFFSET +2 ROWS FETCH FIRST 4 ROWS ONLY) SELECT id FROM skipped_orders",
+        schema,
+        &.{},
+    );
+    defer cte_body_offset.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cte_body_offset.plan.ctes.len);
+    try std.testing.expectEqual(@as(u32, 4), cte_body_offset.plan.ctes[0].query.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), cte_body_offset.plan.ctes[0].query.offset);
+
+    var malformed_generated_cte_body_offset_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH skipped_orders AS (SELECT id FROM orders OFFSET +2 ROWS FETCH FIRST 4 ROWS ONLY) SELECT id FROM skipped_orders",
+    );
+    defer malformed_generated_cte_body_offset_payload.deinit(alloc);
+    if (malformed_generated_cte_body_offset_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_offset_tokens == null or read.cte_items[0].body_offset_expression.tokens == null) return error.TestUnexpectedResult;
+                read.cte_items[0].body_offset_expression.kind = .function_call;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_body_offset_payload,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var cte_body_fetch_count = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH fetched_orders AS (SELECT id FROM orders FETCH FIRST +4 ROWS ONLY) SELECT id FROM fetched_orders",
+        schema,
+        &.{},
+    );
+    defer cte_body_fetch_count.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cte_body_fetch_count.plan.ctes.len);
+    try std.testing.expectEqual(@as(u32, 4), cte_body_fetch_count.plan.ctes[0].query.limit.?);
+
+    var malformed_generated_cte_body_fetch_count_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH fetched_orders AS (SELECT id FROM orders FETCH FIRST +4 ROWS ONLY) SELECT id FROM fetched_orders",
+    );
+    defer malformed_generated_cte_body_fetch_count_payload.deinit(alloc);
+    if (malformed_generated_cte_body_fetch_count_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0 or read.cte_items[0].body_fetch_count_tokens == null or read.cte_items[0].body_fetch_count_expression.tokens == null) return error.TestUnexpectedResult;
+                read.cte_items[0].body_fetch_count_expression.kind = .function_call;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_body_fetch_count_payload,
         schema,
         &.{},
         .{},
@@ -47287,6 +48008,32 @@ test "sql adapter lower expr lowers row_number window query plans" {
         &.{},
     ));
 
+    var malformed_inline_over_partition_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+    );
+    defer malformed_inline_over_partition_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionWindowPartitionExpressionKind(&malformed_inline_over_partition_kind, .function_call);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_inline_over_partition_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_inline_frame_child_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) OVER (PARTITION BY tenant ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS running_amount FROM usage_records",
+    );
+    defer malformed_inline_frame_child_payload.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionWindowFrameStartChildPayload(&malformed_inline_frame_child_payload);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_inline_frame_child_payload,
+        schema,
+        &.{},
+    ));
+
     var malformed_inline_function_name = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS tenant_rank FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
@@ -47461,6 +48208,32 @@ test "sql adapter lower expr lowers row_number window query plans" {
         &.{},
     ));
 
+    var malformed_named_window_leading_gap = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW first_window AS (ORDER BY tenant), usage_window AS (ORDER BY id)",
+    );
+    defer malformed_named_window_leading_gap.deinit(alloc);
+    try corruptGeneratedReadNamedWindowItemsDropLeading(&malformed_named_window_leading_gap);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_named_window_leading_gap,
+        schema,
+        &.{},
+    ));
+
+    var malformed_named_window_name_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)",
+    );
+    defer malformed_named_window_name_range.deinit(alloc);
+    try corruptGeneratedReadFirstNamedWindowNameRange(&malformed_named_window_name_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_named_window_name_range,
+        schema,
+        &.{},
+    ));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id, rank() OVER () AS bad_rank FROM usage_records",
@@ -47492,6 +48265,45 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, named_window.plan.window.windows[0].frame.?.unit);
     try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, named_window.plan.window.windows[1].frame.?.unit);
     try std.testing.expectEqualStrings("row_num", named_window.plan.window.order_by[0].field);
+
+    var malformed_named_window_partition_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER usage_window AS row_num FROM usage_records WINDOW usage_window AS (PARTITION BY tenant ORDER BY id ASC)",
+    );
+    defer malformed_named_window_partition_kind.deinit(alloc);
+    try corruptGeneratedReadFirstWindowPartitionExpressionKind(&malformed_named_window_partition_kind, .function_call);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_named_window_partition_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_named_window_order_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER usage_window AS row_num FROM usage_records WINDOW usage_window AS (PARTITION BY tenant ORDER BY lower(status) DESC, id ASC)",
+    );
+    defer malformed_named_window_order_kind.deinit(alloc);
+    try corruptGeneratedReadFirstWindowOrderExpressionKind(&malformed_named_window_order_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_named_window_order_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_named_window_frame_child_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) OVER usage_window AS running_amount FROM usage_records WINDOW usage_window AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+    );
+    defer malformed_named_window_frame_child_payload.deinit(alloc);
+    try corruptGeneratedReadFirstNamedWindowFrameStartChildPayload(&malformed_named_window_frame_child_payload);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_named_window_frame_child_payload,
+        schema,
+        &.{},
+    ));
 
     var alias_source = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,

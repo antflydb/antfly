@@ -759,17 +759,18 @@ projection, group, and order list boundary expressions, so corrupted CTE body
 metadata fails closed before the typed body planner can consume token fallback;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
-CTE reads now validate generated recursive CTE metadata before dispatching to
-the typed recursive CTE lowerer, including the direct public recursive CTE
-lowering helper, and the typed recursive CTE producer consumes retained
-generated CTE names, column-alias lists, materialization hints, and body ranges
-before parsing the anchor/member body, so corrupted retained recursive flags or
-prefix metadata cannot recover through the legacy token parser. Recursive
-member parsing now receives the cloned body-local generated set-operation AST
-and consumes the retained right-arm projection item ranges plus join side
-table/alias ranges for member projection and join binding, so stale
-recursive-member projection or join-side metadata fails before
-comma-separated projection items or table aliases can be rediscovered from the
+CTE reads now validate generated recursive CTE metadata before generated-native
+recursive plan construction. The recursive producer consumes retained generated
+CTE names, column-alias lists, materialization hints, body ranges,
+set-operation kind, right-member query range, and recursive-member CTE
+references before the anchor/member body can be planned, so corrupted retained
+recursive flags, prefix metadata, operator metadata, or member ranges cannot
+recover through the legacy token parser. Recursive member parsing now receives
+the cloned body-local generated set-operation AST and consumes the retained
+right-arm projection item ranges plus join side table/alias ranges for member
+projection and join binding, so stale recursive-member projection or join-side
+metadata fails before comma-separated projection items or table aliases can be
+rediscovered from the
 token slice; generated pagination
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata, and simple query, aggregate, join, and
@@ -830,17 +831,20 @@ legacy token tail can silently plan the lock.
 Generated CTE body metadata now retains and validates body-level
 `body_row_lock_tokens` as well as body-level Antfly and graph table-function
 source metadata, and rebases that metadata when a CTE body is cloned into the
-direct generated read AST path.
+direct generated read AST path. Non-recursive CTE body lowering now receives
+the exact retained generated CTE item from the CTE parser loop, so each body
+clones and validates its own generated projection, predicate, grouping,
+ordering, pagination, row-lock, join, window, function-source, and
+set-operation payload arrays before typed body parsing.
 Deeper read cutover still requires full generated
-query-body AST payloads for expression-level projections and predicates,
+aggregate payload lowering, richer inline window-expression semantic planning,
 complete multi-join planning and richer join-tree semantics beyond the current
-validated left-associative generated join nodes, complete expression AST nodes,
-complete per-CTE body AST arrays, native generated recursive CTE plan
-construction, aggregates, richer inline window-expression semantic planning,
-ordering, and direct generated read-plan lowering. Generated `LIMIT`, `OFFSET`,
-and `FETCH` pagination
-metadata now feeds the simple query, set-operation, aggregate, window, join,
-and lateral lowerers with fail-closed retained-range validation. Canonical Antfly query table functions
+validated left-associative generated join nodes, and direct generated read-plan
+lowering. Generated projection, predicate, grouping, ordering, pagination,
+row-lock, and result-tail metadata now feeds the query-family lowerers with
+fail-closed retained-range and child-expression validation; when a generated
+read AST is present, pagination and row-lock clauses must come from retained
+generated metadata instead of falling back to typed token rediscovery. Canonical Antfly query table functions
 such as `antfly.full_text_search`, `antfly.semantic_search`,
 `antfly.vector_search`, `antfly.hybrid_search`, `antfly.graph_traverse`,
 `antfly.graph_match`, and `antfly.graph_metric` are now accepted as generated
@@ -1590,10 +1594,11 @@ contract until storage and API row plans grow those outer-join semantics.
    list, and both parsed-statement publication and direct generated read
    lowering require that payload to agree with the retained final-select clause
    metadata before dispatch. Recursive CTE reads now validate generated
-   recursive CTE ranges and the recursive flag before dispatching to the typed
-   recursive CTE lowerer, including the direct public recursive CTE lowering
-   helper, and recursive producer parsing consumes retained generated CTE prefix
-   metadata before parsing the anchor/member body. Generated CTE read lowering now derives non-recursive final
+   recursive CTE ranges and the recursive flag before generated-native
+   recursive plan construction, including the direct public recursive CTE
+   lowering helper; recursive producer parsing consumes retained generated CTE
+   prefix metadata, set-operation kind, and right-member query range before
+   anchor/member body planning. Generated CTE read lowering now derives non-recursive final
    read-family dispatch from generated final-select kind metadata, including
    final set-operation reads, instead of re-entering the legacy read
    classifier.
@@ -1611,7 +1616,12 @@ contract until storage and API row plans grow those outer-join semantics.
    generated range-validated lowering when generated read metadata is available.
    Numeric and placeholder pagination values are parsed from generated
    expression ranges instead of the full clause tail in the executable
-   pagination helpers. Generated read order clauses now fail closed when the
+   pagination helpers, and simple, aggregate, and window reads fail closed when
+   retained generated `OFFSET` expression payloads are corrupted despite valid
+   typed offset text; CTE body pagination lowering now has the same fail-closed
+   coverage for corrupted retained generated body `OFFSET` and counted `FETCH`
+   expression payloads.
+   Generated read order clauses now fail closed when the
    generated order-list item, expression, direction, `USING`, or `NULLS`
    ranges disagree with the token stream or with the span consumed by typed
    order planning. Generated projection clauses now validate generated
@@ -1674,7 +1684,15 @@ contract until storage and API row plans grow those outer-join semantics.
    closed before aggregate plans are accepted.
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
-   before the typed window lowerer accepts a consumed `WINDOW` tail.
+   before the typed window lowerer accepts a consumed `WINDOW` tail, and the
+   named-window spec parser now consumes those retained generated spec,
+   partition-item, order-item, and frame ranges directly while parsing named
+   window definitions so stale inner partition or order expression payloads
+   cannot be ignored by typed window-definition reparsing. Inline generated
+   `OVER (...)` definitions now consume the same retained partition, order, and
+   frame payloads through the shared window-definition parser, and bounded
+   frame offsets validate their retained generated child expression payloads
+   before a typed frame can be accepted.
    Generated inline window `OVER` expressions now validate the generated
    `OVER` span, exact `OVER name` or `OVER (...)` token layout,
    named-window reference or inline definition, partition list, order list,
@@ -1771,7 +1789,9 @@ contract until storage and API row plans grow those outer-join semantics.
    reads; document SQL returns the explicit
    `DocumentSqlLockingUnsupported` diagnostic. CTE read bodies now retain
    `body_row_lock_tokens`, validate the `FOR` row-lock boundary, and clone that
-   metadata into direct generated read ASTs. CTE read bodies also retain,
+   metadata into direct generated read ASTs; CTE body row-lock lowering now
+   fails closed when retained generated body row-lock metadata is stale instead
+   of accepting the typed body text alone. CTE read bodies also retain,
    validate, and clone body-level Antfly and graph table-function metadata so
    generated child-read planning sees the same table-function source semantics
    as direct top-level reads. Parsed-statement classification now also

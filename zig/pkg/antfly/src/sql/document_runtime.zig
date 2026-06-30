@@ -3067,6 +3067,113 @@ test "document SQL residual filters match corpus cases" {
     }
 }
 
+test "document SQL bounded residual scan fails closed only when the scan cap is filled" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        scanned_rows: u32,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return .{ .json = try lookup_alloc.dupe(u8, "{\"status\":\"active\"}"), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            const ndjson = if (self.scanned_rows == 0)
+                ""
+            else
+                "{\"key\":\"doc:a\"}\n";
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    var projection = [_]sql_adapter.DocumentProjection{.{ .kind = .id, .output = "_id" }};
+    const residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"missing\"}}";
+
+    const capped_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 1,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .limit = 1,
+    };
+    var capped_source = MockSource{ .scanned_rows = 1 };
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanRowCapExceeded,
+        executeReadPlanAlloc(alloc, capped_source.source(), capped_plan, .stale),
+    );
+
+    const partial_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 2,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .limit = 1,
+    };
+    var partial_source = MockSource{ .scanned_rows = 1 };
+    var partial = (try executeReadPlanAlloc(alloc, partial_source.source(), partial_plan, .stale)).?;
+    defer partial.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), partial.total);
+    try std.testing.expectEqual(@as(usize, 0), partial.rows.len);
+}
+
 test "document SQL bounded aggregate scan admits only lookup-backed document keys" {
     const alloc = std.testing.allocator;
 

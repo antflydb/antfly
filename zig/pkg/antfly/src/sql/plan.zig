@@ -1139,6 +1139,7 @@ pub const CteSelectParserHooks = struct {
         *anyopaque,
         []const Token,
         []const db_mod.types.RelationalRowsCte,
+        ?*const generated_parser.GeneratedSqlCteAst,
     ) anyerror!LoweredSelect,
 };
 
@@ -1234,6 +1235,102 @@ const GeneratedRecursiveCteMemberMetadata = struct {
     projections: GeneratedRecursiveCteMemberProjectionList,
     join: generated_parser.GeneratedSqlJoinAst,
 };
+
+const GeneratedRecursiveCteProducerMetadata = struct {
+    anchor_tokens: generated_parser.GeneratedSqlTokenRange,
+    member_tokens: generated_parser.GeneratedSqlTokenRange,
+    operation: SelectSetOperation,
+    recursive_member_references_cte: bool,
+};
+
+fn generatedRecursiveCteProducerMetadata(
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+    cte_name: []const u8,
+) !GeneratedRecursiveCteProducerMetadata {
+    const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
+    if (cte.body_kind != .set_operation) return error.UnsupportedSqlShape;
+    const set_operation_tokens = cte.body_set_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (set_operation_tokens.start <= body.start or set_operation_tokens.end > body.end) return error.UnsupportedSqlShape;
+    const right_query = cte.body_set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
+    if (right_query.start <= set_operation_tokens.start or right_query.end != set_operation_tokens.end) return error.UnsupportedSqlShape;
+    const operation = try generatedRecursiveSelectSetOperation(tokens, cte.body_set_operation);
+    return .{
+        .anchor_tokens = .{ .start = body.start, .end = set_operation_tokens.start },
+        .member_tokens = right_query,
+        .operation = operation,
+        .recursive_member_references_cte = try generatedRecursiveMemberReferencesCte(tokens, cte.body_set_operation, cte_name),
+    };
+}
+
+fn generatedRecursiveSelectSetOperation(
+    tokens: []const Token,
+    set_operation: generated_parser.GeneratedSqlSetOperationAst,
+) !SelectSetOperation {
+    const all_tokens = set_operation.all_tokens;
+    const operator_tokens = set_operation.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    switch (set_operation.kind orelse return error.UnsupportedSqlShape) {
+        .@"union" => {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.@"union")) return error.UnsupportedSqlShape;
+            if (all_tokens) |range| {
+                if (range.start != operator_tokens.end or range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!tokens[range.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+                return .union_all;
+            }
+            return .union_distinct;
+        },
+        .intersect, .except => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedRecursiveMemberReferencesCte(
+    tokens: []const Token,
+    set_operation: generated_parser.GeneratedSqlSetOperationAst,
+    cte_name: []const u8,
+) !bool {
+    if (set_operation.right_source_table_tokens) |table| {
+        if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+    }
+    for (set_operation.right_join_items) |join| {
+        if (join.left_table_tokens) |table| {
+            if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+        }
+        if (join.right_table_tokens) |table| {
+            if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn generatedFinalReadReferencesCte(
+    tokens: []const Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+    cte_name: []const u8,
+) !bool {
+    if (read_ast.source_table_tokens) |table| {
+        if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+    }
+    for (read_ast.join_items) |join| {
+        if (join.left_table_tokens) |table| {
+            if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+        }
+        if (join.right_table_tokens) |table| {
+            if (try generatedIdentifierRangeEquals(tokens, table, cte_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn generatedIdentifierRangeEquals(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    expected: []const u8,
+) !bool {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return std.ascii.eqlIgnoreCase(tokens[range.start].text, expected);
+}
 
 fn generatedRecursiveCteMemberMetadata(
     tokens: []const Token,
@@ -1446,6 +1543,42 @@ fn parseGeneratedFetchLimitValueForClause(
     return .{ .value = limit };
 }
 
+fn parseLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !GeneratedLimitValue {
+    if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| return generated_limit;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return .{ .value = try value_mod.parseLimitValue(tokens, pos, params) };
+}
+
+fn parseOffsetValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !u32 {
+    if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset| return generated_offset;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return try value_mod.parseOffsetValue(tokens, pos, params);
+}
+
+fn parseFetchLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !GeneratedLimitValue {
+    if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| return generated_limit;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return .{ .value = try value_mod.parseFetchLimitValue(tokens, pos, params) };
+}
+
 test "sql adapter plan parses generated pagination from expression AST ranges" {
     const alloc = std.testing.allocator;
 
@@ -1545,26 +1678,26 @@ pub fn parseCtesForPlanAlloc(
     }
 
     while (true) {
-        const generated_cte: ?generated_parser.GeneratedSqlCteAst = if (generated_read_ast) |read_ast| blk: {
+        const generated_cte: ?*const generated_parser.GeneratedSqlCteAst = if (generated_read_ast) |read_ast| blk: {
             if (generated_cte_index >= read_ast.cte_items.len) return error.UnsupportedSqlShape;
-            break :blk read_ast.cte_items[generated_cte_index];
+            break :blk &read_ast.cte_items[generated_cte_index];
         } else null;
 
         const cte_name = if (generated_cte) |cte|
-            try generatedReadCteNameAlloc(alloc, tokens, cte, pos)
+            try generatedReadCteNameAlloc(alloc, tokens, cte.*, pos)
         else
             try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
         var cte_name_transferred = false;
         errdefer if (!cte_name_transferred) alloc.free(cte_name);
         if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
         const cte_column_aliases = if (generated_cte) |cte|
-            try generatedReadCteColumnAliasesAlloc(alloc, tokens, cte, pos)
+            try generatedReadCteColumnAliasesAlloc(alloc, tokens, cte.*, pos)
         else
             try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
         defer strings.freeStringSlice(alloc, cte_column_aliases);
         try cursor.expectKeywordTag(.as);
         if (generated_cte) |cte| {
-            try consumeGeneratedReadCteMaterialization(tokens, cte, pos);
+            try consumeGeneratedReadCteMaterialization(tokens, cte.*, pos);
         } else {
             try parser.consumeCteMaterializationHint(tokens, pos);
         }
@@ -1573,7 +1706,7 @@ pub fn parseCtesForPlanAlloc(
         if (generated_cte) |cte| {
             const body_tokens = cte.body_tokens orelse return error.UnsupportedSqlShape;
             if (body_tokens.start != pos.* or body_tokens.end != close_index) return error.UnsupportedSqlShape;
-            if (try lowerGeneratedReadGraphTableFunctionCteAlloc(alloc, tokens, cte)) |table_function| {
+            if (try lowerGeneratedReadGraphTableFunctionCteAlloc(alloc, tokens, cte.*)) |table_function| {
                 pos.* = close_index + 1;
                 try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
                 try ctes.append(alloc, .{
@@ -1601,7 +1734,7 @@ pub fn parseCtesForPlanAlloc(
                 else => return err,
             }
         }
-        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items);
+        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items, generated_cte);
         errdefer lowered.deinit(alloc);
         pos.* = close_index + 1;
         try applyCteColumnAliasesAlloc(alloc, &lowered, cte_column_aliases);
@@ -1992,26 +2125,15 @@ pub fn parseSimpleSelectSetResultTailAlloc(
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
-                lowered.query.limit = generated_limit.value;
-            } else {
-                lowered.query.limit = try value_mod.parseLimitValue(tokens, pos, params);
-            }
+            lowered.query.limit = (try parseLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)).value;
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (lowered.query.offset != 0) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            lowered.query.offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, params);
+            lowered.query.offset = try parseOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast);
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
-                lowered.query.limit = generated_limit.value;
-            } else {
-                lowered.query.limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
-            }
+            lowered.query.limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)).value;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {
@@ -2067,26 +2189,15 @@ pub fn parseSetOperationResultTailAlloc(
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (limit != null) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseLimitValue(tokens, pos, params);
-            }
+            limit = (try parseLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)).value;
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (offset != 0) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset|
-                generated_offset
-            else
-                try value_mod.parseOffsetValue(tokens, pos, params);
+            offset = try parseOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast);
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (limit != null) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
-            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
-                limit = generated_limit.value;
-            } else {
-                limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
-            }
+            limit = (try parseFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)).value;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {
@@ -2558,7 +2669,9 @@ pub fn parseRecursiveCtePlanAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
 
     if (!cursor.peekKeywordTag(.select)) return error.UnsupportedSqlShape;
-    if (!tokensContainTopLevelSourceName(tokens[pos.*..], recursive.cte_name)) return error.UnsupportedSqlShape;
+    if (hooks.generated_read_ast) |read_ast| {
+        if (!(try generatedFinalReadReferencesCte(tokens, read_ast, recursive.cte_name))) return error.UnsupportedSqlShape;
+    } else if (!tokensContainTopLevelSourceName(tokens[pos.*..], recursive.cte_name)) return error.UnsupportedSqlShape;
 
     const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
         .name = recursive.cte_name,
@@ -2625,10 +2738,17 @@ pub fn parseRecursiveCteProducerAlloc(
         const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
         if (body.start != pos.* or body.end != close_index) return error.UnsupportedSqlShape;
     }
+    const generated_producer = if (generated_cte) |cte|
+        try generatedRecursiveCteProducerMetadata(tokens, cte, cte_name)
+    else
+        null;
     const body_tokens = tokens[pos.*..close_index];
     var body_pos: usize = 0;
     var anchor = try hooks.parse_select_with_set_boundary(hooks.ptr, body_tokens, &body_pos, &.{});
     errdefer anchor.deinit(alloc);
+    if (generated_producer) |generated| {
+        if (body_pos != generated.anchor_tokens.end - generated.anchor_tokens.start) return error.UnsupportedSqlShape;
+    }
     const output_columns = try hooks.select_output_columns(hooks.ptr, anchor);
     var output_columns_transferred = false;
     errdefer if (!output_columns_transferred) freeSetOperationOutputColumns(alloc, output_columns);
@@ -2638,12 +2758,20 @@ pub fn parseRecursiveCteProducerAlloc(
     defer if (base_table_name) |name| alloc.free(name);
     try resolveSelectSourceForPlanAlloc(alloc, &anchor, &.{}, &base_table_name);
     if (body_pos >= body_tokens.len) return error.UnsupportedSqlShape;
-    const operation = try grammar.parseSelectSetOperation(body_tokens, &body_pos);
+    const operation = if (generated_producer) |generated| blk: {
+        const local_member_start = generated.member_tokens.start - (generated_cte.?.body_tokens orelse return error.UnsupportedSqlShape).start;
+        if (local_member_start <= body_pos or local_member_start > body_tokens.len) return error.UnsupportedSqlShape;
+        body_pos = local_member_start;
+        break :blk generated.operation;
+    } else try grammar.parseSelectSetOperation(body_tokens, &body_pos);
     switch (operation) {
         .union_all, .union_distinct => {},
         .intersect, .except => return error.UnsupportedSqlShape,
     }
-    const recursive_member_references_cte = tokensContainTopLevelSourceName(body_tokens[body_pos..], cte_name);
+    const recursive_member_references_cte = if (generated_producer) |generated|
+        generated.recursive_member_references_cte
+    else
+        tokensContainTopLevelSourceName(body_tokens[body_pos..], cte_name);
     if (!recursive_member_references_cte) return error.UnsupportedSqlShape;
 
     const recursive_member_ctes = [_]db_mod.types.RelationalRowsCte{.{
@@ -5139,10 +5267,16 @@ test "sql adapter plan resolves join CTE sides to physical base table" {
 test "sql adapter plan consumes generated CTE prefix metadata before parsing body" {
     const alloc = std.testing.allocator;
     const FailingParser = struct {
-        fn parseSelect(ptr: *anyopaque, tokens: []const Token, ctes: []const db_mod.types.RelationalRowsCte) anyerror!LoweredSelect {
+        fn parseSelect(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            ctes: []const db_mod.types.RelationalRowsCte,
+            generated_cte: ?*const generated_parser.GeneratedSqlCteAst,
+        ) anyerror!LoweredSelect {
             _ = ptr;
             _ = tokens;
             _ = ctes;
+            _ = generated_cte;
             return error.TestUnexpectedResult;
         }
     };

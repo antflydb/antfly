@@ -1184,7 +1184,8 @@ fn removeStringsFromJsonArray(value: ?*std.json.Value, fields: []const []const u
 }
 
 fn rejectPrimaryKeyDropFromSchemaJson(root: *std.json.ObjectMap, fields: []const []const u8) !void {
-    const primary_key = root.get("primary_key") orelse return error.InvalidSqlCatalog;
+    const primary_key = root.get("primary_key") orelse return;
+    if (primary_key == .null) return;
     if (primary_key != .object) return error.InvalidSqlCatalog;
     const columns = primary_key.object.get("columns") orelse return error.InvalidSqlCatalog;
     if (jsonStringArrayReferencesAny(columns, fields)) return error.UnsupportedSqlShape;
