@@ -40,8 +40,11 @@ or tap homebrew-taps and install separately:
 
 ```bash
 brew tap antflydb/taps
+brew trust --formula antflydb/taps/antfly
 brew install antfly
 ```
+
+The trust step is required for short-name installs from non-official taps.
 
 This installs the native Zig runtime as `antfly`. CLI commands are available directly as `antfly <command>` (e.g., `antfly query`, `antfly table create`).
 
